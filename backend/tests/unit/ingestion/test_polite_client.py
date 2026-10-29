@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 import pytest
 import respx
+from pydantic import ValidationError
 
 import opennse_terminal
 from opennse_terminal.config import TerminalSettings
@@ -227,9 +228,44 @@ async def test_user_agent_is_sent_on_robots_and_target_requests(
     assert [sent.request.headers["user-agent"] for sent in network.sent] == [USER_AGENT] * 2
 
 
-async def test_user_agent_carries_the_configured_contact(make_client: ClientFactory) -> None:
-    client = make_client(scraper_contact="data-desk@example.invalid")
-    assert client.user_agent == "OpenNSE-Terminal/0.1.0 (+mailto:data-desk@example.invalid)"
+@pytest.mark.parametrize(
+    "contact", ["ops@example.invalid", "hello@urimtrader.me", "data-desk@example.invalid"]
+)
+async def test_user_agent_carries_the_configured_contact(
+    contact: str, make_client: ClientFactory, make_settings: SettingsFactory
+) -> None:
+    client = make_client(scraper_contact=contact)
+    expected = f"OpenNSE-Terminal/0.1.0 (+mailto:{contact})"
+    assert client.user_agent == build_user_agent(make_settings(scraper_contact=contact)) == expected
+
+
+@pytest.mark.parametrize(
+    "contact",
+    [
+        pytest.param("qa@x.invalid\r\nX-Evil: 1", id="crlf-header-injection"),
+        pytest.param("qa@x.invalid\nX-Evil: 1", id="lf"),
+        pytest.param("qa\t@x.invalid", id="tab"),
+        pytest.param("qa@x.invalid\x00", id="nul"),
+        pytest.param("qa@x.invalid\x7f", id="del"),
+        pytest.param("op\u00e9rations@example.invalid", id="non-ascii"),
+        pytest.param("data desk@example.invalid", id="space"),
+        pytest.param("ops.example.invalid", id="no-at-sign"),
+    ],
+)
+def test_contact_unfit_for_the_user_agent_header_is_rejected_at_load(
+    contact: str, make_settings: SettingsFactory
+) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        make_settings(scraper_contact=contact)
+
+    errors = exc_info.value.errors()
+    assert [(error["loc"], error["type"]) for error in errors] == [
+        (("scraper_contact",), "value_error")
+    ]
+    message = str(exc_info.value)
+    assert "scraper_contact" in message
+    assert "User-Agent" in message
+    assert contact not in message
 
 
 async def test_requests_use_a_10_s_connect_and_the_configured_read_timeout(

@@ -14,6 +14,7 @@ scheduler and seeder construct ``TerminalSettings()`` once per process, so an en
 next construction.
 """
 
+import re
 from typing import Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -31,6 +32,19 @@ DEFAULT_CURRENCY: Final[str] = "KES"
 """ISO 4217 code every ``currency`` column and monetary value defaults to (Kenyan shilling)."""
 
 _ASYNC_DRIVER_PREFIX: Final = "postgresql+asyncpg://"
+# Upper bound of pdf_max_bytes (1 GiB). The upload endpoint holds the whole file in memory, and
+# the PDF parser process runs under a 1 GiB address-space limit, so a larger file could never be
+# parsed. The bound also keeps pdf_max_bytes + 1 (the endpoint's file read) and the 1 MiB of
+# multipart overhead far inside the index range of file reads, which 2**63 - 1 would overflow.
+_PDF_MAX_BYTES_LIMIT: Final = 1 << 30
+# Upper bound of pdf_max_concurrency. Each admitted parse holds one worker thread of anyio's
+# default 40-token thread pool, which FastAPI also uses for every sync dependency (the
+# get_terminal_settings provider among them), and runs a parser process of up to 1 GiB. A limit at
+# or above the pool size would starve every other endpoint of threads.
+_PDF_MAX_CONCURRENCY_LIMIT: Final = 32
+# A scraper contact is local@domain in visible ASCII. The HTTP client refuses control and non-ASCII
+# characters in the User-Agent header that carries the contact, and an address has no whitespace.
+_SCRAPER_CONTACT_PATTERN: Final = re.compile(r"[!-~]+@[!-~]+")
 
 
 class TerminalSettings(BaseSettings):
@@ -103,7 +117,8 @@ class TerminalSettings(BaseSettings):
         min_length=3,
         description=(
             "Contact address in the scrapers' user agent, "
-            "OpenNSE-Terminal/<version> (+mailto:<contact>)."
+            "OpenNSE-Terminal/<version> (+mailto:<contact>): local@domain in visible ASCII, "
+            "with no spaces or control characters."
         ),
     )
     # The two *_seconds fields are durations, not money, so float is appropriate for them. They
@@ -132,9 +147,10 @@ class TerminalSettings(BaseSettings):
     pdf_max_bytes: int = Field(
         default=20_971_520,
         gt=0,
+        le=_PDF_MAX_BYTES_LIMIT,
         description=(
-            "Per-file size limit for POST /ingest/pdf, in bytes. The whole request may carry "
-            "1 MiB more for multipart overhead."
+            f"Per-file size limit for POST /ingest/pdf, in bytes, at most {_PDF_MAX_BYTES_LIMIT} "
+            "(1 GiB). The whole request may carry 1 MiB more for multipart overhead."
         ),
     )
     pdf_max_pages: int = Field(
@@ -145,8 +161,10 @@ class TerminalSettings(BaseSettings):
     pdf_max_concurrency: int = Field(
         default=2,
         ge=1,
+        le=_PDF_MAX_CONCURRENCY_LIMIT,
         description=(
-            "Concurrent PDF parses per API process; a request beyond it is answered with 429."
+            f"Concurrent PDF parses per API process, 1-{_PDF_MAX_CONCURRENCY_LIMIT}; a request "
+            "beyond it is answered with 429."
         ),
     )
 
@@ -168,6 +186,21 @@ class TerminalSettings(BaseSettings):
         # so the default principal built from this value could never be constructed.
         if "\x00" in value:
             raise ValueError("default_owner_key must not contain a NUL character")
+        return value
+
+    @field_validator("scraper_contact")
+    @classmethod
+    def _require_header_safe_contact(cls, value: str) -> str:
+        # Every scraper request sends the contact verbatim in its User-Agent header, where a CR,
+        # LF or other control character or a non-ASCII character makes the HTTP client refuse
+        # every request without naming this setting. The value is left out of the message, so a
+        # rejected header line is never echoed into the logs.
+        if _SCRAPER_CONTACT_PATTERN.fullmatch(value) is None:
+            raise ValueError(
+                "scraper_contact must be an address of the form local@domain in visible ASCII "
+                "characters, with no spaces or control characters, because the scrapers send it "
+                "in their User-Agent header as +mailto:<contact>"
+            )
         return value
 
     @field_validator("timezone")

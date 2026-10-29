@@ -20,8 +20,8 @@ The contracts a host inherits through ``include_router`` and through the setting
 supplies are proved in sections of their own below, each without PostgreSQL: hostile JSON request
 bodies get one of the two 422 shapes; ``GET /health`` answers a coded 503 once its database round
 trip outlives its bound; the health service's ``SELECT 1`` probe answers ok, or a coded 503 that
-names only the failure's type; ``TerminalSettings`` bounds its durations and keeps
-``database_url`` out of its repr; and the session module names a database only by its
+names only the failure's type; ``TerminalSettings`` bounds its durations and PDF upload limits
+and keeps ``database_url`` out of its repr; and the session module names a database only by its
 credential-free label. Two more such sections sit beside the checks they extend: after the route
 table, a bare host app's OpenAPI documents both 422 shapes on every operation that declares its
 own 422, and after the upload guard, ``PdfParseLimiter`` counts PDF parse slots against the limit
@@ -1095,6 +1095,37 @@ async def test_admission_never_exceeds_the_limit_in_force_across_every_resize_se
             await held.release()
         assert limiter.active == 0, sequence
         assert [await held.take(3) for _ in range(4)] == [True, True, True, False], sequence
+
+
+HUGE_PARSE_LIMIT: Final = 10**7
+"""A limit far above what ``TerminalSettings`` allows; resizing one slot at a time took about
+0.6 s to grow to it, so a per-slot regression fails the time bound below without hanging."""
+RESIZE_SECONDS_BOUND: Final = 0.1
+
+
+async def test_a_huge_limit_is_applied_without_per_slot_work() -> None:
+    """Growing to a huge limit and shrinking back to 1 each take constant time, and both keep the
+    slot in use: the shrink refuses while it is held, and its release admits the next request."""
+    limiter = PdfParseLimiter()
+    held = HeldSlots(limiter)
+
+    started = time.perf_counter()
+    grown = await held.take(HUGE_PARSE_LIMIT)
+    grow_seconds = time.perf_counter() - started
+    assert grown
+    assert (limiter.limit, limiter.active) == (HUGE_PARSE_LIMIT, 1)
+
+    started = time.perf_counter()
+    shrunk = await held.take(1)
+    shrink_seconds = time.perf_counter() - started
+    assert not shrunk
+    assert (limiter.limit, limiter.active) == (1, 1)
+
+    assert grow_seconds < RESIZE_SECONDS_BOUND
+    assert shrink_seconds < RESIZE_SECONDS_BOUND
+    await held.release()
+    assert await held.take(1)
+    assert (limiter.limit, limiter.active) == (1, 1)
 
 
 class ParseFailedError(Exception):
@@ -2205,14 +2236,18 @@ async def test_failed_round_trip_answers_coded_503_and_logs_only_the_type_name(
 
 
 # ---------------------------------------------------------------------------------------------
-# Settings: ``TerminalSettings`` (``opennse_terminal.config``) duration bounds and repr
+# Settings: ``TerminalSettings`` (``opennse_terminal.config``) duration and PDF limit bounds, repr
 #
 # ``scraper_min_interval_seconds`` feeds ``asyncio.sleep`` and ``scraper_timeout_seconds`` feeds
 # ``httpx.Timeout`` in the polite client, so both must load as finite numbers: zero spacing is
-# allowed, the timeout must be positive, and neither has an upper bound. ``repr()`` and ``str()``
-# must leave out ``database_url``, which carries the database password. Every case runs through
-# keyword arguments and through the ``TERMINAL_*`` environment variables, with ``_env_file=None``
-# so the checkout's ``.env`` is never read. Offline and synchronous: no network, no database.
+# allowed, the timeout must be positive, and neither has an upper bound. ``pdf_max_bytes`` is at
+# most 1 GiB, the parser process's memory limit, which also keeps the upload's file read inside
+# the index range; ``pdf_max_concurrency`` is at most 32, so admitted parses never hold every
+# worker thread of the API process. A larger value is rejected at load, naming the field.
+# ``repr()`` and ``str()`` must leave out ``database_url``, which carries the database password.
+# Every case runs through keyword arguments and through the ``TERMINAL_*`` environment variables,
+# with ``_env_file=None`` so the checkout's ``.env`` is never read. Offline and synchronous: no
+# network, no database.
 # ---------------------------------------------------------------------------------------------
 
 INTERVAL = "scraper_min_interval_seconds"
@@ -2336,6 +2371,59 @@ def test_rendered_settings_omit_database_url(
     assert "database_url" not in rendered
     assert "pdf_max_bytes=" in rendered
     assert settings.database_url == url
+
+
+PDF_MAX_BYTES = "pdf_max_bytes"
+PDF_MAX_CONCURRENCY = "pdf_max_concurrency"
+PDF_LIMIT_FIELDS = (PDF_MAX_BYTES, PDF_MAX_CONCURRENCY)
+INT64_MAX = str(2**63 - 1)
+
+
+# Requested by each PDF limit test rather than autouse, so the module's other tests keep the PDF
+# limit variables they inherit.
+@pytest.fixture
+def _no_pdf_limit_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove any inherited PDF limit variables, so each test sees only what it sets."""
+    for field in PDF_LIMIT_FIELDS:
+        monkeypatch.delenv(_env_var(field), raising=False)
+
+
+@pytest.mark.usefixtures("_no_pdf_limit_env")
+@pytest.mark.parametrize("source", SOURCES)
+@pytest.mark.parametrize(
+    ("field", "raw", "expected"),
+    [(PDF_MAX_BYTES, "1073741824", 1 << 30), (PDF_MAX_CONCURRENCY, "32", 32)],
+)
+def test_pdf_limit_at_its_upper_bound_is_accepted(
+    monkeypatch: pytest.MonkeyPatch, field: str, raw: str, expected: int, source: str
+) -> None:
+    settings = _load(monkeypatch, source, field, raw)
+
+    assert getattr(settings, field) == expected
+
+
+@pytest.mark.usefixtures("_no_pdf_limit_env")
+@pytest.mark.parametrize("source", SOURCES)
+@pytest.mark.parametrize(
+    ("field", "raw"),
+    [
+        (PDF_MAX_BYTES, "1073741825"),
+        (PDF_MAX_BYTES, INT64_MAX),
+        (PDF_MAX_BYTES, "99999999999999999999"),
+        (PDF_MAX_CONCURRENCY, "33"),
+        (PDF_MAX_CONCURRENCY, INT64_MAX),
+        (PDF_MAX_CONCURRENCY, "99999999999999999999"),
+    ],
+)
+def test_pdf_limit_above_its_upper_bound_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, field: str, raw: str, source: str
+) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        _load(monkeypatch, source, field, raw)
+
+    errors = exc_info.value.errors()
+    assert [(error["loc"], error["type"]) for error in errors] == [((field,), "less_than_equal")]
+    assert field in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------------------------

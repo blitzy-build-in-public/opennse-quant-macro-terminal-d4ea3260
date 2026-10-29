@@ -530,13 +530,13 @@ a process environment variable wins over the file.
 | `TERMINAL_DEFAULT_OWNER_KEY` | `local` | Subject of the default principal and owner of the seeded watchlist |
 | `TERMINAL_TIMEZONE` | `Africa/Nairobi` | Exchange calendar and scheduler timezone (IANA name) |
 | `TERMINAL_FUNDAMENTALS_LAG_DAYS` | `90` | Days after `period_end_date` before a fundamentals row is treated as published |
-| `TERMINAL_SCRAPER_CONTACT` | `ops@example.invalid` | Contact address in the scrapers' user agent; set a real address |
+| `TERMINAL_SCRAPER_CONTACT` | `ops@example.invalid` | Contact address in the scrapers' user agent; set a real address, `local@domain` in visible ASCII with no spaces or control characters |
 | `TERMINAL_SCRAPER_MIN_INTERVAL_SECONDS` | `2.0` | Minimum spacing between requests to the same host |
 | `TERMINAL_SCRAPER_TIMEOUT_SECONDS` | `30` | Read timeout per request (the connect timeout is fixed at 10 s) |
 | `TERMINAL_SCRAPER_MAX_RETRIES` | `3` | Retries on timeouts and HTTP 429, 500, 502, 503 and 504 |
-| `TERMINAL_PDF_MAX_BYTES` | `20971520` | Per-file PDF upload limit (20 MiB); the whole request may carry 1 MiB more |
+| `TERMINAL_PDF_MAX_BYTES` | `20971520` | Per-file PDF upload limit (20 MiB), at most 1073741824 (1 GiB); the whole request may carry 1 MiB more |
 | `TERMINAL_PDF_MAX_PAGES` | `400` | Maximum pages per uploaded PDF |
-| `TERMINAL_PDF_MAX_CONCURRENCY` | `2` | Concurrent PDF parses per API process; further requests get 429 |
+| `TERMINAL_PDF_MAX_CONCURRENCY` | `2` | Concurrent PDF parses per API process, 1-32; further requests get 429 |
 | `TERMINAL_API_ORIGIN` | `http://localhost:8000` | FastAPI origin of the Next.js rewrites and the Playwright servers; fixed at `next build` |
 
 `TERMINAL_TEST_DATABASE_URL` and `TERMINAL_API_ORIGIN` are not backend settings and are ignored by

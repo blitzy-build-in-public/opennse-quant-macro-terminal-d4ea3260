@@ -264,27 +264,30 @@ router = APIRouter(route_class=TerminalUploadRoute)
 
 
 class PdfParseLimiter:
-    """Non-blocking admission of PDF parses, resized in place to each request's limit.
+    """Non-blocking admission of PDF parses, resized to each request's limit in constant time.
 
-    One ``asyncio.Semaphore``, created with the limiter and kept for its whole life, holds the
-    free parse slots. :meth:`slot` first resizes it to the request's ``pdf_max_concurrency``
-    without losing a slot that is in use:
+    An ``asyncio.Semaphore`` holds the free parse slots: ``limit - active`` of them, or none
+    while ``active`` is at or above the limit in force. :meth:`slot` first makes the request's
+    ``pdf_max_concurrency`` the limit in force. A changed limit replaces the semaphore with one
+    holding the free slots under the new limit, a single step whatever the size of the change,
+    and keeps every slot in use:
 
-    * a higher limit adds the extra slots at once, first cancelling slots still due to retire;
-    * a lower limit removes free slots at once and retires the rest as running parses finish, so
-      parses admitted under the old limit complete while new requests already meet the new one.
+    * a higher limit frees its extra slots at once;
+    * a lower limit applies to new requests at once, while parses admitted under the old limit
+      run to completion: a finishing parse frees its slot only if fewer parses than the limit in
+      force are then active.
 
     A request is therefore admitted only while fewer parses than the limit in force are active.
-    Admission never waits: a free slot is taken at once, or the request is refused. The semaphore
-    is acquired only while it has a free slot, so it never binds to an event loop. Like every
-    asyncio primitive, a limiter serves the coroutines of one event loop at a time.
+    Admission never waits: a free slot is taken at once, or the request is refused. A semaphore
+    is acquired only while it has a free slot, so no coroutine ever waits on one, replacing it
+    strands no waiter, and it never binds to an event loop. Like every asyncio primitive, a
+    limiter serves the coroutines of one event loop at a time.
     """
 
     def __init__(self) -> None:
         self._semaphore = asyncio.Semaphore(0)
         self._limit = 0
         self._active = 0
-        self._retiring = 0
 
     @property
     def limit(self) -> int:
@@ -310,10 +313,10 @@ class PdfParseLimiter:
         """
         if limit < 1:
             raise ValueError(f"The PDF parse limit must be at least 1, got {limit}")
-        # Nothing here suspends before the slot is taken: resizing and acquiring a free slot of
-        # an unlocked semaphore complete without yielding to the event loop, so checking for a
-        # free slot and taking it cannot interleave with another request.
-        await self._resize(limit)
+        # Nothing here suspends before the slot is taken: resizing is synchronous, and acquiring
+        # a free slot of an unlocked semaphore completes without yielding to the event loop, so
+        # checking for a free slot and taking it cannot interleave with another request.
+        self._resize(limit)
         admitted = not self._semaphore.locked()
         if admitted:
             await self._semaphore.acquire()
@@ -324,28 +327,16 @@ class PdfParseLimiter:
             if admitted:
                 self._release()
 
-    async def _resize(self, limit: int) -> None:
-        """Make ``limit`` the limit in force, keeping every slot in use."""
-        if limit > self._limit:
-            added = limit - self._limit
-            cancelled = min(added, self._retiring)
-            self._retiring -= cancelled
-            for _ in range(added - cancelled):
-                self._semaphore.release()
-        elif limit < self._limit:
-            removed = self._limit - limit
-            while removed and not self._semaphore.locked():
-                await self._semaphore.acquire()
-                removed -= 1
-            self._retiring += removed
-        self._limit = limit
+    def _resize(self, limit: int) -> None:
+        """Make ``limit`` the limit in force, keeping every slot in use, in constant time."""
+        if limit != self._limit:
+            self._semaphore = asyncio.Semaphore(max(0, limit - self._active))
+            self._limit = limit
 
     def _release(self) -> None:
-        """Give back a slot, or retire it while active parses exceed the limit in force."""
+        """Give back a slot, unless the parses still active fill the limit in force."""
         self._active -= 1
-        if self._retiring:
-            self._retiring -= 1
-        else:
+        if self._active < self._limit:
             self._semaphore.release()
 
 
