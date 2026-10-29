@@ -5,6 +5,7 @@ here is offline and synchronous: no network, no database. Expected dates are lit
 against a printed calendar; the tests never recompute Easter or the Sunday-substitution rule.
 """
 
+import csv
 from datetime import UTC, date, datetime
 from importlib.resources import files
 
@@ -209,10 +210,19 @@ def test_holidays_are_exactly_the_rule_dates_plus_gazetted_closures(
     assert set(cal.holidays(year)) == rule_closures | gazetted
 
 
-def test_is_session_rejects_a_datetime(cal: ExchangeCalendar) -> None:
+@pytest.mark.parametrize("method", ["is_session", "previous_session"])
+@pytest.mark.parametrize(
+    "moment",
+    [
+        pytest.param(datetime(2026, 4, 3, 9, 30, tzinfo=UTC), id="verified-2026"),
+        # The type is checked before the year, so an unverified-year datetime is a TypeError too.
+        pytest.param(datetime(2028, 1, 1, 9, 30, tzinfo=UTC), id="unverified-2028"),
+    ],
+)
+def test_lookup_rejects_a_datetime(cal: ExchangeCalendar, method: str, moment: datetime) -> None:
     """A datetime never equals a date key, so it would silently miss every closure."""
-    with pytest.raises(TypeError, match="datetime"):
-        cal.is_session(datetime(2026, 4, 3, 9, 30, tzinfo=UTC))
+    with pytest.raises(TypeError, match=f"^{method} takes a date, not a datetime"):
+        getattr(cal, method)(moment)
 
 
 # --- Gazetted closures data ------------------------------------------------------------------
@@ -266,6 +276,36 @@ def test_parse_closures_csv_accepts_a_header_without_rows() -> None:
 
 
 _HEAD = "# verified_years: 2026,2027\ndate,reason,reference\n"
+
+# Malformed quoting makes the csv module raise csv.Error; the parser re-raises it as a ValueError
+# naming the file line, counted with the comment and blank lines the csv reader never sees.
+_MALFORMED_QUOTING = [
+    pytest.param(
+        '# verified_years: 2026,2027\n"date,reason,reference\n',
+        "^line 2: malformed CSV: unexpected end of data$",
+        id="unterminated-quote-in-header",
+    ),
+    pytest.param(
+        _HEAD + '2026-03-20,"Idd-ul-Fitr,Notice 1\n',
+        "^line 3: malformed CSV: unexpected end of data$",
+        id="unterminated-quote-in-record",
+    ),
+    pytest.param(
+        _HEAD + '2026-03-20,"Idd-ul-Fitr"x,Notice 1\n',
+        "^line 3: malformed CSV: ',' expected after '\"'$",
+        id="character-after-closing-quote",
+    ),
+    pytest.param(
+        _HEAD + '2026-03-20,Idd-ul-Fitr,Notice 1\n# a comment\n\n2026-03-23,"Ad hoc"x,Notice 2\n',
+        "^line 6: malformed CSV: ',' expected after '\"'$",
+        id="malformed-record-after-comment-and-blank-line",
+    ),
+    pytest.param(
+        _HEAD + '2026-03-20,"Idd-ul-Fitr,Notice 1\n# a comment\n2026-03-23,Ad hoc,Notice 2\n',
+        "^line 5: malformed CSV in the record starting on line 3: unexpected end of data$",
+        id="unterminated-quote-consumes-later-lines",
+    ),
+]
 
 
 @pytest.mark.parametrize(
@@ -337,11 +377,19 @@ _HEAD = "# verified_years: 2026,2027\ndate,reason,reference\n"
             "more than 3 columns",
             id="surplus-column",
         ),
+        *_MALFORMED_QUOTING,
     ],
 )
 def test_parse_closures_csv_rejects_malformed_input(text: str, message: str) -> None:
     with pytest.raises(ValueError, match=message):
         parse_closures_csv(text)
+
+
+@pytest.mark.parametrize("text", [pytest.param(p.values[0], id=p.id) for p in _MALFORMED_QUOTING])
+def test_parse_closures_csv_keeps_the_csv_error_as_the_cause(text: str) -> None:
+    with pytest.raises(ValueError) as exc:
+        parse_closures_csv(text)
+    assert isinstance(exc.value.__cause__, csv.Error)
 
 
 @pytest.mark.parametrize(
@@ -375,6 +423,13 @@ def test_calendar_rejects_inconsistent_closures(closures: list[Closure], message
     [
         pytest.param("is_session", date(2028, 1, 3), 2028, id="is_session-2028"),
         pytest.param("previous_session", date(2028, 1, 10), 2028, id="previous_session-2028"),
+        # The predecessor, 2027-12-31, is a valid 2027 session, but the input's own year is not.
+        pytest.param(
+            "previous_session",
+            date(2028, 1, 1),
+            2028,
+            id="previous_session-2028-predecessor-verified",
+        ),
         pytest.param("is_session", date(2025, 12, 31), 2025, id="is_session-2025"),
         # The previous weekday, 2025-12-31, lies in an unverified year, so the walk never guesses.
         pytest.param("previous_session", date(2026, 1, 2), 2025, id="previous_session-into-2025"),

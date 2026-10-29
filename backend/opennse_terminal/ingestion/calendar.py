@@ -153,7 +153,8 @@ def parse_closures_csv(text: str) -> tuple[frozenset[int], tuple[Closure, ...]]:
         The verified years, and the closures in file order.
 
     Raises:
-        ValueError: The file breaks any rule above; the message names the offending line.
+        ValueError: The file breaks any rule above or holds malformed CSV quoting, such as an
+            unterminated quoted field; the message names the offending line.
     """
     verified_years: frozenset[int] | None = None
     data_lines: list[str] = []
@@ -176,7 +177,13 @@ def parse_closures_csv(text: str) -> tuple[frozenset[int], tuple[Closure, ...]]:
         raise ValueError(f"missing the header row {','.join(CLOSURES_HEADER)!r}")
 
     reader = csv.DictReader(data_lines, strict=True)
-    if tuple(reader.fieldnames or ()) != CLOSURES_HEADER:
+    # A csv.Error leaves the DictReader's own line_num stale, so failed reads are located with
+    # the underlying reader's count, which includes the line the error was found on.
+    try:
+        fieldnames = reader.fieldnames
+    except csv.Error as exc:
+        raise _malformed_csv_error(exc, 0, reader.reader.line_num, data_line_numbers) from exc
+    if tuple(fieldnames or ()) != CLOSURES_HEADER:
         raise ValueError(
             f"line {data_line_numbers[0]}: header must be exactly "
             f"{','.join(CLOSURES_HEADER)!r}, found {data_lines[0].strip()!r}"
@@ -184,7 +191,16 @@ def parse_closures_csv(text: str) -> tuple[frozenset[int], tuple[Closure, ...]]:
 
     closures: list[Closure] = []
     seen: dict[date, int] = {}
-    for row in reader:
+    while True:
+        lines_before = reader.reader.line_num
+        try:
+            row = next(reader, None)
+        except csv.Error as exc:
+            raise _malformed_csv_error(
+                exc, lines_before, reader.reader.line_num, data_line_numbers
+            ) from exc
+        if row is None:
+            break
         # line_num counts the lines the reader has consumed from data_lines, so it maps back to
         # the file line on which this record ends.
         line_number = data_line_numbers[reader.line_num - 1]
@@ -197,6 +213,20 @@ def parse_closures_csv(text: str) -> tuple[frozenset[int], tuple[Closure, ...]]:
         seen[closure.date] = line_number
         closures.append(closure)
     return verified_years, tuple(closures)
+
+
+def _malformed_csv_error(
+    exc: csv.Error, lines_before: int, lines_after: int, data_line_numbers: list[int]
+) -> ValueError:
+    # lines_before and lines_after are the reader's line_num before and after the failed read.
+    # An unterminated quote consumes every remaining line before failing at the end of the data,
+    # so the record's first line is named too when it differs. Both counts are clamped to the
+    # data lines, so the message always names a real file line.
+    last = len(data_line_numbers) - 1
+    line_number = data_line_numbers[min(max(lines_after - 1, 0), last)]
+    start_line = data_line_numbers[min(lines_before, last)]
+    where = "" if start_line == line_number else f" in the record starting on line {start_line}"
+    return ValueError(f"line {line_number}: malformed CSV{where}: {exc}")
 
 
 def _parse_closure_row(
@@ -279,7 +309,10 @@ class ExchangeCalendar:
         """Return every closure date of ``year`` mapped to its reason.
 
         The mapping holds the fixed-date holidays, Good Friday, Easter Monday, the Sunday
-        substitutes and the gazetted closures. Weekends are not listed.
+        substitutes and the gazetted closures. Ordinary weekend days are not listed, since they
+        are never sessions, but a holiday falling on a Saturday or Sunday stays in the mapping. A
+        Sunday holiday is listed alongside its substitute, the next following day that is not
+        itself a holiday; a Saturday holiday gets no substitute.
 
         Raises:
             CalendarNotVerified: ``year`` is not a verified year.
@@ -308,12 +341,21 @@ class ExchangeCalendar:
     def previous_session(self, day: date) -> date:
         """Return the latest session strictly before ``day``.
 
-        Walks back one day at a time and never guesses: the walk raises as soon as it reaches a
-        day in an unverified year, so ``previous_session(date(2026, 1, 2))`` raises for 2025.
+        ``day``'s own year must be verified, so ``previous_session(date(2028, 1, 1))`` raises for
+        2028 even though 2027-12-31 is a session. The walk then steps back one day at a time and
+        never guesses: it raises as soon as it reaches a day in an unverified year, so
+        ``previous_session(date(2026, 1, 2))`` raises for 2025.
 
         Raises:
-            CalendarNotVerified: The walk reached a year that is not verified.
+            CalendarNotVerified: ``day``, or a day the walk reached, lies in a year that is not
+                verified.
+            TypeError: ``day`` is a ``datetime``, which never equals a ``date`` key and would
+                silently miss every closure.
         """
+        if isinstance(day, datetime):
+            raise TypeError("previous_session takes a date, not a datetime; pass value.date()")
+        if day.year not in self._verified_years:
+            raise CalendarNotVerified(day.year, self._verified_years)
         candidate = day - _ONE_DAY
         while not self.is_session(candidate):
             candidate -= _ONE_DAY
