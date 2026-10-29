@@ -18,7 +18,10 @@ equity in another currency, or fundamentals in another currency, is refused with
 sector total or eligible set.
 
 An undefined metric is ``None`` together with a reason code in ``flags``, never zero and never an
-exception. Each primitive returns a :class:`Metric` carrying both.
+exception. Each primitive returns a :class:`Metric` carrying both. A NaN or infinite input is not
+an undefined metric but a caller error: ingestion rejects non-finite figures and the bounded
+``NUMERIC`` columns cannot hold infinities, so every public function raises ``ValueError`` for one
+rather than return an infinite metric or a wrong finite one such as a zero P/B.
 """
 
 from __future__ import annotations
@@ -159,6 +162,17 @@ def _require_non_negative_shares(shares: int) -> None:
         raise ValueError(f"shares must be >= 0, got {shares}")
 
 
+def _require_finite(**values: Decimal | None) -> None:
+    """Raise ``ValueError`` for the first value that is NaN (quiet or signalling) or infinite.
+
+    ``None`` passes: a missing figure is an undefined metric, flagged by the caller.
+    """
+    for name, value in values.items():
+        # is_finite() never signals, so a signalling NaN reaches the ValueError too.
+        if value is not None and not value.is_finite():
+            raise ValueError(f"{name} must be finite, got {value}")
+
+
 def _add_flags(flags: list[str], codes: Iterable[str | None]) -> None:
     """Append each non-``None`` code not already present, keeping evaluation order."""
     for code in codes:
@@ -170,8 +184,9 @@ def market_cap(close: Decimal, shares: int) -> Decimal:
     """Market capitalisation = close × shares, in KES.
 
     Raises:
-        ValueError: If ``shares`` is negative.
+        ValueError: If ``close`` is NaN or infinite, or ``shares`` is negative.
     """
+    _require_finite(close=close)
     _require_non_negative_shares(shares)
     return close * Decimal(shares)
 
@@ -185,8 +200,9 @@ def eps(net_income: Decimal | None, shares: int) -> Metric:
     is 0.
 
     Raises:
-        ValueError: If ``shares`` is negative.
+        ValueError: If ``net_income`` is NaN or infinite, or ``shares`` is negative.
     """
+    _require_finite(net_income=net_income)
     _require_non_negative_shares(shares)
     if net_income is None:
         return Metric(None, "pe_missing_earnings")
@@ -201,7 +217,11 @@ def pe_ratio(market_cap_kes: Decimal, net_income: Decimal | None) -> Metric:
 
     Flags: ``pe_missing_earnings`` (net income ``None``), ``pe_zero_earnings`` (net income 0) and
     ``pe_negative_earnings`` (a loss); each leaves the ratio ``None``.
+
+    Raises:
+        ValueError: If ``market_cap_kes`` or ``net_income`` is NaN or infinite.
     """
+    _require_finite(market_cap_kes=market_cap_kes, net_income=net_income)
     if net_income is None:
         return Metric(None, "pe_missing_earnings")
     if net_income.is_zero():
@@ -216,7 +236,11 @@ def pb_ratio(market_cap_kes: Decimal, equity: Decimal | None) -> Metric:
 
     Flags: ``pb_missing_equity`` (equity ``None``) and ``pb_non_positive_equity`` (equity <= 0);
     each leaves the ratio ``None``.
+
+    Raises:
+        ValueError: If ``market_cap_kes`` or ``equity`` is NaN or infinite.
     """
+    _require_finite(market_cap_kes=market_cap_kes, equity=equity)
     if equity is None:
         return Metric(None, "pb_missing_equity")
     if equity <= ZERO:
@@ -237,7 +261,12 @@ def enterprise_value(
     with ``ev_not_meaningful_for_banks`` whatever debt and cash are supplied. Otherwise a missing
     debt or cash figure gives ``None`` with ``ev_missing_inputs``. An enterprise value <= 0 is
     returned as computed, flagged ``negative_enterprise_value``.
+
+    Raises:
+        ValueError: If ``market_cap_kes``, ``debt`` or ``cash`` is NaN or infinite, whatever the
+            sector.
     """
+    _require_finite(market_cap_kes=market_cap_kes, debt=debt, cash=cash)
     if sector in EV_EXCLUDED_SECTORS:
         return Metric(None, "ev_not_meaningful_for_banks")
     if debt is None or cash is None:
@@ -255,7 +284,11 @@ def ev_ebitda(ev: Decimal | None, ebitda: Decimal | None) -> Metric:
     (EBITDA <= 0). A ``None`` enterprise value gives ``Metric(None, None)``, because the flag of
     :func:`enterprise_value` already explains it. A negative enterprise value over a positive
     EBITDA returns the negative ratio as computed.
+
+    Raises:
+        ValueError: If ``ev`` or ``ebitda`` is NaN or infinite.
     """
+    _require_finite(ev=ev, ebitda=ebitda)
     if ebitda is None:
         return Metric(None, "ev_ebitda_missing_ebitda")
     if ebitda <= ZERO:
@@ -271,7 +304,11 @@ def dividend_yield_pct(dps: Decimal | None, close: Decimal) -> Metric:
     A zero dividend gives a defined 0% yield. Flags: ``dy_missing_dps`` (dps ``None``) and
     ``dy_non_positive_price`` (close <= 0, a guard the ``close_price > 0`` database check normally
     makes unreachable); each leaves the yield ``None``.
+
+    Raises:
+        ValueError: If ``dps`` or ``close`` is NaN or infinite.
     """
+    _require_finite(dps=dps, close=close)
     if dps is None:
         return Metric(None, "dy_missing_dps")
     if close <= ZERO:
@@ -283,7 +320,11 @@ def price_change_pct(close: Decimal, previous_close: Decimal | None) -> Decimal 
     """Session change = (close − previous close) ÷ previous close × 100, in percentage points.
 
     Returns ``None`` when there is no previous close or it is <= 0.
+
+    Raises:
+        ValueError: If ``close`` or ``previous_close`` is NaN or infinite.
     """
+    _require_finite(close=close, previous_close=previous_close)
     if previous_close is None or previous_close <= ZERO:
         return None
     return (close - previous_close) / previous_close * HUNDRED
@@ -312,7 +353,10 @@ def compute_valuation(inputs: ValuationInputs) -> ValuationResult:
        EV flag already explains it) and dividend yield, each from its primitive.
 
     Raises:
-        ValueError: If ``inputs.shares_outstanding`` is negative.
+        ValueError: If ``inputs.shares_outstanding`` is negative, ``inputs.close_price`` is NaN or
+            infinite, or a KES fundamentals figure the valuation uses (net income, equity,
+            EBITDA, debt, cash or dps) is NaN or infinite, on the zero-shares and Banking paths
+            too. Refused fundamentals are not used and not checked.
     """
     shares = inputs.shares_outstanding
     mc = market_cap(inputs.close_price, shares)
@@ -346,6 +390,15 @@ def compute_valuation(inputs: ValuationInputs) -> ValuationResult:
             flags=flags,
         )
 
+    # Checked up front: the zero-shares and Banking paths skip primitives that would check some.
+    _require_finite(
+        net_income_kes=fundamentals.net_income_kes,
+        total_equity_kes=fundamentals.total_equity_kes,
+        ebitda_kes=fundamentals.ebitda_kes,
+        total_debt_kes=fundamentals.total_debt_kes,
+        cash_and_equivalents_kes=fundamentals.cash_and_equivalents_kes,
+        dps_kes=fundamentals.dps_kes,
+    )
     net_income = fundamentals.net_income_kes
     zero_shares = Metric(None, "zero_shares")
     if shares == 0:
@@ -435,7 +488,20 @@ def sector_aggregates(sector: str, members: Sequence[ValuationResult]) -> Sector
     Args:
         sector: The sector name, which decides the EV/EBITDA policy.
         members: :func:`compute_valuation` results of the sector's constituents.
+
+    Raises:
+        ValueError: If a member's market cap, net income, equity, enterprise value, EBITDA or dps
+            is NaN or infinite, which only a hand-built :class:`ValuationResult` can carry.
     """
+    for m in members:
+        _require_finite(
+            market_cap_kes=m.market_cap_kes,
+            net_income_kes=m.net_income_kes,
+            total_equity_kes=m.total_equity_kes,
+            enterprise_value_kes=m.enterprise_value_kes,
+            ebitda_kes=m.ebitda_kes,
+            dps_kes=m.dps_kes,
+        )
     flags: list[str] = []
     if any(m.market_cap_kes is None or "currency_mismatch" in m.flags for m in members):
         flags.append("currency_mismatch")

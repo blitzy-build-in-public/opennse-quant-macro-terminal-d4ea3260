@@ -415,6 +415,51 @@ _ROWS = obs(_DAYS, [1, 2, 3])
             id="nan-value",
         ),
         pytest.param(
+            obs(_DAYS, [1, Decimal("Infinity"), 3]),
+            _DAYS,
+            5,
+            2,
+            ValueError,
+            "not finite",
+            id="infinity-in-window",
+        ),
+        pytest.param(
+            obs(_DAYS, [1, Decimal("sNaN"), 3]),
+            _DAYS,
+            5,
+            2,
+            ValueError,
+            "not finite",
+            id="snan-in-window",
+        ),
+        pytest.param(
+            obs(_DAYS, [1, Decimal("1E+999999"), 3]),
+            _DAYS,
+            5,
+            2,
+            ValueError,
+            "adjusted exponent 999999,",
+            id="huge-exponent-in-window",
+        ),
+        pytest.param(
+            obs(_DAYS, [1, Decimal("1." + "1" * 200_000), 3]),
+            _DAYS,
+            5,
+            2,
+            ValueError,
+            "has 200001 significant digits",
+            id="200001-digits-in-window",
+        ),
+        pytest.param(
+            obs(_DAYS, [1, 2, Decimal("1E+999999")]),
+            _DAYS,
+            5,
+            2,
+            ValueError,
+            "adjusted exponent 999999,",
+            id="huge-exponent-current-row",
+        ),
+        pytest.param(
             _ROWS, _DAYS[::-1], 5, None, ValueError, "sessions must be", id="sessions-descending"
         ),
         pytest.param(
@@ -436,9 +481,13 @@ def test_invalid_arguments_raise(
     error: type[Exception],
     message: str,
 ) -> None:
-    """Out-of-range windows, unordered input and non-``Decimal`` or non-finite values raise.
+    """Out-of-range windows, unordered input and non-``Decimal`` or unusable values raise.
 
-    An integer volume is rejected because it would turn the mean into a non-``Decimal``.
+    An integer volume is rejected because it would turn the mean into a non-``Decimal``. With
+    ``min_periods=2`` the third row is scored over a window holding the second, so an Infinity,
+    sNaN, 1E+999999 or 200,001-digit value there, or 1E+999999 as the scored row itself, must be
+    rejected before ``statistics.mean`` turns it into an exact integer ratio: unchecked, 1E+999999
+    in the window ran for about 70 s and as the scored row gave a finite z near 1E+999999.
     """
     with pytest.raises(error, match=message):
         rolling_zscores(rows, sessions, window=window, min_periods=min_periods)

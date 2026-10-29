@@ -2,7 +2,8 @@
 
 Every input is a synthetic in-memory ``Decimal`` built from a string, in KES unless a test needs a
 currency mismatch. Expected values are hand-computed literals. An undefined metric must be
-``None`` together with its reason code in ``flags``: never zero and never an exception.
+``None`` together with its reason code in ``flags``: never zero and never an exception. A NaN or
+infinite input, which validated data never holds, is a caller error that raises ``ValueError``.
 
 Base equity used throughout: close 25.00 KES, 1,000,000 shares, net income 2,500,000, equity
 12,500,000, EBITDA 4,000,000, debt 5,000,000 and cash 2,000,000, giving market cap 25,000,000,
@@ -11,6 +12,7 @@ EPS 2.50, P/E 10.00, P/B 2.00, EV 28,000,000 and EV/EBITDA 7.00.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
@@ -27,6 +29,7 @@ from opennse_terminal.quant.valuation import (
     ValuationInputs,
     ValuationResult,
     compute_valuation,
+    dividend_yield_pct,
     enterprise_value,
     eps,
     ev_ebitda,
@@ -871,3 +874,171 @@ def test_price_change_pct_is_null_without_a_positive_previous_close(
 ) -> None:
     """No previous close, or one ≤ 0, leaves the change undefined rather than dividing by zero."""
     assert price_change_pct(Decimal("26.00"), previous_close) is None
+
+
+# --- Non-finite inputs --------------------------------------------------------------------------
+
+NON_FINITE = ["NaN", "sNaN", "Infinity", "-Infinity"]
+
+
+@pytest.mark.parametrize("value", NON_FINITE)
+@pytest.mark.parametrize(
+    ("field", "name"),
+    [
+        ("close_price", "close"),
+        ("net_income_kes", "net_income_kes"),
+        ("total_equity_kes", "total_equity_kes"),
+        ("ebitda_kes", "ebitda_kes"),
+        ("total_debt_kes", "total_debt_kes"),
+        ("cash_and_equivalents_kes", "cash_and_equivalents_kes"),
+        ("dps_kes", "dps_kes"),
+    ],
+)
+def test_non_finite_valuation_input_is_a_caller_error(field: str, name: str, value: str) -> None:
+    """The base equity with dps 1.25 is fully valued (P/E 10.00, P/B 2.00, EV/EBITDA 7.00, yield
+    5.00%). A NaN or infinite close or fundamentals figure raises ValueError naming it, rather than
+    an infinite metric or a wrong finite one: equity +Infinity would give P/B 25,000,000 ÷ ∞,
+    which rounds to 0.00 with no flag.
+    """
+    row = fundamentals(dps_kes=Decimal("1.25"))
+    if field == "close_price":
+        case = inputs(close_price=Decimal(value), fundamentals=row)
+    else:
+        case = inputs(fundamentals=replace(row, **{field: Decimal(value)}))
+
+    with pytest.raises(ValueError, match=f"^{name} must be finite, got {value}$"):
+        compute_valuation(case)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "field"),
+    [
+        pytest.param({"shares_outstanding": 0}, "net_income_kes", id="zero-shares-net-income"),
+        pytest.param({"shares_outstanding": 0}, "total_equity_kes", id="zero-shares-equity"),
+        pytest.param({"shares_outstanding": 0}, "ebitda_kes", id="zero-shares-ebitda"),
+        pytest.param({"sector": "Banking"}, "total_debt_kes", id="banking-debt"),
+        pytest.param({"sector": "Banking"}, "cash_and_equivalents_kes", id="banking-cash"),
+        pytest.param({"sector": "Banking"}, "ebitda_kes", id="banking-ebitda"),
+    ],
+)
+def test_non_finite_input_raises_on_paths_that_skip_its_metric(
+    overrides: dict[str, Any], field: str
+) -> None:
+    """Zero shares skips EPS, P/E, P/B and EV/EBITDA, and Banking skips EV and EV/EBITDA, yet an
+    infinite figure those metrics would have read still raises instead of being carried into the
+    result's effective inputs, where sector aggregates would sum it.
+    """
+    case = inputs(fundamentals=fundamentals(**{field: Decimal("Infinity")}), **overrides)
+
+    with pytest.raises(ValueError, match=f"^{field} must be finite, got Infinity$"):
+        compute_valuation(case)
+
+
+@pytest.mark.parametrize("value", NON_FINITE)
+def test_refused_fundamentals_are_not_checked(value: str) -> None:
+    """USD fundamentals are refused (currency_mismatch) and never used, so a non-finite figure in
+    them changes nothing: market cap 25,000,000.00 and every fundamental metric undefined.
+    """
+    row = fundamentals(currency="USD", net_income_kes=Decimal(value), dps_kes=Decimal(value))
+
+    result = compute_valuation(inputs(fundamentals=row))
+
+    assert_fundamental_metrics_null(result)
+    assert result.flags == ["currency_mismatch"]
+    assert rounded(result.market_cap_kes, "money") == "25000000.00"
+
+
+@pytest.mark.parametrize("value", NON_FINITE)
+@pytest.mark.parametrize(
+    ("call", "name"),
+    [
+        pytest.param(lambda x: market_cap(x, 1_000_000), "close", id="market_cap-close"),
+        pytest.param(lambda x: eps(x, 1_000_000), "net_income", id="eps-net_income"),
+        pytest.param(
+            lambda x: pe_ratio(x, Decimal("2500000")), "market_cap_kes", id="pe_ratio-market_cap"
+        ),
+        pytest.param(
+            lambda x: pe_ratio(Decimal("25000000"), x), "net_income", id="pe_ratio-net_income"
+        ),
+        pytest.param(
+            lambda x: pb_ratio(x, Decimal("12500000")), "market_cap_kes", id="pb_ratio-market_cap"
+        ),
+        pytest.param(lambda x: pb_ratio(Decimal("25000000"), x), "equity", id="pb_ratio-equity"),
+        pytest.param(
+            lambda x: enterprise_value(
+                x, Decimal("5000000"), Decimal("2000000"), sector="Telecommunications"
+            ),
+            "market_cap_kes",
+            id="enterprise_value-market_cap",
+        ),
+        pytest.param(
+            lambda x: enterprise_value(
+                Decimal("25000000"), x, Decimal("2000000"), sector="Telecommunications"
+            ),
+            "debt",
+            id="enterprise_value-debt",
+        ),
+        pytest.param(
+            lambda x: enterprise_value(
+                Decimal("25000000"), Decimal("5000000"), x, sector="Telecommunications"
+            ),
+            "cash",
+            id="enterprise_value-cash",
+        ),
+        pytest.param(
+            lambda x: enterprise_value(
+                Decimal("25000000"), x, Decimal("2000000"), sector="Banking"
+            ),
+            "debt",
+            id="enterprise_value-banking-debt",
+        ),
+        pytest.param(lambda x: ev_ebitda(x, Decimal("4000000")), "ev", id="ev_ebitda-ev"),
+        pytest.param(lambda x: ev_ebitda(Decimal("28000000"), x), "ebitda", id="ev_ebitda-ebitda"),
+        pytest.param(
+            lambda x: dividend_yield_pct(x, Decimal("25.00")), "dps", id="dividend_yield-dps"
+        ),
+        pytest.param(
+            lambda x: dividend_yield_pct(Decimal("1.25"), x), "close", id="dividend_yield-close"
+        ),
+        pytest.param(
+            lambda x: price_change_pct(x, Decimal("25.00")), "close", id="price_change-close"
+        ),
+        pytest.param(
+            lambda x: price_change_pct(Decimal("26.00"), x),
+            "previous_close",
+            id="price_change-previous_close",
+        ),
+    ],
+)
+def test_primitive_rejects_a_non_finite_argument(
+    call: Callable[[Decimal], object], name: str, value: str
+) -> None:
+    """Every primitive checks each Decimal argument at entry, the Banking EV policy included, so
+    a NaN or infinite figure raises ValueError naming it instead of a signal or an infinite value.
+    """
+    with pytest.raises(ValueError, match=f"^{name} must be finite, got {value}$"):
+        call(Decimal(value))
+
+
+@pytest.mark.parametrize("value", NON_FINITE)
+@pytest.mark.parametrize(
+    "field",
+    [
+        "market_cap_kes",
+        "net_income_kes",
+        "total_equity_kes",
+        "enterprise_value_kes",
+        "ebitda_kes",
+        "dps_kes",
+    ],
+)
+def test_sector_aggregates_reject_a_non_finite_member_figure(field: str, value: str) -> None:
+    """A hand-built ValuationResult can carry a figure compute_valuation never returns. Summed in,
+    NI +Infinity would give sector P/E 25,000,000 ÷ ∞ = 0.00 with no sector_pe_unavailable, so a
+    NaN or infinite summed figure raises ValueError naming it.
+    """
+    base = member(fundamentals=fundamentals(dps_kes=Decimal("1.25")))
+    hostile = replace(base, **{field: Decimal(value)})
+
+    with pytest.raises(ValueError, match=f"^{field} must be finite, got {value}$"):
+        sector_aggregates("Telecommunications", [member_b(), hostile])

@@ -7,6 +7,10 @@ with :func:`quantize_out`, while building response models.
 
 An undefined metric is ``None`` (``null`` in JSON) with a reason code in the caller's ``flags``,
 never zero; :func:`safe_div` is the building block for that.
+
+:func:`require_statistics_input` checks a value before it enters ``statistics.mean`` or
+``statistics.stdev``, so a non-finite or absurdly large input is rejected at once instead of
+crashing or stalling inside the standard library.
 """
 
 from __future__ import annotations
@@ -22,10 +26,13 @@ __all__ = [
     "HUNDRED",
     "ONE",
     "PLACES",
+    "STATISTICS_MAX_ADJUSTED_EXPONENT",
+    "STATISTICS_MAX_DIGITS",
     "ZERO",
     "QuantizeKind",
     "Violation",
     "quantize_out",
+    "require_statistics_input",
     "safe_div",
     "to_decimal",
 ]
@@ -60,6 +67,22 @@ Every ``*_kes`` field, KES total, multiple and aggregate assumes this unit, and 
 not supported, so an equity or a fundamentals row in any other currency is refused with the
 ``currency_mismatch`` flag, never converted. It equals ``config.DEFAULT_CURRENCY``, restated here
 because quant modules import only the standard library and other quant modules.
+"""
+
+STATISTICS_MAX_ADJUSTED_EXPONENT: Final[int] = 40
+"""Largest ``abs(value.adjusted())`` of a non-zero value :func:`require_statistics_input` accepts.
+
+The adjusted exponent is the power of ten of the leading digit, so accepted non-zero magnitudes
+run from 1E-40 to just under 1E+41. Every legitimate input is far inside: stored closes are
+NUMERIC(18,4), KES amounts NUMERIC(24,2) and volumes at most 10^12, and multiples computed from
+them under the 28-digit default context lie roughly between 1E-26 and 1E+28.
+"""
+
+STATISTICS_MAX_DIGITS: Final[int] = 60
+"""Most significant digits of a value :func:`require_statistics_input` accepts.
+
+The count is that of the coefficient, ``len(value.as_tuple().digits)``. Stored values carry at
+most 24 digits (NUMERIC(24,2)) and computed values at most the 28 of the default context.
 """
 
 # Used only for the output quantize step. Its wider precision lets a large magnitude, such as a
@@ -171,3 +194,47 @@ def safe_div(numerator: Decimal, denominator: Decimal) -> Decimal | None:
     if denominator.is_zero():
         return None
     return numerator / denominator
+
+
+def require_statistics_input(value: Decimal, label: str) -> None:
+    """Check that ``value`` is safe to pass to ``statistics.mean`` and ``statistics.stdev``.
+
+    Contract: ``value`` is a finite ``Decimal`` that is either zero, with any exponent, or has an
+    adjusted exponent within ±:data:`STATISTICS_MAX_ADJUSTED_EXPONENT` (40) and at most
+    :data:`STATISTICS_MAX_DIGITS` (60) significant digits. Callers check every element of a series
+    before computing any statistic over it.
+
+    Why: those functions sum each ``Decimal`` as an exact integer ratio. NaN and infinity have none
+    and fail with a misleading ``AttributeError`` (sNaN with ``InvalidOperation``), while the
+    ratio of a finite value has about as many digits as its coefficient plus its absolute exponent:
+    1E+999999 or 1E-999999 costs about 70 s, and a 200,000-digit coefficient several seconds.
+    Within the bounds no ratio exceeds about 100 digits, so the statistics stay cheap. A zero has
+    the ratio 0/1 whatever its exponent.
+
+    ``label`` names the value in the error message, for example ``"row value on 2026-01-19"``. The
+    message reports the value's class, adjusted exponent or digit count, never all of its digits.
+
+    Raises:
+        TypeError: ``value`` is not a ``Decimal``.
+        ValueError: ``value`` is NaN, sNaN or infinite (the message says "not finite"), or it is
+            non-zero and outside the exponent or digit bound.
+    """
+    if not isinstance(value, Decimal):
+        raise TypeError(f"{label} must be Decimal, got {type(value).__name__}")
+    # is_finite and number_class are quiet, so an sNaN raises ValueError, not InvalidOperation.
+    if not value.is_finite():
+        raise ValueError(f"{label} is not finite: {value.number_class()}")
+    if value.is_zero():
+        return
+    adjusted = value.adjusted()
+    if abs(adjusted) > STATISTICS_MAX_ADJUSTED_EXPONENT:
+        raise ValueError(
+            f"{label} has adjusted exponent {adjusted}, outside the accepted "
+            f"±{STATISTICS_MAX_ADJUSTED_EXPONENT}"
+        )
+    digits = len(value.as_tuple().digits)
+    if digits > STATISTICS_MAX_DIGITS:
+        raise ValueError(
+            f"{label} has {digits} significant digits, more than the accepted "
+            f"{STATISTICS_MAX_DIGITS}"
+        )

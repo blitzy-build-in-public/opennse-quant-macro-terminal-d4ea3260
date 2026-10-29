@@ -27,7 +27,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Final, NamedTuple
 
-from opennse_terminal.quant.numeric import safe_div
+from opennse_terminal.quant.numeric import require_statistics_input, safe_div
 
 __all__ = [
     "DEFAULT_SPIKE_THRESHOLD",
@@ -117,8 +117,7 @@ def _check_inputs(rows: Sequence[tuple[date, Decimal]], sessions: Sequence[date]
         # A float or int would make statistics.mean return a float, so only Decimal may enter.
         if not isinstance(value, Decimal):
             raise TypeError(f"row values must be Decimal, got {type(value).__name__}")
-        if not value.is_finite():
-            raise ValueError(f"row value on {trade_date} is not finite: {value}")
+        require_statistics_input(value, f"row value on {trade_date}")
         previous = trade_date
     for earlier, later in zip(sessions, sessions[1:], strict=False):
         if later <= earlier:
@@ -172,7 +171,9 @@ def rolling_zscores(
 
     Raises:
         ValueError: If ``window`` or ``min_periods`` is out of range, ``rows`` or ``sessions`` is
-            not strictly ascending, or a value is NaN or infinite.
+            not strictly ascending, or a value is NaN, infinite or outside the exponent and digit
+            bounds of :func:`~opennse_terminal.quant.numeric.require_statistics_input`. Every row,
+            the current one included, is checked before any statistic is computed.
         TypeError: If a row value is not a ``Decimal``.
     """
     _check_window(window)

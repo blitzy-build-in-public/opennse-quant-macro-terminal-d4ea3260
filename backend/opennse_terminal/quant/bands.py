@@ -17,7 +17,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Final, Literal
 
-from opennse_terminal.quant.numeric import HUNDRED
+from opennse_terminal.quant.numeric import HUNDRED, require_statistics_input
 
 __all__ = [
     "DEFAULT_LOOKBACK_YEARS",
@@ -157,7 +157,11 @@ def valuation_bands(
         metric: The banded multiple, which names the status of an all-null series.
 
     Raises:
-        ValueError: ``daily`` is not strictly ascending by date, or ``metric`` is unknown.
+        ValueError: ``daily`` is not strictly ascending by date, ``metric`` is unknown, or a value
+            is NaN, infinite or outside the exponent and digit bounds of
+            :func:`~opennse_terminal.quant.numeric.require_statistics_input`. Every non-null value
+            is checked, whatever their count, before any statistic is computed.
+        TypeError: A value is neither ``None`` nor a ``Decimal``.
     """
     if metric == "pe":
         empty_status: BandsStatus = "no_positive_earnings"
@@ -173,6 +177,7 @@ def valuation_bands(
             raise ValueError(f"daily series must be strictly ascending: {day} follows {previous}")
         previous = day
         if value is not None:
+            require_statistics_input(value, f"daily value on {day}")
             observed.append((day, value))
 
     coverage_start = observed[0][0] if observed else None

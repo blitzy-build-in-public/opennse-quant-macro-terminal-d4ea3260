@@ -8,9 +8,11 @@ weekday lists, because analytics use the observed market sessions and never a ho
 
 from __future__ import annotations
 
+import statistics
 from collections.abc import Sequence
 from datetime import date, timedelta
 from decimal import Decimal
+from typing import NoReturn
 
 import pytest
 
@@ -404,3 +406,120 @@ def test_unknown_metric_raises() -> None:
             sessions=[date(2026, 1, 5)],
             metric="ev_ebitda",  # type: ignore[arg-type]
         )
+
+
+LONG_COEFFICIENT = Decimal("1." + "1" * 200_000)
+"""1.111…1: finite, adjusted exponent 0, with 200,001 significant digits."""
+
+SIXTY_DIGITS = Decimal("1." + "1" * 59)
+"""1.111…1 with exactly 60 significant digits, the most the statistics accept."""
+
+SIXTY_DIGITS_AT_EXPONENT_40 = Decimal("9." + "9" * 59 + "E+40")
+"""9.99…9E+40: 60 significant digits and adjusted exponent 40, both bounds at once."""
+
+
+def reference_with(
+    position: int, value: Decimal
+) -> tuple[list[date], list[tuple[date, Decimal | None]]]:
+    """Return 61 sessions from 2026-01-05 alternating 8 and 12, with ``value`` at ``position``."""
+    sessions = weekdays(FIRST_SESSION, 61)
+    values: list[Decimal | None] = list(alternating(61))
+    values[position] = value
+    return sessions, series(sessions, values)
+
+
+@pytest.mark.parametrize("position", [30, 60], ids=["mid_series", "current"])
+@pytest.mark.parametrize(
+    ("value", "error", "message"),
+    [
+        pytest.param(Decimal("NaN"), ValueError, "is not finite: NaN", id="nan"),
+        pytest.param(Decimal("sNaN"), ValueError, "is not finite: sNaN", id="snan"),
+        pytest.param(Decimal("Infinity"), ValueError, r"is not finite: \+Infinity", id="inf"),
+        pytest.param(Decimal("-Infinity"), ValueError, "is not finite: -Infinity", id="-inf"),
+        pytest.param(Decimal("1E+999999"), ValueError, "adjusted exponent 999999,", id="1E+999999"),
+        pytest.param(
+            Decimal("-1E+999999"), ValueError, "adjusted exponent 999999,", id="-1E+999999"
+        ),
+        pytest.param(
+            Decimal("1E-999999"), ValueError, "adjusted exponent -999999,", id="1E-999999"
+        ),
+        pytest.param(Decimal("1E+41"), ValueError, "adjusted exponent 41,", id="1E+41"),
+        pytest.param(Decimal("-1E-41"), ValueError, "adjusted exponent -41,", id="-1E-41"),
+        pytest.param(
+            LONG_COEFFICIENT, ValueError, "has 200001 significant digits", id="200001_digits"
+        ),
+        pytest.param(
+            Decimal("1." + "1" * 60), ValueError, "has 61 significant digits", id="61_digits"
+        ),
+        pytest.param(8.0, TypeError, "must be Decimal, got float", id="float"),
+    ],
+)
+def test_unusable_daily_value_raises_before_any_statistic(
+    monkeypatch: pytest.MonkeyPatch,
+    position: int,
+    value: Decimal,
+    error: type[Exception],
+    message: str,
+) -> None:
+    """A value the statistics cannot take is rejected before any of them runs.
+
+    The reference series of 61 values alternating 8 and 12 carries the value mid-series (index
+    30) or as the current value (index 60). Without the check NaN and ±Infinity crashed inside
+    ``statistics.stdev`` with ``AttributeError``, sNaN with ``InvalidOperation``, and
+    ±1E+999999 or 1E-999999 ran for about 70 s, because ``statistics.mean`` and ``stdev`` turn
+    each value into an exact integer ratio of about a million digits; the 200,001-digit
+    coefficient took about 8.5 s. Non-zero values with an adjusted exponent beyond ±40 or more
+    than 60 significant digits are rejected, and a float is not a ``Decimal``. The statistics
+    functions are replaced by one that fails the test, so a missing check fails at once instead of
+    stalling. The message names the day and stays short, never listing the value's digits.
+    """
+
+    def forbidden(*_args: object, **_kwargs: object) -> NoReturn:
+        raise AssertionError("a statistic was computed over an unusable value")
+
+    for name in ("mean", "stdev", "quantiles"):
+        monkeypatch.setattr(statistics, name, forbidden)
+    sessions, daily = reference_with(position, value)
+
+    with pytest.raises(error, match=message) as raised:
+        valuation_bands(daily, requested_start=FIRST_SESSION, sessions=sessions)
+
+    assert str(raised.value).startswith(f"daily value on {sessions[position].isoformat()} ")
+    assert len(str(raised.value)) < 100
+
+
+@pytest.mark.parametrize(
+    ("value", "minimum", "maximum"),
+    [
+        pytest.param(Decimal("1E+40"), Decimal("8"), Decimal("1E+40"), id="1E+40"),
+        pytest.param(Decimal("-1E-40"), Decimal("-1E-40"), Decimal("12"), id="-1E-40"),
+        pytest.param(SIXTY_DIGITS, SIXTY_DIGITS, Decimal("12"), id="60_digits"),
+        pytest.param(
+            SIXTY_DIGITS_AT_EXPONENT_40,
+            Decimal("8"),
+            SIXTY_DIGITS_AT_EXPONENT_40,
+            id="60_digits_at_exponent_40",
+        ),
+        pytest.param(Decimal("0E-1000000"), Decimal("0"), Decimal("12"), id="0E-1000000"),
+        pytest.param(Decimal("-0E+999999"), Decimal("0"), Decimal("12"), id="-0E+999999"),
+    ],
+)
+def test_values_within_the_statistics_bounds_are_accepted(
+    value: Decimal, minimum: Decimal, maximum: Decimal
+) -> None:
+    """Values at the bounds, and a zero of any exponent, enter the statistics like any other.
+
+    The reference series of 61 values alternating 8 and 12 carries the value at index 30, so the
+    statistics are ``ok`` over 61 observations and the value is the minimum or the maximum: an
+    adjusted exponent of exactly ±40, exactly 60 significant digits, both at once, or a zero whose
+    exponent is far beyond the bound (its exact ratio is 0/1).
+    """
+    sessions, daily = reference_with(30, value)
+
+    result = valuation_bands(daily, requested_start=FIRST_SESSION, sessions=sessions)
+
+    assert result.status == "ok"
+    stats = stats_of(result)
+    assert stats.observations == 61
+    assert stats.min == minimum
+    assert stats.max == maximum
