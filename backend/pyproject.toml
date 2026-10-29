@@ -1,0 +1,103 @@
+[build-system]
+requires = ["setuptools==84.2.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opennse-terminal"
+# Static, and kept equal to opennse_terminal.__version__ and the root package.json version.
+version = "0.1.0"
+description = "OpenNSE Quant & Macro Terminal: embeddable FastAPI router, ingestion pipelines, migrations and seeder for NSE equities and CBK macro data"
+requires-python = ">=3.11"
+# No Python lockfile: every direct dependency is pinned exactly with ==, and pip resolves the
+# transitive set at install time. Install from the repository root into a Python 3.12 venv with
+#   pip install -e "./backend[dev]"
+# Public sources only: no package here is a client for a paid or official exchange data API.
+dependencies = [
+    "fastapi==0.162.0",
+    "pydantic==2.14.1",
+    "pydantic-settings==2.16.2",
+    "sqlalchemy[asyncio]==2.0.55",
+    "asyncpg==0.32.0",
+    "alembic==1.20.1",
+    "apscheduler==3.11.3",
+    "httpx==0.28.1",
+    "beautifulsoup4==4.15.0",
+    "lxml==6.1.3",
+    "playwright==1.64.1",
+    "pdfplumber==0.11.10",
+    # 3.0.5 rather than 3.1.x: pandas-stubs 3.0.5.260914 targets it, so strict mypy has matching stubs.
+    "pandas==3.0.5",
+    "openpyxl==3.1.5",
+    "uvicorn[standard]==0.54.0",
+    "python-multipart==0.0.32",
+    "tzdata==2026.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.2.0",
+    "pytest-asyncio==1.4.1",
+    "pytest-cov==7.1.0",
+    "respx==0.23.1",
+    "ruff==0.17.3",
+    "mypy==2.4.0",
+    "pandas-stubs==3.0.5.260914",
+]
+
+[project.scripts]
+opennse-terminal = "opennse_terminal.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["opennse_terminal*"]
+
+# opennse_terminal/migrations/ and migrations/versions/ carry __init__.py files so env.py and the
+# revisions ship as package modules. Alembic is configured in code with
+# script_location = "opennse_terminal:migrations"; there is no alembic.ini. Non-Python resources
+# must be listed here explicitly or they are left out of the wheel.
+[tool.setuptools.package-data]
+"opennse_terminal.migrations" = ["script.py.mako"]
+"opennse_terminal.ingestion.data" = ["*.csv"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = [".", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "S", "DTZ"]
+
+# Only tests may use assert. Package code takes no other blanket ignore: a justified exception is a
+# targeted inline "# noqa: <code>" with its reason.
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# mypy does not discover configuration below the working directory, so it is always run as
+#   mypy --config-file backend/pyproject.toml backend/opennse_terminal
+[tool.mypy]
+strict = true
+
+# The only untyped third-party imports allowed; pandas is covered by pandas-stubs. Package code
+# therefore never imports asyncpg, openpyxl or lxml directly: it catches SQLAlchemy exceptions,
+# calls pd.read_excel(engine="openpyxl") and BeautifulSoup(html, "lxml").
+[[tool.mypy.overrides]]
+module = ["pdfplumber.*", "apscheduler.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# tests/ has no __init__.py; this makes the helpers package importable (from helpers.pdf_builder ...).
+pythonpath = ["tests"]
+asyncio_mode = "auto"
+# Session, module and function fixtures share async engines, and asyncpg connections are bound to
+# the event loop that created them, so every fixture and test runs on one session-scoped loop.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+markers = [
+    "integration: requires PostgreSQL at TERMINAL_TEST_DATABASE_URL",
+    "live: hits the real public source; skipped by default",
+]
+addopts = "-m 'not live' --strict-markers"
