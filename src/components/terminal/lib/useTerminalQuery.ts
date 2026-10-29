@@ -60,7 +60,12 @@ export interface TerminalQueryResult<T> {
   data: T | undefined;
   /** The failure of the current request; `null` unless `state` is `error`. */
   error: TerminalApiError | null;
-  /** True while the request for the current URL has not settled. */
+  /**
+   * True while the current request execution has not settled. Each execution counts on its own:
+   * a return to an earlier URL, re-enabling after `path: null` or removed host data, and a
+   * `refetch` all report `true` until their own request settles, even when an earlier request
+   * for the same URL already has. Always `false` for host-supplied data and a null `path`.
+   */
   isFetching: boolean;
   /**
    * Sends the current request again. Safe to call from event handlers, such as a Retry button
@@ -69,13 +74,18 @@ export interface TerminalQueryResult<T> {
   refetch: () => void;
 }
 
-/** The outcome of the most recent settled request. */
+/** The outcome of the most recent settled request execution, and the last success of any. */
 interface SettledResult<T> {
-  /** `<url>#<nonce>` of the request that settled, or `null` before any has. */
+  /**
+   * `<url>#<nonce>` of the execution that settled, only while that execution is live. It is
+   * `null` before any has settled and once the execution's effect is cleaned up (a new URL,
+   * `refetch`, `path: null`, host-supplied data or unmount), so a later execution with the same
+   * URL and nonce never matches an outcome it did not produce.
+   */
   id: string | null;
-  /** Last successful payload, boxed so a falsy payload still counts as data. */
+  /** Last successful payload of any execution, boxed so a falsy payload still counts as data. */
   last: { value: T } | null;
-  /** The settled request's failure, or `null` when it succeeded. */
+  /** The settled execution's failure, or `null` when it succeeded or `id` is `null`. */
   error: TerminalApiError | null;
 }
 
@@ -112,19 +122,24 @@ function requestIdOf(key: string, nonce: number): string {
 /**
  * Fetch `options.path` from the terminal API and report it as a widget render state.
  *
- * State machine, for the current URL (`apiBaseUrl + path + query`):
+ * State machine, for the current URL (`apiBaseUrl + path + query`). Each run of the fetch effect
+ * is one execution, and only the current execution's own outcome counts as settled:
  * - `data` defined: no request; `ready`, or `empty` when `isEmpty(data)`; `refetch` is a no-op.
  * - `path` null: no request; `empty` with no data.
  * - Request pending with no earlier success: `loading`, `isFetching` true.
- * - Request pending after an earlier success (a new URL, or `refetch`): `ready` or `empty` from
- *   the previous payload, `isFetching` true, so the previous result stays on screen.
+ * - Request pending after an earlier success (a new URL, a return to an earlier URL, re-enabling
+ *   after `path: null` or removed host data, or `refetch`): `ready` or `empty` from the previous
+ *   payload, `isFetching` true, so the previous result stays on screen. An earlier execution's
+ *   failure is not shown, even when its URL is the current one.
  * - Request succeeded: `ready` or `empty` from the new payload.
  * - Request failed: `error` with {@link TerminalQueryResult.error} set, and `data` still holding
  *   the last success, so a widget can show its rows beside field errors. `refetch` then shows
  *   `loading`, or the previous payload with `isFetching`, until the retry settles.
  *
  * A new URL or a `refetch` aborts the request it supersedes, and unmounting aborts the pending
- * request; an aborted request never updates state. Changing the identity of `query`,
+ * request; an aborted request never updates state. Ending an execution, by any of these or by
+ * `path: null` or host-supplied data, also retires its outcome, so a later execution of the same
+ * URL reports `isFetching` until it settles itself. Changing the identity of `query`,
  * `getHeaders` or `isEmpty` without changing the URL never refetches.
  *
  * The first render is `loading`, or derived from `data`, on both server and client, so
@@ -189,6 +204,12 @@ export function useTerminalQuery<T>(options: UseTerminalQueryOptions<T>): Termin
 
     return () => {
       controller.abort();
+      // Retire this execution's outcome, so a later execution of the same URL (a revisit, or
+      // re-enabling after `path: null` or host data) reports `isFetching` until it settles itself.
+      // Returning `previous` unchanged lets React bail out when this execution never settled.
+      setSettled((previous) =>
+        previous.id === requestId ? { id: null, last: previous.last, error: null } : previous,
+      );
     };
   }, [key, nonce, dataProvided]);
 

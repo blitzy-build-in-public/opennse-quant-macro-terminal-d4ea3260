@@ -112,7 +112,8 @@ type Mutation =
 /**
  * The lists the widget shows once a mutation has succeeded, together with the fetched payload
  * they were derived from. They apply only while the query still holds that payload, so a later
- * refetch, after a Retry or a vanished watchlist, replaces them without an effect.
+ * refetch, after a Retry, a vanished watchlist or a timed-out mutation, replaces them without an
+ * effect.
  */
 interface LocalLists {
   base: Watchlist[] | undefined;
@@ -271,7 +272,8 @@ function RemoveIcon(): ReactElement {
  * the host resolves, and the host's credentials reach it only through `getHeaders`. The server
  * owns the state. The widget loads `GET /watchlists` once and afterwards mirrors each mutation's
  * response (`POST /watchlists`, `DELETE /watchlists/{id}`, `PUT` and `DELETE
- * /watchlists/{id}/items/{ticker}`), with no optimistic update to roll back.
+ * /watchlists/{id}/items/{ticker}`), with no optimistic update to roll back. It loads them again
+ * only after a mutation finds its watchlist gone or times out.
  *
  * An empty list of watchlists is a ready state, so the creation form is always offered. A failed
  * initial load shows the frame's error state with Retry; a failed mutation shows its message
@@ -347,7 +349,10 @@ export function WatchlistManager({
    * cleared, `onSuccess` clears the inputs that still hold the submitted text and returns the
    * status announcement, and `onWatchlistsChange` receives the lists. On failure the error is
    * placed by {@link errorsFor}; `watchlist_not_found` instead drops the vanished list and
-   * reloads the watchlists.
+   * reloads the watchlists. After a `timeout_error` the server may still have applied the
+   * request, so the timeout message stays on the error line and the watchlists are reloaded with
+   * `GET /watchlists`; the reloaded payload replaces the shown lists, and the mutation is never
+   * resent.
    *
    * The request carries the signal of its own controller, which the abort effect aborts on
    * unmount or a target change. A completion whose controller was aborted, or is no longer the
@@ -405,6 +410,9 @@ export function WatchlistManager({
             ? errorsFor(error, mutation)
             : { [GENERAL_ERROR_KEY]: FALLBACK_ERROR_MESSAGE },
         );
+        // A request that timed out may still have been applied, so the lists are reloaded from
+        // the server. The mutation itself is never resent: `POST /watchlists` is not idempotent.
+        if (error instanceof TerminalApiError && error.code === "timeout_error") query.refetch();
       },
     );
   }
