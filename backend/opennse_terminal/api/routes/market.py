@@ -277,12 +277,14 @@ async def get_valuation_bands(
     """Return the daily ``metric`` (default ``pe``) bands over ``lookback_years`` (default 5).
 
     Give exactly one of ``ticker`` and ``sector``. The multiple (x) is computed on each market
-    session from that day's close and the fundamentals available by then; null days are
-    excluded. ``stats`` (mean, sample deviation, mean +/- 1 and 2 deviations, quartiles, min,
-    max and current, in x; ``current_percentile`` in percent) is present only when ``status`` is
-    ``ok``, which needs at least 60 daily values. ``series`` samples the last session of each ISO
-    week, and ``coverage`` reports whether the data starts more than 7 days after the requested
-    lookback start.
+    session with a close, from that day's close and the fundamentals available by then: for a
+    sector, each session on which at least one member traded, a member that did not trade that
+    day carrying its close of up to 10 calendar days before. Null days are excluded. ``stats``
+    (mean, sample deviation, mean +/- 1 and 2 deviations, quartiles, min, max and current, in x;
+    ``current_percentile`` in percent) is present only when ``status`` is ``ok``, which needs at
+    least 60 daily values. ``series`` samples the last session of each ISO week, and
+    ``coverage`` reports whether the data starts more than 7 days after the requested lookback
+    start.
     """
     return await market_service.get_valuation_bands(
         session,

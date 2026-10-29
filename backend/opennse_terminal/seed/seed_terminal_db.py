@@ -645,7 +645,9 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+    # The CLI owns logging configuration. It is imported only on this entry, so importing the
+    # seeder as a library neither imports the CLI nor adds a handler.
+    from opennse_terminal.cli import configure_logging
+
+    configure_logging()
     raise SystemExit(main())

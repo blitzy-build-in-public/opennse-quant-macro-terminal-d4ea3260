@@ -337,7 +337,12 @@ class CycleResult(TerminalResponseModel):
 
 
 class BacktestResponse(TerminalResponseModel):
-    """Body of ``GET /cycles/backtest``: one result per event date, in request order."""
+    """Body of ``GET /cycles/backtest``.
+
+    ``cycles`` holds one result per distinct event date, ascending by ``event_date``: a date
+    requested more than once is returned once, and the stored ``terminal_cycles`` defaults are
+    likewise in date order.
+    """
 
     window: BacktestWindow = Field(description="The resolved window applied to every cycle.")
     candidates: list[str] = Field(
@@ -351,4 +356,9 @@ class BacktestResponse(TerminalResponseModel):
             "Latest trade_date among the candidates' prices; null when none of them has prices."
         ),
     )
-    cycles: list[CycleResult] = Field(description="One result per event date.")
+    cycles: list[CycleResult] = Field(
+        description=(
+            "One result per distinct event date, ascending by event_date; a date requested more "
+            "than once appears once."
+        ),
+    )

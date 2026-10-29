@@ -50,9 +50,12 @@ async def get_macro_overview(
     """Return the macro overview over ``history_months`` month-ends (default 24, range 1-240).
 
     The window holds exactly ``history_months`` month-ends ending at the month of the latest
-    observation, and ``coverage.requested_start`` is the first of them (2024-10-31 for 24 months
+    observation, fewer only when it would reach back before January of year 1 (it then opens at
+    0001-01-31), and ``coverage.requested_start`` is the first of them (2024-10-31 for 24 months
     with data through 2026-09-30). ``coverage.is_partial_coverage`` is true when the data starts
-    more than one month after ``requested_start``.
+    more than one month after the first month-end of the full requested window: with ordinary
+    dates that is ``requested_start``, and months cut before year 1 count toward the one-month
+    tolerance.
 
     Values are Decimal strings rounded once by the service: rates in percentage points (``"6.80"``
     means 6.80%), ``fx_kes_usd`` in KES per USD and ``fx_reserves_usd_m`` in millions of USD.

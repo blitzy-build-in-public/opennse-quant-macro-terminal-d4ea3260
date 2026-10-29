@@ -24,12 +24,21 @@ Table location. The reserves table starts at the line "Table <n>: Foreign Exchan
 Million)" whose next non-empty line holds the table's observation dates (``DD-Mon-YY``, for
 example ``08-Jan-26 ... 05-Feb-26``, strictly ascending); the table number varies between
 bulletins. Its value row is the first later line on that page, before the next table, starting
-"1. CBK Foreign Exchange Reserves (USD Million)", with exactly one value per date, latest last.
+"1. CBK Foreign Exchange Reserves (USD Million)", with exactly one whitespace-separated cell per
+date, latest last; any other cell count, residual text included, is a layout change. Each cell
+must be one number as a whole: plain (``12384``), comma-grouped in threes (``12,384``), with an
+optional fraction (``9,051.5``), and optionally signed (``-``, ``+``, U+2212 minus) or enclosed in
+parentheses. Any other cell (``bad12384``, ``12,384%``, ``1,2384``) is rejected as unparsable,
+never read for the digits in it.
 
 Dating, units and bounds. Each value is written to ``terminal_macro_indicators.fx_reserves_usd_m``
 in millions of USD (NUMERIC(14,2), quantized ``ROUND_HALF_UP``) at **its column's header date**,
 never at the bulletin's publication date. Values outside [100, 100,000] are rejected: sanity
-bounds that catch parse, scale and column-shift errors.
+bounds that catch parse, scale and column-shift errors. A negative value (``-12,384`` or
+``(12,384)``) is parsed as negative and so rejected, never written as its magnitude. Rejected
+cells count against the shared run thresholds: up to 10% of a run's rows rejected gives
+``partial``, more gives ``layout_changed`` with nothing written, so one bad cell of a single
+five-date bulletin ends the run ``layout_changed``.
 
 Upsert. Conflict key ``observation_date``: ``fx_reserves_usd_m = COALESCE(EXCLUDED, stored)`` and
 ``source_by_field["fx_reserves_usd_m"] = "cbk_reserves"``. Consecutive bulletins repeat earlier
@@ -50,11 +59,12 @@ from dataclasses import dataclass, field, replace
 from datetime import date
 from decimal import Decimal
 from types import MappingProxyType
-from typing import Any, Final
+from typing import Final
 from urllib.parse import SplitResult, quote, unquote, urljoin, urlsplit
 
 from bs4 import BeautifulSoup, Tag
-from sqlalchemy import select
+from sqlalchemy import Select, case, func, literal, select, true
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from opennse_terminal.config import TerminalSettings
@@ -100,7 +110,7 @@ __all__ = [
     "BulletinLink",
     "BulletinPdf",
     "CbkReservesPipeline",
-    "load_ingested_bulletins",
+    "load_latest_ingested_bulletin",
     "parse_bulletin_listing",
     "parse_publication_date",
     "parse_reserves_bulletin",
@@ -155,8 +165,15 @@ NUMERIC_DATE_RE: Final = re.compile(r"(\d{1,2})([-/])(\d{1,2})\2(\d{4}|\d{2})")
 HEADER_DATE_RE: Final = re.compile(r"\b(\d{1,2})-([A-Za-z]{3,4})-(\d{2})\b")
 """One observation date in the table's date row, ``08-Jan-26`` (two-digit year = 2000 + YY)."""
 
-VALUE_TOKEN_RE: Final = re.compile(r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?")
-"""One number in the value row: ``12,384``, ``12384`` or ``12,384.5``."""
+# A value cell is matched whole, never searched for a number in it, which would read "bad12384"
+# as 12384. The match also runs before the shared cell reader, which drops every comma and a
+# trailing "%" and so would read "1,2384" or "12,384%" as 12384.
+VALUE_TOKEN_RE: Final = re.compile(
+    r"(?:(?P<open>\()|[-+\u2212]?)(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?(open)\))", re.ASCII
+)
+"""The whole of one value-row cell, used with ``fullmatch``: ASCII digits, plain (``12384``) or
+in exact groups of three (``12,384``), with an optional fraction (``9,051.5``), either enclosed in
+balanced parentheses (``(12,384)``) or after an optional ``-``, ``+`` or minus sign (U+2212)."""
 
 RESERVES_COLUMN: Final = "fx_reserves_usd_m"
 """The ``terminal_macro_indicators`` column this pipeline writes, in millions of USD."""
@@ -479,11 +496,14 @@ def _header_dates(matches: Sequence[re.Match[str]]) -> list[tuple[date, str]]:
 
 
 def _value_tokens(following: Sequence[str], count: int) -> list[str]:
-    """The numbers of the value row: the first line of ``following``, before the next line that
-    starts a table, whose lowercased text starts with :data:`ROW_LABEL`.
+    """The value cells of the value row: the first line of ``following``, before the next line
+    that starts a table, whose lowercased text starts with :data:`ROW_LABEL`. Every
+    whitespace-separated cell after the label counts, whatever it holds, so residual text in the
+    row is a count mismatch rather than a skipped word; :func:`_reserves_records` checks each
+    cell's grammar.
 
     Raises:
-        SourceLayoutChanged: No such line, or its number count differs from ``count``.
+        SourceLayoutChanged: No such line, or its cell count differs from ``count``.
     """
     scanned: list[str] = []
     for line in following:
@@ -493,7 +513,7 @@ def _value_tokens(following: Sequence[str], count: int) -> list[str]:
         if lowered.startswith(ROW_LABEL):
             # Sliced on the lowercased text: lowercasing keeps ASCII lengths but not every
             # character's, so the original line is never cut at the label's length.
-            tokens = VALUE_TOKEN_RE.findall(lowered[len(ROW_LABEL) :])
+            tokens = lowered[len(ROW_LABEL) :].split()
             if len(tokens) != count:
                 raise SourceLayoutChanged(
                     expected=[f"{count} values"],
@@ -512,12 +532,20 @@ def _value_tokens(following: Sequence[str], count: int) -> list[str]:
 def _reserves_records(
     dates: Sequence[tuple[date, str]], tokens: Sequence[str], page_number: int
 ) -> list[MacroRecord]:
-    """One record per date-value pair, dated at the column's header date."""
+    """One record per date-value pair, dated at the column's header date.
+
+    A cell that :data:`VALUE_TOKEN_RE` matches whole is read by :func:`parse_value_cell` and
+    quantized, so a signed or parenthesized negative stays negative for the bounds to reject. Any
+    other cell, or one that does not convert, gives a record without values whose error is
+    ``unparsable:fx_reserves_usd_m:<cell>``.
+    """
     quantum = COLUMN_QUANTUM[RESERVES_COLUMN]
     records: list[MacroRecord] = []
     for (observed, date_text), token in zip(dates, tokens, strict=True):
         raw = {"date": date_text, "value": token, "page": str(page_number)}
         try:
+            if VALUE_TOKEN_RE.fullmatch(token) is None:
+                raise ValueError(f"not a reserves value cell: {token!r}")
             value = quantize_to(parse_value_cell(token), quantum)
         except ValueError:
             record = MacroRecord(
@@ -562,17 +590,20 @@ def parse_reserves_bulletin(pdf_bytes: bytes) -> list[MacroRecord]:
     """Parse one Weekly Bulletin PDF into ``fx_reserves_usd_m`` records, one per header date.
 
     Pages are read in order, through pdfplumber's text layer, until the reserves table is found
-    (see the module docstring). Each value is parsed exactly (``"12,384"`` gives
-    ``Decimal("12384.00")``), quantized to 0.01 ``ROUND_HALF_UP`` and dated at its column's header
-    date; ``raw`` keeps the date and value texts and the page number. A value that does not
-    convert becomes a record with an ``unparsable`` error for validation to reject.
+    (see the module docstring). The value row holds one whitespace-separated cell per header
+    date. Each cell is parsed exactly (``"12,384"`` gives ``Decimal("12384.00")``), quantized to
+    0.01 ``ROUND_HALF_UP`` and dated at its column's header date; ``raw`` keeps the date and value
+    texts and the page number. A cell that is not a plain, comma-grouped, signed or parenthesized
+    number (:data:`VALUE_TOKEN_RE`), or does not convert, becomes a record with an
+    ``unparsable`` error for validation to reject; a negative value (``-12,384``, ``(12,384)``)
+    is parsed as negative and rejected by the bounds, never read as its magnitude.
 
     Raises:
         SourceLayoutChanged: The bytes do not start with ``%PDF-``; pdfplumber cannot read the
             document; no title line is followed by a date row ("reserves table not found",
             ``found`` holding up to ten lines that mention foreign exchange reserves); a header
             date is invalid or the dates do not ascend; the value row is missing; or the row's
-            value count differs from the date count.
+            cell count differs from the date count.
     """
     if not pdf_bytes.startswith(_PDF_MAGIC):
         raise SourceLayoutChanged(
@@ -596,6 +627,12 @@ def parse_reserves_bulletin(pdf_bytes: bytes) -> list[MacroRecord]:
 # ---------------------------------------------------------------------------------------------
 
 
+# Runs record each bulletin as date.isoformat(). Only entries of that fixed-width form are
+# compared, as text, and none is cast to a date in SQL, where one impossible date would raise and
+# abort the run's data transaction.
+_RECORDED_DATE_PATTERN: Final = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+
+
 def _iso_date(value: object) -> date | None:
     """``value`` as a date when it is an ISO date string, else ``None``."""
     if not isinstance(value, str):
@@ -606,26 +643,68 @@ def _iso_date(value: object) -> date | None:
         return None
 
 
-async def load_ingested_bulletins(conn: AsyncConnection) -> set[date]:
-    """The publication dates earlier ``cbk_reserves`` runs ingested.
+def _latest_recorded_bulletin(below: str | None) -> Select[tuple[str]]:
+    """``SELECT max(entry)`` over the ``details.bulletins`` entries of ingested runs: one row.
 
-    Reads ``details.bulletins`` of every run whose status is one of :data:`INGESTED_STATUSES`
-    through a bound ``SELECT``; entries that are not ISO date strings are ignored. Run rows are
-    committed on the recorder's own connection, so ``conn`` (the run's data transaction) sees
-    them, and the current run's own row is still ``running`` and therefore not read.
+    The entries are the text elements of each ``succeeded`` or ``partial`` ``cbk_reserves`` run's
+    ``details.bulletins`` array that match ``YYYY-MM-DD`` and, when ``below`` is given, sort
+    before it. A ``bulletins`` value that is missing or not an array, or a ``details`` that is not
+    an object, contributes no element: the ``CASE`` hands ``jsonb_array_elements_text`` an empty
+    array instead, because that function raises on a non-array and a ``WHERE`` guard is not
+    guaranteed to run first. A non-string element's text never matches the pattern. Entries are
+    compared bytewise (collation ``"C"``), so the fixed-width text orders chronologically whatever
+    the database collation. Every value is a bound parameter.
     """
-    statement = select(TerminalIngestionRun.details).where(
-        TerminalIngestionRun.pipeline == PIPELINE_NAME,
-        TerminalIngestionRun.status.in_(INGESTED_STATUSES),
+    recorded = TerminalIngestionRun.details["bulletins"]
+    entries = (
+        func.jsonb_array_elements_text(
+            case((func.jsonb_typeof(recorded) == "array", recorded), else_=literal([], JSONB))
+        )
+        .table_valued("value")
+        .render_derived(name="bulletin")
+        .lateral()
     )
-    result = await conn.execute(statement)
-    ingested: set[date] = set()
-    for details in result.scalars():
-        entries: Any = details.get("bulletins") if isinstance(details, Mapping) else None
-        if not isinstance(entries, list):
-            continue
-        ingested.update(day for day in map(_iso_date, entries) if day is not None)
-    return ingested
+    entry = entries.c.value.collate("C")
+    statement = (
+        select(func.max(entry))
+        .select_from(TerminalIngestionRun)
+        .join(entries, true())
+        .where(
+            TerminalIngestionRun.pipeline == PIPELINE_NAME,
+            TerminalIngestionRun.status.in_(INGESTED_STATUSES),
+            entries.c.value.regexp_match(_RECORDED_DATE_PATTERN),
+        )
+    )
+    return statement if below is None else statement.where(entry < below)
+
+
+async def load_latest_ingested_bulletin(conn: AsyncConnection) -> date | None:
+    """The latest publication date an earlier ``cbk_reserves`` run ingested, or ``None``.
+
+    Reads the ``details.bulletins`` entries of every run whose status is one of
+    :data:`INGESTED_STATUSES`, in the ``YYYY-MM-DD`` form runs record them in
+    (``date.isoformat()``). Any other entry, a non-string element and a ``bulletins`` value that
+    is not an array are ignored. The reduction runs in PostgreSQL: each bound ``SELECT max(...)``
+    returns one row whatever the size of the run history, and no ``details`` document is
+    transferred. The greatest entry is checked here with ``date.fromisoformat``; a well-formed but
+    impossible one (``2026-02-30``, ``9999-99-99``) is skipped by repeating the query below it,
+    until a valid date or nothing remains, so it can neither hide the true latest date nor raise
+    inside PostgreSQL.
+
+    Run rows are committed on the recorder's own connection, so ``conn`` (the run's data
+    transaction) sees them, and the current run's own row is still ``running`` and therefore not
+    read.
+    """
+    below: str | None = None
+    while True:
+        candidate = await conn.scalar(_latest_recorded_bulletin(below))
+        if candidate is None:
+            return None
+        latest = _iso_date(candidate)
+        if latest is not None:
+            return latest
+        # Strictly decreasing over a finite set of entries, so the loop ends.
+        below = candidate
 
 
 class CbkReservesPipeline(Pipeline[list[BulletinPdf], MacroRecord]):
@@ -656,22 +735,25 @@ class CbkReservesPipeline(Pipeline[list[BulletinPdf], MacroRecord]):
         ``ctx.details`` once the selection is known.
 
         Raises:
-            NoNewData: Without ``limit``, the newest listed bulletin is not newer than every
-                ingested one; ``details`` gets the newest listed and latest ingested dates.
+            NoNewData: Without ``limit``, the newest listed bulletin is not newer than the latest
+                ingested one (:func:`load_latest_ingested_bulletin`); ``details`` gets the newest
+                listed and latest ingested dates.
             SourceLayoutChanged: The listing has no dated bulletin link.
             FetchFailed, RobotsDisallowed: From ``ctx.http``.
         """
         ctx.details["source_url"] = WEEKLY_BULLETIN_URL
         html = await ctx.http.get_text(WEEKLY_BULLETIN_URL)
         links = parse_bulletin_listing(html)
-        ingested = set() if self.limit is not None else await load_ingested_bulletins(ctx.conn)
-        selected = select_bulletins(links, ingested=ingested, limit=self.limit)
+        latest = None if self.limit is not None else await load_latest_ingested_bulletin(ctx.conn)
+        selected = select_bulletins(
+            links, ingested=() if latest is None else (latest,), limit=self.limit
+        )
         if not selected:
             raise NoNewData(
                 "no weekly bulletin newer than those already ingested",
                 {
                     "newest_listed_bulletin": links[0].publication_date,
-                    "latest_ingested_bulletin": max(ingested, default=None),
+                    "latest_ingested_bulletin": latest,
                 },
             )
         ctx.details["bulletins"] = [link.publication_date.isoformat() for link in selected]

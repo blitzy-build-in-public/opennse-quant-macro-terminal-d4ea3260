@@ -3,7 +3,9 @@
 The heatmap compares capitalization-weighted price returns per sector against the whole market,
 period by period. Period boundaries are the last observed market sessions on or before each
 month-end or Friday: the distinct ``trade_date`` values the database holds, never a holiday list,
-so a calendar error cannot move a boundary onto a day without prices.
+so a calendar error cannot move a boundary onto a day without prices. A month-end or Friday that
+resolves to a boundary already taken is replaced by an earlier one, so every requested period is
+returned whenever the history reaches back far enough.
 
 Returns are in percentage points (``Decimal("10")`` means +10%) at full context precision; services
 round them once with ``quantize_out(value, "pct")``.
@@ -15,7 +17,7 @@ from bisect import bisect_right
 from calendar import monthrange
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import MINYEAR, date, timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Final, Literal
 
@@ -129,31 +131,33 @@ class _CapTotals:
         return growth * HUNDRED
 
 
-def _month_end_targets(as_of: date, periods: int) -> list[date]:
-    """Month-ends of ``as_of``'s month and of the ``periods`` months before it, newest first."""
-    targets: list[date] = []
-    month_number = as_of.year * 12 + as_of.month - 1
-    for offset in range(periods + 1):
-        year, month_index = divmod(month_number - offset, 12)
-        if year < MINYEAR:
-            break
-        month = month_index + 1
-        targets.append(date(year, month, monthrange(year, month)[1]))
-    return targets
+def _month_end_of(day: date) -> date:
+    """The last calendar day of ``day``'s month."""
+    return date(day.year, day.month, monthrange(day.year, day.month)[1])
 
 
-def _friday_targets(as_of: date, periods: int) -> list[date]:
-    """The Friday of ``as_of``'s ISO week and the ``periods`` Fridays before it, newest first."""
-    # ISO weeks run Monday to Sunday, so a weekend as_of maps back to the Friday just gone. The
+def _friday_of(day: date) -> date:
+    """The Friday of ``day``'s ISO week."""
+    # ISO weeks run Monday to Sunday, so a weekend day maps back to the Friday just gone. The
     # Friday of any representable week is representable, because date.max is itself a Friday.
-    friday = as_of + timedelta(days=_FRIDAY - as_of.weekday())
-    targets: list[date] = []
-    for offset in range(periods + 1):
-        try:
-            targets.append(friday - timedelta(weeks=offset))
-        except OverflowError:
-            break
-    return targets
+    return day + timedelta(days=_FRIDAY - day.weekday())
+
+
+def _month_end_before(day: date) -> date | None:
+    """The latest month-end strictly before ``day``, or ``None`` when it precedes date.min."""
+    try:
+        return day.replace(day=1) - timedelta(days=1)
+    except OverflowError:
+        return None
+
+
+def _friday_before(day: date) -> date | None:
+    """The latest Friday strictly before ``day``, or ``None`` when it precedes date.min."""
+    days_back = (day.weekday() - _FRIDAY) % 7 or 7
+    try:
+        return day - timedelta(days=days_back)
+    except OverflowError:
+        return None
 
 
 def period_boundaries(
@@ -164,19 +168,27 @@ def period_boundaries(
 ) -> list[date]:
     """Return the boundary sessions of the ``periods`` periods ending at ``as_of``.
 
-    Each target date is a month-end (``interval="month"``) or a Friday (``interval="week"``):
-    the one of ``as_of``'s month or ISO week and the ``periods`` before it. A target after
-    ``as_of`` is clamped to ``as_of``, so the latest period runs to date. Each boundary is the last
-    observed market session on or before its clamped target. Targets with no session on or before
-    them are dropped, and targets that resolve to the same session collapse into one, so sparse
-    data gives fewer boundaries.
+    Boundaries are found walking back from ``as_of``. The first target is the month-end of
+    ``as_of``'s month (``interval="month"``) or the Friday of its ISO week (``interval="week"``),
+    clamped to ``as_of`` so the latest period runs to date. Each boundary is the last observed
+    market session on or before its target, and the next target is the latest month-end or Friday
+    strictly before that boundary. A month-end or Friday that would resolve to a boundary already
+    taken (a non-session ``as_of``, or a month or week without sessions) is thereby replaced by an
+    earlier one, so ``periods + 1`` distinct boundaries are returned whenever the history reaches
+    that far. The walk stops early only when a target has no session on or before it or would
+    precede date.min, so a short history gives fewer boundaries.
 
     ``boundaries[0]`` opens the first period and ``boundaries[1:]`` are the period ends, ready for
     :func:`sector_returns`.
 
-    Example:
+    Examples:
         ``as_of`` 2026-09-30, ``"month"``, 12 periods: the last sessions on or before 2025-09-30,
         2025-10-31, ..., 2026-08-31 and 2026-09-30, which is 13 boundaries and 12 periods.
+
+        ``as_of`` 2026-05-01, ``"month"``, 3 periods, on a weekday calendar where 2026-05-01 is not
+        a session: the first target 2026-05-01 resolves to 2026-04-30, which also closes April, so
+        the walk continues from March and returns 2026-01-30, 2026-02-27, 2026-03-31 and
+        2026-04-30.
 
     Args:
         sessions: Observed market sessions, sorted ascending and distinct.
@@ -185,7 +197,7 @@ def period_boundaries(
         as_of: Last day of the latest period.
 
     Returns:
-        Up to ``periods + 1`` distinct sessions, ascending.
+        ``periods + 1`` distinct sessions, ascending, or fewer when the history runs out.
 
     Raises:
         ValueError: If ``periods`` is below 1 or ``interval`` is not a :data:`HeatmapInterval`.
@@ -193,17 +205,26 @@ def period_boundaries(
     if periods < 1:
         raise ValueError(f"periods must be >= 1, got {periods}")
     if interval == "month":
-        targets = _month_end_targets(as_of, periods)
+        target: date | None = min(_month_end_of(as_of), as_of)
+        step_back = _month_end_before
     elif interval == "week":
-        targets = _friday_targets(as_of, periods)
+        target = min(_friday_of(as_of), as_of)
+        step_back = _friday_before
     else:
         raise ValueError(f"unknown heatmap interval {interval!r}")
-    boundaries: set[date] = set()
-    for target in targets:
-        index = bisect_right(sessions, min(target, as_of))
-        if index > 0:
-            boundaries.add(sessions[index - 1])
-    return sorted(boundaries)
+    # Every month-end or Friday from a boundary's own target down to that boundary resolves to the
+    # boundary again, so the walk jumps straight below it: one bisection per boundary, however long
+    # a stretch without sessions (as_of years after the data) is.
+    boundaries: list[date] = []
+    while target is not None and len(boundaries) <= periods:
+        index = bisect_right(sessions, target)
+        if index == 0:
+            break
+        boundary = sessions[index - 1]
+        boundaries.append(boundary)
+        target = step_back(boundary)
+    boundaries.reverse()
+    return boundaries
 
 
 def sector_returns(

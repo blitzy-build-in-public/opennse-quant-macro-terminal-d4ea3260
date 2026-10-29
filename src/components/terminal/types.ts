@@ -267,8 +267,9 @@ export interface ScreenerFilters {
 }
 
 /**
- * One equity in the screener, valued as of the response's `as_of`. Z-score reasons appear in
- * `flags` prefixed with their metric, as `volume_z:<code>` and `turnover_z:<code>`.
+ * One equity in the screener, valued as of the response's `as_of`. Session-change and Z-score
+ * reasons appear in `flags` prefixed with their metric, as `change_pct:<code>`,
+ * `volume_z:<code>` and `turnover_z:<code>`.
  */
 export interface ScreenerRow {
   /** NSE ticker symbol, for example `SCOM`. */
@@ -283,7 +284,7 @@ export interface ScreenerRow {
   trade_date: string;
   /** Closing price on `trade_date`, KES per share. */
   close_price: DecimalString;
-  /** Change from the previous close, %. */
+  /** Change from the previous close, %; null without one (`change_pct:no_previous_close`). */
   change_pct: DecimalString | null;
   /** Close × shares outstanding, KES; null (`currency_mismatch`) for a non-KES equity. */
   market_cap_kes: DecimalString | null;
@@ -699,7 +700,11 @@ export interface CycleResult {
   flags: string[];
 }
 
-/** Body of `GET /cycles/backtest`: one result per event date, in request order. */
+/**
+ * Body of `GET /cycles/backtest`. `cycles` holds one result per distinct event date, ascending by
+ * `event_date`: a date requested more than once is returned once, and the stored
+ * `terminal_cycles` defaults are likewise in date order.
+ */
 export interface BacktestResponse {
   /** The resolved window applied to every cycle. */
   window: BacktestWindow;
@@ -707,7 +712,10 @@ export interface BacktestResponse {
   candidates: string[];
   /** Latest trade date among the candidates' prices; null when none has prices. */
   data_available_through: string | null;
-  /** One result per event date. */
+  /**
+   * One result per distinct event date, ascending by `event_date`; a date requested more than
+   * once appears once.
+   */
   cycles: CycleResult[];
 }
 

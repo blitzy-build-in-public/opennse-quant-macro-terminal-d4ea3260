@@ -138,7 +138,7 @@ def build_alembic_config(
 
 
 def head_revision() -> str:
-    """Return the single head revision of the packaged history (``"terminal_0001"`` today).
+    """Return the single head revision of the packaged history (``"terminal_0002"`` today).
 
     Reads only the script directory and never touches a database. Raises ``RuntimeError`` when
     the history has no head or several heads. The seeder compares
@@ -189,11 +189,12 @@ def run_downgrade(database_url: str, revision: str) -> None:
     """Downgrade the terminal schema at ``database_url`` to ``revision``, e.g. ``"base"``.
 
     Same calling rules as :func:`run_upgrade`: synchronous, outside a running event loop, with a
-    ``postgresql+asyncpg://`` URL. Only the revisions' own ``downgrade()`` steps run, so
-    ``downgrade base`` drops the 11 tables ``terminal_0001`` created and nothing else. Alembic
-    keeps :data:`VERSION_TABLE`, now empty; that is intended, since only what the revisions
-    created is dropped. Checks that every ``terminal_`` table is gone must therefore exclude
-    :data:`VERSION_TABLE` or assert that it holds no rows.
+    ``postgresql+asyncpg://`` URL. Only the revisions' own ``downgrade()`` steps run, newest
+    first, so ``downgrade base`` restores the two ticker foreign keys ``terminal_0002`` recreated
+    to their ``terminal_0001`` definitions, then drops the 11 tables ``terminal_0001`` created,
+    and nothing else. Alembic keeps :data:`VERSION_TABLE`, now empty; that is intended, since
+    only what the revisions created is dropped. Checks that every ``terminal_`` table is gone
+    must therefore exclude :data:`VERSION_TABLE` or assert that it holds no rows.
 
     A connect failure or timeout raises the same credential-free ``ConnectionError`` as
     :func:`run_upgrade`, within :data:`CONNECT_TIMEOUT_SECONDS`.

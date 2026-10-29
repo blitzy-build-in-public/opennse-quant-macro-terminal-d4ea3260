@@ -11,9 +11,15 @@ Only stored rows are read, seeded or ingested alike. A future event such as the 
 answered with the descriptive projection of the completed cycles, which is computed per request
 and never written to the database; no future-dated row is ever assumed.
 
-Each request issues a constant number of statements per cycle: the price history of a cycle is
-one Core column query over its window and a short lead-in, never the union of every window as
-ORM entities.
+Each request issues a constant number of statements per cycle, and every read of price, session
+or macro history is bounded by the requested windows, so its cost does not grow with stored
+history between or outside them. A cycle's observed sessions are one distinct ``trade_date``
+query over its window up to the end of the candidates' data, and one backward query limited to
+the 30 sessions before the window; its price history is one Core column query over those
+sessions, never the union of every window as ORM entities. The overlay rows of every cycle are
+one statement over the cycles' observed ranges, each widened by the 62-day overlay staleness
+limit, with overlapping or adjacent ranges merged. A cycle whose window holds no data yet reads
+no lead-in and no price, and a request of only such cycles reads no overlay.
 
 Business-rule errors are coded ``HTTPException`` bodies ``{code, message, field}`` (see
 :class:`~opennse_terminal.schemas.common.ErrorDetail`). The module registers no exception handlers
@@ -21,14 +27,13 @@ and never imports ``opennse_terminal.api``, which imports the services.
 """
 
 import logging
-from bisect import bisect_left, bisect_right
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import date, timedelta
 from decimal import Decimal
 from typing import Final
 
 from fastapi import HTTPException
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from opennse_terminal.config import TerminalSettings
@@ -82,7 +87,7 @@ logger = logging.getLogger("opennse_terminal.services.cycle_service")
 _HTTP_422: Final = 422
 
 _LEAD_SESSIONS: Final = MA_SESSIONS + BASE_CLOSE_MAX_SESSIONS
-"""Market sessions of price history read before each window start.
+"""Market sessions, with their price history, read before each window start.
 
 The trailing turnover mean at the anchor reads back 20 sessions and the base close up to 10, so
 30 sessions cover both with room to spare."""
@@ -237,12 +242,71 @@ async def _data_available_through(session: AsyncSession, tickers: Sequence[str])
     return latest
 
 
-async def _load_overlay_rows(session: AsyncSession, start: date, end: date) -> list[MacroRow]:
+async def _sessions_before(session: AsyncSession, day: date, count: int) -> list[date]:
+    """The last ``count`` observed market sessions strictly before ``day``, ascending.
+
+    One backward ``DISTINCT trade_date`` query with ``LIMIT count``, so only the lead-in is read
+    however much history precedes ``day``; every earlier session is returned when fewer exist.
+    """
+    stmt = (
+        select(TerminalDailyPrice.trade_date)
+        .where(TerminalDailyPrice.trade_date < day)
+        .distinct()
+        .order_by(TerminalDailyPrice.trade_date.desc())
+        .limit(count)
+    )
+    result = await session.execute(stmt)
+    return sorted(result.scalars().all())
+
+
+async def _cycle_sessions(
+    session: AsyncSession, window: CycleWindow, data_available_through: date | None
+) -> list[date]:
+    """The observed market sessions the backtest of ``window`` reads, ascending.
+
+    These are the window's own sessions, from ``window_start`` to ``window_end`` or
+    ``data_available_through``, whichever is earlier, preceded by the last :data:`_LEAD_SESSIONS`
+    sessions before ``window_start`` (every earlier session when fewer exist). Positions counted
+    back from the anchor, the first session in the window, are therefore those of the full
+    observed calendar for the turnover mean and the base close, which read at most 19 and 10
+    sessions back. Empty, with no lead-in read, when the window holds no session up to the end of
+    the data: the cycle is then ``awaiting_data``.
+    """
+    if data_available_through is None:
+        return []
+    last_day = min(window.window_end, data_available_through)
+    if last_day < window.window_start:
+        return []
+    in_window = await load_market_sessions(session, window.window_start, last_day)
+    if not in_window:
+        return []
+    lead_in = await _sessions_before(session, window.window_start, _LEAD_SESSIONS)
+    return [*lead_in, *in_window]
+
+
+def _merge_ranges(ranges: Iterable[tuple[date, date]]) -> list[tuple[date, date]]:
+    """Merge inclusive ``(start, end)`` date ranges that overlap or touch, ascending by start."""
+    merged: list[tuple[date, date]] = []
+    for start, end in sorted(ranges):
+        if merged and (start - merged[-1][1]).days <= 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+async def _load_overlay_rows(
+    session: AsyncSession, ranges: Sequence[tuple[date, date]]
+) -> list[MacroRow]:
     """Macro rows carrying an overlay series (inflation, 91-day or 364-day bill), ascending.
 
-    Rows from ``start`` to ``end`` inclusive are read: an overlay value older than 62 days is
-    never used, so callers pass the earliest window start minus that limit.
+    One statement reads the rows observed within any of the inclusive, disjoint ``ranges``; no
+    statement runs when ``ranges`` is empty. An overlay value older than 62 days is never used,
+    so callers pass, per cycle, its window start minus that limit through its last observed
+    session.
     """
+    if not ranges:
+        return []
     stmt = (
         select(
             TerminalMacroIndicator.observation_date,
@@ -251,8 +315,15 @@ async def _load_overlay_rows(session: AsyncSession, start: date, end: date) -> l
             TerminalMacroIndicator.tbill_364d_pct,
         )
         .where(
-            TerminalMacroIndicator.observation_date >= start,
-            TerminalMacroIndicator.observation_date <= end,
+            or_(
+                *(
+                    and_(
+                        TerminalMacroIndicator.observation_date >= start,
+                        TerminalMacroIndicator.observation_date <= end,
+                    )
+                    for start, end in ranges
+                )
+            ),
             or_(
                 TerminalMacroIndicator.inflation_yoy_pct.is_not(None),
                 TerminalMacroIndicator.tbill_91d_pct.is_not(None),
@@ -274,27 +345,18 @@ async def _load_overlay_rows(session: AsyncSession, start: date, end: date) -> l
 
 
 async def _load_cycle_prices(
-    session: AsyncSession,
-    tickers: Sequence[str],
-    window: CycleWindow,
-    sessions: Sequence[date],
-    data_available_through: date | None,
+    session: AsyncSession, tickers: Sequence[str], cycle_sessions: Sequence[date]
 ) -> dict[str, list[PriceRow]]:
-    """Price rows the backtest of ``window`` reads, per ticker, in one Core column query.
+    """Price rows one cycle's backtest reads, per ticker, in one Core column query.
 
-    The range runs from the market session :data:`_LEAD_SESSIONS` sessions before the window's
-    first session (the turnover mean and base-close lookback read before the window) to the
-    window end or the end of the data, whichever is earlier. A window without an observed session
-    needs no price row, because the cycle is then ``awaiting_data``.
+    The range spans ``cycle_sessions`` (see :func:`_cycle_sessions`): from the first lead-in
+    session, :data:`_LEAD_SESSIONS` sessions before the window's first session (the turnover mean
+    and base-close lookback read before the window), to the window's last observed session. A
+    cycle without sessions needs no price row, because it is then ``awaiting_data``.
     """
-    if not tickers or data_available_through is None:
+    if not tickers or not cycle_sessions:
         return {}
-    first = bisect_left(sessions, window.window_start)
-    last = bisect_right(sessions, min(window.window_end, data_available_through))
-    if first >= last:
-        return {}
-    lead_start = sessions[max(0, first - _LEAD_SESSIONS)]
-    return await load_price_rows(session, tickers, lead_start, sessions[last - 1])
+    return await load_price_rows(session, tickers, cycle_sessions[0], cycle_sessions[-1])
 
 
 def _candidates_for_cycle(
@@ -545,25 +607,28 @@ async def get_backtest(
     candidate_tickers = [equity.ticker for equity in equities]
 
     data_available_through = await _data_available_through(session, candidate_tickers)
-    sessions = await load_market_sessions(session)
+    cycle_sessions = [
+        await _cycle_sessions(session, window, data_available_through) for window in windows
+    ]
     fundamentals = await load_fundamentals_rows(session, candidate_tickers)
     macro_rows = await _load_overlay_rows(
         session,
-        _days_before(min(window.window_start for window in windows), OVERLAY_MAX_STALENESS_DAYS),
-        max(window.window_end for window in windows),
+        _merge_ranges(
+            (_days_before(window.window_start, OVERLAY_MAX_STALENESS_DAYS), observed[-1])
+            for window, observed in zip(windows, cycle_sessions, strict=True)
+            if observed
+        ),
     )
 
     results: list[CycleBacktestResult] = []
-    for event, window in zip(events, windows, strict=True):
-        prices = await _load_cycle_prices(
-            session, candidate_tickers, window, sessions, data_available_through
-        )
+    for event, window, observed in zip(events, windows, cycle_sessions, strict=True):
+        prices = await _load_cycle_prices(session, candidate_tickers, observed)
         results.append(
             run_cycle_backtest(
                 event,
                 window,
                 _candidates_for_cycle(equities, prices, fundamentals),
-                sessions,
+                observed,
                 macro_rows,
                 data_available_through=data_available_through,
                 lag_days=settings.fundamentals_lag_days,
@@ -576,7 +641,9 @@ async def get_backtest(
         "cycle backtest over %d candidates through %s: %s",
         len(candidate_tickers),
         data_available_through,
-        ", ".join(f"{result.label}={result.status}" for result in results),
+        # Labels are stored text: repr escapes CR, LF and every other control or line-separator
+        # character, so one backtest stays one log record on one line whatever a label holds.
+        ", ".join(f"{result.label!r}={result.status}" for result in results),
     )
     return BacktestResponse(
         window=BacktestWindow(

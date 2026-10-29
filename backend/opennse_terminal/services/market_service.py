@@ -117,7 +117,9 @@ MARKET_SUBJECT: Final = "market"
 
 SECTOR_BAND_CLOSE_MAX_AGE_DAYS: Final = 10
 """Oldest close, in calendar days on or before a session, a member contributes to a sector's
-daily valuation-band value; an older close leaves the member out that day."""
+daily valuation-band value; an older close leaves the member out that day. The carry applies only
+on a session on which at least one member of the sector has a close: a session on which no member
+traded has no sector value."""
 
 _SeriesMetric = Literal["volume", "turnover"]
 
@@ -565,7 +567,10 @@ def _screener_row(
     """
     latest = history[-1]
     previous_close = history[-2].close_price if len(history) > 1 else None
+    change = price_change_pct(latest.close_price, previous_close)
     flags = list(valuation.flags)
+    if change.flag is not None:
+        flags.append(f"change_pct:{change.flag}")
     flags.extend(f"volume_z:{code}" for code in volume_point.flags)
     flags.extend(f"turnover_z:{code}" for code in turnover_point.flags)
     return ScreenerRow(
@@ -575,7 +580,7 @@ def _screener_row(
         currency=equity.currency,
         trade_date=latest.trade_date,
         close_price=quantize_out(latest.close_price, "per_share"),
-        change_pct=quantize_out(price_change_pct(latest.close_price, previous_close), "pct"),
+        change_pct=quantize_out(change.value, "pct"),
         market_cap_kes=quantize_out(valuation.market_cap_kes, "money"),
         eps_kes=quantize_out(valuation.eps_kes, "per_share"),
         pe=quantize_out(valuation.pe, "ratio"),
@@ -645,9 +650,10 @@ async def get_screener(
     and turnover (KES) of that session; and the rolling ``z_window`` volume and turnover
     Z-scores of that session against the ticker's own prior rows. Fundamentals are the fiscal
     year available ``settings.fundamentals_lag_days`` after period end. Banking equities have a
-    null EV/EBITDA with ``ev_not_meaningful_for_banks``; Z-score reasons are prefixed
-    ``volume_z:`` or ``turnover_z:``. A row is an anomaly when its unrounded Z-score is at or
-    above ``anomaly_threshold`` (positive side only).
+    null EV/EBITDA with ``ev_not_meaningful_for_banks``. A null change carries its reason
+    prefixed ``change_pct:``, as in ``change_pct:no_previous_close`` on a counter's first
+    session, and Z-score reasons are prefixed ``volume_z:`` or ``turnover_z:``. A row is an
+    anomaly when its unrounded Z-score is at or above ``anomaly_threshold`` (positive side only).
 
     Filters compare the quantized values; a null metric fails any filter on it. Rows sort by
     ``sort`` in ``order`` with nulls last and ties by ticker. ``sector_aggregates`` covers every
@@ -908,15 +914,23 @@ def _sector_daily(
     metric: BandMetric,
     lag_days: int,
 ) -> tuple[list[tuple[date, Decimal | None]], bool]:
-    """The sector's matched-set daily multiple on each session, and whether a currency was refused.
+    """The sector's matched-set daily multiple on each of its sessions, and whether a currency was
+    refused.
 
-    Each member contributes its latest close within ``SECTOR_BAND_CLOSE_MAX_AGE_DAYS`` on or
-    before the session, valued with that session's available fundamentals; members without such
-    a close are left out that day.
+    The sector's sessions are those of ``sessions`` on which at least one member has a price row.
+    A session on which no member traded is not a session with a close for the sector: it gets no
+    entry at all, neither a value nor a null day. On each of the sector's sessions every member
+    contributes its latest close within ``SECTOR_BAND_CLOSE_MAX_AGE_DAYS`` on or before the
+    session, valued with that session's available fundamentals and the equity's
+    ``shares_outstanding``; a member without such a close is left out that day. A one-member
+    sector therefore has exactly its counter's sessions, each valued at that day's close.
     """
+    traded = {row.trade_date for equity in members for row in prices.get(equity.ticker, [])}
     daily: list[tuple[date, Decimal | None]] = []
     refused = False
     for day in sessions:
+        if day not in traded:
+            continue
         results: list[ValuationResult] = []
         for equity in members:
             close = close_as_of(
@@ -985,13 +999,15 @@ async def get_valuation_bands(
 
     The lookback runs from ``requested_start`` (``as_of`` minus ``lookback_years`` calendar
     years, the day clamped to the month's length) to ``as_of`` (default the latest stored
-    ``trade_date``). The daily multiple (x) is computed on each market session:
+    ``trade_date``). The daily multiple (x) is computed on each market session with a close:
 
     * per counter, on every session the ticker has a close, from that close and the fiscal-year
       fundamentals available that day (``settings.fundamentals_lag_days`` after period end);
-    * per sector, on every market session, as the matched-set sector aggregate over the members
-      with a close within 10 calendar days on or before the day, each with that day's
-      fundamentals and the equity's ``shares_outstanding``.
+    * per sector, on every market session on which at least one member has a close, as the
+      matched-set sector aggregate over the members whose latest close is at most 10 calendar
+      days old on that day (a member that did not trade that day carries such a close), each
+      with that day's fundamentals and the equity's ``shares_outstanding``. A session on which
+      no member traded has no sector value, so a one-member sector has its counter's sessions.
 
     Undefined days (losses for P/E, non-positive equity for P/B) are excluded. The statistics
     (mean, sample deviation, mean +/- 1 and 2 deviations, min, quartiles, max, current, all x;

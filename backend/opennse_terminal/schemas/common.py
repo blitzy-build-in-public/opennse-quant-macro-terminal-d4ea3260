@@ -286,6 +286,11 @@ Flag = Literal[
     "sector_pb_unavailable",
     "sector_ev_ebitda_unavailable",
     "sector_dy_unavailable",
+    # Screener session change.
+    "no_previous_close",
+    # Emitted by quant.valuation.price_change_pct for a previous close <= 0, so it is listed with
+    # the other base codes although the close_price > 0 database check normally prevents it.
+    "non_positive_previous_close",
     # Historical valuation bands.
     "insufficient_history",
     "no_positive_earnings",
@@ -315,8 +320,9 @@ FLAG_CODES: Final[frozenset[str]] = frozenset(get_args(Flag))
 """The members of :data:`Flag`, for membership checks at runtime."""
 
 # Every ``flags`` field in the schema modules is ``list[str]``, not ``list[Flag]``: the screener
-# prefixes a Z-score code with its metric, as in ``volume_z:insufficient_observations`` and
-# ``turnover_z:zero_variance``, which a Literal would reject. The convention is
+# prefixes a Z-score code and a session-change code with its metric, as in
+# ``volume_z:insufficient_observations``, ``turnover_z:zero_variance`` and
+# ``change_pct:no_previous_close``, which a Literal would reject. The convention is
 #     flags: list[str] = Field(
 #         default_factory=list, description="Reason codes for null or qualified values."
 #     )
@@ -373,7 +379,9 @@ class CoverageMeta(TerminalResponseModel):
     """How much of a requested history window the stored data covers.
 
     Valuation bands report partial coverage when ``coverage_start`` is more than 7 days after
-    ``requested_start``; the macro overview when it is more than one month after.
+    ``requested_start``; the macro overview when it is more than one month after the first
+    month-end of its full requested window: ``requested_start`` with ordinary dates, while months
+    cut before year 1 count toward the one-month tolerance.
     """
 
     requested_start: dt.date = Field(

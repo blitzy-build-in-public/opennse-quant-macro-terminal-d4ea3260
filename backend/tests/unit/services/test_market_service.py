@@ -14,7 +14,9 @@ and rounds each output once with ``quantize_out`` (ROUND_HALF_UP, 2 dp). The con
   aggregates over the whole universe, independent of the filters.
 - **Heatmap**: the last session on or before each month-end or Friday; only KES equities.
 - **Valuation bands**: ``requested_start`` is ``as_of`` minus the lookback, coverage is partial
-  when data starts more than 7 days later, and ``stats`` exist only for ``status = "ok"``.
+  when data starts more than 7 days later, and ``stats`` exist only for ``status = "ok"``. A
+  sector has a daily value only on the sessions on which a member traded, so a one-member
+  sector's band is its counter's.
 - **Anomalies**: positive spikes at or above the threshold over the last ``lookback_sessions``
   sessions, sorted by ``trade_date`` then ``z_score``, both descending.
 - **Flows**: ``end`` defaults to ``as_of`` and ``start`` to ``end`` minus 365 days; local net flow
@@ -59,6 +61,7 @@ from opennse_terminal.config import TerminalSettings
 from opennse_terminal.models import (
     TerminalDailyPrice,
     TerminalEquity,
+    TerminalFundamental,
     TerminalWatchlist,
     TerminalWatchlistItem,
 )
@@ -741,14 +744,16 @@ async def test_screener_values_at_the_latest_close_with_lagged_fundamentals(
 async def test_screener_on_the_first_session_has_no_change_or_z_score(
     session: AsyncSession, settings: TerminalSettings
 ) -> None:
-    """On 2012-01-02 each counter has one row: no previous close gives a null change, and an
-    empty window gives null Z-scores with prefixed ``insufficient_observations`` reasons and no
-    anomaly. The fiscal years available then are FY2010 for the banks and FY2011 for SCOM."""
+    """On 2012-01-02 each counter has one row: no previous close gives a null change with
+    ``change_pct:no_previous_close``, and an empty window gives null Z-scores with prefixed
+    ``insufficient_observations`` reasons and no anomaly. The fiscal years available then are
+    FY2010 for the banks and FY2011 for SCOM."""
     response = await ms.get_screener(session, ScreenerParams(as_of=FIRST_SESSION), LOCAL, settings)
     assert response.count == 8
     for row in response.rows:
         assert row.trade_date == FIRST_SESSION
         assert (row.change_pct, row.volume_z, row.turnover_z) == (None, None, None)
+        assert "change_pct:no_previous_close" in row.flags
         assert "volume_z:insufficient_observations" in row.flags
         assert "turnover_z:insufficient_observations" in row.flags
         assert not (row.is_volume_anomaly or row.is_turnover_anomaly)
@@ -948,6 +953,151 @@ async def test_short_valuation_band_has_no_statistics(
     assert response.coverage.is_partial_coverage
     assert response.series
     assert response.series[-1].date == date(2012, 2, 15)
+
+
+async def add_sparse_counter(
+    session: AsyncSession, ticker: str, sector: str, closes: dict[date, Decimal]
+) -> None:
+    """Add a KES counter of ``sector`` to this clone with a price row on each day of ``closes``
+    only: 1,000,000 shares and FY2025 net income 100,000 KES (available from 2026-03-31), so its
+    P/E on a day is that day's close x 10."""
+    session.add(
+        TerminalEquity(
+            ticker=ticker,
+            company_name=f"{ticker} Holdings",
+            sector=sector,
+            shares_outstanding=1_000_000,
+            source="csv_import",
+        )
+    )
+    await session.flush()
+    session.add(
+        TerminalFundamental(
+            ticker=ticker,
+            period_end_date=date(2025, 12, 31),
+            period_type="FY",
+            net_income_kes=Decimal("100000"),
+            source_by_field={"net_income_kes": "csv_import"},
+        )
+    )
+    session.add_all(
+        TerminalDailyPrice(
+            ticker=ticker,
+            trade_date=day,
+            close_price=close,
+            volume=1_000,
+            turnover_kes=close * 1_000,
+            source="csv_import",
+        )
+        for day, close in closes.items()
+    )
+    await session.commit()
+
+
+async def test_sector_band_has_values_only_on_sessions_a_member_traded(
+    session: AsyncSession, settings: TerminalSettings
+) -> None:
+    """Sector "QA Edge": QSTL closes 10.00 only on Thursday 2026-09-03 and Tuesday 2026-09-15;
+    QE1 to QE4 close 15.00 only on 2026-09-30. The sector has a daily value on those three
+    sessions alone: 100.00, 100.00, then 150.00 (60,000,000 / 400,000), QSTL's 15-day-old close
+    being left out (with it, 140.00). The weeks of 2026-09-07 and 2026-09-21, in which no member
+    traded, get no point although QSTL's close is at most 10 days old there; each point is dated
+    on the last session of its week."""
+    await add_sparse_counter(
+        session,
+        "QSTL",
+        "QA Edge",
+        {date(2026, 9, 3): Decimal("10.00"), date(2026, 9, 15): Decimal("10.00")},
+    )
+    for ticker in ("QE1", "QE2", "QE3", "QE4"):
+        await add_sparse_counter(session, ticker, "QA Edge", {LATEST: Decimal("15.00")})
+
+    response = await ms.get_valuation_bands(session, settings, sector="QA Edge", lookback_years=1)
+
+    assert (response.status, response.flags, response.stats) == (
+        "insufficient_history",
+        ["insufficient_history"],
+        None,
+    )
+    coverage = response.coverage
+    assert (coverage.requested_start, coverage.coverage_start, coverage.is_partial_coverage) == (
+        date(2025, 9, 30),
+        date(2026, 9, 3),
+        True,
+    )
+    assert [(point.date, point.value) for point in response.series] == [
+        (date(2026, 9, 4), Decimal("100.00")),
+        (date(2026, 9, 18), Decimal("100.00")),
+        (LATEST, Decimal("150.00")),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("sessions_back", "status", "coverage_start", "stats"),
+    [
+        pytest.param(70, "insufficient_history", date(2026, 6, 25), None, id="56-closes"),
+        pytest.param(
+            100,
+            "ok",
+            date(2026, 5, 13),
+            (
+                80,
+                Decimal("115.00"),
+                Decimal("11.25"),
+                Decimal("115.00"),
+                Decimal("130.00"),
+                Decimal("100.00"),
+            ),
+            id="80-closes",
+        ),
+    ],
+)
+async def test_one_member_sector_band_equals_its_counter_band(
+    session: AsyncSession,
+    settings: TerminalSettings,
+    sessions_back: int,
+    status: str,
+    coverage_start: date,
+    stats: tuple[int, Decimal, Decimal, Decimal, Decimal, Decimal] | None,
+) -> None:
+    """QWK, the only member of "QA Week", closes on each of the last ``sessions_back`` sessions
+    except Fridays (14 of 70, 20 of 100), cycling 10.00, 11.00, 12.00 and 13.00. The sector has
+    the counter's sessions and values, so status, flags, coverage, weekly series and statistics
+    are the counter's; no Friday is filled with Thursday's close. 56 values are too few for
+    statistics. 80 values are 20 each of P/E 100 to 130: mean and median 115.00, sample deviation
+    11.25 (the square root of 10,000 / 79), current 130.00 at percentile 100.00."""
+    sessions = (await ms.load_market_sessions(session))[-sessions_back:]
+    days = [day for day in sessions if day.isoweekday() != 5]
+    await add_sparse_counter(
+        session, "QWK", "QA Week", {day: Decimal(10 + i % 4) for i, day in enumerate(days)}
+    )
+
+    counter = await ms.get_valuation_bands(session, settings, ticker="QWK", lookback_years=1)
+    sector = await ms.get_valuation_bands(session, settings, sector="QA Week", lookback_years=1)
+
+    assert (counter.status, counter.coverage.coverage_start) == (status, coverage_start)
+    assert counter.series[-1].date == LATEST
+    assert counter.series[-1].value == Decimal("130.00")
+    observed = counter.stats
+    assert (
+        None
+        if observed is None
+        else (
+            observed.observations,
+            observed.mean,
+            observed.stdev,
+            observed.median,
+            observed.current,
+            observed.current_percentile,
+        )
+    ) == stats
+    assert (sector.status, sector.flags, sector.coverage, sector.series, sector.stats) == (
+        counter.status,
+        counter.flags,
+        counter.coverage,
+        counter.series,
+        counter.stats,
+    )
 
 
 # ---------------------------------------------------------------------------------------------

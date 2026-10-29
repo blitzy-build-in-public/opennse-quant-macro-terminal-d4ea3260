@@ -182,7 +182,8 @@ class MacroOverviewResponse(TerminalResponseModel):
     """Body of ``GET /macro/overview``.
 
     Every list is empty, never an error, when no macro or bond data is stored. The window holds
-    exactly ``history_months`` month-ends ending at the latest observation month, and
+    exactly ``history_months`` month-ends ending at the latest observation month, fewer only when
+    it would reach back before January of year 1 (it then opens at 0001-01-31), and
     ``coverage.requested_start`` is the first of them: 2024-10-31 for 24 months with data through
     2026-09-30. With no data the window ends at the current month.
     """
@@ -190,7 +191,9 @@ class MacroOverviewResponse(TerminalResponseModel):
     coverage: CoverageMeta = Field(
         description=(
             "Window coverage; is_partial_coverage is true when the first observation is more "
-            "than one month after requested_start."
+            "than one month after the first month-end of the full requested window: "
+            "requested_start with ordinary dates, while months cut before year 1 count toward "
+            "the one-month tolerance."
         ),
     )
     latest: list[IndicatorSnapshot] = Field(

@@ -7,10 +7,11 @@ and ``get_macro_overview`` on seeded PostgreSQL.
 - **T-bills** 91D (0.25 years), 182D (0.50) and 364D (1.00): each tenor independently takes the
   latest non-null value of its column on or before ``day`` and at most 62 days old, with its own
   ``observation_date`` and its column's ``source_by_field`` entry (``unknown`` without one);
-- **bonds**: FXD observations dated from ``day`` minus 365 days to ``day``, bucketed to the
-  nearest of 2, 5, 10, 15, 20 and 25 years by remaining tenor (a midpoint goes to the lower
-  bucket). A bucket takes its most recent real observation (``source != "seed"``, ties by the
-  lower ``bond_code``), and a seeded one only when it has no real observation in the window.
+- **bonds**: FXD observations dated from ``day`` minus 365 days (``date.min`` at the earliest) to
+  ``day``, bucketed to the nearest of 2, 5, 10, 15, 20 and 25 years by remaining tenor (a midpoint
+  goes to the lower bucket). A bucket takes its most recent real observation
+  (``source != "seed"``, ties by the lower ``bond_code``), and a seeded one only when it has no
+  real observation in the window.
 
 Points come back in ascending tenor, T-bills first on an equal tenor, with yields and tenors
 quantized to 2 dp (ROUND_HALF_UP). The KPI snapshots are built from each indicator's latest and
@@ -24,7 +25,9 @@ deletes rows changes only its own clone. The contract held there:
 - **Window and coverage**: exactly ``history_months`` month-ends ending at the month of the latest
   macro observation. ``requested_start`` is the first of them (2024-10-31 for 24 months, 2006-10-31
   for 240), ``coverage_start`` the first window date with any indicator, and coverage is partial
-  when there is none or it falls more than one month later (2012-01-31 at 240 months).
+  when there is none or it falls more than one month later (2012-01-31 at 240 months). Stored dates
+  from 0001-01-01 to 9999-12-31 never raise: a window reaching back before January of year 1 is
+  cut there, and the months it lost still count towards partial coverage.
 - **latest**: all eight indicators, each resolved to its own latest and previous non-null values
   (inflation 6.80 on 2026-09-30 after 6.60, CBR 8.75), so a newer reserves-only row moves the
   window and the reserves tile but hides no other tile.
@@ -447,6 +450,29 @@ def test_bond_window_is_the_365_days_up_to_the_day(days_before: int, kept: bool)
 
 
 @pytest.mark.parametrize(
+    ("day", "observation_date"),
+    [
+        pytest.param(date(1, 1, 31), date(1, 1, 15), id="january_of_year_one"),
+        pytest.param(date(1, 12, 31), date.min, id="364_days_after_date_min"),
+    ],
+)
+def test_bond_window_opens_at_date_min_within_365_days_of_it(
+    day: date, observation_date: date
+) -> None:
+    """A curve dated less than 365 days after 0001-01-01 cannot look back a full year, so its
+    bond window opens at ``date.min`` instead of overflowing, and keeps every FXD observation
+    from there up to the day: a 10.00-year bond fills the 10Y bucket at 13.50."""
+    observation = bond(observation_date, "FXD1/0001/010", "10.00")
+
+    points = yield_curve_at([], {}, [observation], day)
+
+    observed = observation_date.isoformat()
+    assert [point_fields(point) for point in points] == [
+        ("10Y", "10.00", "13.50", "bond", "FXD1/0001/010", observed, "cbk_bonds")
+    ]
+
+
+@pytest.mark.parametrize(
     ("bond_rows", "chosen"),
     [
         pytest.param(
@@ -669,6 +695,108 @@ def test_bond_reads_cover_only_the_curve_intervals(
     26-year gap leaves two, so the bonds between them are never loaded. A ``current_day``
     before a one-month window's month-end moves the start back to 365 days before it."""
     assert macro_service._bond_read_ranges(month_ends, current_day) == ranges
+
+
+# ---------------------------------------------------------------------------------------------
+# Window and coverage at the calendar's ends
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("end", "history_months", "expected"),
+    [
+        pytest.param(
+            date(2024, 3, 15),
+            3,
+            [date(2024, 1, 31), date(2024, 2, 29), date(2024, 3, 31)],
+            id="fits_the_calendar",
+        ),
+        pytest.param(
+            date(1, 3, 31),
+            3,
+            [date(1, 1, 31), date(1, 2, 28), date(1, 3, 31)],
+            id="opens_exactly_at_january_of_year_one",
+        ),
+        pytest.param(
+            date(1, 3, 31),
+            24,
+            [date(1, 1, 31), date(1, 2, 28), date(1, 3, 31)],
+            id="cut_at_january_of_year_one",
+        ),
+        pytest.param(date(1, 1, 31), 24, [date(1, 1, 31)], id="only_january_of_year_one"),
+        pytest.param(date(9999, 12, 31), 1, [date(9999, 12, 31)], id="december_9999"),
+        pytest.param(
+            date(9999, 12, 15),
+            2,
+            [date(9999, 11, 30), date(9999, 12, 31)],
+            id="ends_at_december_9999",
+        ),
+    ],
+)
+def test_window_holds_history_months_month_ends_cut_at_january_of_year_one(
+    end: date, history_months: int, expected: list[date]
+) -> None:
+    """The window holds exactly ``history_months`` month-ends ending at ``end``'s month (February
+    2024 ends on the 29th), fewer only when it would reach back before January of year 1, where
+    it opens instead; it always holds ``end``'s own month."""
+    assert macro_service._window_month_ends(end, history_months) == expected
+
+
+@pytest.mark.parametrize(
+    ("observed_on", "requested_start", "months_cut", "coverage_start", "is_partial"),
+    [
+        pytest.param(
+            date(2024, 11, 30), date(2024, 10, 31), 0, "2024-11-30", False, id="one_month_later"
+        ),
+        pytest.param(
+            date(2024, 12, 1), date(2024, 10, 31), 0, "2024-12-01", True, id="past_one_month_later"
+        ),
+        pytest.param(
+            date(9999, 12, 31), date(9999, 12, 31), 0, "9999-12-31", False, id="december_9999"
+        ),
+        pytest.param(None, date(9999, 12, 31), 0, None, True, id="december_9999_unobserved"),
+        pytest.param(
+            date(9999, 12, 31), date(9999, 11, 30), 0, "9999-12-31", False, id="november_9999"
+        ),
+        pytest.param(
+            date(1, 1, 31), date(1, 1, 31), 1, "0001-01-31", False, id="one_cut_first_month"
+        ),
+        pytest.param(
+            date(1, 2, 28), date(1, 1, 31), 1, "0001-02-28", True, id="one_cut_second_month"
+        ),
+        pytest.param(None, date(1, 1, 31), 1, None, True, id="one_cut_unobserved"),
+        pytest.param(
+            date(1, 1, 31), date(1, 1, 31), 2, "0001-01-31", True, id="two_cut_always_partial"
+        ),
+        pytest.param(
+            date(1, 1, 31), date(1, 1, 31), 23, "0001-01-31", True, id="23_cut_always_partial"
+        ),
+    ],
+)
+def test_coverage_is_partial_past_one_month_after_the_uncut_window_start(
+    observed_on: date | None,
+    requested_start: date,
+    months_cut: int,
+    coverage_start: str | None,
+    is_partial: bool,
+) -> None:
+    """Coverage is partial when nothing is observed in the window, or the first observation falls
+    after the month-end one month past the window's first month. A window cut at January of year
+    1 still has that first month ``months_cut`` months before ``requested_start``: with one month
+    cut the threshold is 0001-01-31 itself, and with two or more it lies before year 1, so every
+    observation is later. A window opening in December 9999 has no later month-end, so only a
+    missing observation makes it partial."""
+    macro_rows = (
+        [] if observed_on is None else [MacroRow(observed_on, inflation_yoy_pct=Decimal("5.00"))]
+    )
+
+    coverage = macro_service._coverage(macro_rows, requested_start, months_cut)
+
+    assert coverage.model_dump(mode="json") == {
+        "requested_start": requested_start.isoformat(),
+        "coverage_start": coverage_start,
+        "is_partial_coverage": is_partial,
+    }
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1030,3 +1158,116 @@ async def test_empty_database_returns_empty_lists_ending_at_the_current_month(
         "rates_series": [],
         "yield_curve": {"current": [], "history": []},
     }
+
+
+YEAR_ONE_CURVE: list[CurveRow] = [
+    ("91D", "0.25", "7.50", "tbill", None, "0001-01-31", "csv_import"),
+    ("10Y", "10.00", "13.50", "bond", "FXD1/0001/010", "0001-01-15", "cbk_bonds"),
+]
+YEAR_9999_CURVE: list[CurveRow] = [
+    ("91D", "0.25", "7.50", "tbill", None, "9999-12-31", "csv_import"),
+]
+
+
+@pytest.mark.parametrize(
+    ("latest_day", "history_months", "requested_start", "is_partial", "window", "curve"),
+    [
+        pytest.param(
+            date(1, 1, 31),
+            1,
+            "0001-01-31",
+            False,
+            [date(1, 1, 31)],
+            YEAR_ONE_CURVE,
+            id="year_one_one_month",
+        ),
+        pytest.param(
+            date(1, 1, 31),
+            24,
+            "0001-01-31",
+            True,
+            [date(1, 1, 31)],
+            YEAR_ONE_CURVE,
+            id="year_one_24_months_cut",
+        ),
+        pytest.param(
+            date(9999, 12, 31),
+            1,
+            "9999-12-31",
+            False,
+            [date(9999, 12, 31)],
+            YEAR_9999_CURVE,
+            id="december_9999_one_month",
+        ),
+        pytest.param(
+            date(9999, 12, 31),
+            24,
+            "9998-01-31",
+            True,
+            month_ends(date(9998, 1, 31), 24),
+            YEAR_9999_CURVE,
+            id="december_9999_24_months",
+        ),
+    ],
+)
+async def test_boundary_dates_build_the_overview_without_raising(
+    session: AsyncSession,
+    latest_day: date,
+    history_months: int,
+    requested_start: str,
+    is_partial: bool,
+    window: list[date],
+    curve: list[CurveRow],
+) -> None:
+    """Imported rows may carry any date a ``date`` can hold, and the overview still builds.
+
+    Only one macro row is stored (inflation 5.00 and a 91-day yield of 7.50 from ``csv_import``),
+    on 0001-01-31 with a 10.00-year FXD bond auctioned 0001-01-15, or on 9999-12-31 without one.
+    A window reaching back before January of year 1 is cut there, so 24 months ending in 0001-01
+    hold only 0001-01-31 and are partial: the uncut window would open 23 months before January
+    of year 1, so every date falls more than a month after it. A 24-month window ending in
+    December 9999 opens at 9998-01-31 and is partial, while one month of 9999-12 is fully
+    covered. Every month-end curve before the row is empty; the last one and the current curve
+    hold its bill yield and, in year 1, the bond, read from a lookback clamped at ``date.min``.
+    """
+    await session.execute(delete(TerminalMacroIndicator))
+    await session.execute(delete(TerminalBondYield))
+    session.add(
+        TerminalMacroIndicator(
+            observation_date=latest_day,
+            inflation_yoy_pct=Decimal("5.0000"),
+            tbill_91d_pct=Decimal("7.5000"),
+            source_by_field={"inflation_yoy_pct": "csv_import", "tbill_91d_pct": "csv_import"},
+        )
+    )
+    if latest_day.year == 1:
+        session.add(
+            TerminalBondYield(
+                observation_date=date(1, 1, 15),
+                bond_code="FXD1/0001/010",
+                original_tenor_years=Decimal("10.00"),
+                remaining_tenor_years=Decimal("10.00"),
+                maturity_date=date(11, 1, 15),
+                yield_pct=Decimal("13.5000"),
+                source="cbk_bonds",
+            )
+        )
+    await session.commit()
+
+    overview = await get_macro_overview(session, history_months)
+
+    assert overview.coverage.model_dump(mode="json") == {
+        "requested_start": requested_start,
+        "coverage_start": latest_day.isoformat(),
+        "is_partial_coverage": is_partial,
+    }
+    assert [point.model_dump(mode="json") for point in overview.inflation_series] == [
+        {"date": latest_day.isoformat(), "value": "5.00"}
+    ]
+    assert [point_fields(point) for point in overview.yield_curve.current] == curve
+    history = overview.yield_curve.history
+    assert [snapshot.as_of for snapshot in history] == window
+    assert [[point_fields(point) for point in snapshot.points] for snapshot in history] == [
+        *([] for _ in window[:-1]),
+        curve,
+    ]

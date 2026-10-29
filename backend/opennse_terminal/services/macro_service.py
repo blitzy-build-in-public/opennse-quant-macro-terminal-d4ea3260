@@ -146,14 +146,18 @@ def _month_end(year: int, month: int) -> date:
 
 
 def _window_month_ends(end: date, history_months: int) -> list[date]:
-    """Return exactly ``history_months`` month-ends, oldest first, ending at ``end``'s month.
+    """Return ``history_months`` month-ends, oldest first, ending at ``end``'s month.
 
-    Month-ends are derived by month arithmetic, never by subtracting days, so the month-end before
-    2026-09-30 is 2026-08-31.
+    The window holds exactly ``history_months`` month-ends, fewer only when it would reach back
+    before January of year 1, the first month a ``date`` can hold: it then opens at 0001-01-31
+    and still holds ``end``'s own month. Month-ends are derived by month arithmetic, never by
+    subtracting days, so the month-end before 2026-09-30 is 2026-08-31.
     """
+    # The months from January of year 1 to end's month, both included.
+    representable_months = (end.year - date.min.year) * 12 + end.month
     return [
         _month_end(*_shift_month(end.year, end.month, offset))
-        for offset in range(1 - history_months, 1)
+        for offset in range(1 - min(history_months, representable_months), 1)
     ]
 
 
@@ -192,8 +196,13 @@ def _preferred(candidate: BondObservation, incumbent: BondObservation) -> bool:
 
 
 def _choose_bonds(bond_rows: Sequence[BondObservation], day: date) -> dict[int, BondObservation]:
-    """Pick one observation per tenor bucket from the 365 days up to and including ``day``."""
-    start = bisect_left(bond_rows, day - _BOND_LOOKBACK, key=lambda bond: bond.observation_date)
+    """Pick one observation per tenor bucket from the 365 days up to and including ``day``.
+
+    The window opens at ``date.min`` when ``day`` lies less than 365 days after it.
+    """
+    start = bisect_left(
+        bond_rows, _lookback_start(day, _BOND_LOOKBACK), key=lambda bond: bond.observation_date
+    )
     stop = bisect_right(bond_rows, day, key=lambda bond: bond.observation_date)
     chosen: dict[int, BondObservation] = {}
     for index in range(start, stop):
@@ -218,11 +227,11 @@ def yield_curve_at(
       through :func:`~opennse_terminal.quant.asof.macro_as_of`, so a newer row holding only other
       indicators never hides a bill yield. Its ``source`` is that row's ``source_by_field`` entry
       for the column, or ``unknown``. A tenor without such a value is omitted.
-    * **Bonds**: FXD observations dated from ``day`` minus 365 days to ``day`` are bucketed to the
-      nearest of 2, 5, 10, 15, 20 and 25 years by remaining tenor. Each bucket takes its most recent
-      real observation (``source != "seed"``, ties by ``bond_code``), and a seeded one only when
-      the bucket has no real observation in the window. ``tenor_years`` is the chosen bond's
-      remaining tenor.
+    * **Bonds**: FXD observations dated from ``day`` minus 365 days (``date.min`` at the earliest)
+      to ``day`` are bucketed to the nearest of 2, 5, 10, 15, 20 and 25 years by remaining tenor.
+      Each bucket takes its most recent real observation (``source != "seed"``, ties by
+      ``bond_code``), and a seeded one only when the bucket has no real observation in the window.
+      ``tenor_years`` is the chosen bond's remaining tenor.
 
     Yields are percentage points and tenors years, both quantized to 2 dp.
 
@@ -284,23 +293,38 @@ def _has_indicator(row: MacroRow) -> bool:
     return any(getattr(row, column) is not None for column in MACRO_INDICATOR_COLUMNS)
 
 
-def _coverage(macro_rows: Sequence[MacroRow], requested_start: date) -> CoverageMeta:
+def _coverage(
+    macro_rows: Sequence[MacroRow], requested_start: date, months_cut: int = 0
+) -> CoverageMeta:
     """Coverage of the window that opens at the month-end ``requested_start``.
 
     ``coverage_start`` is the first observation on or after ``requested_start`` with any non-null
     indicator. Coverage is partial when there is none, or when it falls after the month-end one
-    month past ``requested_start``.
+    month past the window's first month. That first month is ``requested_start``'s, or the month
+    ``months_cut`` months before it when :func:`_window_month_ends` cut that many month-ends that
+    would have fallen before January of year 1. A threshold month-end before year 1 precedes every
+    date, so coverage is then always partial; one after year 9999 follows every date, so coverage
+    is then partial only without a ``coverage_start``.
     """
     coverage_start: date | None = None
     for index in range(_first_on_or_after(macro_rows, requested_start), len(macro_rows)):
         if _has_indicator(macro_rows[index]):
             coverage_start = macro_rows[index].observation_date
             break
-    one_month_later = _month_end(*_shift_month(requested_start.year, requested_start.month, 1))
+    threshold_year, threshold_month = _shift_month(
+        requested_start.year, requested_start.month, 1 - months_cut
+    )
+    if threshold_year < date.min.year:
+        is_partial = True
+    elif threshold_year > date.max.year:
+        is_partial = coverage_start is None
+    else:
+        one_month_later = _month_end(threshold_year, threshold_month)
+        is_partial = coverage_start is None or coverage_start > one_month_later
     return CoverageMeta(
         requested_start=requested_start,
         coverage_start=coverage_start,
-        is_partial_coverage=coverage_start is None or coverage_start > one_month_later,
+        is_partial_coverage=is_partial,
     )
 
 
@@ -578,9 +602,10 @@ async def get_macro_overview(session: AsyncSession, history_months: int) -> Macr
     """Build ``GET /macro/overview``: KPI snapshots, inflation and rates history, yield curve.
 
     The window holds exactly ``history_months`` month-ends ending at the month of the latest macro
-    observation; ``coverage.requested_start`` is the first of them (2024-10-31 for 24 months with
-    data through 2026-09-30). ``coverage.is_partial_coverage`` is true when no indicator is
-    observed in the window or the first one falls more than one month after ``requested_start``.
+    observation, fewer only when it would reach back before January of year 1, where it is cut;
+    ``coverage.requested_start`` is the first of them (2024-10-31 for 24 months with data through
+    2026-09-30). ``coverage.is_partial_coverage`` is true when no indicator is observed in the
+    window or the first one falls more than one month after the uncut window's first month.
 
     * ``latest``: one snapshot per indicator, all eight whenever a macro row exists. Each column
       is resolved on its own: its latest non-null value with that value's date, the non-null value
@@ -596,7 +621,7 @@ async def get_macro_overview(session: AsyncSession, history_months: int) -> Macr
     reserves and tenors are quantized to 2 dp. With only FXD bonds stored the window ends at the
     month of the latest bond observation and ``latest`` is empty; with nothing stored every list
     is empty and the window ends at the current month. This function never raises for missing
-    data.
+    data, nor for any stored date from 0001-01-01 to 9999-12-31.
 
     Reads take at most three statements. Statement 1 returns at most two values per indicator;
     the rows statements 2 and 3 load are bounded by the window and the lookbacks of its curves and
@@ -653,7 +678,7 @@ async def get_macro_overview(session: AsyncSession, history_months: int) -> Macr
     window_rows = macro_rows[_first_on_or_after(macro_rows, requested_start) :]
 
     overview = MacroOverviewResponse(
-        coverage=_coverage(macro_rows, requested_start),
+        coverage=_coverage(macro_rows, requested_start, history_months - len(month_ends)),
         latest=[] if latest_macro_date is None else _indicator_snapshots(observed),
         inflation_series=_inflation_series(window_rows),
         rates_series=_rates_series(window_rows),

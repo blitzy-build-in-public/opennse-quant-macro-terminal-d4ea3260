@@ -9,6 +9,9 @@ migration, so autogenerate has nothing to propose.
 Migrations run through the product's own ``opennse-terminal migrate`` command, in-process, on its
 async (asyncpg) engine, exactly as a host operator runs it.
 
+A database already stamped with the first shipped revision, ``terminal_0001``, must reach the
+same schema on ``upgrade head`` as a fresh database does, so the upgrade path is checked too.
+
 This is the only test module that creates objects without the ``terminal_`` prefix: the simulated
 host tables ``users`` and ``alembic_version``. They stand in for a host's schema, so the "no
 generic users or auth tables" requirement of the Database Schema Isolation rule is about the
@@ -24,14 +27,16 @@ would block the ``DROP TABLE`` statements of ``migrate downgrade base``.
 import asyncio
 import pprint
 import re
+import uuid
 from collections.abc import Sequence
 from typing import Any, Final, Protocol
 
 import pytest
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
-from sqlalchemy import text
+from sqlalchemy import insert, select, text, update
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 # Imported for its side effect: it registers all 11 terminal_ tables on TerminalBase.metadata.
@@ -39,6 +44,12 @@ import opennse_terminal.models  # noqa: F401
 from opennse_terminal import cli
 from opennse_terminal.db.base import TABLE_PREFIX, TerminalBase
 from opennse_terminal.migrations import VERSION_TABLE, head_revision, include_terminal_only
+from opennse_terminal.models import (
+    TerminalCorporateFiling,
+    TerminalEquity,
+    TerminalWatchlist,
+    TerminalWatchlistItem,
+)
 
 TERMINAL_TABLES: Final[frozenset[str]] = frozenset(
     {
@@ -72,6 +83,30 @@ HOST_STATE: Final[dict[str, list[tuple[Any, ...]]]] = {
     "users_columns": [("id",), ("email",)],
 }
 """What :func:`_host_state` reads while the simulated host objects are untouched."""
+
+BOUNDARY_REVISION: Final[str] = "terminal_0001"
+"""The first shipped revision; databases stamped with it must still upgrade to the head schema."""
+
+TICKER_FK_ACTIONS_AT_BOUNDARY: Final[dict[str, tuple[str, str]]] = {
+    "fk_terminal_corporate_filings_ticker_terminal_equities": ("a", "n"),
+    "fk_terminal_daily_prices_ticker_terminal_equities": ("c", "c"),
+    "fk_terminal_fundamentals_ticker_terminal_equities": ("c", "c"),
+    "fk_terminal_watchlist_items_ticker_terminal_equities": ("a", "c"),
+}
+"""``(confupdtype, confdeltype)`` of each foreign key to ``terminal_equities`` at
+``terminal_0001``, in ``pg_constraint`` codes: ``a`` no action, ``c`` cascade, ``n`` set null."""
+
+TICKER_FK_ACTIONS_AT_HEAD: Final[dict[str, tuple[str, str]]] = {
+    "fk_terminal_corporate_filings_ticker_terminal_equities": ("c", "n"),
+    "fk_terminal_daily_prices_ticker_terminal_equities": ("c", "c"),
+    "fk_terminal_fundamentals_ticker_terminal_equities": ("c", "c"),
+    "fk_terminal_watchlist_items_ticker_terminal_equities": ("c", "c"),
+}
+"""The same foreign keys at the head: every one cascades on update; delete actions unchanged."""
+
+OLD_TICKER: Final[str] = "RNMOLD"
+NEW_TICKER: Final[str] = "RNMNEW"
+"""An equity's ticker before and after the rename the upgrade-path test performs."""
 
 
 class _DatabaseHandle(Protocol):
@@ -201,6 +236,69 @@ async def _create_host_objects(engine: AsyncEngine) -> None:
         )
 
 
+async def _ticker_fk_actions(engine: AsyncEngine) -> dict[str, tuple[str, str]]:
+    """``name -> (on update, on delete)`` codes of every foreign key to ``terminal_equities``."""
+    rows = await _fetch(
+        engine,
+        "SELECT conname, confupdtype::text, confdeltype::text FROM pg_constraint "
+        "WHERE contype = 'f' AND confrelid = 'terminal_equities'::regclass",
+    )
+    return {name: (on_update, on_delete) for name, on_update, on_delete in rows}
+
+
+async def _insert_ticker_references(engine: AsyncEngine) -> None:
+    """Commit one equity at :data:`OLD_TICKER`, a watchlist item and a filing that reference it."""
+    watchlist_id = uuid.uuid4()
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(TerminalEquity).values(
+                ticker=OLD_TICKER,
+                company_name="Rename Check PLC",
+                sector="Banking",
+                shares_outstanding=1_000_000,
+                source="seed",
+            )
+        )
+        await connection.execute(
+            insert(TerminalWatchlist).values(id=watchlist_id, owner_key="local", name="Renames")
+        )
+        await connection.execute(
+            insert(TerminalWatchlistItem).values(watchlist_id=watchlist_id, ticker=OLD_TICKER)
+        )
+        await connection.execute(
+            insert(TerminalCorporateFiling).values(
+                ticker=OLD_TICKER,
+                document_type="annual_report",
+                file_name="rename-check.pdf",
+                file_sha256="0" * 64,
+                file_size_bytes=1024,
+                page_count=1,
+                extraction=[],
+                status="no_items",
+            )
+        )
+
+
+async def _rename_ticker(engine: AsyncEngine, old: str, new: str) -> None:
+    """Rename the equity ``old`` to ``new`` in a committed transaction of its own."""
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(TerminalEquity).where(TerminalEquity.ticker == old).values(ticker=new)
+        )
+
+
+async def _stored_tickers(engine: AsyncEngine) -> dict[str, list[str | None]]:
+    """The tickers stored on equities, watchlist items and filings."""
+    async with engine.connect() as connection:
+        return {
+            "equities": list((await connection.scalars(select(TerminalEquity.ticker))).all()),
+            "items": list((await connection.scalars(select(TerminalWatchlistItem.ticker))).all()),
+            "filings": list(
+                (await connection.scalars(select(TerminalCorporateFiling.ticker))).all()
+            ),
+        }
+
+
 def test_metadata_contains_only_terminal_tables() -> None:
     """The ORM metadata holds exactly the 11 ``terminal_`` tables and nothing a host owns."""
     tables = set(TerminalBase.metadata.tables)
@@ -247,7 +345,7 @@ async def test_migration_history_is_isolated_from_host(
     expected_tables = TERMINAL_TABLES | {VERSION_TABLE}
     new_tables = await _tables(engine) - before_tables
     assert new_tables == expected_tables, _describe_tables(new_tables, expected_tables)
-    assert head_revision() == "terminal_0001"
+    assert head_revision() == "terminal_0002"
     assert await _terminal_versions(engine) == [(head_revision(),)]
 
     # Step 4: no users/auth lookalike under the prefix.
@@ -296,3 +394,54 @@ async def test_migration_history_is_isolated_from_host(
     assert restored == expected_tables, _describe_tables(restored, expected_tables)
     assert await _terminal_versions(engine) == [(head_revision(),)]
     assert await _host_state(engine) == HOST_STATE
+
+
+async def test_upgrade_from_terminal_0001_cascades_ticker_renames(
+    empty_database: _DatabaseHandle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A database stamped ``terminal_0001`` upgrades to the head schema, rows included.
+
+    1. ``migrate upgrade terminal_0001`` gives the first shipped schema: the watchlist-item and
+       filing ticker foreign keys take no action on update, so renaming a referenced ticker is
+       rejected.
+    2. ``migrate upgrade head`` makes all four ticker foreign keys cascade on update, keeps their
+       delete actions, leaves nothing for autogenerate to propose, and the rename then carries
+       over to the watchlist item and the filing.
+    3. ``migrate downgrade terminal_0001`` restores the first schema's actions, with the rows in
+       place, and a further ``upgrade head`` cascades again.
+    """
+    engine = empty_database.engine
+    monkeypatch.setenv("TERMINAL_DATABASE_URL", empty_database.url)
+
+    # Step 1: the first shipped revision, with rows that reference a ticker.
+    assert await _run_cli(["migrate", "upgrade", BOUNDARY_REVISION]) == cli.EXIT_OK
+    assert await _terminal_versions(engine) == [(BOUNDARY_REVISION,)]
+    assert await _ticker_fk_actions(engine) == TICKER_FK_ACTIONS_AT_BOUNDARY
+    await _insert_ticker_references(engine)
+    stored_before = {"equities": [OLD_TICKER], "items": [OLD_TICKER], "filings": [OLD_TICKER]}
+    assert await _stored_tickers(engine) == stored_before
+    with pytest.raises(IntegrityError):
+        await _rename_ticker(engine, OLD_TICKER, NEW_TICKER)
+    assert await _stored_tickers(engine) == stored_before
+
+    # Step 2: the upgrade path reaches the same schema as a fresh head, and renames cascade.
+    assert await _run_cli(["migrate", "upgrade", "head"]) == cli.EXIT_OK
+    assert await _terminal_versions(engine) == [(head_revision(),)]
+    assert await _ticker_fk_actions(engine) == TICKER_FK_ACTIONS_AT_HEAD
+    async with engine.connect() as connection:
+        diff = await connection.run_sync(_compare)
+    assert diff == [], "models and upgraded schema differ:\n" + pprint.pformat(diff)
+    await _rename_ticker(engine, OLD_TICKER, NEW_TICKER)
+    assert await _stored_tickers(engine) == {
+        "equities": [NEW_TICKER],
+        "items": [NEW_TICKER],
+        "filings": [NEW_TICKER],
+    }
+
+    # Step 3: the successor revision is reversible on a database holding rows.
+    assert await _run_cli(["migrate", "downgrade", BOUNDARY_REVISION]) == cli.EXIT_OK
+    assert await _terminal_versions(engine) == [(BOUNDARY_REVISION,)]
+    assert await _ticker_fk_actions(engine) == TICKER_FK_ACTIONS_AT_BOUNDARY
+    assert await _run_cli(["migrate", "upgrade", "head"]) == cli.EXIT_OK
+    assert await _terminal_versions(engine) == [(head_revision(),)]
+    assert await _ticker_fk_actions(engine) == TICKER_FK_ACTIONS_AT_HEAD

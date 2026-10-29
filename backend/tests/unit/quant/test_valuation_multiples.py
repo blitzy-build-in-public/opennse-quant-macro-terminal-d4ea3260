@@ -864,16 +864,24 @@ def test_price_change_pct_from_previous_close() -> None:
     """Close 26.00 against previous close 25.00: (26.00 − 25.00) ÷ 25.00 × 100 = 4.00%."""
     change = price_change_pct(Decimal("26.00"), Decimal("25.00"))
 
-    assert change == Decimal("4")
-    assert rounded(change, "pct") == "4.00"
+    assert change == Metric(Decimal("4"), None)
+    assert rounded(change.value, "pct") == "4.00"
 
 
-@pytest.mark.parametrize("previous_close", [None, Decimal("0"), Decimal("-1.00")])
+@pytest.mark.parametrize(
+    ("previous_close", "flag"),
+    [
+        pytest.param(None, "no_previous_close", id="no-previous-close"),
+        pytest.param(Decimal("0"), "non_positive_previous_close", id="zero-previous-close"),
+        pytest.param(Decimal("-1.00"), "non_positive_previous_close", id="negative-previous-close"),
+    ],
+)
 def test_price_change_pct_is_null_without_a_positive_previous_close(
-    previous_close: Decimal | None,
+    previous_close: Decimal | None, flag: str
 ) -> None:
-    """No previous close, or one ≤ 0, leaves the change undefined rather than dividing by zero."""
-    assert price_change_pct(Decimal("26.00"), previous_close) is None
+    """No previous close, or one ≤ 0, leaves the change undefined with its reason code rather
+    than dividing by zero."""
+    assert price_change_pct(Decimal("26.00"), previous_close) == Metric(None, flag)
 
 
 # --- Non-finite inputs --------------------------------------------------------------------------

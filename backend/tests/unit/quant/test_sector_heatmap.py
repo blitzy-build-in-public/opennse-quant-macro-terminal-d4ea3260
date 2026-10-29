@@ -433,9 +433,9 @@ def test_month_boundaries(periods: int, as_of: date, expected: list[date]) -> No
     """Last session on or before each month-end, the latest clamped to ``as_of``.
 
     The month-end of September (2026-09-30) is after as_of 2026-09-16, so that period closes on
-    the last session on or before 2026-09-16, itself. With 12 periods the targets reach back to
-    2025-09-30, but sessions begin 2026-04-01: 2025-09-30 to 2026-03-31 are dropped, leaving 6
-    boundaries (5 periods).
+    the last session on or before 2026-09-16, itself. With 12 periods the walk back reaches
+    2026-04-30 and stops at the target 2026-03-31, which precedes the first session 2026-04-01,
+    leaving 6 boundaries (5 periods).
     """
     assert period_boundaries(MONTH_SESSIONS, "month", periods, as_of) == expected
 
@@ -474,31 +474,188 @@ def test_week_boundaries(periods: int, as_of: date, expected: list[date]) -> Non
 
     Fri 2026-09-18 is closed, so its week ends Thu 2026-09-17. Wed 2026-09-16 precedes its Friday
     and closes its own week. Sun 2026-09-20 belongs to the ISO week of Fri 2026-09-18. Sessions
-    begin Tue 2026-09-01, so Fridays from 2026-08-28 back are dropped.
+    begin Tue 2026-09-01, so the walk back stops at the target Fri 2026-08-28.
     """
     assert period_boundaries(WEEK_SESSIONS, "week", periods, as_of) == expected
+
+
+HISTORY_SESSIONS = weekdays(
+    date(2025, 9, 1),
+    date(2026, 9, 30),
+    excluded=[date(2026, 4, 3), date(2026, 4, 6), date(2026, 5, 1)],
+)
+"""Weekdays from Mon 2025-09-01 to Wed 2026-09-30, the last session, with Good Friday 2026-04-03,
+Easter Monday 2026-04-06 and Labour Day Fri 2026-05-01 closed."""
+
+HISTORY_MONTH_BOUNDARIES = [
+    date(2025, 9, 30),
+    date(2025, 10, 31),
+    date(2025, 11, 28),
+    date(2025, 12, 31),
+    date(2026, 1, 30),
+    date(2026, 2, 27),
+    date(2026, 3, 31),
+    date(2026, 4, 30),
+    date(2026, 5, 29),
+    date(2026, 6, 30),
+    date(2026, 7, 31),
+    date(2026, 8, 31),
+    date(2026, 9, 30),
+]
+"""The 13 boundaries of 12 monthly periods ending at the last session of HISTORY_SESSIONS."""
+
+
+@pytest.mark.parametrize(
+    ("sessions", "interval", "periods", "as_of", "expected"),
+    [
+        pytest.param(
+            HISTORY_SESSIONS,
+            "month",
+            3,
+            date(2026, 5, 1),
+            [date(2026, 1, 30), date(2026, 2, 27), date(2026, 3, 31), date(2026, 4, 30)],
+            id="month-holiday-as-of-after-month-end",
+        ),
+        pytest.param(
+            HISTORY_SESSIONS,
+            "month",
+            1,
+            date(2026, 3, 1),
+            [date(2026, 1, 30), date(2026, 2, 27)],
+            id="month-weekend-as-of-after-month-end",
+        ),
+        pytest.param(
+            HISTORY_SESSIONS,
+            "week",
+            3,
+            date(2026, 4, 6),
+            [date(2026, 3, 13), date(2026, 3, 20), date(2026, 3, 27), date(2026, 4, 2)],
+            id="week-holiday-as-of-after-closed-friday",
+        ),
+        pytest.param(
+            HISTORY_SESSIONS,
+            "month",
+            12,
+            date(2026, 12, 31),
+            HISTORY_MONTH_BOUNDARIES,
+            id="month-as-of-a-quarter-after-the-data",
+        ),
+        pytest.param(
+            HISTORY_SESSIONS,
+            "month",
+            12,
+            date(2027, 6, 30),
+            HISTORY_MONTH_BOUNDARIES,
+            id="month-as-of-nine-months-after-the-data",
+        ),
+        pytest.param(
+            HISTORY_SESSIONS,
+            "month",
+            12,
+            date.max,
+            HISTORY_MONTH_BOUNDARIES,
+            id="month-as-of-date-max",
+        ),
+        pytest.param(
+            HISTORY_SESSIONS,
+            "week",
+            4,
+            date(2026, 10, 12),
+            [
+                date(2026, 9, 4),
+                date(2026, 9, 11),
+                date(2026, 9, 18),
+                date(2026, 9, 25),
+                date(2026, 9, 30),
+            ],
+            id="week-as-of-after-the-data",
+        ),
+        pytest.param(
+            HISTORY_SESSIONS,
+            "week",
+            4,
+            date.max,
+            [
+                date(2026, 9, 4),
+                date(2026, 9, 11),
+                date(2026, 9, 18),
+                date(2026, 9, 25),
+                date(2026, 9, 30),
+            ],
+            id="week-as-of-date-max",
+        ),
+        pytest.param(
+            weekdays(
+                date(2026, 4, 1),
+                date(2026, 9, 30),
+                excluded=weekdays(date(2026, 7, 1), date(2026, 7, 31)),
+            ),
+            "month",
+            3,
+            date(2026, 9, 30),
+            [date(2026, 5, 29), date(2026, 6, 30), date(2026, 8, 31), date(2026, 9, 30)],
+            id="month-without-sessions",
+        ),
+        pytest.param(
+            weekdays(
+                date(2026, 8, 3),
+                date(2026, 9, 30),
+                excluded=weekdays(date(2026, 9, 7), date(2026, 9, 11)),
+            ),
+            "week",
+            3,
+            date(2026, 9, 25),
+            [date(2026, 8, 28), date(2026, 9, 4), date(2026, 9, 18), date(2026, 9, 25)],
+            id="week-without-sessions",
+        ),
+    ],
+)
+def test_collapsed_targets_step_further_back(
+    sessions: list[date],
+    interval: HeatmapInterval,
+    periods: int,
+    as_of: date,
+    expected: list[date],
+) -> None:
+    """A target resolving to a boundary already taken gives way to an earlier month-end or Friday.
+
+    The next target is the latest month-end or Friday strictly before the last boundary, so
+    ``periods + 1`` boundaries come back whenever the history reaches that far:
+
+    - Fri 2026-05-01 resolves to Thu 2026-04-30, which also closes April, so March comes next;
+      Sun 2026-03-01 resolves to Fri 2026-02-27, which also closes February.
+    - Easter Mon 2026-04-06 resolves to Thu 2026-04-02, which also closes the week of the closed
+      Good Friday 2026-04-03, so the week of Fri 2026-03-27 comes next.
+    - An as_of after the last session 2026-09-30, up to date.max, resolves to 2026-09-30 and the
+      walk continues from there: 2026-08-31 for months, Fri 2026-09-25 for weeks.
+    - A month (July 2026) or week (2026-09-07 to 2026-09-11) without sessions resolves to the
+      previous period's boundary, so the period ending 2026-08-31 opens on 2026-06-30 and the one
+      ending 2026-09-18 opens on 2026-09-04.
+    """
+    assert period_boundaries(sessions, interval, periods, as_of) == expected
 
 
 @pytest.mark.parametrize(
     ("sessions", "expected"),
     [
-        pytest.param([date(2026, 7, 15)], [date(2026, 7, 15)], id="targets-collapse"),
+        pytest.param([date(2026, 7, 15)], [date(2026, 7, 15)], id="history-runs-out"),
         pytest.param([], [], id="no-sessions"),
     ],
 )
 def test_sparse_sessions_give_fewer_boundaries(sessions: list[date], expected: list[date]) -> None:
-    """Targets 2026-06-30 to 2026-09-30 over one session 2026-07-15: 06-30 has none on or before
-    it and the rest all resolve to 07-15, which appears once. No sessions give no boundaries.
+    """Over one session 2026-07-15 the target 2026-09-30 resolves to 07-15 and the next target,
+    2026-06-30, has no session on or before it, so the history runs out after one boundary. No
+    sessions give no boundaries.
     """
     assert period_boundaries(sessions, "month", 3, date(2026, 9, 30)) == expected
 
 
 @pytest.mark.parametrize("interval", ["month", "week"])
 def test_boundaries_stop_at_the_first_representable_date(interval: HeatmapInterval) -> None:
-    """At as_of 0001-01-03 the earlier month-end or Friday precedes date.min and is skipped.
+    """At as_of 0001-01-03 the earlier month-end or Friday precedes date.min and ends the walk.
 
     The month target 0001-01-31 and the Friday 0001-01-05 both clamp to 0001-01-03, whose last
-    session is 0001-01-01.
+    session is 0001-01-01; the next month-end or Friday before it is not representable.
     """
     assert period_boundaries([date(1, 1, 1)], interval, 3, date(1, 1, 3)) == [date(1, 1, 1)]
 

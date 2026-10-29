@@ -16,7 +16,7 @@ deselected by default.
 """
 
 from collections.abc import Callable, Iterator, Sequence
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from itertools import pairwise
 from typing import Any, Protocol
@@ -24,7 +24,8 @@ from typing import Any, Protocol
 import httpx
 import pytest
 import respx
-from sqlalchemy import select
+from pdfplumber.page import Page
+from sqlalchemy import event, insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from helpers.pdf_builder import build_pdf, text_page
@@ -34,6 +35,7 @@ from opennse_terminal.ingestion.base import (
     SourceLayoutChanged,
     execute_pipeline,
 )
+from opennse_terminal.ingestion.cbk import validate_macro_records
 from opennse_terminal.ingestion.cbk.reserves import (
     BOUNDS,
     BULLETIN_PATH_MARKER,
@@ -43,6 +45,7 @@ from opennse_terminal.ingestion.cbk.reserves import (
     WEEKLY_BULLETIN_URL,
     BulletinLink,
     CbkReservesPipeline,
+    load_latest_ingested_bulletin,
     parse_bulletin_listing,
     parse_publication_date,
     parse_reserves_bulletin,
@@ -346,6 +349,11 @@ def test_renumbered_table_is_found_past_a_narrative_mention() -> None:
             id="value-count-mismatch",
         ),
         pytest.param(
+            bulletin_pdf(TITLE_LINE, "08-Jan-26 15-Jan-26", f"{VALUE_LABEL} 12,384 note 12,390"),
+            "reserves row has 3 values for 2 header dates",
+            id="residual-text-in-value-row",
+        ),
+        pytest.param(
             bulletin_pdf(DATE_ROW, VALUE_ROW),
             "reserves table not found",
             id="no-title",
@@ -373,6 +381,67 @@ def test_bulletin_layout_changes_are_rejected(content: bytes, message: str) -> N
         parse_reserves_bulletin(content)
 
     assert excinfo.value.message == message
+
+
+@pytest.mark.parametrize(
+    ("cell", "parsed", "reason"),
+    [
+        pytest.param(
+            "(12,384)", Decimal("-12384"), f"out_of_range:{RESERVES}:-12384.00", id="parenthesized"
+        ),
+        pytest.param(
+            "-12,384", Decimal("-12384"), f"out_of_range:{RESERVES}:-12384.00", id="minus"
+        ),
+        pytest.param("bad12384", None, f"unparsable:{RESERVES}:bad12384", id="leading-text"),
+        pytest.param("12384bad", None, f"unparsable:{RESERVES}:12384bad", id="trailing-text"),
+        pytest.param("12,384%", None, f"unparsable:{RESERVES}:12,384%", id="percent-sign"),
+        pytest.param("1,2384", None, f"unparsable:{RESERVES}:1,2384", id="misplaced-comma"),
+        pytest.param("12,38,4", None, f"unparsable:{RESERVES}:12,38,4", id="short-groups"),
+        pytest.param("(12,384", None, f"unparsable:{RESERVES}:(12,384", id="unbalanced"),
+        pytest.param("12.384.5", None, f"unparsable:{RESERVES}:12.384.5", id="two-points"),
+    ],
+)
+def test_malformed_or_negative_value_cells_are_rejected_not_repaired(
+    cell: str, parsed: Decimal | None, reason: str
+) -> None:
+    records = parse_reserves_bulletin(
+        bulletin_pdf(TITLE_LINE, "08-Jan-26 15-Jan-26", f"{VALUE_LABEL} {cell} 12,390")
+    )
+    outcome = validate_macro_records(records, BOUNDS)
+
+    assert [record.observation_date for record in records] == [date(2026, 1, 8), date(2026, 1, 15)]
+    first, second = records
+    assert first.raw["value"] == cell
+    assert first.values == ({} if parsed is None else {RESERVES: parsed})
+    assert [row.reason for row in outcome.rejected] == [reason]
+    # Only the well-formed cell survives: no cell is read as the 12384 its digits spell.
+    assert outcome.valid == [second]
+    assert second.values == {RESERVES: Decimal("12390")}
+
+
+def test_minus_sign_in_the_text_layer_reads_as_negative_and_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Embedded fonts with a ToUnicode map give pdfplumber U+2212 for a minus glyph; the test
+    # PDF's WinAnsi font cannot draw it, so its extracted text is made to report one.
+    extract_text = Page.extract_text
+    monkeypatch.setattr(
+        Page,
+        "extract_text",
+        lambda page, **kwargs: extract_text(page, **kwargs).replace("-12,384", "\u221212,384"),
+    )
+
+    records = parse_reserves_bulletin(
+        bulletin_pdf(TITLE_LINE, "08-Jan-26 15-Jan-26", f"{VALUE_LABEL} -12,384 12,390")
+    )
+    outcome = validate_macro_records(records, BOUNDS)
+
+    first, second = records
+    assert first.raw["value"] == "\u221212,384"
+    assert first.values == {RESERVES: Decimal("-12384")}
+    assert [row.reason for row in outcome.rejected] == [f"out_of_range:{RESERVES}:-12384.00"]
+    assert outcome.valid == [second]
+    assert second.values == {RESERVES: Decimal("12390")}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -672,6 +741,123 @@ async def test_bulletin_without_the_reserves_table_writes_nothing(
     assert await stored_reserves(engine, list(EXPECTED_RESERVES)) == EXPECTED_RESERVES
 
 
+@pytest.mark.parametrize(
+    ("cell", "reason"),
+    [
+        pytest.param("(12,384)", f"out_of_range:{RESERVES}:-12384.00", id="parenthesized"),
+        pytest.param("bad12384", f"unparsable:{RESERVES}:bad12384", id="leading-text"),
+    ],
+)
+async def test_bulletin_with_a_malformed_value_cell_writes_nothing(
+    seeded_database: SeededDatabase, cbk: FakeCbk, cell: str, reason: str
+) -> None:
+    engine = seeded_database.engine
+    cbk.pdf_content[bulletin_url(cbk.links[0])] = bulletin_pdf(
+        TITLE_LINE, DATE_ROW, f"{VALUE_LABEL} {cell} 12,341 12,296 12,352 12,387"
+    )
+
+    changed = await run(seeded_database, cbk)
+
+    # One rejected cell of the bulletin's five is 20% of the run's rows, above the 10% allowed.
+    assert changed.status is RunStatus.LAYOUT_CHANGED
+    assert (changed.rows_fetched, changed.rows_written, changed.rows_rejected) == (5, 0, 1)
+    assert changed.error_message == "1 of 5 rows rejected, more than 10% of the rows parsed"
+    assert [row["reason"] for row in changed.details["rejected"]] == [reason]
+    assert (await stored_run(engine, changed)).status == "layout_changed"
+    assert await stored_rows(engine, list(EXPECTED_RESERVES)) == {}
+
+
+# ---------------------------------------------------------------------------------------------
+# Ingested-bulletin history
+# ---------------------------------------------------------------------------------------------
+
+HISTORY_START = datetime(2026, 2, 6, 15, 15, tzinfo=UTC)
+LATER = "2027-01-01"
+"""A recorded entry later than every valid ingested bulletin below, so counting it would show."""
+
+HISTORY: tuple[tuple[str, str, Any], ...] = (
+    # A backfill holds the newest bulletin, and a later-started default run an older one.
+    ("cbk_reserves", "succeeded", {"bulletins": [SECOND_NEWEST.isoformat(), NEWEST.isoformat()]}),
+    ("cbk_reserves", "partial", {"bulletins": ["2026-01-23"]}),
+    # Runs that ingested nothing, the current run's own running row included.
+    *(
+        ("cbk_reserves", status, {"bulletins": [LATER]})
+        for status in (
+            "running",
+            "failed",
+            "layout_changed",
+            "blocked_by_robots",
+            "no_new_data",
+            "ambiguous_session",
+        )
+    ),
+    ("cbk_fx", "succeeded", {"bulletins": [LATER]}),
+    # Ingested runs whose details hold no valid YYYY-MM-DD entry later than NEWEST.
+    ("cbk_reserves", "succeeded", {"bulletins": LATER}),
+    ("cbk_reserves", "succeeded", {"bulletins": {"date": LATER}}),
+    ("cbk_reserves", "succeeded", {"bulletin_urls": [LATER]}),
+    ("cbk_reserves", "succeeded", {"bulletins": None}),
+    ("cbk_reserves", "succeeded", {"bulletins": [20270101, None, [LATER], {"date": LATER}]}),
+    ("cbk_reserves", "partial", {"bulletins": ["not-a-date", "20270101"]}),
+    ("cbk_reserves", "partial", {"bulletins": [f" {LATER}", f"{LATER}\n"]}),
+    # Well-formed but impossible dates that sort after NEWEST.
+    ("cbk_reserves", "succeeded", {"bulletins": ["2099-02-30", "9999-99-99"]}),
+    # Details that are not an object: a JSON array and JSON null.
+    ("cbk_reserves", "succeeded", [LATER]),
+    ("cbk_reserves", "succeeded", None),
+)
+"""``(pipeline, status, details)`` of the inserted runs, started a day apart in this order."""
+
+
+async def test_latest_ingested_bulletin_is_aggregated_over_valid_entries_of_ingested_runs(
+    seeded_database: SeededDatabase,
+) -> None:
+    engine = seeded_database.engine
+    # The seeded template holds the seeder's own run only.
+    async with engine.connect() as conn:
+        assert await load_latest_ingested_bulletin(conn) is None
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(TerminalIngestionRun),
+            [
+                {
+                    "pipeline": pipeline,
+                    "trigger": "cli",
+                    "started_at": HISTORY_START + timedelta(days=index),
+                    "status": status,
+                    "details": details,
+                }
+                for index, (pipeline, status, details) in enumerate(HISTORY)
+            ],
+        )
+
+    statements: list[str] = []
+
+    def record(
+        conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool
+    ) -> None:
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "after_cursor_execute", record)
+    try:
+        async with engine.connect() as conn:
+            latest = await load_latest_ingested_bulletin(conn)
+    finally:
+        event.remove(engine.sync_engine, "after_cursor_execute", record)
+
+    assert latest == NEWEST
+    # Every read of the run history is one ungrouped aggregate, so one row whatever the history
+    # size, and no details document is selected.
+    reads = [statement for statement in statements if "terminal_ingestion_runs" in statement]
+    assert reads
+    for statement in reads:
+        select_list = statement.split("FROM", 1)[0]
+        assert select_list.strip().startswith("SELECT max(")
+        assert "details" not in select_list
+        assert "GROUP BY" not in statement
+
+
 # ---------------------------------------------------------------------------------------------
 # Live source (deselected by default)
 # ---------------------------------------------------------------------------------------------
@@ -692,3 +878,5 @@ async def test_live_newest_bulletin_carries_the_reserves_table(
     assert len(records) >= 1
     dates = [record.observation_date for record in records]
     assert all(earlier < later for earlier, later in pairwise(d for d in dates if d is not None))
+    # Every published cell is one well-formed number within the bounds.
+    assert validate_macro_records(records, BOUNDS).rejected == []

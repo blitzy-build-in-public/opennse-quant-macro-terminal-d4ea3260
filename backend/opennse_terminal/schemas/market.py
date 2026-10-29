@@ -199,7 +199,10 @@ class ScreenerRow(TerminalResponseModel):
     trade_date: dt.date = Field(description="Date of the latest close on or before as_of.")
     close_price: Decimal = Field(description="Closing price on trade_date, in KES per share.")
     change_pct: Decimal | None = Field(
-        description="Change from the previous close, in percent; null without a previous close.",
+        description=(
+            "Change from the previous close, in percent; null without a previous close, with "
+            "change_pct:no_previous_close in flags."
+        ),
     )
     market_cap_kes: Decimal | None = Field(
         description=(
@@ -243,7 +246,8 @@ class ScreenerRow(TerminalResponseModel):
         default_factory=list,
         description=(
             "Reason codes for null or qualified values: valuation codes such as "
-            "ev_not_meaningful_for_banks, and Z-score codes prefixed volume_z: or turnover_z:, "
+            "ev_not_meaningful_for_banks, the session-change code prefixed change_pct:, as in "
+            "change_pct:no_previous_close, and Z-score codes prefixed volume_z: or turnover_z:, "
             "for example volume_z:insufficient_observations."
         ),
     )

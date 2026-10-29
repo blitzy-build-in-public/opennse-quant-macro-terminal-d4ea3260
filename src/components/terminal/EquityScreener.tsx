@@ -87,11 +87,12 @@ type NullableMetric =
   | "turnover_z";
 
 /**
- * Flag-code prefixes that explain a null value of each metric (the reason codes of the valuation
- * and Z-score engines). A metric whose row carries none of them falls back to every row flag.
+ * Flag-code prefixes that explain a null value of each metric (the reason codes of the valuation,
+ * session-change and Z-score engines). A metric whose row carries none of them falls back to
+ * every row flag.
  */
 const METRIC_FLAG_PREFIXES: Record<NullableMetric, readonly string[]> = {
-  change_pct: [],
+  change_pct: ["change_pct:"],
   market_cap_kes: ["currency_mismatch"],
   eps_kes: ["pe_", "zero_shares", "no_fundamentals", "currency_mismatch"],
   pe: ["pe_", "zero_shares", "no_fundamentals", "currency_mismatch"],

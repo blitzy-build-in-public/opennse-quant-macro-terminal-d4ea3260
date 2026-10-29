@@ -6,9 +6,14 @@ being rejected while any of them still references the old ticker. On delete, pri
 fundamentals and watchlist items cascade, while a filing keeps its extraction and has its ticker
 set to null.
 
-Both schema sources are checked: the ORM models on ``TerminalBase.metadata`` and the DDL that
-migration ``terminal_0001`` emits in Alembic's offline mode, which renders SQL without connecting
-to a database.
+Both schema sources are checked: the ORM models on ``TerminalBase.metadata`` and the DDL that the
+migration history emits in Alembic's offline mode, which renders SQL without connecting to a
+database. ``terminal_0001`` defines all four keys inline in ``CREATE TABLE``, the watchlist-item
+and filing keys without an ON UPDATE action; ``terminal_0002`` drops those two and adds them back
+with ON UPDATE CASCADE. The head DDL's last statement that defines or drops each key must
+therefore define it with the models' actions, and the DDL up to ``terminal_0001`` must define
+each key once with the actions that revision shipped with, so the shipped revision is never
+edited in place.
 
 Expected names and actions are literals, never derived from the code under test. The tests are
 pure: no database or network.
@@ -52,9 +57,69 @@ EXPECTED_TICKER_FKS: list[tuple[str, str, str, str]] = [
         "SET NULL",
     ),
 ]
+# (table, foreign key name, referential actions the DDL of terminal_0001 renders)
+BOUNDARY_TICKER_FKS: list[tuple[str, str, str]] = [
+    (
+        "terminal_daily_prices",
+        "fk_terminal_daily_prices_ticker_terminal_equities",
+        "ON DELETE CASCADE ON UPDATE CASCADE",
+    ),
+    (
+        "terminal_fundamentals",
+        "fk_terminal_fundamentals_ticker_terminal_equities",
+        "ON DELETE CASCADE ON UPDATE CASCADE",
+    ),
+    (
+        "terminal_watchlist_items",
+        "fk_terminal_watchlist_items_ticker_terminal_equities",
+        "ON DELETE CASCADE",
+    ),
+    (
+        "terminal_corporate_filings",
+        "fk_terminal_corporate_filings_ticker_terminal_equities",
+        "ON DELETE SET NULL",
+    ),
+]
+BOUNDARY_REVISION = "terminal_0001"
 EQUITIES_TABLE = "terminal_equities"
 # Offline mode needs only the dialect of the URL; nothing connects to this address.
 OFFLINE_URL = "postgresql+asyncpg://localhost/x"
+DROPPED = "DROP"
+
+
+def _offline_upgrade_ddl(capsys: pytest.CaptureFixture[str], revision: str) -> str:
+    """The SQL ``upgrade`` to ``revision`` emits from an empty database, without connecting."""
+    # In offline mode Alembic writes the migration SQL to stdout instead of executing it.
+    command.upgrade(build_alembic_config(OFFLINE_URL), revision, sql=True)
+    return capsys.readouterr().out
+
+
+def _fk_statements(ddl: str, table_name: str, fk_name: str) -> list[str]:
+    """Each statement of ``ddl`` that defines or drops ``fk_name``, in order.
+
+    A definition, inline in its table's ``CREATE TABLE`` or through ``ALTER TABLE ... ADD
+    CONSTRAINT``, is given as everything after its ``REFERENCES`` target, for example
+    ``"ON DELETE CASCADE ON UPDATE CASCADE"``; a drop is given as :data:`DROPPED`.
+    """
+    clause = f"CONSTRAINT {fk_name} FOREIGN KEY(ticker) REFERENCES {EQUITIES_TABLE} (ticker)"
+    found: list[str] = []
+    for raw_statement in ddl.split(";\n"):
+        # Alembic precedes each revision's first statement with a "-- Running upgrade" comment.
+        sql_lines = [line for line in raw_statement.splitlines() if not line.startswith("--")]
+        statement = "\n".join(sql_lines).strip()
+        if fk_name not in statement:
+            continue
+        if statement == f"ALTER TABLE {table_name} DROP CONSTRAINT {fk_name}":
+            found.append(DROPPED)
+            continue
+        assert statement.startswith(
+            (f"CREATE TABLE {table_name} (", f"ALTER TABLE {table_name} ADD {clause}")
+        ), statement
+        lines = [line for line in statement.splitlines() if clause in line]
+        assert len(lines) == 1, statement
+        # An inline constraint ends with ", " unless it is the table's last element.
+        found.append(lines[0].split(clause, 1)[1].strip().removesuffix(",").rstrip())
+    return found
 
 
 def _ticker_fk(table_name: str) -> ForeignKeyConstraint:
@@ -101,13 +166,15 @@ def test_migration_ddl_renders_the_ticker_fk_actions(
     onupdate: str,
     ondelete: str,
 ) -> None:
-    # In offline mode Alembic writes the migration SQL to stdout instead of executing it.
-    command.upgrade(build_alembic_config(OFFLINE_URL), "head", sql=True)
-    ddl = capsys.readouterr().out
-    # The clause must sit inside its own table's CREATE TABLE statement, which ends at "\n);".
-    start = ddl.index(f"CREATE TABLE {table_name} (")
-    create_table = ddl[start : ddl.index("\n);", start)]
-    assert (
-        f"CONSTRAINT {fk_name} FOREIGN KEY(ticker) REFERENCES {EQUITIES_TABLE} (ticker) "
-        f"ON DELETE {ondelete} ON UPDATE {onupdate}"
-    ) in create_table
+    statements = _fk_statements(_offline_upgrade_ddl(capsys, "head"), table_name, fk_name)
+    # The last statement decides the head schema; a drop there would leave no key at all.
+    assert statements, f"the head DDL never defines {fk_name}"
+    assert statements[-1] == f"ON DELETE {ondelete} ON UPDATE {onupdate}"
+
+
+@pytest.mark.parametrize(("table_name", "fk_name", "actions"), BOUNDARY_TICKER_FKS)
+def test_first_revision_ddl_keeps_its_shipped_ticker_fk_actions(
+    capsys: pytest.CaptureFixture[str], table_name: str, fk_name: str, actions: str
+) -> None:
+    ddl = _offline_upgrade_ddl(capsys, BOUNDARY_REVISION)
+    assert _fk_statements(ddl, table_name, fk_name) == [actions]

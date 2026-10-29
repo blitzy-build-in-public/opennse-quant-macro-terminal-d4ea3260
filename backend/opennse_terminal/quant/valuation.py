@@ -316,18 +316,22 @@ def dividend_yield_pct(dps: Decimal | None, close: Decimal) -> Metric:
     return Metric(dps / close * HUNDRED, None)
 
 
-def price_change_pct(close: Decimal, previous_close: Decimal | None) -> Decimal | None:
+def price_change_pct(close: Decimal, previous_close: Decimal | None) -> Metric:
     """Session change = (close − previous close) ÷ previous close × 100, in percentage points.
 
-    Returns ``None`` when there is no previous close or it is <= 0.
+    Flags: ``no_previous_close`` (previous close ``None``, as on a counter's first session) and
+    ``non_positive_previous_close`` (previous close <= 0, a guard the ``close_price > 0`` database
+    check normally makes unreachable); each leaves the change ``None``.
 
     Raises:
         ValueError: If ``close`` or ``previous_close`` is NaN or infinite.
     """
     _require_finite(close=close, previous_close=previous_close)
-    if previous_close is None or previous_close <= ZERO:
-        return None
-    return (close - previous_close) / previous_close * HUNDRED
+    if previous_close is None:
+        return Metric(None, "no_previous_close")
+    if previous_close <= ZERO:
+        return Metric(None, "non_positive_previous_close")
+    return Metric((close - previous_close) / previous_close * HUNDRED, None)
 
 
 def compute_valuation(inputs: ValuationInputs) -> ValuationResult:
@@ -483,7 +487,7 @@ def sector_aggregates(sector: str, members: Sequence[ValuationResult]) -> Sector
 
     The aggregates are point-in-time. Services pass every equity of the sector, valued as of one
     day: for the screener, as of its ``as_of`` and independent of its filters; for sector
-    valuation bands, once per market session.
+    valuation bands, once per market session on which at least one member has a close.
 
     Args:
         sector: The sector name, which decides the EV/EBITDA policy.

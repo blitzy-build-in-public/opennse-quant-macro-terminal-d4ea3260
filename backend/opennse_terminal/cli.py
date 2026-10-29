@@ -26,7 +26,9 @@ choices load neither Playwright, pdfplumber nor pandas. Nothing here imports the
 import argparse
 import asyncio
 import logging
+import os
 import re
+import stat
 import sys
 import textwrap
 from collections.abc import Callable, Mapping, Sequence
@@ -52,6 +54,7 @@ __all__ = [
     "EXIT_OK",
     "PROG",
     "build_parser",
+    "configure_logging",
     "main",
 ]
 
@@ -137,6 +140,24 @@ the configured timezone (TERMINAL_TIMEZONE, default Africa/Nairobi). Run exactly
 one scheduler process, separate from the API.
 """
 
+# argparse prints a parser's epilog only in that parser's own help, so the configuration source
+# that _MAIN_EPILOG names is repeated in the help of every subcommand that reads it. seed --help
+# is the seeder's own and states its source itself.
+_SETTINGS_NOTE: Final = """\
+The database URL (postgresql+asyncpg://) is read from TERMINAL_DATABASE_URL,
+or from .env in the working directory when that variable is not set. README.md,
+section "Configuration", lists every TERMINAL_* setting with its default.
+"""
+
+# The settings the ingestion pipelines read, for the help of ingest and scheduler.
+_PIPELINE_SETTINGS_NOTE: Final = """\
+Pipelines send TERMINAL_SCRAPER_CONTACT in their user agent and space requests
+to one host at least TERMINAL_SCRAPER_MIN_INTERVAL_SECONDS apart. HTTP requests
+have a read timeout of TERMINAL_SCRAPER_TIMEOUT_SECONDS and are retried up to
+TERMINAL_SCRAPER_MAX_RETRIES times after a timeout or an HTTP 429, 500, 502,
+503 or 504. nse_market_statistics dates its session in TERMINAL_TIMEZONE.
+"""
+
 
 # ---------------------------------------------------------------------------------------------
 # Argument parsing
@@ -210,6 +231,7 @@ def _build_parsers() -> tuple[argparse.ArgumentParser, Mapping[str, argparse.Arg
         "migrate",
         help="upgrade or downgrade the terminal_ schema (never touches host tables)",
         description=_MIGRATE_DESCRIPTION,
+        epilog=_SETTINGS_NOTE,
         formatter_class=raw,
     )
     directions = migrate.add_subparsers(dest="direction", required=True, title="directions")
@@ -217,6 +239,8 @@ def _build_parsers() -> tuple[argparse.ArgumentParser, Mapping[str, argparse.Arg
         "upgrade",
         help="apply migrations up to REVISION",
         description="Apply the terminal_ migrations up to REVISION.",
+        epilog=_SETTINGS_NOTE,
+        formatter_class=raw,
     )
     upgrade.add_argument(
         "revision",
@@ -228,10 +252,13 @@ def _build_parsers() -> tuple[argparse.ArgumentParser, Mapping[str, argparse.Arg
     downgrade = directions.add_parser(
         "downgrade",
         help="revert migrations down to REVISION",
-        description=(
+        description=textwrap.fill(
             "Revert the terminal_ migrations down to REVISION; base drops every terminal_ "
-            "table the history created and nothing else."
+            "table the history created and nothing else.",
+            width=_HELP_WIDTH,
         ),
+        epilog=_SETTINGS_NOTE,
+        formatter_class=raw,
     )
     downgrade.add_argument(
         "revision", metavar="REVISION", help="target revision, such as base or terminal_0001"
@@ -246,15 +273,16 @@ def _build_parsers() -> tuple[argparse.ArgumentParser, Mapping[str, argparse.Arg
     )
 
     cbk_names = ", ".join(CBK_PIPELINES)
+    cbk_order = textwrap.fill(
+        f"{CBK_GROUP} runs {cbk_names} in that order, each as its own run, and exits with "
+        "the code of the first of them that did not exit 0.",
+        width=_HELP_WIDTH,
+    )
     ingest = commands.add_parser(
         "ingest",
         help="run a public-source ingestion pipeline, or all CBK pipelines with cbk",
         description=_INGEST_DESCRIPTION,
-        epilog=textwrap.fill(
-            f"{CBK_GROUP} runs {cbk_names} in that order, each as its own run, and exits with "
-            "the code of the first of them that did not exit 0.",
-            width=_HELP_WIDTH,
-        ),
+        epilog=f"{cbk_order}\n\n{_PIPELINE_SETTINGS_NOTE}\n{_SETTINGS_NOTE}",
         formatter_class=raw,
     )
     ingest.add_argument(
@@ -286,11 +314,14 @@ def _build_parsers() -> tuple[argparse.ArgumentParser, Mapping[str, argparse.Arg
     importer = commands.add_parser(
         "import",
         help="import a CSV or Excel file of equities, prices, fundamentals, macro or flows",
-        description=(
+        description=textwrap.fill(
             f"Import a {' or '.join(SUPPORTED_SUFFIXES)} file of up to "
             f"{MAX_FILE_BYTES // (1024 * 1024)} MiB and {MAX_ROWS:,} rows. The run is recorded "
-            "in terminal_ingestion_runs as csv_import:KIND."
+            "in terminal_ingestion_runs as csv_import:KIND.",
+            width=_HELP_WIDTH,
         ),
+        epilog=_SETTINGS_NOTE,
+        formatter_class=raw,
     )
     importer.add_argument("kind", choices=IMPORT_KINDS, help="what the file holds")
     importer.add_argument("path", type=Path, help="the .csv or .xlsx file to import")
@@ -305,6 +336,7 @@ def _build_parsers() -> tuple[argparse.ArgumentParser, Mapping[str, argparse.Arg
         "scheduler",
         help="run the ingestion scheduler process until SIGINT or SIGTERM",
         description=_SCHEDULER_DESCRIPTION,
+        epilog=f"{_PIPELINE_SETTINGS_NOTE}\n{_SETTINGS_NOTE}",
         formatter_class=raw,
     )
     subcommands = {
@@ -343,9 +375,17 @@ def _check_ingest(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
 
 
 def _check_import(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    """Reject a path that is not an existing ``.csv``/``.xlsx`` file, and ``--sheet`` for CSV.
+    """Reject a path that is not a readable ``.csv``/``.xlsx`` file, and ``--sheet`` for CSV.
 
-    The size and row limits are enforced by ``import_file`` itself, as part of the run.
+    Each check fails as an argument error (exit 2) before any settings, engine or run row exists,
+    in this order: the path is an existing regular file, its suffix is supported, ``--sheet`` is
+    not given for a CSV file and, last, the file opens for reading, so an unreadable file is named
+    here rather than ending a recorded run ``failed``. The open is read-only and non-blocking: a
+    FIFO or device swapped in after the first check opens at once and ``fstat`` rejects it, where
+    a blocking open would wait for a writer. Nothing is read, and the descriptor is closed at once.
+
+    ``import_file`` opens and checks the file again on its own descriptor, so a file changed after
+    this check still ends its run ``failed``; it also enforces the size and row limits.
     """
     from opennse_terminal.ingestion.files.tabular_import import SUPPORTED_SUFFIXES
 
@@ -361,6 +401,19 @@ def _check_import(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error(f"{path} must be a {' or '.join(SUPPORTED_SUFFIXES)} file")
     if args.sheet is not None and suffix != _XLSX_SUFFIX:
         parser.error(f"--sheet applies only to {_XLSX_SUFFIX} files")
+    # A flag the platform lacks counts as 0; O_NOCTTY keeps a terminal swapped in for the file
+    # from becoming this process's controlling terminal.
+    flags: int = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
+    try:
+        fd = os.open(path, flags)
+        try:
+            is_regular = stat.S_ISREG(os.fstat(fd).st_mode)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        parser.error(f"cannot read {path}: {exc.strerror or type(exc).__name__}")
+    if not is_regular:
+        parser.error(f"{path} does not exist or is not a file")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -381,22 +434,64 @@ def _load_settings() -> TerminalSettings | None:
         return None
 
 
-def _failure_reason(exc: Exception) -> str:
-    """Describe ``exc`` for a log line without letting connection details through.
+def _log_text(text: str) -> str:
+    r"""Return ``text`` escaped so that it stays on one log line, and otherwise unchanged.
 
-    ``OSError`` (a refused or timed-out connection, or the migrations' ``ConnectionError``, which
-    names only the database, host and port) and ``ValueError`` (the URL checks, which quote the URL
-    only through ``database_log_label``) are given with their text. Anything else, such as a
-    database server error that can quote the user name or a SQLAlchemy error embedding statement
-    parameters, is named by its type only, as everywhere in ingestion and the seeder.
+    Free text from outside the program, such as a revision typed on the command line, Alembic's
+    message quoting it, or an ``OSError`` quoting an operator's file path, must neither break the
+    line it is logged on nor forge another (CWE-117), and ``%s`` formatting escapes nothing.
+    Every character that ``str.isprintable()`` rejects is therefore written as a backslash
+    escape: ``\r``, ``\n`` and ``\t`` by name, any other as ``\xNN``, ``\uNNNN`` or
+    ``\UNNNNNNNN``, its code point in hexadecimal as in a Python string literal. That covers the
+    other C0 and C1 controls (``ESC`` and ``NEL`` included), the line and paragraph separators
+    U+2028 and U+2029, and every other separator, format, surrogate, private-use or unassigned
+    code point. A backslash is doubled, so the input cannot spell an escape that reads like one
+    of these. Printable text, non-ASCII letters included, is kept as is, so ``head``,
+    ``terminal_0001`` and Alembic's ``Can't locate revision identified by 'x'`` read unchanged.
+    """
+    if text.isprintable() and "\\" not in text:
+        return text
+    named = {"\\": "\\\\", "\r": "\\r", "\n": "\\n", "\t": "\\t"}
+    parts: list[str] = []
+    for char in text:
+        code = ord(char)
+        if char in named:
+            parts.append(named[char])
+        elif char.isprintable():
+            parts.append(char)
+        elif code <= 0xFF:
+            parts.append(f"\\x{code:02x}")
+        elif code <= 0xFFFF:
+            parts.append(f"\\u{code:04x}")
+        else:
+            parts.append(f"\\U{code:08x}")
+    return "".join(parts)
+
+
+def _failure_reason(exc: Exception) -> str:
+    """Describe ``exc`` for one log line without letting connection details through.
+
+    ``OSError`` (a refused or timed-out connection, the migrations' ``ConnectionError``, which
+    names only the database, host and port, or a file error naming an operator-supplied path) and
+    ``ValueError`` (the URL checks, which quote the URL only through ``database_log_label``) are
+    given with their text, escaped by :func:`_log_text` because it can quote free text. Anything
+    else, such as a database server error that can quote the user name or a SQLAlchemy error
+    embedding statement parameters, is named by its type only, as everywhere in ingestion and the
+    seeder.
     """
     if isinstance(exc, OSError | ValueError):
-        return str(exc) or type(exc).__name__
+        return _log_text(str(exc)) or type(exc).__name__
     return type(exc).__name__
 
 
 def _cmd_migrate(args: argparse.Namespace) -> int:
-    """``migrate upgrade|downgrade REVISION`` against ``TerminalSettings().database_url``."""
+    """``migrate upgrade|downgrade REVISION`` against ``TerminalSettings().database_url``.
+
+    Logs one INFO line on success and one ERROR line on failure. ``REVISION`` is unrestricted
+    command-line text and goes to Alembic as typed; on both lines it, and Alembic's message,
+    which can quote it, are escaped by :func:`_log_text`, so neither can break or forge a line.
+    The database is named only by its credential-free ``database_log_label``.
+    """
     from alembic.util import CommandError
 
     from opennse_terminal.db.session import database_log_label
@@ -414,14 +509,17 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
     try:
         migrate(settings.database_url, revision)
     except CommandError as exc:
-        # Alembic's own errors, such as an unknown revision, name only revisions.
-        reason = str(exc)
+        # Alembic's own errors, such as an unknown revision, name only revisions, but quote the
+        # revision as typed, so they are escaped like it.
+        reason = _log_text(str(exc))
     except Exception as exc:
         reason = _failure_reason(exc)
     else:
-        logger.info("migrated %s to %s on %s", direction, revision, target)
+        logger.info("migrated %s to %s on %s", direction, _log_text(revision), target)
         return EXIT_OK
-    logger.error("migrate %s to %s on %s failed: %s", direction, revision, target, reason)
+    logger.error(
+        "migrate %s to %s on %s failed: %s", direction, _log_text(revision), target, reason
+    )
     return EXIT_FAILED
 
 
@@ -559,6 +657,20 @@ _CHECKS: Final[Mapping[str, Callable[[argparse.Namespace, argparse.ArgumentParse
 # ---------------------------------------------------------------------------------------------
 
 
+def configure_logging() -> None:
+    """Log INFO and above to stderr as ``<time> <LEVEL> <logger> <message>``.
+
+    The one logging setup of the command-line entry points, shared by the ``opennse-terminal``
+    console script (:func:`main`) and ``python -m opennse_terminal.seed.seed_terminal_db``, so no
+    library module adds a handler. ``logging.basicConfig`` leaves a root logger that already has
+    handlers unchanged, so a host or test harness that configured logging keeps its own setup.
+    """
+    logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
+    # Alembic logs one INFO line per built-in plugin when it is first imported, which the
+    # handlers' lazy imports would print as noise after logging is configured.
+    logging.getLogger("alembic.runtime.plugins").setLevel(logging.WARNING)
+
+
 def _parse(tokens: list[str]) -> tuple[str, argparse.Namespace, list[str]]:
     """Parse ``tokens`` into the command, its namespace and, for ``seed``, its raw arguments.
 
@@ -586,34 +698,49 @@ def _parse(tokens: list[str]) -> tuple[str, argparse.Namespace, list[str]]:
 def main(argv: list[str] | None = None) -> int:
     """Run ``opennse-terminal`` with ``argv`` (default ``sys.argv[1:]``) and return its exit code.
 
-    Never raises ``SystemExit``: argparse's exits for ``--help``, ``--version`` and invalid
-    arguments become the returned code, so in-process callers, tests included, always receive
-    an int. The migration, ingestion, import and scheduler handlers each start their own event
-    loop, so this must be called outside a running loop (async code uses
-    ``asyncio.to_thread(main, argv)``). Configures INFO logging on the root logger unless it
-    already has handlers.
+    Never raises ``SystemExit`` and never ends in a traceback, so in-process callers, tests
+    included, always receive an int:
+
+    * argparse's exits become the returned code: 0 after ``--help`` or ``--version``, 2 for
+      invalid arguments. A ``SystemExit`` raised by a handler becomes its code the same way
+      (``None`` is 0; a non-integer code is logged at ERROR by its type and returns 1).
+    * Ctrl-C, while parsing or while a command runs, logs one WARNING and returns 130.
+    * Any other exception that escapes parsing or a handler, such as a failed lazy import, logs
+      one ERROR naming the command (``opennse-terminal`` before one is parsed) and the
+      exception's type, never its text or traceback, which can carry the database URL, and
+      returns 1.
+    * ``seed`` returns the seeder's own code unchanged.
+
+    The migration, ingestion, import and scheduler handlers each start their own event loop, so
+    this must be called outside a running loop (async code uses ``asyncio.to_thread(main,
+    argv)``). Configures logging through :func:`configure_logging`.
     """
-    logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
-    # Alembic logs one INFO line per built-in plugin when it is first imported, which the
-    # handlers' lazy imports would print as noise after logging is configured.
-    logging.getLogger("alembic.runtime.plugins").setLevel(logging.WARNING)
-    tokens = list(sys.argv[1:] if argv is None else argv)
+    command = PROG
     try:
+        configure_logging()
+        tokens = list(sys.argv[1:] if argv is None else argv)
         command, args, seed_argv = _parse(tokens)
-    except SystemExit as exc:
-        # None is sys.exit()'s success; argparse itself always exits with an int.
-        if exc.code is None:
-            return EXIT_OK
-        return exc.code if isinstance(exc.code, int) else EXIT_FAILED
-    try:
         if command == "seed":
             return _cmd_seed(seed_argv)
         return _HANDLERS[command](args)
+    except SystemExit as exc:
+        # argparse always exits with an int, and None is sys.exit()'s success.
+        if exc.code is None:
+            return EXIT_OK
+        if isinstance(exc.code, int):
+            return exc.code
+        logger.error("%s exited with a non-integer status: %s", command, type(exc.code).__name__)
+        return EXIT_FAILED
     except KeyboardInterrupt:
         # asyncio.run cancels the running task first, so an ingestion run is recorded failed
         # ("cancelled") and its data transaction rolled back, as is a migration's.
         logger.warning("interrupted; uncommitted changes were rolled back")
         return EXIT_INTERRUPTED
+    except Exception as exc:
+        # Type name only, with no traceback: exception text can quote the database URL and its
+        # password, as in _failure_reason and the seeder.
+        logger.error("%s failed on an unexpected error: %s", command, type(exc).__name__)
+        return EXIT_FAILED
 
 
 if __name__ == "__main__":
