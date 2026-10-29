@@ -17,13 +17,16 @@ Expected values are literals from the importer's contract, never recomputed with
 test. Amounts are ``Decimal`` and volumes and share counts ``int``.
 """
 
+import asyncio
+import contextlib
 import csv
 import io
 import logging
+import os
 import re
 import uuid
 from collections import deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
@@ -32,6 +35,7 @@ from typing import Any, cast
 
 import pytest
 from openpyxl import Workbook
+from sqlalchemy import Join
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -258,10 +262,22 @@ class _ScriptedConnection:
         return len(self._results)
 
 
+def _from_names(froms: Sequence[Any]) -> list[str]:
+    """The names of the tables and ``VALUES`` lists in ``froms``, each join expanded in order."""
+    names: list[str] = []
+    for source in froms:
+        if isinstance(source, Join):
+            names.extend(_from_names([source.left, source.right]))
+        else:
+            names.append(source.name)
+    return names
+
+
 def _query(statement: Any) -> tuple[list[str], list[object]]:
-    """The tables a ``select()`` reads and its bound parameter values, compiled for PostgreSQL."""
+    """The tables and ``VALUES`` lists a ``select()`` reads and its bound parameter values,
+    compiled for PostgreSQL."""
     compiled = statement.compile(dialect=postgresql.dialect())
-    return [table.name for table in statement.get_final_froms()], list(compiled.params.values())
+    return _from_names(statement.get_final_froms()), list(compiled.params.values())
 
 
 def _open(
@@ -659,6 +675,9 @@ def test_normalize_column_name(header: object, column: str) -> None:
         ("0.33345", "dps_kes", Decimal("0.3335"), 4),
         ("129.20", "fx_kes_usd", Decimal("129.2"), 4),
         ("99999999999999.99994", "close_price", Decimal("99999999999999.9999"), 4),
+        # 33 significant digits in parentheses: rounded once, HALF_UP from the exact value, not
+        # first to 28 digits (which would give -1.01).
+        ("(1.00499999999999999999999999999999)", "foreign_net_flow_kes", Decimal("-1.00"), 2),
     ],
 )
 def test_parse_decimal_cell_is_exact_and_rounds_half_up_to_the_column_scale(
@@ -690,6 +709,9 @@ def test_parse_decimal_cell_reads_empty_cells_as_null(text: str | None, column: 
     [
         ("(0.001)", "turnover_kes", Decimal("0.00")),
         ("-0.00004", "close_price", Decimal("0.0000")),
+        # Exponents below the decimal context's range round to zero without a decimal signal.
+        ("(1e-1000000)", "close_price", Decimal("0.0000")),
+        ("-1e-999999999999999999", "turnover_kes", Decimal("0.00")),
     ],
 )
 def test_parse_decimal_cell_never_keeps_a_negative_zero(
@@ -711,6 +733,12 @@ def test_parse_decimal_cell_never_keeps_a_negative_zero(
         ("99999999999999.99995", "close_price", "close_price must be below 10^14 in magnitude"),
         ("1e30", "turnover_kes", "turnover_kes must be below 10^22 in magnitude"),
         ("100000", "inflation_yoy_pct", "inflation_yoy_pct must be below 10^5 in magnitude"),
+        # Exponents beyond the decimal context's range are out of range, not a decimal signal.
+        ("1e1000000", "close_price", "close_price must be below 10^14 in magnitude"),
+        ("(1e1000000)", "turnover_kes", "turnover_kes must be below 10^22 in magnitude"),
+        ("-1e1000000", "foreign_net_flow_kes", "foreign_net_flow_kes must be below 10^22"),
+        ("1e999999999999999999", "inflation_yoy_pct", "inflation_yoy_pct must be below 10^5"),
+        ("(" + "9" * 35 + ")", "revenue_kes", "revenue_kes must be below 10^22 in magnitude"),
         ("12", "ticker", "'ticker' is not a decimal import column"),
     ],
 )
@@ -752,6 +780,12 @@ def test_parse_int_cell_reads_empty_cells_as_null(text: str | None) -> None:
         ("(100)", "-100 is outside 0..1000000000000"),
         ("12.5", "not a whole number: '12.5'"),
         ("abc", "not an integer: 'abc'"),
+        # Exponents beyond the decimal context's range are out of range, not a decimal signal.
+        ("1e1000000", "1E+1000000 is outside 0..1000000000000"),
+        ("(1e1000000)", "-1E+1000000 is outside 0..1000000000000"),
+        ("(1e-1000000)", "-1E-1000000 is outside 0..1000000000000"),
+        ("1e-999999999999999999", "not a whole number: '1e-999999999999999999'"),
+        ("(" + "1" * 35 + ")", "-11111111111111111111111111111111111 is outside 0..1000000000000"),
     ],
 )
 def test_parse_int_cell_rejects_fractions_negatives_and_counts_above_the_cap(
@@ -975,11 +1009,69 @@ async def test_fetch_reads_the_file_and_records_its_evidence(tmp_path: Path) -> 
     }
 
 
+NO_FIFOS = pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="the platform has no FIFOs")
+
+
+def _release_fifo_readers(path: Path) -> None:
+    """Open the FIFO at ``path`` for writing and close it, so a reader blocked opening it returns.
+
+    A regression that opened the path blocking would otherwise leave its worker thread waiting
+    for a writer forever, and the test process could not exit after the timeout failed the test.
+    """
+    if not path.is_fifo():
+        return
+    with contextlib.suppress(OSError):  # ENXIO: no reader is waiting
+        os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+
+
+class _OsView:
+    """``os`` as the importer sees it, with some functions replaced.
+
+    Patched in as ``tabular_import.os`` only, so no other caller of ``os`` meets the hooks.
+    """
+
+    def __init__(self, **hooks: Callable[..., Any]) -> None:
+        self._hooks = hooks
+
+    def __getattr__(self, name: str) -> Any:
+        return self._hooks[name] if name in self._hooks else getattr(os, name)
+
+
+def _after_fstat(
+    monkeypatch: pytest.MonkeyPatch, action: Callable[[], None]
+) -> list[os.stat_result]:
+    """Run ``action`` once, right after the importer's first ``os.fstat``.
+
+    Returns the checks seen; the check returned to the importer is the one taken before
+    ``action`` ran.
+    """
+    seen: list[os.stat_result] = []
+
+    def fstat(fd: int) -> os.stat_result:
+        info = os.fstat(fd)
+        if not seen:
+            seen.append(info)
+            action()
+        return info
+
+    monkeypatch.setattr(tabular_import, "os", _OsView(fstat=fstat))
+    return seen
+
+
 @pytest.mark.parametrize(
     ("setup", "reason"),
     [
         pytest.param("missing", "file_not_found", id="missing"),
         pytest.param("directory", "not_a_file", id="directory"),
+        pytest.param("fifo", "not_a_file", id="fifo", marks=NO_FIFOS),
+        pytest.param(
+            "character_device",
+            "not_a_file",
+            id="character-device",
+            marks=pytest.mark.skipif(
+                not Path(os.devnull).is_char_device(), reason="no character device to link"
+            ),
+        ),
     ],
 )
 async def test_fetch_fails_for_a_path_that_is_not_a_readable_file(
@@ -988,10 +1080,96 @@ async def test_fetch_fails_for_a_path_that_is_not_a_readable_file(
     path = tmp_path / "prices.csv"
     if setup == "directory":
         path.mkdir()
+    elif setup == "fifo":
+        os.mkfifo(path)
+    elif setup == "character_device":
+        path.symlink_to(os.devnull)
+    pipeline, ctx = _open("daily_prices", path)
+    try:
+        with pytest.raises(FetchFailed) as failure:
+            # Bounded: a FIFO or device opened blocking would wait for a writer forever.
+            await asyncio.wait_for(pipeline.fetch(ctx), timeout=5)
+    finally:
+        _release_fifo_readers(path)
+    assert (failure.value.url, failure.value.reason) == (str(path.resolve()), reason)
+
+
+@NO_FIFOS
+async def test_fetch_reads_the_checked_descriptor_when_the_path_is_replaced_by_a_fifo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_csv(tmp_path / "prices.csv", [PRICE_HEADER, ("SCOM", SESSION, "28.45", 1_000)])
+    original = path.read_bytes()
+
+    def replace_with_fifo() -> None:
+        path.rename(tmp_path / "moved.csv")
+        os.mkfifo(path)
+
+    checks = _after_fstat(monkeypatch, replace_with_fifo)
+    pipeline, ctx = _open("daily_prices", path)
+    try:
+        raw = await asyncio.wait_for(pipeline.fetch(ctx), timeout=5)
+    finally:
+        _release_fifo_readers(path)
+    assert len(checks) == 1
+    assert path.is_fifo()
+    assert raw == original
+    assert ctx.details["file_size_bytes"] == len(original)
+
+
+async def test_fetch_rejects_a_file_that_grew_above_the_limit_after_its_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "prices.csv"
+    with path.open("wb") as handle:
+        handle.truncate(52_428_800)
+
+    def grow() -> None:
+        with path.open("r+b") as handle:
+            handle.truncate(52_428_801)
+
+    checks = _after_fstat(monkeypatch, grow)
     pipeline, ctx = _open("daily_prices", path)
     with pytest.raises(FetchFailed) as failure:
         await pipeline.fetch(ctx)
-    assert (failure.value.url, failure.value.reason) == (str(path.resolve()), reason)
+    assert len(checks) == 1
+    assert failure.value.reason == "file_too_large"
+    assert ctx.details["file_size_bytes"] == 52_428_800
+
+
+@pytest.mark.parametrize("stage", ["open", "fstat", "read", "close"])
+async def test_fetch_names_an_os_error_and_closes_the_descriptor_it_opened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    path = _write_csv(tmp_path / "prices.csv", [PRICE_HEADER, ("SCOM", SESSION, "28.45", 1_000)])
+    opened: list[int] = []
+    closed: list[int] = []
+
+    def tracked_open(file: Path, flags: int) -> int:
+        fd = os.open(file, flags)
+        opened.append(fd)
+        return fd
+
+    def tracked_close(fd: int) -> None:
+        os.close(fd)
+        closed.append(fd)
+        if stage == "close":
+            raise OSError(5, "Input/output error")
+
+    def denied(*args: object) -> object:
+        raise PermissionError(13, "Permission denied")
+
+    hooks: dict[str, Callable[..., Any]] = {"open": tracked_open, "close": tracked_close}
+    if stage in ("open", "fstat", "read"):
+        hooks[stage] = denied
+    monkeypatch.setattr(tabular_import, "os", _OsView(**hooks))
+    pipeline, ctx = _open("daily_prices", path)
+    with pytest.raises(FetchFailed) as failure:
+        await pipeline.fetch(ctx)
+    expected = "unreadable_file:OSError" if stage == "close" else "unreadable_file:PermissionError"
+    assert failure.value.reason == expected
+    assert closed == opened
+    assert len(opened) == (0 if stage == "open" else 1)
 
 
 async def test_fetch_rejects_a_file_above_the_size_limit(tmp_path: Path) -> None:
@@ -1096,8 +1274,38 @@ async def test_parse_reads_an_operator_csv_export(
     assert staged.ctx.details["ignored_columns"] == ["notes"]
     assert staged.ctx.details["blank_rows_skipped"] == 1
     assert caplog.messages == [
-        "daily_prices import of Prices Export.CSV ignores columns it does not read: notes"
+        "run 2b7e1516-28ae-4d2a-a6f7-15880cf4f3c1: daily_prices import ignores 1 columns it does"
+        " not read (details.ignored_columns)"
     ]
+
+
+async def test_parse_logs_neither_the_file_name_nor_a_forged_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger=LOGGER)
+    name = "prices\r\nFORGED ERROR line.csv"
+    try:
+        path = _write_csv(
+            tmp_path / name,
+            [(*PRICE_HEADER, "Notes"), ("SCOM", "2026-09-28", "28.45", "1,000", "checked")],
+        )
+    except OSError as exc:
+        pytest.skip(f"the filesystem rejects a CR/LF file name: {type(exc).__name__}")
+    staged = await _stage("daily_prices", path)
+    assert [record.row_number for record in staged.outcome.valid] == [2]
+    # Details are run evidence stored on the run row, not log output: the name stays there.
+    assert staged.ctx.details["file_name"] == name
+    assert staged.ctx.details["ignored_columns"] == ["notes"]
+    assert caplog.messages == [
+        "run 2b7e1516-28ae-4d2a-a6f7-15880cf4f3c1: daily_prices import ignores 1 columns it does"
+        " not read (details.ignored_columns)"
+    ]
+    for record in caplog.records:
+        message = record.getMessage()
+        assert name not in message
+        assert "FORGED" not in message
+        assert "\r" not in message
+        assert "\n" not in message
 
 
 MISSING_HEADER_CASES = [
@@ -1395,6 +1603,14 @@ REJECTION_CASES = [
         "out_of_range:turnover_kes",
         id="estimated-turnover-overflows",
     ),
+    # 265,371,653 x 37,683,000,000,003.7683 = 9,999,999,999,999,999,999,999.9999, below 10^22,
+    # which rounds half up to 10^22 and would overflow NUMERIC(24,2).
+    pytest.param(
+        "daily_prices",
+        {"close_price": "37683000000003.7683", "volume": "265371653"},
+        "out_of_range:turnover_kes",
+        id="estimated-turnover-rounds-up-to-the-limit",
+    ),
     pytest.param(
         "daily_prices",
         {"close_price": "0", "high_price": "27", "low_price": "28"},
@@ -1510,6 +1726,23 @@ async def test_validate_rejects_a_row_with_its_reason_codes(
     assert staged.outcome.rejected == [RejectedRow(index=2, reason=reason, row=row)]
 
 
+async def test_validate_keeps_an_estimated_turnover_that_rounds_to_just_below_the_limit(
+    tmp_path: Path,
+) -> None:
+    # 859,282,386,827 x 11,637,617,799.8087 = 9,999,999,999,999,999,999,999.9949, which rounds
+    # half up to 9,999,999,999,999,999,999,999.99, the largest value NUMERIC(24,2) holds.
+    row = {
+        **VALID_CELLS["daily_prices"],
+        "close_price": "11637617799.8087",
+        "volume": "859282386827",
+    }
+    staged = await _validate_one_row(tmp_path, "daily_prices", row)
+    assert staged.outcome.rejected == []
+    [record] = staged.outcome.valid
+    assert str(record.values["turnover_kes"]) == "9999999999999999999999.99"
+    assert record.values["turnover_estimated"] is True
+
+
 async def test_fundamentals_without_type_or_currency_columns_default_to_fy_and_kes(
     tmp_path: Path,
 ) -> None:
@@ -1550,6 +1783,61 @@ async def test_rejected_rows_feed_the_shared_thresholds(
     assert {row.reason for row in staged.outcome.rejected} <= {"non_positive:close_price"}
     parsed, rejected = len(staged.records), len(staged.outcome.rejected)
     assert evaluate_thresholds(parsed, rejected, TabularImportPipeline.min_rows) is status
+
+
+EXTREME_CLOSE = ("SCOM", date(2026, 8, 3), "1e1000000", 1_000)
+EXTREME_VOLUME = ("SCOM", date(2026, 8, 4), "28.45", "(1e1000000)")
+# 265,371,653 x 37,683,000,000,003.7683 rounds half up to 10^22, beyond NUMERIC(24,2).
+TURNOVER_AT_LIMIT = ("SCOM", date(2026, 8, 5), "37683000000003.7683", 265_371_653)
+
+
+@pytest.mark.parametrize(
+    ("bad_rows", "rejected", "status"),
+    [
+        pytest.param(
+            [EXTREME_CLOSE],
+            [(22, "out_of_range:close_price")],
+            RunStatus.PARTIAL,
+            id="extreme-exponent-close",
+        ),
+        pytest.param(
+            [EXTREME_VOLUME],
+            [(22, "out_of_range:volume")],
+            RunStatus.PARTIAL,
+            id="parenthesized-extreme-exponent-volume",
+        ),
+        pytest.param(
+            [EXTREME_CLOSE, TURNOVER_AT_LIMIT],
+            [(22, "out_of_range:close_price"), (23, "out_of_range:turnover_kes")],
+            RunStatus.PARTIAL,
+            id="extreme-close-and-turnover-at-limit-within-ten-percent",
+        ),
+        pytest.param(
+            [EXTREME_CLOSE, EXTREME_VOLUME, TURNOVER_AT_LIMIT],
+            [
+                (22, "out_of_range:close_price"),
+                (23, "out_of_range:volume"),
+                (24, "out_of_range:turnover_kes"),
+            ],
+            RunStatus.LAYOUT_CHANGED,
+            id="three-of-twenty-three-above-ten-percent",
+        ),
+    ],
+)
+async def test_extreme_cells_and_turnover_overflow_are_rejected_rows_under_the_thresholds(
+    tmp_path: Path,
+    bad_rows: list[tuple[object, ...]],
+    rejected: list[tuple[int, str]],
+    status: RunStatus,
+) -> None:
+    """Twenty valid rows plus cells beyond the decimal context or the turnover column: each bad
+    row is rejected with its code instead of failing the run, and counts toward the thresholds."""
+    path = _write_csv(tmp_path / "prices.csv", [PRICE_HEADER, *_price_rows(20), *bad_rows])
+    staged = await _stage("daily_prices", path)
+    assert len(staged.outcome.valid) == 20
+    assert [(row.index, row.reason) for row in staged.outcome.rejected] == rejected
+    parsed, count = len(staged.records), len(staged.outcome.rejected)
+    assert evaluate_thresholds(parsed, count, TabularImportPipeline.min_rows) is status
 
 
 # --- Reconcile -------------------------------------------------------------------------------
@@ -1617,37 +1905,70 @@ async def test_daily_prices_reconcile_rejects_unknown_tickers(tmp_path: Path) ->
     assert conn.unanswered == 0
 
 
+@pytest.mark.parametrize(
+    ("rows", "stored", "valid", "rejected", "queries"),
+    [
+        pytest.param(
+            [
+                ("SCOM", date(2026, 3, 31), "FY", "USD", "2,990,000,000"),
+                ("SCOM", date(2025, 9, 30), "H1", "usd", "1,450,000,000"),
+                ("SCOM", date(2025, 3, 31), None, None, "371,000,000,000"),
+                ("KQ", date(2026, 3, 31), "FY", "KES", "190,000,000,000"),
+            ],
+            [
+                [("SCOM",)],
+                [
+                    ("SCOM", date(2026, 3, 31), "FY", "KES"),
+                    ("SCOM", date(2025, 9, 30), "H1", "USD"),
+                ],
+            ],
+            [(3, "H1", "USD"), (4, "FY", "KES")],
+            [(2, "currency_conflict"), (5, "unknown_ticker")],
+            [
+                (["terminal_equities"], [["KQ", "SCOM"]]),
+                # Exactly the file's periods of known tickers, never SCOM's other stored periods.
+                (
+                    ["terminal_fundamentals", "requested"],
+                    [
+                        *("SCOM", date(2025, 3, 31), "FY"),
+                        *("SCOM", date(2025, 9, 30), "H1"),
+                        *("SCOM", date(2026, 3, 31), "FY"),
+                    ],
+                ),
+            ],
+            id="known_and_unknown_tickers",
+        ),
+        pytest.param(
+            [("KQ", date(2026, 3, 31), "FY", "KES", "190,000,000,000")],
+            [[]],
+            [],
+            [(2, "unknown_ticker")],
+            [(["terminal_equities"], [["KQ"]])],
+            id="unknown_tickers_only_skip_the_period_query",
+        ),
+    ],
+)
 async def test_fundamentals_reconcile_rejects_unknown_tickers_and_currency_conflicts(
     tmp_path: Path,
+    rows: list[tuple[object, ...]],
+    stored: list[list[tuple[object, ...]]],
+    valid: list[tuple[int, str, str]],
+    rejected: list[tuple[int, str]],
+    queries: list[tuple[list[str], list[object]]],
 ) -> None:
     path = _write_csv(
         tmp_path / "fundamentals.csv",
-        [
-            ("Ticker", "Period End Date", "Period Type", "Currency", "Revenue KES"),
-            ("SCOM", date(2026, 3, 31), "FY", "USD", "2,990,000,000"),
-            ("SCOM", date(2025, 9, 30), "H1", "usd", "1,450,000,000"),
-            ("SCOM", date(2025, 3, 31), None, None, "371,000,000,000"),
-            ("KQ", date(2026, 3, 31), "FY", "KES", "190,000,000,000"),
-        ],
+        [("Ticker", "Period End Date", "Period Type", "Currency", "Revenue KES"), *rows],
     )
-    conn = _ScriptedConnection(
-        [("SCOM",)],
-        [("SCOM", date(2026, 3, 31), "FY", "KES"), ("SCOM", date(2025, 9, 30), "H1", "USD")],
-    )
+    conn = _ScriptedConnection(*stored)
     staged = await _stage("fundamentals", path, conn=conn)
     reconciled = await staged.pipeline.reconcile(staged.ctx, staged.outcome.valid)
     assert [
         (record.row_number, record.values["period_type"], record.values["currency"])
         for record in reconciled.valid
-    ] == [(3, "H1", "USD"), (4, "FY", "KES")]
-    assert [(row.index, row.reason) for row in reconciled.rejected] == [
-        (2, "currency_conflict"),
-        (5, "unknown_ticker"),
-    ]
-    assert [_query(statement) for statement in conn.statements] == [
-        (["terminal_equities"], [["KQ", "SCOM"]]),
-        (["terminal_fundamentals"], [["SCOM"]]),
-    ]
+    ] == valid
+    assert [(row.index, row.reason) for row in reconciled.rejected] == rejected
+    assert [_query(statement) for statement in conn.statements] == queries
     assert conn.unanswered == 0
 
 
@@ -1739,27 +2060,101 @@ async def test_equities_reconcile_defaults_currency_to_kes_without_an_isin_query
     ]
 
 
-async def test_foreign_flows_reconcile_rejects_rows_without_a_price_row(tmp_path: Path) -> None:
-    path = _write_csv(
-        tmp_path / "flows.csv",
-        [
-            SAMPLES["foreign_flows"].header,
-            ("SCOM", SESSION, "(1,250,000.00)"),
-            ("SCOM", NEXT_SESSION, "500,000"),
-            ("EQTY", date(2026, 9, 25), "3,400,500.565"),
-        ],
-    )
-    conn = _ScriptedConnection([("SCOM", SESSION)])
+@pytest.mark.parametrize(
+    ("rows", "stored", "valid", "rejected", "binds"),
+    [
+        pytest.param(
+            [
+                ("SCOM", SESSION, "(1,250,000.00)"),
+                ("SCOM", NEXT_SESSION, "500,000"),
+                ("EQTY", date(2026, 9, 25), "3,400,500.565"),
+            ],
+            [("SCOM", SESSION)],
+            [2],
+            [(3, "no_price_row"), (4, "no_price_row")],
+            [*("EQTY", date(2026, 9, 25)), *("SCOM", SESSION), *("SCOM", NEXT_SESSION)],
+            id="rows_without_a_price_row",
+        ),
+        pytest.param(
+            [("SCOM", date(2016, 9, 28), "100,000"), ("SCOM", SESSION, "(200,000)")],
+            [("SCOM", date(2016, 9, 28)), ("SCOM", SESSION)],
+            [2, 3],
+            [],
+            # The two sessions only: no date range, so none of the decade between them is read.
+            [*("SCOM", date(2016, 9, 28)), *("SCOM", SESSION)],
+            id="dates_a_decade_apart",
+        ),
+    ],
+)
+async def test_foreign_flows_reconcile_rejects_rows_without_a_price_row(
+    tmp_path: Path,
+    rows: list[tuple[object, ...]],
+    stored: list[tuple[object, ...]],
+    valid: list[int],
+    rejected: list[tuple[int, str]],
+    binds: list[object],
+) -> None:
+    path = _write_csv(tmp_path / "flows.csv", [SAMPLES["foreign_flows"].header, *rows])
+    conn = _ScriptedConnection(stored)
     staged = await _stage("foreign_flows", path, conn=conn)
     reconciled = await staged.pipeline.reconcile(staged.ctx, staged.outcome.valid)
-    assert [record.row_number for record in reconciled.valid] == [2]
-    assert [(row.index, row.reason) for row in reconciled.rejected] == [
-        (3, "no_price_row"),
-        (4, "no_price_row"),
-    ]
+    assert [record.row_number for record in reconciled.valid] == valid
+    assert [(row.index, row.reason) for row in reconciled.rejected] == rejected
     assert [_query(statement) for statement in conn.statements] == [
-        (["terminal_daily_prices"], [["EQTY", "SCOM"], date(2026, 9, 25), NEXT_SESSION])
+        (["terminal_daily_prices", "requested"], binds)
     ]
+    assert conn.unanswered == 0
+
+
+@pytest.mark.parametrize(
+    ("kind", "header", "lookups", "table", "key_suffix", "statement_binds"),
+    [
+        pytest.param(
+            "foreign_flows",
+            SAMPLES["foreign_flows"].header,
+            [],
+            "terminal_daily_prices",
+            (),
+            [10_000, 2],
+            id="foreign_flows",
+        ),
+        pytest.param(
+            "fundamentals",
+            ("Ticker", "Period End Date", "Revenue KES"),
+            [[("SCOM",)]],
+            "terminal_fundamentals",
+            ("FY",),
+            [1, 15_000, 3],
+            id="fundamentals",
+        ),
+    ],
+)
+async def test_reconcile_requests_exact_keys_in_batches_of_5000(
+    tmp_path: Path,
+    kind: ImportKind,
+    header: tuple[str, ...],
+    lookups: list[list[tuple[object, ...]]],
+    table: str,
+    key_suffix: tuple[str, ...],
+    statement_binds: list[int],
+) -> None:
+    """5,001 keys take two statements, each binding exactly its slice of the sorted keys and at
+    most 15,000 parameters, far below asyncpg's 32,767."""
+    days = [date.fromordinal(SESSION.toordinal() - offset) for offset in range(5_001)]
+    path = _write_csv(tmp_path / "keys.csv", [header, *(("SCOM", day, "1") for day in days)])
+    conn = _ScriptedConnection(*lookups, [], [])
+    staged = await _stage(kind, path, conn=conn)
+    assert len(staged.outcome.valid) == 5_001
+    reconciled = await staged.pipeline.reconcile(staged.ctx, staged.outcome.valid)
+    assert len(reconciled.valid) + len(reconciled.rejected) == 5_001
+    queries = [_query(statement) for statement in conn.statements]
+    assert [len(binds) for _, binds in queries] == statement_binds
+    batches = queries[len(lookups) :]
+    assert [names for names, _ in batches] == [[table, "requested"]] * 2
+    assert [value for _, binds in batches for value in binds] == [
+        part for day in sorted(days) for part in ("SCOM", day, *key_suffix)
+    ]
+    assert conn.unanswered == 0
 
 
 # --- Upsert ----------------------------------------------------------------------------------

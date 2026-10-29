@@ -47,6 +47,7 @@ argparse choices, and that import must stay cheap.
 import asyncio
 import io
 import logging
+import os
 import re
 import stat
 import uuid
@@ -60,8 +61,13 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, ClassVar, Final, Literal, TypeGuard, get_args
 
-from sqlalchemy import Date, FromClause, Integer, Numeric, String, Table, select
+# ``column`` and ``values`` are aliased: this module's loop variables named ``column`` would
+# shadow the bare names (F402).
+from sqlalchemy import Date, FromClause, Integer, Numeric, String, Table, Values, and_, select
+from sqlalchemy import column as sql_column
+from sqlalchemy import values as sql_values
 from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.types import TypeEngine
 
 from opennse_terminal.config import DEFAULT_CURRENCY, MAX_SHARE_COUNT, TerminalSettings
 from opennse_terminal.db.session import build_engine
@@ -393,8 +399,10 @@ def parse_decimal_cell(text: str | None, column: str) -> Decimal | None:
 
     Returns ``None`` for an empty cell. Raises ``ValueError`` for text that is not a finite
     number, and for a value whose magnitude reaches ``10 ** COLUMN_INTEGER_DIGITS[column]``,
-    before or after rounding, because it would overflow the column. An unknown ``column`` also
-    raises ``ValueError``.
+    before or after rounding, because it would overflow the column. The magnitude checks are
+    exact, so an extreme exponent such as ``1e1000000`` or ``(1e1000000)`` is rejected as out of
+    range (``_OutOfRangeError``, a ``ValueError``) rather than raising a ``decimal`` signal. An
+    unknown ``column`` also raises ``ValueError``.
     """
     scale = COLUMN_SCALES.get(column)
     if scale is None:
@@ -412,11 +420,12 @@ def parse_decimal_cell(text: str | None, column: str) -> Decimal | None:
     limit = _LIMITS[column]
     overflow = f"{column} must be below 10^{COLUMN_INTEGER_DIGITS[column]} in magnitude"
     # Checked before quantizing as well: quantizing a huge value to the column scale would need
-    # more than the context's 28 digits and raise InvalidOperation instead.
-    if abs(value) >= limit:
+    # more than the context's 28 digits and raise InvalidOperation instead. copy_abs is exact,
+    # whereas abs() applies the context and raises Overflow beyond its exponent range (1e1000000).
+    if value.copy_abs() >= limit:
         raise _OutOfRangeError(overflow)
     quantized = value.quantize(_QUANTA[column], rounding=ROUND_HALF_UP)
-    if abs(quantized) >= limit:
+    if quantized.copy_abs() >= limit:
         raise _OutOfRangeError(overflow)
     # "(0)" and "-0.001" would otherwise keep a negative zero.
     return quantized.copy_abs() if quantized.is_zero() else quantized
@@ -511,15 +520,40 @@ def _text(values: Mapping[str, CellValue], column: str) -> str | None:
 
 
 def _chunks(items: Sequence[Any], size: int = _IN_CHUNK) -> Iterator[Sequence[Any]]:
-    """Yield slices of at most ``size`` items, keeping ``IN`` lists far below asyncpg's
-    32,767 bind parameters."""
+    """Yield slices of at most ``size`` items, keeping every statement far below asyncpg's
+    32,767 bind parameters: at the default 5,000, an ``IN`` list binds at most 5,000 and a
+    ``VALUES`` list of composite keys, at most three parts each, at most 15,000."""
     for start in range(0, len(items), size):
         yield items[start : start + size]
+
+
+def _key_batches(keys: Sequence[tuple[Any, ...]], **parts: TypeEngine[Any]) -> Iterator[Values]:
+    """Yield ``keys`` as typed ``VALUES`` lists named ``requested``, one per :func:`_chunks`
+    slice; each column is named by a keyword of ``parts``, in order, and bound as its type.
+
+    A ``select()`` joined to one on ``=`` of every key column reads only the stored rows whose
+    composite key is requested, through the table's unique key index, never a ticker's other
+    periods or sessions.
+    """
+    for chunk in _chunks(keys):
+        yield sql_values(
+            *(sql_column(name, type_) for name, type_ in parts.items()), name="requested"
+        ).data(chunk)
 
 
 # ---------------------------------------------------------------------------------------------
 # File reading (pandas is imported here only)
 # ---------------------------------------------------------------------------------------------
+
+_OPEN_FLAGS: Final[int] = (
+    os.O_RDONLY
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_NOCTTY", 0)
+    | getattr(os, "O_BINARY", 0)
+)
+"""Flags of the one descriptor :meth:`TabularImportPipeline.fetch` checks and reads. Non-blocking,
+so a FIFO or device at the path opens at once instead of waiting for a writer and ``fstat`` then
+rejects it; a terminal never becomes the controlling one. A flag the platform lacks counts as 0."""
 
 
 def _read_grid(raw: bytes, *, suffix: str, sheet: str | None, source: str) -> list[list[str]]:
@@ -712,8 +746,10 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         if self.sheet is not None and self._suffix != ".xlsx":
             raise ValueError(f"a sheet name applies only to .xlsx files, not {self.path.name!r}")
         self.source_url: str = str(self.path.resolve())
-        # Bound to the run's ctx.details by fetch(); parse() and upsert() have no context.
+        # Bound to the run's ctx.details and ctx.run_id by fetch(); parse() and upsert() have no
+        # context, and their log lines name the run by its id, never by the file's name.
         self._details: dict[str, Any] = {}
+        self._run_id: uuid.UUID | None = None
 
     @property
     def run_name(self) -> str:
@@ -723,45 +759,59 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
     # --- fetch ---------------------------------------------------------------------------------
 
     async def fetch(self, ctx: RunContext) -> bytes:
-        """Read the file's bytes in a worker thread.
+        """Read the file's bytes through one descriptor, in one worker thread.
+
+        The path is opened once, non-blocking (:data:`_OPEN_FLAGS`), so a FIFO or device opens
+        at once instead of waiting for a writer. ``fstat`` on that descriptor checks that it is a
+        regular file of at most :data:`MAX_FILE_BYTES`, and the bytes are read from the same
+        descriptor, one byte past the limit so a file that grew after the check is caught. The
+        path is never reopened, so replacing it after the check cannot block or change the read.
+        ``details.file_size_bytes`` holds the checked size, then the length read.
 
         Raises :class:`FetchFailed` with ``file_not_found``, ``not_a_file``, ``file_too_large``
         (above :data:`MAX_FILE_BYTES`, checked before reading) or ``unreadable_file:<error>``.
         """
         self._details = ctx.details
+        self._run_id = ctx.run_id
         ctx.details.update({"kind": self.kind, "file_name": self.path.name, "sheet": self.sheet})
-        size = await asyncio.to_thread(self._file_size)
+        size, raw = await asyncio.to_thread(self._read_file)
         ctx.details["file_size_bytes"] = size
-        if size > MAX_FILE_BYTES:
+        if raw is None or len(raw) > MAX_FILE_BYTES:
             raise FetchFailed(self.source_url, "file_too_large")
-        raw = await asyncio.to_thread(self._read_bytes)
         ctx.details["file_size_bytes"] = len(raw)
         return raw
 
-    def _file_size(self) -> int:
+    def _read_file(self) -> tuple[int, bytes | None]:
+        """The checked size and the bytes read, or ``None`` for a file above the limit."""
         try:
-            info = self.path.stat()
+            fd = os.open(self.path, _OPEN_FLAGS)
         except FileNotFoundError:
             raise FetchFailed(self.source_url, "file_not_found") from None
+        except IsADirectoryError:
+            raise FetchFailed(self.source_url, "not_a_file") from None
         except OSError as exc:
             raise FetchFailed(self.source_url, f"unreadable_file:{type(exc).__name__}") from exc
-        # Checked before opening: opening a FIFO would block the worker thread.
-        if not stat.S_ISREG(info.st_mode):
-            raise FetchFailed(self.source_url, "not_a_file")
-        return info.st_size
-
-    def _read_bytes(self) -> bytes:
         try:
-            with self.path.open("rb") as handle:
-                # One byte past the limit catches a file that grew after the size check.
-                raw = handle.read(MAX_FILE_BYTES + 1)
-        except FileNotFoundError:
-            raise FetchFailed(self.source_url, "file_not_found") from None
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode):
+                    raise FetchFailed(self.source_url, "not_a_file")
+                if info.st_size > MAX_FILE_BYTES:
+                    return info.st_size, None
+                chunks: list[bytes] = []
+                remaining = MAX_FILE_BYTES + 1
+                # os.read may return fewer bytes than asked; an empty chunk ends the file.
+                while remaining > 0:
+                    chunk = os.read(fd, remaining)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+            finally:
+                os.close(fd)
         except OSError as exc:
             raise FetchFailed(self.source_url, f"unreadable_file:{type(exc).__name__}") from exc
-        if len(raw) > MAX_FILE_BYTES:
-            raise FetchFailed(self.source_url, "file_too_large")
-        return raw
+        return info.st_size, b"".join(chunks)
 
     # --- parse ---------------------------------------------------------------------------------
 
@@ -769,9 +819,10 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         """Read the grid, check the headers and convert the kind's columns of every row.
 
         Headers are normalized with :func:`normalize_column_name`. Columns the kind does not read
-        are ignored (``details.ignored_columns``, logged at WARNING). Rows whose kind columns are
-        all empty are skipped (``details.blank_rows_skipped``). Conversion failures are collected
-        on each record for :meth:`validate`; nothing is raised per row.
+        are ignored and named in ``details.ignored_columns``; the WARNING logged for them carries
+        only the run id, the kind and their count, never the file's name or its headers. Rows
+        whose kind columns are all empty are skipped (``details.blank_rows_skipped``). Conversion
+        failures are collected on each record for :meth:`validate`; nothing is raised per row.
 
         Raises:
             SourceLayoutChanged: No header row, a repeated header, a missing required header, or
@@ -805,10 +856,10 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         if ignored:
             self._details["ignored_columns"] = ignored
             logger.warning(
-                "%s import of %s ignores columns it does not read: %s",
+                "run %s: %s import ignores %d columns it does not read (details.ignored_columns)",
+                self._run_id,
                 self.kind,
-                self.path.name,
-                ", ".join(ignored),
+                len(ignored),
             )
 
         records: list[TabularRecord] = []
@@ -842,7 +893,9 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         - ``daily_prices``: ``close_price`` <= 0 (``non_positive:close_price``); a negative open,
           high, low or turnover (``negative:<col>``); high below low (``high_below_low``). An
           empty turnover is derived as volume x close, rounded ``ROUND_HALF_UP`` to 0.01, with
-          ``turnover_estimated = True``; a supplied one gives ``turnover_estimated = False``.
+          ``turnover_estimated = True``, and an estimate that reaches 10^22 after rounding is
+          rejected (``out_of_range:turnover_kes``); a supplied one gives
+          ``turnover_estimated = False``.
         - ``fundamentals``: ``period_type`` (default ``FY``) not ``FY`` or ``H1``
           (``invalid_period_type``); ``currency`` defaults to KES; a row with no value column
           (``no_values``).
@@ -910,7 +963,9 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
 
         Rows sharing the kind's conflict key are collapsed, the last occurrence winning
         (``details.duplicates_collapsed``): one ``INSERT ... ON CONFLICT DO UPDATE`` cannot touch
-        a row twice. Then, with bound ``select()`` statements in ``IN`` batches of 5,000:
+        a row twice. Then, with bound ``select()`` statements in batches of at most 5,000 keys,
+        either an ``IN`` list of tickers or ISINs or a join to a typed ``VALUES`` list of the
+        file's exact composite keys, so no stored row outside the file's keys is read:
 
         - ``equities``: an ``isin`` held by another ticker, stored or claimed by an earlier row,
           is rejected (``isin_conflict``). Each accepted row is completed with the stored
@@ -953,14 +1008,34 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
             known.update(result.scalars())
         stored_currency: dict[tuple[str, date, str], str] = {}
         if self.kind == "fundamentals":
-            for chunk in _chunks(sorted(known)):
+            periods = sorted(
+                {
+                    (
+                        ticker,
+                        _required_date(record.values, "period_end_date"),
+                        _required_text(record.values, "period_type"),
+                    )
+                    for record in records
+                    if (ticker := _required_text(record.values, "ticker")) in known
+                }
+            )
+            for requested in _key_batches(
+                periods, ticker=String(), period_end_date=Date(), period_type=String()
+            ):
                 result_rows = await conn.execute(
                     select(
                         TerminalFundamental.ticker,
                         TerminalFundamental.period_end_date,
                         TerminalFundamental.period_type,
                         TerminalFundamental.currency,
-                    ).where(TerminalFundamental.ticker.in_(chunk))
+                    ).join(
+                        requested,
+                        and_(
+                            TerminalFundamental.ticker == requested.c.ticker,
+                            TerminalFundamental.period_end_date == requested.c.period_end_date,
+                            TerminalFundamental.period_type == requested.c.period_type,
+                        ),
+                    )
                 )
                 for ticker, period_end, period_type, currency in result_rows.tuples():
                     stored_currency[(ticker, period_end, period_type)] = currency
@@ -1078,14 +1153,20 @@ def _check_prices(values: dict[str, CellValue]) -> list[str]:
     if _decimal(values, "turnover_kes") is not None:
         values["turnover_estimated"] = False
     elif close is not None and close > 0 and volume is not None:
-        # Exact: below the 10^22 limit the product has at most 26 significant digits.
+        limit = _LIMITS["turnover_kes"]
+        # Exact: below the 10^22 limit the product has at most 26 significant digits, and only
+        # there is it rounded, as in parse_decimal_cell. The rounded value is what is checked: a
+        # product within 0.005 of 10^22 rounds HALF_UP to 10^22, which the column cannot hold.
         estimate = Decimal(volume) * close
-        if estimate >= _LIMITS["turnover_kes"]:
+        rounded = (
+            estimate.quantize(_QUANTA["turnover_kes"], rounding=ROUND_HALF_UP)
+            if estimate < limit
+            else estimate
+        )
+        if rounded.copy_abs() >= limit:
             codes.append("out_of_range:turnover_kes")
         else:
-            values["turnover_kes"] = estimate.quantize(
-                _QUANTA["turnover_kes"], rounding=ROUND_HALF_UP
-            )
+            values["turnover_kes"] = rounded
             values["turnover_estimated"] = True
     return codes
 
@@ -1152,22 +1233,22 @@ async def _reconcile_flows(
 ) -> ValidationOutcome[TabularRecord]:
     """Reject flows for ``(ticker, trade_date)`` keys that have no price row.
 
-    The stored keys are selected by ticker within the file's date range, which avoids an ``IN``
-    list of every key in the file.
+    Exactly the file's keys are looked up, joined as typed ``VALUES`` lists of at most 5,000
+    keys, so a file with widely separated dates never reads the sessions between them.
     """
     keys = [
         (_required_text(record.values, "ticker"), _required_date(record.values, "trade_date"))
         for record in records
     ]
-    tickers = sorted({ticker for ticker, _ in keys})
-    first = min(trade_date for _, trade_date in keys)
-    last = max(trade_date for _, trade_date in keys)
     existing: set[tuple[str, date]] = set()
-    for chunk in _chunks(tickers):
+    for requested in _key_batches(sorted(set(keys)), ticker=String(), trade_date=Date()):
         result = await conn.execute(
-            select(TerminalDailyPrice.ticker, TerminalDailyPrice.trade_date).where(
-                TerminalDailyPrice.ticker.in_(chunk),
-                TerminalDailyPrice.trade_date.between(first, last),
+            select(TerminalDailyPrice.ticker, TerminalDailyPrice.trade_date).join(
+                requested,
+                and_(
+                    TerminalDailyPrice.ticker == requested.c.ticker,
+                    TerminalDailyPrice.trade_date == requested.c.trade_date,
+                ),
             )
         )
         existing.update((ticker, trade_date) for ticker, trade_date in result.tuples())

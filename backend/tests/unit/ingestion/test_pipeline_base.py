@@ -907,6 +907,13 @@ def test_normalize_header(text: str, expected: str) -> None:
         pytest.param("5.", True, "5", id="trailing-point"),
         pytest.param("1.5E-2", True, "0.015", id="exponent"),
         pytest.param("1e3", True, "1E+3", id="lowercase-exponent"),
+        pytest.param("(1e1000000)", True, "-1E+1000000", id="parentheses-beyond-context-exponent"),
+        pytest.param(
+            "(1234567890123456789012345678901234.5)",
+            True,
+            "-1234567890123456789012345678901234.5",
+            id="parentheses-beyond-28-digits",
+        ),
     ],
 )
 def test_parse_decimal_text_returns_the_exact_decimal(
@@ -963,6 +970,14 @@ def test_parse_decimal_text_returns_none_for_blanks_and_non_numbers(
 
 def test_parse_decimal_text_reads_parentheses_as_negative_by_default() -> None:
     assert parse_decimal_text("(2,500)") == Decimal("-2500")
+
+
+@pytest.mark.parametrize("text", ["(0)", "(0.00)"])
+def test_parse_decimal_text_keeps_a_parenthesized_zero_positive(text: str) -> None:
+    result = parse_decimal_text(text)
+    assert result == Decimal(0)
+    assert result is not None
+    assert not result.is_signed()
 
 
 # --- dedupe_by_key --------------------------------------------------------------------------

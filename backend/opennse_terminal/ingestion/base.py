@@ -550,7 +550,9 @@ def parse_decimal_text(text: str | None, *, parentheses_negative: bool = True) -
         value = Decimal(cleaned)
     except InvalidOperation:
         return None
-    return -value if negative else value
+    # copy_negate is exact: unlike unary minus it never rounds to the context's precision or
+    # overflows its exponent range. A zero is left as is, so "(0)" stays a positive zero.
+    return value.copy_negate() if negative and not value.is_zero() else value
 
 
 def dedupe_by_key(
