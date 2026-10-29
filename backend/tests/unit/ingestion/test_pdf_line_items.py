@@ -20,6 +20,7 @@ import pytest
 from pdfplumber.utils.exceptions import PdfminerException
 
 from helpers.pdf_builder import Page, StatementRow, TextCell, build_pdf, statement_page, text_page
+from opennse_terminal.ingestion.files import pdf_line_items
 from opennse_terminal.ingestion.files.pdf_line_items import (
     LINE_ITEMS,
     Candidate,
@@ -625,6 +626,47 @@ def test_malformed_number_is_offered_as_a_candidate(
     assert revenue.candidates[0] == Candidate("Revenue", 1, "(1,234", None)
 
 
+def test_each_header_row_is_built_once_for_the_lines_below_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Column evidence is computed once per page: each header row is built once and shared by
+    # every line below it up to the next header row, never searched for or rebuilt per matched
+    # line. The lower header row reverses the years, so a lower row read against the upper
+    # header would give 1,100 instead of 1,234 and make the item ambiguous.
+    build_header = pdf_line_items._build_header
+    built: list[int] = []
+
+    def counting_build_header(
+        lines: Sequence[pdf_line_items._Line], index: int
+    ) -> pdf_line_items._Header:
+        built.append(index)
+        return build_header(lines, index)
+
+    monkeypatch.setattr(pdf_line_items, "_build_header", counting_build_header)
+    upper = statement_page(
+        title=INCOME_TITLE,
+        scale_note=THOUSANDS,
+        columns=YEAR_COLS,
+        rows=[row("Revenue", "1,234", "1,100")] * 20,
+    )
+    # The upper section takes 23 lines of 16 pt from 780 (title, scale note, header row and 20
+    # rows), so the lower one starts on the next line, at 412.
+    lower = statement_page(
+        title="Continuing operations",
+        scale_note=None,
+        columns=PRIOR_FIRST_COLS,
+        rows=[row("Revenue", "1,100", "1,234")] * 20,
+        top=412.0,
+    )
+    result = extract(Page((*upper.cells, *lower.cells)), items=["revenue"])
+
+    revenue = only_item(result)
+    assert revenue.status == "found"
+    assert revenue.value == Decimal("1234000")
+    # Line 2 is the upper header row; line 24 the lower one, after the heading on line 23.
+    assert built == [2, 24]
+
+
 # ---------------------------------------------------------------------------------------------
 # Labels and statement pages
 # ---------------------------------------------------------------------------------------------
@@ -1183,6 +1225,101 @@ def test_ebitda_with_an_ambiguous_part_is_ambiguous(
     assert ebitda.matched_label == label
     assert ebitda.derivation == []
     assert raw_candidates(ebitda) == candidates
+
+
+OPERATING_PROFIT = row("Operating profit", "6", "400,000", "350,000")
+
+
+@pytest.mark.parametrize(
+    ("income_rows", "cash_flow_rows", "label", "candidates"),
+    [
+        (
+            [OPERATING_PROFIT],
+            [
+                row("Depreciation of equipment", "", "10,000", "9,000"),
+                row("Depreciation of buildings", "", "10,000", "8,000"),
+            ],
+            "Depreciation of equipment",
+            [
+                Candidate("Depreciation of equipment", 2, "10,000", Decimal("10000000")),
+                Candidate("Depreciation of buildings", 2, "10,000", Decimal("10000000")),
+            ],
+        ),
+        (
+            [OPERATING_PROFIT],
+            [
+                row("Depreciation of equipment", "", "40,000", "35,000"),
+                row("Amortisation of software", "", "5,000", "4,000"),
+                row("Amortisation of licences", "", "5,000", "4,500"),
+            ],
+            "Amortisation of software",
+            [
+                Candidate("Amortisation of software", 2, "5,000", Decimal("5000000")),
+                Candidate("Amortisation of licences", 2, "5,000", Decimal("5000000")),
+            ],
+        ),
+        (
+            [OPERATING_PROFIT, row("Depreciation of buildings", "7", "10,000", "8,000")],
+            [row("Depreciation of equipment", "", "10,000", "9,000")],
+            "Depreciation of equipment",
+            [
+                Candidate("Depreciation of equipment", 2, "10,000", Decimal("10000000")),
+                Candidate("Depreciation of buildings", 1, "10,000", Decimal("10000000")),
+            ],
+        ),
+        (
+            [OPERATING_PROFIT],
+            [
+                row("Depreciation", "", "10,000", "9,000"),
+                row("Depreciation", "", "10,000", "8,000"),
+            ],
+            "Depreciation",
+            [
+                Candidate("Depreciation", 2, "10,000", Decimal("10000000")),
+                Candidate("Depreciation", 2, "10,000", Decimal("10000000")),
+            ],
+        ),
+    ],
+    ids=[
+        "two_depreciation_lines",
+        "two_amortisation_lines",
+        "depreciation_lines_on_two_statements",
+        "same_label_twice_on_one_page",
+    ],
+)
+def test_ebitda_with_distinct_d_and_a_components_is_ambiguous(
+    income_rows: list[StatementRow],
+    cash_flow_rows: list[StatementRow],
+    label: str,
+    candidates: list[Candidate],
+) -> None:
+    # Equal amounts do not make distinct component lines one figure: without a combined
+    # "depreciation and amortisation" line their total is not established, so nothing commits.
+    result = extract(income_page(income_rows), cashflow_page(cash_flow_rows), items=["ebitda"])
+
+    ebitda = only_item(result)
+    assert ebitda.status == "ambiguous"
+    assert ebitda.value is None
+    assert ebitda.raw_value is None
+    assert ebitda.matched_label == label
+    assert ebitda.derivation == []
+    assert ebitda.candidates == candidates
+
+
+def test_ebitda_depreciation_repeated_on_two_statements_is_one_part() -> None:
+    result = extract(
+        income_page([OPERATING_PROFIT, row("Depreciation", "7", "40,000", "35,000")]),
+        cashflow_page([row("Depreciation", "", "40,000", "35,000")]),
+        items=["ebitda"],
+    )
+
+    ebitda = only_item(result)
+    assert ebitda.status == "derived"
+    assert ebitda.value == Decimal("440000000")
+    assert ebitda.derivation == [
+        DerivationPart("Operating profit", 1, Decimal("400000000")),
+        DerivationPart("Depreciation", 2, Decimal("40000000")),
+    ]
 
 
 # ---------------------------------------------------------------------------------------------

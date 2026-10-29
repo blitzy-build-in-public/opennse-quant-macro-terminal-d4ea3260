@@ -441,13 +441,15 @@ _ENTITY_ONLY_HEADER: Final = _Header(columns=(), entity_only=True)
 @dataclass(frozen=True, slots=True)
 class _Page:
     """A page's lines and its statement kind, own scale marker and USD marker; ``scale`` is the
-    marker, or the document's inherited scale."""
+    marker, or the document's inherited scale. ``headers[i]`` is the column evidence for line
+    ``i`` (see :func:`_page_headers`), computed once per page so a match looks it up in O(1)."""
 
     number: int
     lines: tuple[_Line, ...]
     kind: _StatementKind | None
     marker_scale: int | None
     has_usd: bool
+    headers: tuple[_Header | None, ...]
     scale: int = 1
 
 
@@ -745,7 +747,8 @@ def _scale_marker(region: Sequence[_Line]) -> int | None:
 
 
 def _analyse_page(page_number: int, words: Sequence[_Word]) -> _Page:
-    """Lines, statement kind, scale marker and USD marker of one page."""
+    """Lines, statement kind, scale marker, USD marker and per-line column evidence of one
+    page; the column evidence takes one forward pass over the lines."""
     lines = _lines(page_number, words)
     region = _header_region(lines)
     return _Page(
@@ -754,6 +757,7 @@ def _analyse_page(page_number: int, words: Sequence[_Word]) -> _Page:
         kind=_classify_page(lines),
         marker_scale=_scale_marker(region),
         has_usd=any(_USD_RE.search(line.text) is not None for line in region),
+        headers=_page_headers(lines),
     )
 
 
@@ -768,13 +772,15 @@ def _overlaps(a_x0: float, a_x1: float, b_x0: float, b_x1: float) -> bool:
 
 
 def _centre(word: _Word) -> float:
+    """The x-centre of ``word`` in points: layout geometry only, never part of an amount."""
     return (word.x0 + word.x1) / 2
 
 
-def _context_line(page: _Page, index: int) -> _Line | None:
-    """The line at ``index`` when it exists and holds only entity, note and unit words."""
-    if 0 <= index < len(page.lines) and page.lines[index].is_context:
-        return page.lines[index]
+def _context_line(lines: Sequence[_Line], index: int) -> _Line | None:
+    """The page line at ``index`` when it exists and holds only entity, note and unit words;
+    ``None`` otherwise, including an ``index`` outside the page. Constant time."""
+    if 0 <= index < len(lines) and lines[index].is_context:
+        return lines[index]
     return None
 
 
@@ -812,13 +818,14 @@ def _column_hints(column: _Word, lines: Sequence[_Line]) -> tuple[str, ...]:
     return tuple(hints)
 
 
-def _build_header(page: _Page, index: int) -> _Header:
-    """Columns of the header row at ``index``: one per period token, plus a Note column per
-    note token on the row or its context lines. Entity tokens come from the row itself and the
-    context line directly above it."""
-    line = page.lines[index]
-    above = _context_line(page, index - 1)
-    below = _context_line(page, index + 1)
+def _build_header(lines: Sequence[_Line], index: int) -> _Header:
+    """Columns of the page's header row ``lines[index]``: one per period token, plus a Note
+    column per note token on the row or its context lines. Entity tokens come from the row
+    itself and the context line directly above it. Only the row and its two neighbouring lines
+    are read, so the cost does not grow with the page's line count."""
+    line = lines[index]
+    above = _context_line(lines, index - 1)
+    below = _context_line(lines, index + 1)
     context = tuple(item for item in (above, line, below) if item is not None)
     same_entities = [word for word in line.words if word.norm in _ENTITY_WORDS]
     above_entities = (
@@ -861,17 +868,32 @@ def _build_header(page: _Page, index: int) -> _Header:
     return _Header(columns=tuple(columns))
 
 
+def _page_headers(lines: Sequence[_Line]) -> tuple[_Header | None, ...]:
+    """Column evidence for every line of a page, in one forward pass.
+
+    Entry ``i`` comes from the nearest line above line ``i`` that is a column-header row or a
+    Group-and-Company line without periods: the header built from that row, or the entity-only
+    header for such a line; ``None`` when neither lies above. Each header row is built once and
+    the same :class:`_Header` is shared by every line up to the next such line, so the work is
+    linear in the page's lines however many of them match an item.
+    """
+    headers: list[_Header | None] = []
+    current: _Header | None = None
+    for index, line in enumerate(lines):
+        headers.append(current)
+        if line.is_header:
+            current = _build_header(lines, index)
+        elif line.is_entity_conflict:
+            current = _ENTITY_ONLY_HEADER
+    return tuple(headers)
+
+
 def _header_row(page: _Page, index: int) -> _Header | None:
     """Column evidence for the line at ``index``: the nearest column-header row above it on the
     same page. A Group-and-Company line without periods met first yields the entity-only
-    header; ``None`` means the page has no header row above the line."""
-    for above in range(index - 1, -1, -1):
-        candidate = page.lines[above]
-        if candidate.is_header:
-            return _build_header(page, above)
-        if candidate.is_entity_conflict:
-            return _ENTITY_ONLY_HEADER
-    return None
+    header; ``None`` means the page has no header row above the line. A constant-time lookup
+    in the page's precomputed :attr:`_Page.headers`."""
+    return page.headers[index]
 
 
 def _choose_column(columns: Sequence[_Column], period_year: int | None) -> _Column | None:
@@ -955,6 +977,8 @@ def _select_value(document: _Document, page: _Page, index: int) -> _Reading:
 
 
 def _money_scale(reading: _Reading) -> int:
+    """Multiplier of a monetary reading: its page's scale (the page's own marker, else the
+    document's inherited scale)."""
     return reading.scale
 
 
@@ -998,6 +1022,8 @@ _SHARES: Final = _Valuation(scale_of=_share_scale, value_of=_share_value)
 
 
 def _reading_value(reading: _Reading, valuation: _Valuation) -> Decimal | None:
+    """The item's value of ``reading`` under ``valuation``, after scaling; ``None`` when the line
+    was not read or its amount is not a valid value for the item."""
     if reading.amount is None:
         return None
     return valuation.value_of(reading, reading.amount)
@@ -1070,11 +1096,12 @@ def _is_candidate_line(line: _Line, *, monetary: bool) -> bool:
     return not (monetary and "per share" in line.norm_label)
 
 
-def _match_item(
-    document: _Document, spec: _ItemSpec, valuation: _Valuation, *, monetary: bool = True
-) -> _Outcome | None:
-    """Search an item's pages pattern by pattern; the highest-priority pattern with any match
-    decides it through :func:`_resolve`. ``None`` when no pattern matches."""
+def _match_readings(
+    document: _Document, spec: _ItemSpec, *, monetary: bool = True
+) -> tuple[list[_Reading], int | None]:
+    """Search an item's pages pattern by pattern: the readings of every candidate line matched
+    by the highest-priority pattern with any match, in search-page then line order, and the
+    item's primary statement page. The list is empty when no pattern matches."""
     pages, primary = _search_pages(document, spec.kinds)
     for pattern in spec.patterns:
         readings = [
@@ -1085,8 +1112,19 @@ def _match_item(
             and pattern.fullmatch(line.norm_label) is not None
         ]
         if readings:
-            return _resolve(readings, primary, valuation)
-    return None
+            return readings, primary
+    return [], primary
+
+
+def _match_item(
+    document: _Document, spec: _ItemSpec, valuation: _Valuation, *, monetary: bool = True
+) -> _Outcome | None:
+    """Search an item's pages pattern by pattern; the highest-priority pattern with any match
+    decides it through :func:`_resolve`. ``None`` when no pattern matches."""
+    readings, primary = _match_readings(document, spec, monetary=monetary)
+    if not readings:
+        return None
+    return _resolve(readings, primary, valuation)
 
 
 def _combine(outcomes: Sequence[_Outcome], primary_page: int | None) -> _Outcome:
@@ -1195,17 +1233,41 @@ def _debt_rule(document: _Document) -> _Outcome | None:
     return _combine(outcomes, primary)
 
 
+def _da_component(document: _Document, spec: _ItemSpec) -> _Outcome | None:
+    """One D&A component, ``_DEPRECIATION`` or ``_AMORTISATION``, for the fallback of
+    :func:`_depreciation_and_amortisation`: its matches settled by :func:`_resolve`, except that
+    distinct component lines are never merged.
+
+    More than one distinct label, or more than one matched line on one page, is ``ambiguous``
+    even when the amounts agree, keeping :func:`_resolve`'s reported line and candidates, since
+    only an explicit combined line establishes their total. One label printed once on each of
+    several pages with equal values (the same aggregate on the income statement and the
+    statement of cash flows) stays ``found``. ``None`` when no line matches.
+    """
+    readings, primary = _match_readings(document, spec)
+    if not readings:
+        return None
+    outcome = _resolve(readings, primary, _MONEY)
+    labels = {reading.norm_label for reading in readings}
+    pages = [reading.page_number for reading in readings]
+    if len(labels) > 1 or len(set(pages)) < len(pages):
+        return replace(outcome, status="ambiguous")
+    return outcome
+
+
 def _depreciation_and_amortisation(document: _Document) -> list[_Outcome] | None:
     """D&A from the cash-flow or income-statement pages: a combined "depreciation and
-    amortisation" line, otherwise one "depreciation ..." line plus at most one "amortisation
-    ..." line. ``None`` when no depreciation is found."""
+    amortisation" line (the explicit total, settled by :func:`_resolve`), otherwise exactly one
+    "depreciation ..." line plus at most one "amortisation ..." line, each settled by
+    :func:`_da_component`, so distinct component lines are ambiguous, never merged or summed.
+    ``None`` when no depreciation is found."""
     combined = _match_item(document, _DA_COMBINED, _MONEY)
     if combined is not None:
         return [combined]
-    depreciation = _match_item(document, _DEPRECIATION, _MONEY)
+    depreciation = _da_component(document, _DEPRECIATION)
     if depreciation is None:
         return None
-    amortisation = _match_item(document, _AMORTISATION, _MONEY)
+    amortisation = _da_component(document, _AMORTISATION)
     return [depreciation] if amortisation is None else [depreciation, amortisation]
 
 
@@ -1245,6 +1307,8 @@ def _derive_ebitda(document: _Document) -> _Outcome | None:
 
 
 def _not_found(name: str, unit: ItemUnit) -> ExtractedLineItem:
+    """The ``not_found`` item ``name`` in ``unit``: value, raw value, scale, page and label
+    ``None``, and ``derivation`` and ``candidates`` empty."""
     return ExtractedLineItem(item=name, status="not_found", value=None, unit=unit)
 
 
@@ -1331,6 +1395,8 @@ def _filing_status(items: Sequence[ExtractedLineItem]) -> FilingStatus:
 
 
 def _log_result(result: ExtractionResult) -> None:
+    """Log the INFO extraction summary: page count, found-or-derived, ambiguous and missing item
+    counts, detected scale, currency and status. Never the PDF bytes; no file hash is known here."""
     found = sum(1 for item in result.items if item.status in ("found", "derived"))
     ambiguous = sum(1 for item in result.items if item.status == "ambiguous")
     logger.info(
