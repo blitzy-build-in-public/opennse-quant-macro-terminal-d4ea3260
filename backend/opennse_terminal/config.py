@@ -159,6 +159,15 @@ class TerminalSettings(BaseSettings):
             )
         return value
 
+    @field_validator("default_owner_key")
+    @classmethod
+    def _refuse_nul_in_owner_key(cls, value: str) -> str:
+        # PostgreSQL text cannot hold NUL, and api.deps.TerminalPrincipal refuses such a subject,
+        # so the default principal built from this value could never be constructed.
+        if "\x00" in value:
+            raise ValueError("default_owner_key must not contain a NUL character")
+        return value
+
     @field_validator("timezone")
     @classmethod
     def _require_known_timezone(cls, value: str) -> str:

@@ -42,6 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from opennse_terminal.models import TerminalEquity, TerminalWatchlist, TerminalWatchlistItem
+from opennse_terminal.models.watchlists import OWNER_KEY_MAX_LENGTH
 from opennse_terminal.schemas.common import ErrorDetail
 from opennse_terminal.schemas.watchlists import Watchlist, WatchlistCreate
 
@@ -115,6 +116,27 @@ def _unknown_item_ticker(ticker: str) -> HTTPException:
         f"Ticker {ticker!r} is not a known equity.",
         "ticker",
     )
+
+
+def _require_storable_subject(principal: OwnerPrincipal) -> None:
+    """Refuse a ``principal.subject`` that ``terminal_watchlists.owner_key`` cannot store.
+
+    The owner key holds 1 to ``OWNER_KEY_MAX_LENGTH`` characters and, like all PostgreSQL text,
+    no NUL character. ``api.deps.TerminalPrincipal`` already refuses any other subject, but a host
+    override may return its own object, so the write checks again rather than letting the
+    database reject the row with an uncoded driver error. A violation is a broken host contract,
+    not a client error: ``TypeError`` for a non-``str`` subject, ``ValueError`` otherwise. The
+    message never repeats the subject.
+    """
+    subject = principal.subject
+    if not isinstance(subject, str):
+        raise TypeError(f"principal.subject must be a str, got {type(subject).__name__}")
+    if not 1 <= len(subject) <= OWNER_KEY_MAX_LENGTH:
+        raise ValueError(
+            f"principal.subject must be 1-{OWNER_KEY_MAX_LENGTH} characters, got {len(subject)}"
+        )
+    if "\x00" in subject:
+        raise ValueError("principal.subject must not contain a NUL character")
 
 
 def _normalise_ticker(ticker: str) -> str:
@@ -286,6 +308,10 @@ async def create_watchlist(
 
     Tickers are trimmed, upper-cased and de-duplicated. Errors, checked in this order:
 
+    * ``ValueError``, before any query, when ``principal.subject`` cannot be stored as
+      ``owner_key``: empty, longer than ``OWNER_KEY_MAX_LENGTH`` (255) characters, or containing
+      a NUL character (``TypeError`` when it is not a ``str``). This is a broken host principal
+      contract, not a client error, so it is not a coded ``HTTPException``;
     * 422 ``unknown_ticker`` (``field="tickers"``) naming every ticker absent from
       ``terminal_equities``;
     * 409 ``watchlist_name_taken`` (``field="name"``) when ``principal`` already owns a list of
@@ -293,6 +319,7 @@ async def create_watchlist(
 
     Not idempotent: repeating the request gives 409. The route answers 201 with the result.
     """
+    _require_storable_subject(principal)
     tickers = _normalise_tickers(body.tickers)
     unknown = await _unknown_tickers(session, tickers)
     if unknown:

@@ -12,13 +12,18 @@ or auth table and declares no foreign key to any host table, so authentication s
 
 import uuid
 from datetime import datetime
+from typing import Final
 
 from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from opennse_terminal.db.base import TerminalBase
 
-__all__ = ["TerminalWatchlist", "TerminalWatchlistItem"]
+__all__ = ["OWNER_KEY_MAX_LENGTH", "TerminalWatchlist", "TerminalWatchlistItem"]
+
+OWNER_KEY_MAX_LENGTH: Final = 255
+"""Longest principal subject ``terminal_watchlists.owner_key`` (``VARCHAR(255)``) can store, in
+characters; the watchlist service refuses a longer subject before writing."""
 
 
 class TerminalWatchlistItem(TerminalBase):
@@ -80,7 +85,7 @@ class TerminalWatchlist(TerminalBase):
     __table_args__ = (UniqueConstraint("owner_key", "name"),)
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    owner_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    owner_key: Mapped[str] = mapped_column(String(OWNER_KEY_MAX_LENGTH), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
