@@ -23,6 +23,7 @@ import httpx
 import pytest
 import respx
 
+import opennse_terminal
 from opennse_terminal.config import TerminalSettings
 from opennse_terminal.ingestion import http as polite_http
 from opennse_terminal.ingestion.base import FetchFailed, RobotsDisallowed
@@ -53,30 +54,13 @@ RATES_PAGE_URL = f"{CBK}/statistics/interest-rates/"
 CSV_URL = f"{CBK}/uploads/interest_rates/central_bank_rates.csv"
 PDF_URL = f"{CBK}/uploads/weekly_bulletin/weekly_bulletin.pdf"
 
-ALLOW_ALL = "User-agent: *\nAllow: /\n"
+# The public NSE and CBK sites' own robots.txt: every path allowed except the CMS admin area.
+ALLOW_ALL = "User-agent: *\nDisallow: /wp-admin/\n"
 MIB = 1024 * 1024
 MIB_CHUNK = b"\0" * MIB
 ATTEMPTS_WITH_THREE_RETRIES = 4
 
-
-def make_settings(**overrides: Any) -> TerminalSettings:
-    """Hermetic settings: no ``.env`` file and every field explicit, so the ``TERMINAL_*``
-    variables of the process environment cannot leak in (keyword arguments win over them)."""
-    fields: dict[str, Any] = {
-        "database_url": "postgresql+asyncpg://opennse:opennse@localhost:5432/opennse_test",
-        "default_owner_key": "local",
-        "timezone": "Africa/Nairobi",
-        "fundamentals_lag_days": 90,
-        "scraper_contact": "tests@example.invalid",
-        "scraper_min_interval_seconds": 2.0,
-        "scraper_timeout_seconds": 30,
-        "scraper_max_retries": 3,
-        "pdf_max_bytes": 20971520,
-        "pdf_max_pages": 400,
-        "pdf_max_concurrency": 2,
-    }
-    fields.update(overrides)
-    return TerminalSettings(_env_file=None, **fields)
+SettingsFactory = Callable[..., TerminalSettings]
 
 
 class FakeClock:
@@ -104,6 +88,10 @@ class FakeSleep:
         self.delays.append(seconds)
         self.clock.advance(seconds)
         await asyncio.sleep(0)
+
+    def reset(self) -> None:
+        """Forget the waits recorded so far, so a test can isolate the ones that follow."""
+        self.delays.clear()
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,9 +163,11 @@ def network(clock: FakeClock) -> FakeNetwork:
 
 
 @pytest.fixture
-def make_client(network: FakeNetwork, clock: FakeClock, sleep: FakeSleep) -> ClientFactory:
-    """Builds a ``PoliteClient`` on the fake network, clock and sleep; keyword arguments
-    override settings fields."""
+def make_client(
+    network: FakeNetwork, clock: FakeClock, sleep: FakeSleep, make_settings: SettingsFactory
+) -> ClientFactory:
+    """Builds a ``PoliteClient`` on the fake network, clock and sleep, with the hermetic test
+    settings; keyword arguments override settings fields."""
 
     def build(**overrides: Any) -> PoliteClient:
         return PoliteClient(
@@ -215,18 +205,19 @@ async def test_contract_constants() -> None:
     assert MAX_REDIRECTS == 5
     assert frozenset({429, 500, 502, 503, 504}) == RETRY_STATUSES
     assert 60.0 <= BACKOFF_CAP_SECONDS <= 60.0
+    assert MAX_RESPONSE_BYTES == 25 * 1024 * 1024
     assert ATTEMPT_DEADLINE_READ_TIMEOUTS == 4
     assert ROBOTS_AGENT == "OpenNSE-Terminal"
 
 
 async def test_user_agent_is_sent_on_robots_and_target_requests(
-    network: FakeNetwork, make_client: ClientFactory
+    network: FakeNetwork, make_client: ClientFactory, make_settings: SettingsFactory
 ) -> None:
     network.robots(CBK)
     network.router.get(INFLATION_URL).respond(200, text="<table></table>")
     client = make_client()
-    assert client.user_agent == USER_AGENT
-    assert build_user_agent(make_settings()) == USER_AGENT
+    expected = f"OpenNSE-Terminal/{opennse_terminal.__version__} (+mailto:tests@example.invalid)"
+    assert client.user_agent == build_user_agent(make_settings()) == expected == USER_AGENT
 
     async with client as http:
         await http.get_text(INFLATION_URL)
@@ -328,6 +319,23 @@ async def test_requests_to_one_host_start_at_least_the_min_interval_apart(
     assert all(0 < delay <= interval for delay in sleep.delays)
 
 
+async def test_spacing_waits_only_the_rest_of_the_interval(
+    network: FakeNetwork, make_client: ClientFactory, clock: FakeClock, sleep: FakeSleep
+) -> None:
+    network.robots(CBK)
+    network.router.get(INFLATION_URL).respond(200, text="a")
+    async with make_client(scraper_min_interval_seconds=2.0) as http:
+        await http.ensure_allowed(INFLATION_URL)
+        clock.advance(0.5)
+        await http.get_text(INFLATION_URL)
+
+    assert network.urls() == [CBK_ROBOTS, INFLATION_URL]
+    assert len(sleep.delays) == 1
+    assert 1.5 - 1e-9 <= sleep.delays[0] <= 1.5 + 1e-9
+    robots_at, page_at = network.starts()
+    assert page_at - robots_at >= 2.0
+
+
 async def test_another_host_is_not_delayed_by_spacing(
     network: FakeNetwork, make_client: ClientFactory, sleep: FakeSleep
 ) -> None:
@@ -372,7 +380,7 @@ async def test_concurrent_fetches_share_one_robots_request_and_stay_spaced(
     async with make_client() as http:
         texts = await asyncio.gather(http.get_text(INFLATION_URL), http.get_text(BONDS_URL))
 
-    assert texts == ["inflation", "bonds"]
+    assert list(texts) == ["inflation", "bonds"]
     assert robots.call_count == 1
     starts = sorted(network.starts())
     assert len(starts) == 3
@@ -414,17 +422,25 @@ async def test_reopened_client_rereads_robots_but_keeps_spacing(
     ],
 )
 async def test_transient_failure_is_retried_three_times_then_fails(
-    failure: object,
+    failure: httpx.Response | type[httpx.TransportError],
     reason: str,
     network: FakeNetwork,
     make_client: ClientFactory,
+    clock: FakeClock,
     sleep: FakeSleep,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     network.robots(CBK)
-    page = network.router.get(INFLATION_URL).mock(side_effect=failure)
+    page = network.router.get(INFLATION_URL).mock(
+        side_effect=[failure] * ATTEMPTS_WITH_THREE_RETRIES
+    )
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        async with make_client(scraper_min_interval_seconds=0.0) as http:
+        # Default 2.0 s spacing: with robots.txt read and its spacing long past, every wait that
+        # follows is a backoff, each of which already outlasts the spacing.
+        async with make_client() as http:
+            await http.ensure_allowed(INFLATION_URL)
+            clock.advance(10.0)
+            sleep.reset()
             with pytest.raises(FetchFailed) as caught:
                 await http.fetch(INFLATION_URL)
 

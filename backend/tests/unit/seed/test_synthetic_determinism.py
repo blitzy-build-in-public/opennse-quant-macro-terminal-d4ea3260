@@ -19,14 +19,17 @@ import hashlib
 import os
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
-from dataclasses import replace
+from calendar import monthrange
+from collections import Counter
+from collections.abc import Callable, Hashable, Sequence
+from dataclasses import fields, replace
 from datetime import date, timedelta
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, localcontext
 from statistics import mean
 
 import pytest
 
+from opennse_terminal.config import DEFAULT_CURRENCY, MAX_SHARE_COUNT, TerminalSettings
 from opennse_terminal.quant.numeric import quantize_out
 from opennse_terminal.quant.zscore import Observation, is_spike, rolling_zscores
 from opennse_terminal.seed import reference_data as ref
@@ -36,9 +39,12 @@ from opennse_terminal.seed.synthetic import (
     EXPECTED_MACRO_ROWS,
     EXPECTED_PRICE_ROWS,
     EXPECTED_SESSIONS,
+    SeedBondRow,
     SeedDataset,
+    SeedFundamentalRow,
     SeedMacroRow,
     SeedPriceRow,
+    SeedWatchlist,
     add_years,
     canonical_bytes,
     dataset_fingerprint,
@@ -151,6 +157,120 @@ COMPLETED_CYCLES = [
     ("2017 Cycle", date(2017, 8, 8)),
     ("2022 Cycle", date(2022, 8, 9)),
 ]
+ALL_CYCLES = [*COMPLETED_CYCLES, ("2027 Election Watch", date(2027, 8, 10))]
+
+# The Quickmart preset's risk scenarios, split at the first colon; the dashes are U+2013.
+RISK_SCENARIOS = [
+    {
+        "title": "Ownership & Motive",
+        "description": "50% secondary exit with zero primary capital injection into Quickmart.",
+    },
+    {
+        "title": "Growth Financing",
+        "description": (
+            "Future store expansion must rely on retained earnings, supplier credit, or "
+            "bank debt rather than IPO cash."
+        ),
+    },
+    {
+        "title": "Valuation Floor",
+        "description": (
+            "Test whether KES 7.50 per share is justified under varying WACC (16%\u201320%), "
+            "thin supermarket operating margins (3%\u20136%), and working-capital stress "
+            "scenarios."
+        ),
+    },
+]
+
+# Target P/E and P/B of each counter's latest FY row at its anchor market cap, at 2 dp.
+TARGET_MULTIPLES = [
+    ("SCOM", "14.00", "4.50"),
+    ("EQTY", "4.50", "0.90"),
+    ("KCB", "4.00", "0.80"),
+    ("EABL", "12.00", "5.00"),
+    ("KEGN", "6.00", "0.40"),
+    ("COOP", "4.00", "0.80"),
+    ("ABSA", "5.50", "1.30"),
+    ("SBIC", "6.00", "1.00"),
+]
+
+# The terminal_ table each record type fills and its columns, less the database-assigned ones
+# (``id``, timestamps, ``ingestion_run_id``, ``filing_id``). The watchlist record holds the
+# ``terminal_watchlists.name`` and the tickers of its items; ``owner_key`` is the opaque principal
+# subject the seeder assigns, never a user record.
+RECORD_COLUMNS = [
+    (
+        "terminal_daily_prices",
+        SeedPriceRow,
+        {
+            "ticker",
+            "trade_date",
+            "open_price",
+            "high_price",
+            "low_price",
+            "close_price",
+            "volume",
+            "turnover_kes",
+            "turnover_estimated",
+            "foreign_net_flow_kes",
+            "source",
+            "flow_source",
+        },
+    ),
+    (
+        "terminal_fundamentals",
+        SeedFundamentalRow,
+        {
+            "ticker",
+            "period_end_date",
+            "period_type",
+            "revenue_kes",
+            "ebitda_kes",
+            "net_income_kes",
+            "total_assets_kes",
+            "total_equity_kes",
+            "total_debt_kes",
+            "cash_and_equivalents_kes",
+            "operating_cash_flow_kes",
+            "dps_kes",
+            "shares_outstanding",
+            "currency",
+            "source_by_field",
+        },
+    ),
+    (
+        "terminal_macro_indicators",
+        SeedMacroRow,
+        {
+            "observation_date",
+            "inflation_yoy_pct",
+            "cbr_rate_pct",
+            "interbank_rate_pct",
+            "tbill_91d_pct",
+            "tbill_182d_pct",
+            "tbill_364d_pct",
+            "fx_kes_usd",
+            "fx_reserves_usd_m",
+            "source_by_field",
+        },
+    ),
+    (
+        "terminal_bond_yields",
+        SeedBondRow,
+        {
+            "observation_date",
+            "bond_code",
+            "isin",
+            "original_tenor_years",
+            "remaining_tenor_years",
+            "maturity_date",
+            "coupon_rate_pct",
+            "yield_pct",
+            "source",
+        },
+    ),
+    ("terminal_watchlists", SeedWatchlist, {"name", "tickers"}),
+]
 
 # Columns banks leave NULL: EBITDA and enterprise value are not meaningful for deposit funding.
 BANK_NULL_COLUMNS = (
@@ -216,9 +336,21 @@ def test_generate_all_is_byte_identical_across_runs_and_caller_contexts(
         context.prec = 6
         context.rounding = ROUND_DOWN
         rerun = generate_all()
+    payload = canonical_bytes(dataset)
+    fingerprint = dataset_fingerprint(dataset)
 
-    assert canonical_bytes(rerun) == canonical_bytes(dataset)
-    assert dataset_fingerprint(rerun) == dataset_fingerprint(dataset)
+    assert isinstance(payload, bytes)
+    assert payload
+    assert isinstance(fingerprint, str)
+    assert fingerprint
+    assert canonical_bytes(rerun) == payload
+    assert dataset_fingerprint(rerun) == fingerprint
+
+
+def test_calendars_are_identical_on_every_call() -> None:
+    """AAP 0.8.1: the session calendar, recomputed past its cache, and the month-ends repeat."""
+    assert synthetic_sessions.__wrapped__() == synthetic_sessions() == synthetic_sessions()
+    assert month_ends() == month_ends()
 
 
 @pytest.mark.parametrize("hash_seed", ["1", "2"], ids=lambda seed: f"PYTHONHASHSEED={seed}")
@@ -289,6 +421,34 @@ def test_to_row_returns_a_detached_column_mapping(dataset: SeedDataset) -> None:
     assert record.source_by_field["inflation_yoy_pct"] == "seed"
 
 
+# Reference constants ------------------------------------------------------------------------------
+
+
+def test_reference_constants_equal_the_specified_literals() -> None:
+    """AAP 0.8.2 and 0.8.3: the generator's inputs are the specified values, so a wrong constant
+    fails here as well as in the generated rows."""
+    assert ref.ANCHOR_DATE == date(2026, 9, 30)
+    assert ref.SEED_SOURCE == "seed"
+    assert ref.BANKING_SECTOR == "Banking"
+    assert ref.TICKERS == TICKERS
+    assert dict(ref.PRICE_ANCHORS) == ANCHOR_CLOSES
+    assert sorted(ref.PLANTED_SPIKES) == sorted(PLANTED_SPIKES)
+    assert ref.SPIKE_MIN_Z == SPIKE_MIN_Z
+    assert dict(ref.MACRO_ANCHOR) == ANCHOR_MACRO
+    assert dict(ref.MACRO_BOUNDS) == MACRO_BOUNDS
+    assert dict(ref.BOND_TENOR_SPREADS) == BOND_SPREADS
+    assert ref.BOND_CODE_PREFIX == "FXD-SEED-"
+    assert ref.SEED_WATCHLIST_NAME == "NSE Core 8"
+    assert [(cycle.label, cycle.event_date) for cycle in ref.CYCLES] == ALL_CYCLES
+    assert [dict(scenario) for scenario in ref.QUICKMART_RISK_SCENARIOS] == RISK_SCENARIOS
+    assert [
+        (equity.ticker, equity.company_name, equity.sector, equity.shares_outstanding)
+        for equity in ref.EQUITIES
+    ] == [record[:4] for record in EQUITY_RECORDS]
+    assert DEFAULT_CURRENCY == "KES"
+    assert MAX_SHARE_COUNT == 1_000_000_000_000
+
+
 # Row counts and calendar --------------------------------------------------------------------------
 
 
@@ -309,6 +469,54 @@ def test_row_counts(dataset: SeedDataset) -> None:
         EXPECTED_MACRO_ROWS,
         EXPECTED_BOND_ROWS,
     ) == (3_762, 30_096, 131, 177, 1_062)
+    assert len(dataset.watchlist.tickers) == 8
+
+
+def test_natural_keys_are_unique(dataset: SeedDataset) -> None:
+    """AAP 0.8.1 and 0.9.2: no two rows share the key the seeder's ``ON CONFLICT`` targets."""
+    keys: dict[str, list[Hashable]] = {
+        "terminal_daily_prices (ticker, trade_date)": [
+            (row.ticker, row.trade_date) for row in dataset.prices
+        ],
+        "terminal_fundamentals (ticker, period_end_date, period_type)": [
+            (row.ticker, row.period_end_date, row.period_type) for row in dataset.fundamentals
+        ],
+        "terminal_macro_indicators (observation_date)": [
+            row.observation_date for row in dataset.macro
+        ],
+        "terminal_bond_yields (observation_date, bond_code)": [
+            (row.observation_date, row.bond_code) for row in dataset.bonds
+        ],
+        "terminal_equities (ticker)": [row.ticker for row in dataset.equities],
+        "terminal_equities (isin)": [row.isin for row in dataset.equities],
+        "terminal_cycles (event_date)": [row.event_date for row in dataset.cycles],
+        "terminal_ipo_scenarios (company_name)": [
+            row.company_name for row in dataset.ipo_scenarios
+        ],
+        "terminal_watchlist_items (ticker)": list(dataset.watchlist.tickers),
+    }
+
+    for key, values in keys.items():
+        assert [value for value, count in Counter(values).items() if count > 1] == [], key
+
+
+@pytest.mark.parametrize(
+    ("table", "record_type", "columns"),
+    RECORD_COLUMNS,
+    ids=[table for table, _, _ in RECORD_COLUMNS],
+)
+def test_records_carry_the_terminal_table_column_names(
+    table: str, record_type: type, columns: set[str]
+) -> None:
+    """Rule 3: each record's fields are its ``terminal_`` table's column names, with no ``id``.
+
+    Equities, cycles and the IPO preset are checked column by column through :func:`to_row`.
+    """
+    names = {field.name for field in fields(record_type)}
+
+    assert names == columns, table
+    assert "id" not in names
+    assert "owner_key" not in names
 
 
 def test_synthetic_calendar_is_weekdays_minus_eight_fixed_dates() -> None:
@@ -351,9 +559,16 @@ def test_month_ends_within_a_range(start: date, end: date, expected: tuple[date,
 
 
 def test_default_month_ends_are_the_177_seeded_months() -> None:
-    """2012-01-31 to 2026-09-30, one per month."""
+    """2012-01-31 to 2026-09-30, one per month: each month's last day by ``monthrange``."""
+    expected = [
+        date(year, month, monthrange(year, month)[1])
+        for year in range(2012, 2027)
+        for month in range(1, 13)
+        if (year, month) <= (2026, 9)
+    ]
     ends = month_ends()
 
+    assert list(ends) == expected
     assert len(ends) == 177
     assert ends[0] == date(2012, 1, 31)
     assert ends[-1] == ANCHOR
@@ -428,6 +643,8 @@ def test_price_rows_follow_the_ohlc_volume_turnover_and_flow_rules(dataset: Seed
     previous: SeedPriceRow | None = None
     for row in dataset.prices:
         prices = (row.open_price, row.high_price, row.low_price, row.close_price)
+        amounts = (*prices, row.turnover_kes, row.foreign_net_flow_kes)
+        assert all(isinstance(amount, Decimal) for amount in amounts), row
         assert all(price > 0 and price.as_tuple().exponent == -2 for price in prices), row
         low_body = min(row.open_price, row.close_price)
         high_body = max(row.open_price, row.close_price)
@@ -438,8 +655,9 @@ def test_price_rows_follow_the_ohlc_volume_turnover_and_flow_rules(dataset: Seed
             gap = abs(row.open_price - previous.close_price)
             assert gap <= previous.close_price * one_pct + HALF_CENT, row
 
-        assert isinstance(row.volume, int), row
-        assert 1 <= row.volume <= 10**12, row
+        # ``type(...) is int`` rather than isinstance, which would also accept a bool.
+        assert type(row.volume) is int, row
+        assert 1 <= row.volume <= MAX_SHARE_COUNT, row
         typical = (row.high_price + row.low_price + row.close_price) / 3
         assert row.turnover_kes == half_up(row.volume * typical), row
         assert row.turnover_estimated is False, row
@@ -642,6 +860,7 @@ def test_macro_history_spans_bounds_and_orders_the_bills(dataset: SeedDataset) -
     for row in dataset.macro:
         for column, (low, high) in MACRO_BOUNDS.items():
             value = getattr(row, column)
+            assert isinstance(value, Decimal), (row.observation_date, column, value)
             assert low <= value <= high, (row.observation_date, column, value)
             assert value.as_tuple().exponent == -2, (row.observation_date, column, value)
         assert row.tbill_91d_pct <= row.tbill_182d_pct <= row.tbill_364d_pct, row
@@ -670,7 +889,10 @@ def test_bond_rows_follow_the_mock_curve_rules(dataset: SeedDataset) -> None:
         tenor = int(row.original_tenor_years)
         day = row.observation_date
         seen.setdefault(day, []).append(tenor)
+        # The FXD prefix puts the mock bond on the yield curve; SEED marks it as synthetic.
         assert row.bond_code == f"FXD-SEED-{tenor}Y-{day:%Y%m}", row
+        assert isinstance(row.yield_pct, Decimal), row
+        assert row.yield_pct > 0, row
         assert row.original_tenor_years == row.remaining_tenor_years == Decimal(tenor), row
         assert row.original_tenor_years.as_tuple().exponent == -2, row
         assert row.maturity_date == add_years(day, tenor), row
@@ -750,6 +972,42 @@ def test_banks_leave_ebitda_debt_cash_and_operating_cash_flow_null(dataset: Seed
 
         assert null_columns == (list(BANK_NULL_COLUMNS) if row.ticker in BANKS else []), row
         assert row.source_by_field == dict.fromkeys(populated, "seed"), row
+
+
+def test_fundamental_values_are_exact_decimals_in_kes(dataset: SeedDataset) -> None:
+    """Rule 4: every populated money and dividend column is a ``Decimal``, the share count an
+    ``int`` within 1..10^12, and the currency KES."""
+    amount_columns = [
+        column for column in FUNDAMENTAL_VALUE_COLUMNS if column != "shares_outstanding"
+    ]
+    for row in dataset.fundamentals:
+        assert type(row.shares_outstanding) is int, row
+        assert 1 <= row.shares_outstanding <= MAX_SHARE_COUNT, row
+        assert row.currency == DEFAULT_CURRENCY, row
+        for column in amount_columns:
+            value = getattr(row, column)
+            assert value is None or isinstance(value, Decimal), (row.ticker, column, value)
+
+
+@pytest.mark.parametrize(("ticker", "pe", "pb"), TARGET_MULTIPLES, ids=TICKERS)
+def test_latest_fundamentals_price_at_the_target_multiples(
+    dataset: SeedDataset, ticker: str, pe: str, pb: str
+) -> None:
+    """AAP 0.8.3: at the anchor market cap (2026-09-30 close x the equity's share count), the
+    latest FY row's net income and equity give the target P/E and P/B, rounded half up to 2 dp.
+
+    The latest year carries no history noise, so only the 0.01 rounding of a billions-scale net
+    income or equity separates the ratio from its target.
+    """
+    latest = max(
+        (row for row in dataset.fundamentals if row.ticker == ticker),
+        key=lambda row: row.period_end_date,
+    )
+    equity = next(row for row in dataset.equities if row.ticker == ticker)
+    market_cap = ANCHOR_CLOSES[ticker] * equity.shares_outstanding
+
+    assert half_up(market_cap / latest.net_income_kes) == Decimal(pe)
+    assert half_up(market_cap / latest.total_equity_kes) == Decimal(pb)
 
 
 @pytest.mark.parametrize(
@@ -878,6 +1136,18 @@ def test_equities_are_seeded_in_attachment_order(dataset: SeedDataset) -> None:
     assert len({row.sector for row in dataset.equities}) == 4
 
 
+def test_equity_values_carry_exact_types(dataset: SeedDataset) -> None:
+    """Rule 4: shares are an ``int`` within 0..10^12, free float a ``Decimal``, currency KES.
+
+    ``to_row`` equality cannot tell ``25.0`` or ``Decimal("25.00")`` apart, so types are checked.
+    """
+    for row in dataset.equities:
+        assert type(row.shares_outstanding) is int, row
+        assert 0 <= row.shares_outstanding <= MAX_SHARE_COUNT, row
+        assert isinstance(row.free_float_pct, Decimal), row
+        assert row.currency == DEFAULT_CURRENCY, row
+
+
 def test_quickmart_preset(dataset: SeedDataset) -> None:
     """The attachment's preset with its synthetic fills: 500,000,000 of 1,000,000,000 shares is
     the 50% secondary sale; EBITDA 2,025,000,000 on revenue 45,000,000,000 is a 4.50% margin."""
@@ -905,35 +1175,44 @@ def test_quickmart_preset(dataset: SeedDataset) -> None:
         "peer_ev_ebitda_multiple": Decimal("6.00"),
         "dcf_weight_pct": Decimal("50"),
         "forecast_years": 5,
-        "risk_scenarios": [
-            {
-                "title": "Ownership & Motive",
-                "description": (
-                    "50% secondary exit with zero primary capital injection into Quickmart."
-                ),
-            },
-            {
-                "title": "Growth Financing",
-                "description": (
-                    "Future store expansion must rely on retained earnings, supplier credit, or "
-                    "bank debt rather than IPO cash."
-                ),
-            },
-            {
-                "title": "Valuation Floor",
-                "description": (
-                    "Test whether KES 7.50 per share is justified under varying WACC (16%–20%), "
-                    "thin supermarket operating margins (3%–6%), and working-capital stress "
-                    "scenarios."
-                ),
-            },
-        ],
+        "risk_scenarios": RISK_SCENARIOS,
         "currency": "KES",
         "source": "seed",
         "is_preset": True,
     }
     assert preset.base_ebitda_kes / preset.base_revenue_kes * 100 == Decimal("4.5")
-    assert preset.shares_offered * 100 / preset.shares_outstanding_post_offer == Decimal("50")
+    # Decimal division: int / int would compute a float.
+    assert Decimal(preset.shares_offered) / preset.shares_outstanding_post_offer * 100 == (
+        preset.pct_stake_sold
+    )
+    assert preset.primary_proceeds_kes <= preset.offer_price_kes * preset.shares_offered
+    assert preset.is_preset is True
+    assert preset.currency == DEFAULT_CURRENCY
+
+
+def test_quickmart_preset_values_carry_exact_types(dataset: SeedDataset) -> None:
+    """AAP 0.8.2 and Rule 4: money, rates and multiples are ``Decimal``; counts are ``int``.
+
+    ``Decimal("7.50") == 7.5`` is true in Python, so the dict equality above cannot tell a float
+    or an int from a ``Decimal``; this checks each field's type.
+    """
+    (preset,) = dataset.ipo_scenarios
+    counts = {"shares_offered", "shares_outstanding_post_offer", "forecast_years"}
+    texts = {"company_name", "sector", "currency", "source"}
+
+    for field in fields(preset):
+        value = getattr(preset, field.name)
+        if field.name in counts:
+            assert type(value) is int, field.name
+        elif field.name in texts:
+            assert type(value) is str, field.name
+        elif field.name == "risk_scenarios":
+            assert type(value) is list, field.name
+        elif field.name == "is_preset":
+            assert value is True
+        else:
+            assert isinstance(value, Decimal), field.name
+    assert 1 <= preset.shares_offered <= preset.shares_outstanding_post_offer <= MAX_SHARE_COUNT
 
 
 def test_election_cycles(dataset: SeedDataset) -> None:
@@ -945,15 +1224,21 @@ def test_election_cycles(dataset: SeedDataset) -> None:
             "event_type": "general_election",
             "source": "seed",
         }
-        for label, event_date in [*COMPLETED_CYCLES, ("2027 Election Watch", date(2027, 8, 10))]
+        for label, event_date in ALL_CYCLES
     ]
 
 
 def test_watchlist_holds_the_eight_counters(dataset: SeedDataset) -> None:
-    """The "NSE Core 8" watchlist; the seeder assigns its owner from the default principal."""
+    """The "NSE Core 8" watchlist; the seeder assigns its owner from the default principal.
+
+    The record carries no owner (see :func:`test_records_carry_the_terminal_table_column_names`):
+    the seeder sets ``owner_key`` to ``TerminalSettings.default_owner_key``, the opaque subject
+    ``"local"`` by default, so no user record is involved.
+    """
     assert dataset.watchlist.name == "NSE Core 8"
     assert dataset.watchlist.tickers == TICKERS
     assert generate_watchlist() == dataset.watchlist
+    assert TerminalSettings.model_fields["default_owner_key"].default == "local"
 
 
 # Generator guards ---------------------------------------------------------------------------------
