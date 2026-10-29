@@ -1,5 +1,6 @@
 "use client";
 
+import { useMemo } from "react";
 import type { ReactElement } from "react";
 import {
   CartesianGrid,
@@ -91,7 +92,17 @@ const META_CLASS = "text-xs text-slate-400";
 const UPDATING_CLASS = "text-sky-300";
 const STATUS_NOTE_CLASS = "text-xs text-amber-300";
 const PARTIAL_NOTE_CLASS = "text-xs text-slate-400";
-const CHART_CLASS = "h-64 w-full";
+// Recharts' accessibility layer renders the chart as `<svg class="recharts-surface" tabindex="0">`,
+// which the keyboard reaches and navigates with the arrow keys. Recharts 3 also renders its z-index
+// layers as `<g tabindex="-1">`: Tab never reaches them, but a mouse click on plotted data focuses
+// one, and a click on bare plot area focuses the surface. The browser outlines a focused SVG
+// element even for a mouse click, and an arrow key pressed after the click makes that element
+// :focus-visible. So the layers' outline and the surface's pointer-focus outline are hidden, and
+// the widgets' sky-400 ring is drawn on the surface whenever it or a descendant is :focus-visible:
+// it appears for keyboard use and not for a mouse click. The solid style is explicit because
+// Tailwind 3's `outline-2` sets only the width.
+const CHART_CLASS =
+  "h-64 w-full [&_g[tabindex='-1']]:outline-none [&_.recharts-surface:focus:not(:focus-visible)]:outline-none [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:[outline-style:solid] [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-offset-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-sky-400";
 // The custom tooltip mirrors TOOLTIP_CONTENT_STYLE (slate-900 surface, slate-700 border, slate-300
 // text, 12px) with utility classes instead of an inline style.
 const TOOLTIP_CLASS =
@@ -259,6 +270,27 @@ function monthTick(value: unknown): string {
   return typeof value === "string" ? formatMonth(value) : "";
 }
 
+/** Fraction digits kept from a generated tick position: enough for any step a ratio axis uses. */
+const RATIO_TICK_FRACTION_DIGITS = 6;
+
+/**
+ * `YAxis` tick of the multiple axis (`4`, `12.5`, `1,234.5`, `−2`). A tick is a generated axis
+ * coordinate with no server string behind it, so it is written here as a plain decimal — at most
+ * {@link RATIO_TICK_FRACTION_DIGITS} fraction digits with trailing zeros dropped, which removes
+ * float noise such as `0.15000000000000002`, and never in exponent notation — and then grouped and
+ * signed by `formatDecimal`. The `×` unit is left to the axis label. Non-numbers give `""`.
+ */
+function formatRatioTick(value: unknown): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "";
+  // toFixed switches to exponent notation from 10^21; BigInt prints every digit of such an
+  // integral value.
+  const text =
+    Math.abs(value) >= 1e21
+      ? BigInt(Math.round(value)).toString()
+      : value.toFixed(RATIO_TICK_FRACTION_DIGITS).replace(/0+$/, "").replace(/\.$/, "");
+  return formatDecimal(text, "ratio", { unit: false });
+}
+
 /** Tooltip of the hovered week: its date and the multiple formatted from the exact string. */
 function BandsTooltip({ active, payload }: TooltipContentProps): ReactElement | null {
   const entry = payload[0];
@@ -314,7 +346,7 @@ function BandsBody({
   updating: boolean;
 }): ReactElement {
   const metricLabel = METRIC_LABELS[data.metric];
-  const rows = toRows(data.series);
+  const rows = useMemo(() => toRows(data.series), [data.series]);
   const { stats, coverage, flags } = data;
   const statusNote = statusNoteOf(data.status);
 
@@ -359,6 +391,7 @@ function BandsBody({
               />
               <YAxis
                 domain={["auto", "auto"]}
+                tickFormatter={formatRatioTick}
                 tick={AXIS_TICK}
                 stroke={CHART_COLORS.axis}
                 width={48}

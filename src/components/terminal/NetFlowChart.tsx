@@ -5,16 +5,16 @@ import type { ReactElement } from "react";
 import {
   Bar,
   CartesianGrid,
-  Cell,
   ComposedChart,
   Line,
+  Rectangle,
   ReferenceLine,
   ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
 } from "recharts";
-import type { TooltipContentProps } from "recharts";
+import type { BarShapeProps, TooltipContentProps } from "recharts";
 
 import { AXIS_TICK, CHART_COLORS } from "./lib/chartTheme";
 import {
@@ -84,7 +84,17 @@ const META_CLASS =
 const COVERAGE_CLASS = "font-medium tabular-nums text-slate-200";
 const NO_DATA_CLASS = "rounded border border-slate-800 bg-slate-950 p-3 text-sm text-slate-300";
 const FIGURE_CLASS = "m-0 flex flex-col gap-2";
-const CHART_CLASS = "h-64 w-full";
+// Recharts' accessibility layer renders the chart as `<svg class="recharts-surface" tabindex="0">`,
+// which the keyboard reaches and navigates with the arrow keys. Recharts 3 also renders its z-index
+// layers as `<g tabindex="-1">`: Tab never reaches them, but a mouse click on plotted data focuses
+// one, and a click on bare plot area focuses the surface. The browser outlines a focused SVG
+// element even for a mouse click, and an arrow key pressed after the click makes that element
+// :focus-visible. So the layers' outline and the surface's pointer-focus outline are hidden, and
+// the widgets' sky-400 ring is drawn on the surface whenever it or a descendant is :focus-visible:
+// it appears for keyboard use and not for a mouse click. The solid style is explicit because
+// Tailwind 3's `outline-2` sets only the width.
+const CHART_CLASS =
+  "h-64 w-full [&_g[tabindex='-1']]:outline-none [&_.recharts-surface:focus:not(:focus-visible)]:outline-none [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:[outline-style:solid] [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-offset-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-sky-400";
 const LEGEND_CLASS = "flex flex-col gap-1 text-xs";
 const LEGEND_LIST_CLASS =
   "m-0 flex list-none flex-wrap items-center gap-x-4 gap-y-1 p-0 text-slate-300";
@@ -210,6 +220,18 @@ function trimZeroFraction(text: string): string {
 /** Whether a Recharts payload entry carries one of this chart's rows. */
 function isFlowChartRow(value: unknown): value is FlowChartRow {
   return typeof value === "object" && value !== null && "date" in value && "point" in value;
+}
+
+/**
+ * Daily bar shape coloured by the exact sign of its own session's foreign net string: emerald at
+ * or above zero, rose below it, muted when the value is null or the entry is not one of this
+ * chart's rows. Used instead of `Cell`, which the pinned Recharts 3.10 deprecates for removal in
+ * 4.0.
+ */
+function renderFlowBar(props: BarShapeProps): ReactElement {
+  const row: unknown = props.payload;
+  const fill = isFlowChartRow(row) ? barFill(row.point.foreign_net_kes) : CHART_COLORS.muted;
+  return <Rectangle {...props} fill={fill} />;
 }
 
 /** One labelled value of the tooltip's description list. */
@@ -386,11 +408,8 @@ function NetFlowBody({ data, rollingWindow, isUpdating }: NetFlowBodyProps): Rea
                   yAxisId="left"
                   name="Daily foreign net"
                   isAnimationActive={false}
-                >
-                  {rows.map((row) => (
-                    <Cell key={row.date} fill={barFill(row.point.foreign_net_kes)} />
-                  ))}
-                </Bar>
+                  shape={renderFlowBar}
+                />
                 <Line
                   dataKey="line"
                   yAxisId="right"
