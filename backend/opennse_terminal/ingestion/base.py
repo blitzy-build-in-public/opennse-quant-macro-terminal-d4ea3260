@@ -900,21 +900,28 @@ async def _run_in_transaction(
             http=http,
             details=details,
         )
+        # Each stage's input is released once the next stage holds what it needs, so a large run
+        # keeps one generation of its data alive rather than the raw content and every record
+        # list until the write ends.
         raw = await pipeline.fetch(ctx)
         records = await _run_stage(pipeline.parse, raw)
-        progress.fetched = len(records)
+        del raw
+        parsed = len(records)
+        progress.fetched = parsed
         validated = await _run_stage(pipeline.validate, records)
+        del records
         progress.rejected.extend(validated.rejected)
         reconciled = await pipeline.reconcile(ctx, validated.valid)
+        del validated
         progress.rejected.extend(reconciled.rejected)
 
-        status = evaluate_thresholds(len(records), len(progress.rejected), pipeline.min_rows)
+        status = evaluate_thresholds(parsed, len(progress.rejected), pipeline.min_rows)
         if status is RunStatus.LAYOUT_CHANGED:
-            if len(records) < pipeline.min_rows:
-                message = f"{len(records)} rows parsed, below the minimum of {pipeline.min_rows}"
+            if parsed < pipeline.min_rows:
+                message = f"{parsed} rows parsed, below the minimum of {pipeline.min_rows}"
             else:
                 message = (
-                    f"{len(progress.rejected)} of {len(records)} rows rejected, more than "
+                    f"{len(progress.rejected)} of {parsed} rows rejected, more than "
                     f"{MAX_INVALID_FRACTION:.0%} of the rows parsed"
                 )
             raise SourceLayoutChanged(
@@ -922,7 +929,7 @@ async def _run_in_transaction(
                     "min_rows": pipeline.min_rows,
                     "max_invalid_fraction": str(MAX_INVALID_FRACTION),
                 },
-                found={"parsed": len(records), "rejected": len(progress.rejected)},
+                found={"parsed": parsed, "rejected": len(progress.rejected)},
                 message=message,
             )
         written = await pipeline.upsert(conn, reconciled.valid, run_id) if reconciled.valid else 0

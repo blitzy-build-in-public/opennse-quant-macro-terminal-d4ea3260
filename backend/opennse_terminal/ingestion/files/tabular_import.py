@@ -48,15 +48,17 @@ import asyncio
 import io
 import logging
 import os
+import posixpath
 import re
 import stat
 import uuid
+import zipfile
+import zlib
 from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
-from itertools import islice
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, ClassVar, Final, Literal, TypeGuard, get_args
@@ -109,6 +111,10 @@ __all__ = [
     "KIND_SPECS",
     "MAX_FILE_BYTES",
     "MAX_ROWS",
+    "MAX_XLSX_EXPANDED_BYTES",
+    "MAX_XLSX_MEMBERS",
+    "MAX_XLSX_PARTS_BYTES",
+    "MAX_XLSX_WORKSHEET_BYTES",
     "SUPPORTED_SUFFIXES",
     "CellValue",
     "ImportKind",
@@ -154,6 +160,42 @@ with ``too_many_rows`` and is never imported in part."""
 
 SUPPORTED_SUFFIXES: Final = (".csv", ".xlsx")
 """File extensions the importer reads (compared case-insensitively)."""
+
+# An .xlsx file is a ZIP archive, so MAX_FILE_BYTES bounds only its compressed size. These limits
+# bound what it expands to; they are checked on the archive's central directory, its manifest
+# and its workbook relationships before the workbook is opened, every member openpyxl may read
+# whole is first inflated in bounded chunks to prove it expands to exactly its declared size,
+# and an archive beyond a limit fails the run with its code.
+
+MAX_XLSX_MEMBERS: Final = 1_000
+"""Most members an ``.xlsx`` archive may hold; more fails with ``xlsx_too_many_members``."""
+
+MAX_XLSX_PARTS_BYTES: Final = 64 * 1024 * 1024
+"""Largest total expanded size, in bytes (64 MiB), of the ``.xlsx`` members that are not streamed
+worksheets (see :data:`MAX_XLSX_WORKSHEET_BYTES`); a larger total fails with
+``xlsx_parts_too_large``, as does a ``[Content_Types].xml`` larger than 1 MiB, before it is read.
+
+openpyxl parses the manifest, the shared strings, the workbook and its relationships, the
+properties, theme and styles, each sheet's relationships and any chartsheet whole when the
+workbook opens, before any row limit applies, and the manifest and relationships, not the part
+names, decide which member plays which role. So every other member counts toward this one
+budget, whatever its name, media and unused parts included. The trade-off: a workbook whose
+non-worksheet parts exceed 64 MiB in total is rejected even when its sheet is small."""
+
+MAX_XLSX_WORKSHEET_BYTES: Final = 512 * 1024 * 1024
+"""Largest expanded size, in bytes (512 MiB), of one streamed worksheet; a larger one fails with
+``xlsx_worksheet_too_large``. openpyxl reads a worksheet as a stream, and a sheet of
+:data:`MAX_ROWS` rows is about 400 MB of XML.
+
+A member is a streamed worksheet only when it is named ``xl/worksheets/<name>.xml`` and
+``[Content_Types].xml`` declares it with the worksheet content type and no other, in a workbook
+whose manifest declares no DOCTYPE and whose workbook relationships part is readable (at most
+1 MiB, well-formed, no DOCTYPE) and holds no chartsheet, which openpyxl parses whole. Otherwise
+it counts toward :data:`MAX_XLSX_PARTS_BYTES`."""
+
+MAX_XLSX_EXPANDED_BYTES: Final = 1024 * 1024 * 1024
+"""Largest total expanded size, in bytes (1 GiB), of every member of an ``.xlsx`` archive; a larger
+total fails with ``xlsx_expanded_too_large``."""
 
 CellValue = Decimal | int | date | str | bool | None
 """A converted cell: ``Decimal`` amounts, ``int`` share counts and volumes, ``date``s, trimmed
@@ -320,10 +362,16 @@ _ISIN_RE: Final = re.compile(r"KE[0-9A-Z]{9}[0-9]")
 _CURRENCY_RE: Final = re.compile(r"[A-Z]{3}")
 _ISO_DATE_RE: Final = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?: 00:00:00)?")
 _DMY_DATE_RE: Final = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{4})")
+# Package part names compare case-insensitively (ECMA-376 Part 2, part name equivalence).
+_XLSX_WORKSHEET_RE: Final = re.compile(r"xl/worksheets/[^/]+\.xml", re.IGNORECASE)
 _HUNDRED: Final = Decimal(100)
 _DEFAULT_PERIOD_TYPE: Final = "FY"
 _IN_CHUNK: Final = 5_000
 _MISSING_KEYS_SAMPLE: Final = 50
+
+_WRITE_BATCH_ROWS: Final = 1_000
+"""Accepted rows per ``db.upsert`` writer call. Only one batch of write rows exists at a time,
+and every batch runs on the run's connection, inside its one data transaction."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -556,19 +604,374 @@ so a FIFO or device at the path opens at once instead of waiting for a writer an
 rejects it; a terminal never becomes the controlling one. A flag the platform lacks counts as 0."""
 
 
-def _read_grid(raw: bytes, *, suffix: str, sheet: str | None, source: str) -> list[list[str]]:
-    """Read a CSV or ``.xlsx`` file as a grid of cell texts, the header line first.
+# The package parts _preflight_xlsx reads, and the content types openpyxl (3.1.5) routes by.
+_XLSX_MANIFEST: Final = "[Content_Types].xml"
+_XLSX_DEFAULT_WORKBOOK: Final = "xl/workbook.xml"
+_XLSX_WORKSHEET_TYPE: Final = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"
+)
+# In the order openpyxl tries them: the workbook it opens is the first Override of the first of
+# these types the manifest declares, else xl/workbook.xml.
+_XLSX_WORKBOOK_TYPES: Final = (
+    "application/vnd.ms-excel.template.macroEnabled.main+xml",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
+    "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+)
+_XLSX_PACKAGE_XML_BYTES: Final = 1024 * 1024
+"""Largest declared size, in bytes (1 MiB), of the manifest or workbook relationships part that
+:func:`_preflight_xlsx` parses. A manifest is about 1 KB plus 150 bytes per part, so one of
+:data:`MAX_XLSX_MEMBERS` parts stays near 150 KB."""
+
+# ECMA-376 Part 2 (Open Packaging Conventions) allows only stored and deflated, unencrypted
+# members; zipfile flags an encrypted member with bit 0 of its general purpose flags.
+_XLSX_COMPRESS_TYPES: Final = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
+_ZIP_ENCRYPTED_FLAG: Final = 0x1
+# A ZIP local file header: its signature, then 26 bytes whose last four are the lengths of the
+# member name and of the extra field that follow it, before the member's data (APPNOTE 4.3.7).
+_ZIP_LOCAL_HEADER_SIGNATURE: Final = b"PK\x03\x04"
+_ZIP_LOCAL_HEADER_BYTES: Final = 30
+_ZIP_LOCAL_NAME_LENGTH_AT: Final = 26
+_XLSX_VERIFY_INPUT_BYTES: Final = 64 * 1024
+"""Most compressed bytes (64 KiB) :func:`_inflated` hands zlib at a time."""
+_XLSX_VERIFY_OUTPUT_BYTES: Final = 1024 * 1024
+"""Most expanded bytes (1 MiB) :func:`_inflated` takes from zlib at a time."""
+
+
+def _member_data(raw: bytes, member: zipfile.ZipInfo, source: str) -> memoryview:
+    """The compressed data of ``member`` within the archive ``raw``, where zipfile reads it:
+    ``compress_size`` bytes (from the central directory) after the local file header at
+    ``member.header_offset``, which is 30 bytes plus the name and extra-field lengths that local
+    header records. Nothing is copied.
+
+    Raises:
+        FetchFailed: ``xlsx_size_mismatch`` when no local file header is at that offset or the
+            data runs past the end of ``raw``.
+    """
+    header = member.header_offset
+    if (
+        header < 0
+        or header + _ZIP_LOCAL_HEADER_BYTES > len(raw)
+        or raw[header : header + len(_ZIP_LOCAL_HEADER_SIGNATURE)] != _ZIP_LOCAL_HEADER_SIGNATURE
+    ):
+        raise FetchFailed(source, "xlsx_size_mismatch")
+    lengths = header + _ZIP_LOCAL_NAME_LENGTH_AT
+    name_length = int.from_bytes(raw[lengths : lengths + 2], "little")
+    extra_length = int.from_bytes(raw[lengths + 2 : lengths + 4], "little")
+    start = header + _ZIP_LOCAL_HEADER_BYTES + name_length + extra_length
+    end = start + member.compress_size
+    if end > len(raw):
+        raise FetchFailed(source, "xlsx_size_mismatch")
+    return memoryview(raw)[start:end]
+
+
+def _inflated(data: memoryview) -> Iterator[bytes]:
+    """Decompress the raw DEFLATE stream ``data`` as zipfile does (to the end of the stream or
+    of ``data``, whichever comes first), yielding at most :data:`_XLSX_VERIFY_OUTPUT_BYTES` at a
+    time from at most :data:`_XLSX_VERIFY_INPUT_BYTES` of input.
+
+    Raises:
+        zlib.error: ``data`` is not a valid DEFLATE stream.
+    """
+    decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+    for start in range(0, len(data), _XLSX_VERIFY_INPUT_BYTES):
+        pending: bytes | memoryview = data[start : start + _XLSX_VERIFY_INPUT_BYTES]
+        while pending and not decompressor.eof:
+            yield decompressor.decompress(pending, _XLSX_VERIFY_OUTPUT_BYTES)
+            pending = decompressor.unconsumed_tail
+        if decompressor.eof:
+            return
+    # zlib can still hold output once every input byte is consumed; zipfile's final flush()
+    # returns it, so it is drained here too, as bounded as the rest.
+    while not decompressor.eof:
+        chunk = decompressor.decompress(b"", _XLSX_VERIFY_OUTPUT_BYTES)
+        if not chunk:
+            return
+        yield chunk
+
+
+def _member_chunks(
+    raw: bytes, member: zipfile.ZipInfo, source: str
+) -> Iterator[bytes | memoryview]:
+    """Yield, in order, what a whole read of the stored or deflated ``member`` of ``raw``
+    decompresses, at most :data:`_XLSX_VERIFY_OUTPUT_BYTES` at a time, and fail as soon as that
+    exceeds the member's declared ``file_size``. Once the data ends, it must have expanded to
+    exactly ``file_size`` bytes with the declared CRC-32; a stored member must also declare a
+    ``compress_size`` equal to its ``file_size``. Only after the last chunk is everything
+    yielded verified.
+
+    zipfile reads the same data with the same lengths, so a member that passes expands to no
+    more than ``file_size`` however it is read later.
+
+    Raises:
+        FetchFailed: ``xlsx_size_mismatch`` when the member's data does not match its
+            central-directory entry: no local file header at its offset, data past the end of
+            ``raw``, an invalid DEFLATE stream, another expanded size or another CRC-32.
+    """
+    data = _member_data(raw, member, source)
+    chunks: Iterator[bytes | memoryview]
+    if member.compress_type == zipfile.ZIP_STORED:
+        if member.compress_size != member.file_size:
+            raise FetchFailed(source, "xlsx_size_mismatch")
+        chunks = iter((data,))
+    else:
+        chunks = _inflated(data)
+    expanded = 0
+    crc = 0
+    try:
+        for chunk in chunks:
+            expanded += len(chunk)
+            if expanded > member.file_size:
+                raise FetchFailed(source, "xlsx_size_mismatch")
+            crc = zlib.crc32(chunk, crc)
+            yield chunk
+    except zlib.error as exc:
+        raise FetchFailed(source, "xlsx_size_mismatch") from exc
+    if expanded != member.file_size or crc != member.CRC:
+        raise FetchFailed(source, "xlsx_size_mismatch")
+
+
+def _verify_member(raw: bytes, member: zipfile.ZipInfo, source: str) -> None:
+    """Check that ``member`` expands to exactly its declared size and CRC-32
+    (:func:`_member_chunks`), holding one chunk at a time.
+
+    Raises:
+        FetchFailed: ``xlsx_size_mismatch``.
+    """
+    for _chunk in _member_chunks(raw, member, source):
+        pass
+
+
+def _verified_member_bytes(raw: bytes, member: zipfile.ZipInfo, source: str) -> bytes:
+    """The expanded data of ``member``, verified by :func:`_member_chunks`; the caller bounds its
+    declared size first.
+
+    Raises:
+        FetchFailed: ``xlsx_size_mismatch``.
+    """
+    return b"".join(_member_chunks(raw, member, source))
+
+
+class _DoctypeDeclaredError(Exception):
+    """Raised by :class:`_PackagePartTarget` to stop parsing at a DOCTYPE declaration."""
+
+
+class _PackagePartTarget:
+    """``xml.etree.ElementTree.XMLParser`` target that keeps, for each child of the root
+    element, its local name and its attributes, the way openpyxl reads a manifest or a
+    relationships part, and builds no tree.
+
+    A DOCTYPE stops the parse (:class:`_DoctypeDeclaredError`) before its declarations are
+    read: DTD entities and attribute defaults are where two XML parsers can disagree, so a part
+    declaring one is not trusted to describe the package.
+    """
+
+    def __init__(self) -> None:
+        self.children: list[tuple[str, dict[str, str]]] = []
+        self._depth = 0
+
+    def start(self, tag: str, attrib: dict[str, str]) -> None:
+        if self._depth == 1:
+            self.children.append((tag.rpartition("}")[2], attrib))
+        self._depth += 1
+
+    def end(self, tag: str) -> None:
+        self._depth -= 1
+
+    def doctype(self, name: str, pubid: str | None, system: str | None) -> None:
+        raise _DoctypeDeclaredError(name)
+
+
+def _package_part_children(part: bytes) -> list[tuple[str, dict[str, str]]] | None:
+    """The children of the root element of the package part ``part`` (its expanded data), each
+    as its local name and its unprefixed and ``{namespace}``-prefixed attributes; ``None`` when
+    the part declares a DOCTYPE. The caller bounds and verifies the part's size first.
+
+    Raises:
+        xml.etree.ElementTree.ParseError: The part is not well-formed XML.
+        LookupError: The part declares an encoding Python does not know.
+    """
+    import xml.etree.ElementTree as ElementTree
+
+    target = _PackagePartTarget()
+    # S314 asks for defusedxml. The stdlib parser is safe here: the caller caps the part's
+    # declared size at _XLSX_PACKAGE_XML_BYTES and verifies it expands to exactly that, openpyxl
+    # parses the same part whole right after, the target stops at a DOCTYPE so no entity is
+    # declared, and the bundled expat (2.9.0) limits entity amplification.
+    parser = ElementTree.XMLParser(target=target)  # noqa: S314
+    try:
+        parser.feed(part)
+        parser.close()
+    except _DoctypeDeclaredError:
+        return None
+    return target.children
+
+
+def _xlsx_worksheet_grants(raw: bytes, archive: zipfile.ZipFile, source: str) -> frozenset[str]:
+    """The members of ``archive`` (opened on ``raw``, every member stored or deflated) that
+    openpyxl reads only as streamed worksheets.
+
+    A member qualifies when it is named ``xl/worksheets/<name>.xml`` and the manifest has an
+    ``Override`` whose ``PartName`` minus its leading ``/`` equals the name exactly (zipfile
+    lookups are exact) with the worksheet content type, and no ``Override`` giving it another
+    type: openpyxl opens the shared strings and the workbook by their ``Override``, so a member
+    with any other type may be parsed whole. Nothing qualifies when the manifest declares a
+    DOCTYPE, or when the relationships part of the workbook openpyxl opens is absent, larger
+    than :data:`_XLSX_PACKAGE_XML_BYTES`, not well-formed, declares a DOCTYPE or has any child
+    whose ``Type`` contains ``chartsheet``: openpyxl parses a chartsheet's target whole,
+    whatever its name, and reads every child of that part as a relationship.
+
+    The manifest and the relationships part are parsed from data :func:`_member_chunks` has
+    verified, never read through zipfile, which inflates a whole read in one unbounded step.
+
+    Raises:
+        FetchFailed: ``xlsx_parts_too_large`` when the manifest is larger than
+            :data:`_XLSX_PACKAGE_XML_BYTES`, and ``xlsx_size_mismatch`` when the manifest or the
+            relationships part does not expand to its declared size and CRC-32; openpyxl reads
+            both whole when the workbook opens.
+        KeyError, xml.etree.ElementTree.ParseError, LookupError: The manifest is absent or not
+            well-formed; openpyxl fails on it too.
+    """
+    manifest_member = archive.getinfo(_XLSX_MANIFEST)
+    if manifest_member.file_size > _XLSX_PACKAGE_XML_BYTES:
+        raise FetchFailed(source, "xlsx_parts_too_large")
+    manifest = _package_part_children(_verified_member_bytes(raw, manifest_member, source))
+    if manifest is None:
+        return frozenset()
+    # (member, content type) of each Override, in document order; Default entries name no part.
+    overrides = [
+        (attrib["PartName"][1:], attrib["ContentType"])
+        for local_name, attrib in manifest
+        if local_name == "Override" and "PartName" in attrib and "ContentType" in attrib
+    ]
+    workbook = next(
+        (
+            member
+            for workbook_type in _XLSX_WORKBOOK_TYPES
+            for member, content_type in overrides
+            if content_type == workbook_type
+        ),
+        _XLSX_DEFAULT_WORKBOOK,
+    )
+    folder, workbook_name = posixpath.split(workbook)
+    relationships = posixpath.join(folder, "_rels", f"{workbook_name}.rels")
+    try:
+        relationships_member = archive.getinfo(relationships)
+    except KeyError:
+        return frozenset()
+    if relationships_member.file_size > _XLSX_PACKAGE_XML_BYTES:
+        return frozenset()
+    # A mismatch fails the run here rather than withholding the grants: openpyxl reads this
+    # part whole next, and that read would inflate all of it.
+    part = _verified_member_bytes(raw, relationships_member, source)
+    try:
+        children = _package_part_children(part)
+    except Exception:
+        # Not well-formed, or in an unknown encoding: openpyxl reads this part next and fails
+        # the run on it, so nothing is trusted to be a worksheet meanwhile.
+        return frozenset()
+    if children is None or any(
+        "chartsheet" in attrib.get("Type", "") for _local_name, attrib in children
+    ):
+        return frozenset()
+    declared: dict[str, set[str]] = {}
+    for member, content_type in overrides:
+        declared.setdefault(member, set()).add(content_type)
+    return frozenset(
+        member
+        for member, content_types in declared.items()
+        if content_types == {_XLSX_WORKSHEET_TYPE} and _XLSX_WORKSHEET_RE.fullmatch(member)
+    )
+
+
+def _preflight_xlsx(raw: bytes, source: str) -> None:
+    """Bound what the ``.xlsx`` archive ``raw`` can expand to, before openpyxl opens it.
+
+    Checks, in order: the member count against :data:`MAX_XLSX_MEMBERS` and the total declared
+    expanded size against :data:`MAX_XLSX_EXPANDED_BYTES`, from the central directory; that
+    every member is stored or deflated and unencrypted; then which members are streamed
+    worksheets (:func:`_xlsx_worksheet_grants`, which verifies and parses only the manifest and
+    the workbook relationships, each at most 1 MiB); then each streamed worksheet against
+    :data:`MAX_XLSX_WORKSHEET_BYTES` and the sum of every other member against
+    :data:`MAX_XLSX_PARTS_BYTES`; last, that every member other than a streamed worksheet
+    expands to exactly its declared size and CRC-32 (:func:`_member_chunks`). Nothing is ever
+    decompressed more than 1 MiB at a time.
+
+    Raises:
+        FetchFailed: ``xlsx_too_many_members``, ``xlsx_expanded_too_large``,
+            ``xlsx_unsupported_member`` (a member compressed other than stored or deflated, or
+            encrypted), ``xlsx_worksheet_too_large``, ``xlsx_parts_too_large`` or
+            ``xlsx_size_mismatch`` (a member's data does not match its central-directory entry).
+        zipfile.BadZipFile: ``raw`` is not a ZIP archive.
+        KeyError, xml.etree.ElementTree.ParseError, LookupError: The manifest is absent or not
+            well-formed.
+    """
+    # A declared size bounds what zipfile returns, not what it decompresses: a whole read
+    # (ZipFile.read, or ZipExtFile.read() with no size) inflates the member's entire compressed
+    # data in one call and only then cuts it at file_size and checks the CRC-32, so a member
+    # that understates its size expands without bound before BadZipFile is raised. Hence every
+    # member openpyxl may read whole is inflated here first, 1 MiB at a time, and must expand to
+    # exactly its declared size.
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        members = archive.infolist()
+        if len(members) > MAX_XLSX_MEMBERS:
+            raise FetchFailed(source, "xlsx_too_many_members")
+        if sum(member.file_size for member in members) > MAX_XLSX_EXPANDED_BYTES:
+            raise FetchFailed(source, "xlsx_expanded_too_large")
+        if any(
+            member.compress_type not in _XLSX_COMPRESS_TYPES
+            or member.flag_bits & _ZIP_ENCRYPTED_FLAG
+            for member in members
+        ):
+            raise FetchFailed(source, "xlsx_unsupported_member")
+        worksheets = _xlsx_worksheet_grants(raw, archive, source)
+    parts = 0
+    for member in members:
+        if member.filename not in worksheets:
+            parts += member.file_size
+        elif member.file_size > MAX_XLSX_WORKSHEET_BYTES:
+            raise FetchFailed(source, "xlsx_worksheet_too_large")
+    if parts > MAX_XLSX_PARTS_BYTES:
+        raise FetchFailed(source, "xlsx_parts_too_large")
+    # openpyxl reads a streamed worksheet in reads of a bounded size, each of which zipfile
+    # inflates at most that much at a time and cuts at the declared size, capped above; so the
+    # worksheets need no verification. Every other member may be read whole, and their declared
+    # sizes total at most MAX_XLSX_PARTS_BYTES, which bounds this pass.
+    for member in members:
+        if member.filename not in worksheets:
+            _verify_member(raw, member, source)
+
+
+def _read_grid(
+    raw: bytes, *, suffix: str, sheet: str | None, source: str
+) -> tuple[int, Iterator[list[str]]]:
+    """Read a CSV or ``.xlsx`` file as rows of cell texts, the header line first.
 
     Every cell is read as text (``dtype=str``, no NA inference), so nothing passes through
     ``float``; Excel numeric cells arrive as pandas' shortest round-trip string (``95.75``) and
     date cells as ``YYYY-MM-DD 00:00:00``. Empty cells become ``""``. The header is read as a
     data row (``header=None``) because pandas would otherwise rename a repeated header to
-    ``name.1``, hiding the duplicate. CSV blank lines are kept, so grid index + 1 is the line.
+    ``name.1``, hiding the duplicate. CSV blank lines are kept, so row index + 1 is the line.
+
+    The file is parsed as one frame, never in pandas chunks: the C parser widens a short row to
+    the table's width only within a chunk, so a chunk starting with a short or blank line fails
+    the full rows after it, and one starting with an over-long line silently drops its extra
+    cells. The whole file is read, and every limit and read error raised, before this returns.
+
+    Returns:
+        The number of rows, the header line included, and an iterator that converts the frame
+        to a list of cell texts one row at a time, in file order. No grid of the whole file is
+        built: the frame is the only copy of the file's cells, and it is released once the
+        iterator is exhausted or dropped.
 
     Raises:
         SourceLayoutChanged: The named sheet is not in the workbook.
-        FetchFailed: The file cannot be decoded or parsed (``unreadable_file:<error>``), or it
-            has more than :data:`MAX_ROWS` rows after the header (``too_many_rows``).
+        FetchFailed: The file cannot be decoded or parsed (``unreadable_file:<error>``), it
+            has more than :data:`MAX_ROWS` rows after the header (``too_many_rows``), or an
+            ``.xlsx`` archive fails a check of :func:`_preflight_xlsx`
+            (``xlsx_too_many_members``, ``xlsx_expanded_too_large``,
+            ``xlsx_unsupported_member``, ``xlsx_worksheet_too_large``,
+            ``xlsx_parts_too_large``, ``xlsx_size_mismatch``).
     """
     import pandas as pd
 
@@ -586,6 +989,9 @@ def _read_grid(raw: bytes, *, suffix: str, sheet: str | None, source: str) -> li
                 nrows=row_cap,
             )
         else:
+            # openpyxl parses the shared strings and the other non-worksheet parts whole while
+            # the workbook opens, before nrows applies, so the archive is bounded first.
+            _preflight_xlsx(raw, source)
             with pd.ExcelFile(io.BytesIO(raw), engine="openpyxl") as workbook:
                 sheet_names = [str(name) for name in workbook.sheet_names]
                 if sheet is not None and sheet not in sheet_names:
@@ -602,17 +1008,25 @@ def _read_grid(raw: bytes, *, suffix: str, sheet: str | None, source: str) -> li
                     keep_default_na=False,
                     nrows=row_cap,
                 )
-        frame = frame.fillna("")
-        grid = [[str(cell) for cell in row] for row in frame.itertuples(index=False, name=None)]
     except IngestionError:
         raise
     except Exception as exc:
         # Untrusted input: any decoder or parser failure (ParserError, EmptyDataError,
         # UnicodeDecodeError, BadZipFile, a corrupt workbook) ends the run failed, named by type.
         raise FetchFailed(source, f"unreadable_file:{type(exc).__name__}") from exc
-    if len(grid) > MAX_ROWS + 1:
+    if len(frame) > MAX_ROWS + 1:
         raise FetchFailed(source, "too_many_rows")
-    return grid
+
+    def rows() -> Iterator[list[str]]:
+        # dtype=str cells are text, or NA for an empty cell or a short row. NA becomes "" here,
+        # tested only on cells that are not text, so the frame is never copied to fill it.
+        for row in frame.itertuples(index=False, name=None):
+            yield [
+                cell if isinstance(cell, str) else "" if pd.isna(cell) else str(cell)
+                for cell in row
+            ]
+
+    return len(frame), rows()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -709,7 +1123,7 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
     network request; the framework's HTTP client is never used.
 
     Stages: :meth:`fetch` reads the file (at most :data:`MAX_FILE_BYTES`); :meth:`parse` reads
-    the grid, checks the headers and converts the kind's columns; :meth:`validate` mirrors every
+    the rows, checks the headers and converts the kind's columns; :meth:`validate` mirrors every
     CHECK and length limit of the target table; :meth:`reconcile` collapses repeated keys and
     checks stored data (unknown tickers, ISIN owners, currency conflicts, missing price rows);
     :meth:`upsert` writes through ``opennse_terminal.db.upsert``. Rejections at either check count
@@ -816,24 +1230,30 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
     # --- parse ---------------------------------------------------------------------------------
 
     def parse(self, raw: bytes) -> list[TabularRecord]:
-        """Read the grid, check the headers and convert the kind's columns of every row.
+        """Read the file, check the headers and convert the kind's columns of every row.
 
-        Headers are normalized with :func:`normalize_column_name`. Columns the kind does not read
-        are ignored and named in ``details.ignored_columns``; the WARNING logged for them carries
-        only the run id, the kind and their count, never the file's name or its headers. Rows
-        whose kind columns are all empty are skipped (``details.blank_rows_skipped``). Conversion
-        failures are collected on each record for :meth:`validate`; nothing is raised per row.
+        The rows are taken one at a time from :func:`_read_grid`, the first as the header and the
+        rest as data rows numbered from line 2, so only the parsed frame and the records exist
+        at once, never a grid of the whole file. Headers are normalized with
+        :func:`normalize_column_name`. Columns the kind does not read are ignored and named in
+        ``details.ignored_columns``; the WARNING logged for them carries only the run id, the kind
+        and their count, never the file's name or its headers. Rows whose kind columns are all
+        empty are skipped (``details.blank_rows_skipped``). Conversion failures are collected on
+        each record for :meth:`validate`; nothing is raised per row.
 
         Raises:
             SourceLayoutChanged: No header row, a repeated header, a missing required header, or
                 (``.xlsx``) a missing sheet.
-            FetchFailed: The file cannot be read, or it has more than :data:`MAX_ROWS` rows.
+            FetchFailed: The file cannot be read, it has more than :data:`MAX_ROWS` rows, or an
+                ``.xlsx`` archive would expand beyond the ``MAX_XLSX_*`` limits.
         """
-        grid = _read_grid(raw, suffix=self._suffix, sheet=self.sheet, source=self.source_url)
+        row_count, rows = _read_grid(
+            raw, suffix=self._suffix, sheet=self.sheet, source=self.source_url
+        )
         required = list(self.spec.required)
-        if not grid:
+        if row_count == 0:
             raise SourceLayoutChanged(expected=required, found=[], message="the file is empty")
-        headers = [normalize_column_name(cell) for cell in grid[0]]
+        headers = [normalize_column_name(cell) for cell in next(rows)]
         named = [header for header in headers if header]
         repeated = sorted(header for header, count in Counter(named).items() if count > 1)
         if repeated:
@@ -864,8 +1284,8 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
 
         records: list[TabularRecord] = []
         blank = 0
-        # The header is line 1, so the first data row is line 2.
-        for line, row in enumerate(islice(grid, 1, None), start=2):
+        # The header is line 1 and has been taken, so the first data row is line 2.
+        for line, row in enumerate(rows, start=2):
             cells = {
                 column: row[index] if index < len(row) else ""
                 for column, index in positions.items()
@@ -1068,7 +1488,13 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         self, conn: AsyncConnection, records: Sequence[TabularRecord], run_id: uuid.UUID
     ) -> int:
         """Write the accepted rows through ``opennse_terminal.db.upsert`` on ``conn``; never
-        commits. The writers batch at most 1,000 rows per statement themselves.
+        commits.
+
+        The rows are sorted by the kind's conflict key and handed to the writer in batches of at
+        most :data:`_WRITE_BATCH_ROWS` (1,000), each batch's write rows built only when it is
+        written. Every batch runs on ``conn``, inside the run's one data transaction, and covers
+        a key range above the previous batch's, so the import locks rows in key order;
+        :meth:`reconcile` has already collapsed repeated keys, so no key spans two batches.
 
         - ``equities``: ``upsert_rows(..., key=("ticker",), mode="do_update")`` with complete
           rows and ``source = 'csv_import'``.
@@ -1079,35 +1505,53 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         - ``fundamentals`` and ``macro_indicators``: COALESCE merges recording ``csv_import`` in
           ``source_by_field`` for each non-empty cell.
         - ``foreign_flows``: ``update_flows(flow_source="csv_import")``, touching only the flow
-          columns; keys that lost their price row since :meth:`reconcile` are logged and
-          recorded in ``details.flow_missing_keys``.
+          columns; keys that lost their price row since :meth:`reconcile` are counted across
+          the batches, logged once and recorded in ``details.flow_missing_keys`` (their count
+          and the first 50, in key order).
 
-        Returns the number of rows inserted or updated. Re-importing a file rewrites identical
-        values, so the stored state is unchanged.
+        Returns the number of rows inserted or updated, summed over the batches. Re-importing a
+        file rewrites identical values, so the stored state is unchanged.
         """
         columns = _WRITE_COLUMNS[self.kind]
-        rows = [{column: record.values.get(column) for column in columns} for record in records]
-        if self.kind == "equities":
-            for row in rows:
-                row["source"] = _SOURCE
-            return await upsert_rows(conn, TerminalEquity, rows, key=("ticker",), mode="do_update")
-        if self.kind == "daily_prices":
-            return await upsert_prices(conn, rows, source=_SOURCE, ingestion_run_id=run_id)
-        if self.kind == "fundamentals":
-            return await upsert_fundamentals(conn, rows, source=_SOURCE)
-        if self.kind == "macro_indicators":
-            return await upsert_macro(conn, rows, source=_SOURCE)
-        outcome = await update_flows(conn, rows, flow_source=_SOURCE)
-        if outcome.missing_keys:
+        ordered = sorted(records, key=self._key_of)
+        written = 0
+        missing_count = 0
+        missing_sample: list[tuple[str, date]] = []
+        for start in range(0, len(ordered), _WRITE_BATCH_ROWS):
+            rows = [
+                {column: record.values.get(column) for column in columns}
+                for record in ordered[start : start + _WRITE_BATCH_ROWS]
+            ]
+            if self.kind == "equities":
+                for row in rows:
+                    row["source"] = _SOURCE
+                written += await upsert_rows(
+                    conn, TerminalEquity, rows, key=("ticker",), mode="do_update"
+                )
+            elif self.kind == "daily_prices":
+                written += await upsert_prices(conn, rows, source=_SOURCE, ingestion_run_id=run_id)
+            elif self.kind == "fundamentals":
+                written += await upsert_fundamentals(conn, rows, source=_SOURCE)
+            elif self.kind == "macro_indicators":
+                written += await upsert_macro(conn, rows, source=_SOURCE)
+            else:
+                outcome = await update_flows(conn, rows, flow_source=_SOURCE)
+                written += outcome.rows_updated
+                missing_count += len(outcome.missing_keys)
+                # Batches ascend by key and each batch's keys are sorted, so this keeps the
+                # first keys overall.
+                room = _MISSING_KEYS_SAMPLE - len(missing_sample)
+                missing_sample.extend(outcome.missing_keys[:room])
+        if missing_count:
             logger.warning(
                 "foreign_flows import found %d keys without a price row at write time",
-                len(outcome.missing_keys),
+                missing_count,
             )
             self._details["flow_missing_keys"] = {
-                "count": len(outcome.missing_keys),
-                "sample": [list(key) for key in outcome.missing_keys[:_MISSING_KEYS_SAMPLE]],
+                "count": missing_count,
+                "sample": [list(key) for key in missing_sample],
             }
-        return outcome.rows_updated
+        return written
 
 
 def _no_values(values: Mapping[str, CellValue], failed: set[str], columns: Sequence[str]) -> bool:

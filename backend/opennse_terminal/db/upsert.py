@@ -22,11 +22,15 @@ Contract shared by every public function:
    conflict-key columns. Rows skipped by ``DO NOTHING``, by the price precedence guard or by the
    fundamentals currency guard are not counted. ``update_flows`` returns a ``FlowUpdateResult``.
    Callers that need a row's ``id`` select it by natural key afterwards, in the same transaction.
-5. **Batching.** Rows are de-duplicated by conflict key with the last occurrence winning (one
-   ``INSERT ... ON CONFLICT DO UPDATE`` cannot affect a row twice), so callers order rows with the
-   preferred value last. They are sorted by key, so concurrent writers lock rows in one order;
-   normalized to a single column set per statement; and chunked to at most 1,000 rows and 32,000
-   bind parameters per statement (asyncpg's limit is 32,767).
+5. **Batching.** Rows are validated, de-duplicated by conflict key with the last occurrence
+   winning (one ``INSERT ... ON CONFLICT DO UPDATE`` cannot affect a row twice, so callers order
+   rows with the preferred value last) and sorted by key, once per call. Statements then follow
+   that key order, so concurrent writers lock rows in one order: each statement covers a key range
+   above the previous one's, and ``upsert_rows`` writes rows of different column sets as
+   contiguous same-column runs of the sorted rows. A statement's rows are normalized to one column
+   set only as its chunk is built, at most 1,000 rows and 32,000 bind parameters (asyncpg's limit
+   is 32,767), so a call holds references to the caller's rows plus one chunk of new rows; the
+   caller's rows are never copied wholesale or mutated.
 6. **Identity and timestamps.** A UUID ``id`` is generated for each row that lacks one and is
    never updated. ``ON CONFLICT DO UPDATE`` does not apply a column's ``onupdate``, so updates set
    ``updated_at`` (``ingested_at`` for prices) to ``now()`` explicitly. ``created_at`` is never
@@ -43,10 +47,11 @@ This module imports ``opennse_terminal.models``, whose modules import only ``db.
 
 import logging
 import uuid
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Final, Literal, TypeAlias
+from itertools import chain, groupby, islice
+from typing import Any, Final, Literal, TypeAlias, TypeVar, cast
 
 from sqlalchemy import (
     ColumnElement,
@@ -119,6 +124,9 @@ FUNDAMENTAL_VALUE_COLUMNS: Final[tuple[str, ...]] = FUNDAMENTAL_LINE_ITEM_COLUMN
 recorded in ``source_by_field``, in table order."""
 
 _Row: TypeAlias = dict[str, object]
+_InputRow: TypeAlias = Mapping[str, object]
+_Key: TypeAlias = tuple[Any, ...]
+_T = TypeVar("_T")
 
 _MAX_ROWS_PER_STATEMENT: Final[int] = 1_000
 _MAX_BIND_PARAMS: Final[int] = 32_000
@@ -191,19 +199,18 @@ async def _connection(executor: Executor) -> AsyncConnection:
 
 def _validate_rows(
     table: Table,
-    rows: Sequence[Mapping[str, object]],
+    rows: Sequence[_InputRow],
     *,
     required: Collection[str],
     allowed: Collection[str] | None,
-) -> list[_Row]:
-    """Check every row and return mutable copies.
+) -> None:
+    """Check every row in place; nothing is copied or changed.
 
     ``allowed`` restricts the accepted keys to a subset of the table's columns; ``None`` accepts
     every column. Raises ``ValueError`` for an unknown, unaccepted or missing key and
     ``TypeError`` for a ``float`` value (``bool`` and ``int`` are fine).
     """
     accepted = frozenset(table.c.keys()) if allowed is None else frozenset(allowed)
-    checked: list[_Row] = []
     for index, row in enumerate(rows):
         for name, value in row.items():
             if name not in table.c:
@@ -217,18 +224,23 @@ def _validate_rows(
         missing = [name for name in required if name not in row]
         if missing:
             raise ValueError(f"{table.name} row {index}: missing required columns {missing}")
-        checked.append(dict(row))
-    return checked
 
 
-def _dedupe_sorted(rows: Sequence[_Row], key: Sequence[str]) -> tuple[list[_Row], int]:
+def _dedupe_sorted(
+    rows: Sequence[_InputRow],
+    key: Sequence[str],
+    key_of: Callable[[_InputRow], _Key] | None = None,
+) -> tuple[list[_InputRow], int]:
     """Keep the last row per conflict key, sorted by key; also return how many were dropped.
 
-    A ``None`` key value raises ``ValueError``: it can never match a conflict target.
+    The result holds the caller's mappings themselves, never copies. ``key_of`` returns a row's
+    key values in ``key`` order, for a writer that defaults a key column without changing the
+    row; by default they are the row's own values. A ``None`` key value raises ``ValueError``: it
+    can never match a conflict target.
     """
-    by_key: dict[tuple[Any, ...], _Row] = {}
+    by_key: dict[_Key, _InputRow] = {}
     for row in rows:
-        row_key = tuple(row[name] for name in key)
+        row_key = key_of(row) if key_of is not None else tuple(row[name] for name in key)
         for name, value in zip(key, row_key, strict=True):
             if value is None:
                 raise ValueError(f"conflict-key column {name!r} is None")
@@ -237,16 +249,13 @@ def _dedupe_sorted(rows: Sequence[_Row], key: Sequence[str]) -> tuple[list[_Row]
     return unique, len(rows) - len(unique)
 
 
-def _with_ids(table: Table, rows: Sequence[_Row]) -> None:
-    """Give each row without one a new UUID ``id``, where the table's primary key is ``id``.
+def _generates_ids(table: Table) -> bool:
+    """True where the table's primary key is ``id``: each written row then gets a new UUID ``id``
+    unless it supplies one, set on the statement's own copy of the row.
 
     ORM-side defaults are not relied on in multi-row Core inserts.
     """
-    if "id" not in table.c or not table.c["id"].primary_key:
-        return
-    for row in rows:
-        if row.get("id") is None:
-            row["id"] = uuid.uuid4()
+    return "id" in table.c and bool(table.c["id"].primary_key)
 
 
 def _params_per_row(table: Table, columns: Collection[str]) -> int:
@@ -261,14 +270,16 @@ def _params_per_row(table: Table, columns: Collection[str]) -> int:
     return len(columns) + defaulted
 
 
-def _chunks(rows: Sequence[_Row], n_columns: int) -> Iterator[Sequence[_Row]]:
-    """Yield slices of at most 1,000 rows and 32,000 bind parameters each.
+def _chunks(rows: Iterable[_T], n_columns: int) -> Iterator[list[_T]]:
+    """Yield lists of at most 1,000 rows and 32,000 bind parameters each, drawing ``rows`` one
+    chunk at a time, so a lazy ``rows`` is never materialized beyond the current chunk.
 
     ``itertools.batched`` would do, but it needs Python 3.12 and the package supports 3.11.
     """
     size = max(1, min(_MAX_ROWS_PER_STATEMENT, _MAX_BIND_PARAMS // max(1, n_columns)))
-    for start in range(0, len(rows), size):
-        yield rows[start : start + size]
+    iterator = iter(rows)
+    while chunk := list(islice(iterator, size)):
+        yield chunk
 
 
 async def _count(conn: AsyncConnection, stmt: Executable) -> int:
@@ -280,54 +291,85 @@ async def _count(conn: AsyncConnection, stmt: Executable) -> int:
 async def _insert_all(
     executor: Executor,
     table: Table,
-    rows: Sequence[_Row],
+    rows: Iterable[_Row],
     key: Sequence[str],
     on_conflict: Callable[[Insert], Insert],
 ) -> int:
-    """Insert ``rows`` (one shared column set) chunk by chunk, applying ``on_conflict`` to each
-    statement, and return the number of rows ``RETURNING`` reports.
+    """Insert ``rows`` (normalized rows sharing one column tuple, in key order) chunk by chunk,
+    applying ``on_conflict`` to each statement, and return the number of rows ``RETURNING``
+    reports.
 
+    ``rows`` is consumed lazily, one chunk at a time, so a generator that normalizes the caller's
+    rows holds only the current chunk's new rows. The first row's columns size the chunks.
     ``on_conflict`` receives the multi-row ``INSERT`` and returns it with its ``ON CONFLICT``
     clause; it reads ``EXCLUDED`` from the statement it is given.
     """
-    if not rows:
+    iterator = iter(rows)
+    first = next(iterator, None)
+    if first is None:
         return 0
-    columns = tuple(rows[0])
+    columns = tuple(first)
     key_columns = [table.c[name] for name in key]
     conn = await _connection(executor)
     written = 0
-    for chunk in _chunks(rows, _params_per_row(table, columns)):
-        stmt = on_conflict(pg_insert(table).values(list(chunk)))
+    for chunk in _chunks(chain((first,), iterator), _params_per_row(table, columns)):
+        stmt = on_conflict(pg_insert(table).values(chunk))
         written += await _count(conn, stmt.returning(*key_columns))
     return written
 
 
+def _normalized_rows(
+    rows: Iterable[_InputRow], columns: Sequence[str], *, with_ids: bool
+) -> Iterator[_Row]:
+    """Yield each row as a new dict of exactly ``columns``, in that order.
+
+    With ``with_ids``, an ``id`` the row lacks or holds as ``None`` is a new UUID. The input rows
+    are only read.
+    """
+    for row in rows:
+        out: _Row = {name: row.get(name) for name in columns}
+        if with_ids and out.get("id") is None:
+            out["id"] = uuid.uuid4()
+        yield out
+
+
 def _provenance_rows(
-    rows: Sequence[_Row],
+    table: Table,
+    rows: Iterable[_InputRow],
     *,
     carried: Sequence[str],
     written: Sequence[str],
     source: str,
-) -> list[_Row]:
-    """Normalize COALESCE-merge rows to one column set and attach per-row provenance.
+    defaults: Mapping[str, object] | None = None,
+    extra: Mapping[str, object] | None = None,
+) -> Iterator[_Row]:
+    """Yield COALESCE-merge rows normalized to one column set, with per-row provenance.
 
-    Each output row holds the ``carried`` columns, every ``written`` column (``None`` where the
-    row did not supply a value) and ``source_by_field``, which maps exactly the row's non-null
-    written columns to ``source``. Rows whose written values are all ``None`` would change
-    nothing and are dropped.
+    Each output row is a new dict holding the ``carried`` columns; each ``defaults`` column, with
+    the row's value or, where the row lacks it or holds ``None``, the default; every ``written``
+    column (``None`` where the row did not supply a value); ``source_by_field``, which maps
+    exactly the row's non-null written columns to ``source``; the ``extra`` columns; and a new
+    UUID ``id`` where the table's primary key is ``id``. Rows whose written values are all
+    ``None`` would change nothing and are skipped. The input rows are only read.
     """
-    normalized: list[_Row] = []
+    with_ids = _generates_ids(table)
     for row in rows:
         supplied = {name: row.get(name) for name in written}
         if all(value is None for value in supplied.values()):
             continue
         out: _Row = {name: row[name] for name in carried}
+        for name, default in (defaults or {}).items():
+            value = row.get(name)
+            out[name] = default if value is None else value
         out.update(supplied)
         out["source_by_field"] = {
             name: source for name, value in supplied.items() if value is not None
         }
-        normalized.append(out)
-    return normalized
+        if extra:
+            out.update(extra)
+        if with_ids:
+            out["id"] = uuid.uuid4()
+        yield out
 
 
 def _generic_conflict(
@@ -335,7 +377,7 @@ def _generic_conflict(
 ) -> Callable[[Insert], Insert]:
     """Build ``upsert_rows``'s ``ON CONFLICT`` clause.
 
-    With no ``update_names`` (``do_nothing`` mode, or a group carrying only key columns) the
+    With no ``update_names`` (``do_nothing`` mode, or a run carrying only key columns) the
     clause is ``DO NOTHING``; otherwise ``DO UPDATE`` sets those columns from ``EXCLUDED``, plus
     ``updated_at = now()`` where the table has it and the rows do not supply it.
     """
@@ -370,6 +412,17 @@ def _require_source(source: str, writer: str) -> None:
         raise ValueError(f"{writer}: source must be a non-empty string")
 
 
+def _fundamentals_key(row: _InputRow) -> _Key:
+    """A fundamentals row's conflict key, with an absent or ``None`` ``period_type`` read as
+    ``"FY"``, the value its written copy carries."""
+    period_type = row.get("period_type")
+    return (
+        row["ticker"],
+        row["period_end_date"],
+        _DEFAULT_PERIOD_TYPE if period_type is None else period_type,
+    )
+
+
 async def upsert_rows(
     executor: Executor,
     model: type[TerminalBase],
@@ -383,19 +436,23 @@ async def upsert_rows(
     every row must contain with a non-null value. Rows may carry any column of the table.
 
     Columns written: on insert, the columns each row supplies; columns a row omits take their
-    defaults, and a UUID ``id`` is generated when absent. Rows are grouped by their column set and
-    each group is written by its own statements, so callers need not normalize rows.
+    defaults, and a UUID ``id`` is generated when absent. Rows are validated, de-duplicated and
+    sorted by key once; the sorted rows are then written as contiguous runs that share a column
+    set (a generated ``id`` counts as supplied), each run by its own statements in key order, so
+    callers need not normalize rows and every statement covers a key range above the previous
+    one's: concurrent callers lock rows in one order whatever their column sets. Each statement's
+    rows are copied only as its chunk is built; the caller's rows are never mutated.
 
     Precedence:
 
     - ``"do_nothing"``: an existing row is never touched. The seeder writes every table this way,
       so a re-seed inserts no rows and never alters scraped or imported data.
-    - ``"do_update"``: an existing row takes every column the group supplies except the key,
+    - ``"do_update"``: an existing row takes every column its run supplies except the key,
       ``id`` and ``created_at``, and ``updated_at = now()`` where the table has that column and the
       rows do not supply it. Unsupplied columns keep their stored values. There is no
       change-detection predicate: re-writing identical values counts the row. Used for
       ``terminal_bond_yields`` on ``(observation_date, bond_code)``, ``terminal_equities`` on
-      ``(ticker,)`` and ``terminal_corporate_filings`` on ``(file_sha256,)``. A group that carries
+      ``(ticker,)`` and ``terminal_corporate_filings`` on ``(file_sha256,)``. A run that carries
       only key columns has nothing to update and falls back to ``DO NOTHING``.
 
     Works for composite-key tables without ``id``, such as ``terminal_watchlist_items`` on
@@ -411,25 +468,27 @@ async def upsert_rows(
     if mode not in ("do_nothing", "do_update"):
         raise ValueError(f"upsert_rows({table.name}): unknown mode {mode!r}")
 
-    checked = _validate_rows(table, rows, required=key_names, allowed=None)
-    unique, duplicates = _dedupe_sorted(checked, key_names)
-    _with_ids(table, unique)
+    _validate_rows(table, rows, required=key_names, allowed=None)
+    unique, duplicates = _dedupe_sorted(rows, key_names)
+    with_ids = _generates_ids(table)
 
-    groups: dict[frozenset[str], list[_Row]] = {}
-    for row in unique:
-        groups.setdefault(frozenset(row), []).append(row)
+    def column_set(row: _InputRow) -> frozenset[str]:
+        # A generated id is written like a supplied one, so it belongs to the row's column set.
+        return frozenset(row) | {"id"} if with_ids else frozenset(row)
 
     written = 0
-    for names, group in groups.items():
-        # One column order per group: a multi-row VALUES binds every row by the first row's keys.
+    # Contiguous runs in key order, never a partition by column set: statements must follow the
+    # global key order, or two callers with mixed column sets can lock rows in opposite orders.
+    for names, run in groupby(unique, key=column_set):
+        # One column order per run: a multi-row VALUES binds every row by the first row's keys.
         ordered = [col.key for col in table.columns if col.key in names]
-        normalized = [{name: row[name] for name in ordered} for row in group]
         update_names = tuple(
             name for name in ordered if name not in key_names and name not in _NEVER_UPDATED
         )
         on_conflict = _generic_conflict(
             table, key_names, update_names if mode == "do_update" else ()
         )
+        normalized = _normalized_rows(run, ordered, with_ids=with_ids)
         written += await _insert_all(executor, table, normalized, key_names, on_conflict)
 
     logger.debug(
@@ -489,22 +548,27 @@ async def upsert_prices(
     writes_flows = source == _FLOW_WRITER
     accepted = (*_PRICE_KEY, *PRICE_COLUMNS, *((FLOW_COLUMN,) if writes_flows else ()))
 
-    checked = _validate_rows(table, rows, required=_PRICE_REQUIRED, allowed=accepted)
-    unique, duplicates = _dedupe_sorted(checked, _PRICE_KEY)
+    _validate_rows(table, rows, required=_PRICE_REQUIRED, allowed=accepted)
+    unique, duplicates = _dedupe_sorted(rows, _PRICE_KEY)
 
-    normalized: list[_Row] = []
-    for row in unique:
-        out: _Row = {"id": uuid.uuid4(), "ticker": row["ticker"], "trade_date": row["trade_date"]}
-        out.update({name: row.get(name) for name in PRICE_COLUMNS})
-        if out["turnover_estimated"] is None:
-            out["turnover_estimated"] = False
-        out["source"] = source
-        out["ingestion_run_id"] = ingestion_run_id
-        if writes_flows:
-            flow = row.get(FLOW_COLUMN)
-            out[FLOW_COLUMN] = flow
-            out[_FLOW_SOURCE_COLUMN] = source if flow is not None else None
-        normalized.append(out)
+    def normalized() -> Iterator[_Row]:
+        # Built lazily, so only the chunk being written exists as new dicts.
+        for row in unique:
+            out: _Row = {
+                "id": uuid.uuid4(),
+                "ticker": row["ticker"],
+                "trade_date": row["trade_date"],
+            }
+            out.update({name: row.get(name) for name in PRICE_COLUMNS})
+            if out["turnover_estimated"] is None:
+                out["turnover_estimated"] = False
+            out["source"] = source
+            out["ingestion_run_id"] = ingestion_run_id
+            if writes_flows:
+                flow = row.get(FLOW_COLUMN)
+                out[FLOW_COLUMN] = flow
+                out[_FLOW_SOURCE_COLUMN] = source if flow is not None else None
+            yield out
 
     rank = PRICE_SOURCE_PRECEDENCE.index(source)
     overwritable = PRICE_SOURCE_PRECEDENCE[: rank + 1]
@@ -527,7 +591,7 @@ async def upsert_prices(
             where=table.c["source"].in_(overwritable),
         )
 
-    written = await _insert_all(executor, table, normalized, _PRICE_KEY, on_conflict)
+    written = await _insert_all(executor, table, normalized(), _PRICE_KEY, on_conflict)
     logger.debug(
         "upsert_prices %s (%s): %d rows in, %d duplicates dropped, %d written",
         table.name,
@@ -561,19 +625,19 @@ async def update_flows(
     """
     _require_source(flow_source, "update_flows")
     table = _table(TerminalDailyPrice)
-    checked = _validate_rows(table, rows, required=_FLOW_ROW_COLUMNS, allowed=_FLOW_ROW_COLUMNS)
-    requested_keys: set[tuple[str, date]] = set()
-    for index, row in enumerate(checked):
+    _validate_rows(table, rows, required=_FLOW_ROW_COLUMNS, allowed=_FLOW_ROW_COLUMNS)
+    for index, row in enumerate(rows):
         ticker, trade_date = row["ticker"], row["trade_date"]
         if not isinstance(ticker, str) or not isinstance(trade_date, date):
             raise TypeError(f"update_flows row {index}: ticker must be str and trade_date a date")
         if row[FLOW_COLUMN] is None:
             raise ValueError(f"update_flows row {index}: {FLOW_COLUMN} must not be None")
-        requested_keys.add((ticker, trade_date))
-    unique, duplicates = _dedupe_sorted(checked, _PRICE_KEY)
-    requested = sorted(requested_keys)
+    unique, duplicates = _dedupe_sorted(rows, _PRICE_KEY)
 
-    updated: set[tuple[str, date]] = set()
+    # The unique rows are the requested keys, sorted; each chunk's keys its UPDATE does not return
+    # have no price row. Chunks hold disjoint keys, so the per-chunk counts add up.
+    rows_updated = 0
+    missing: list[tuple[str, date]] = []
     if unique:
         conn = await _connection(executor)
         for chunk in _chunks(unique, len(_FLOW_ROW_COLUMNS)):
@@ -599,10 +663,15 @@ async def update_flows(
                 .returning(table.c["ticker"], table.c["trade_date"])
             )
             result = await conn.execute(stmt)
-            updated.update((ticker, trade_date) for ticker, trade_date in result.all())
+            returned = {(ticker, trade_date) for ticker, trade_date in result.all()}
+            rows_updated += len(returned)
+            for row in chunk:
+                # The loop above checked that ticker is a str and trade_date a date.
+                row_key = cast(tuple[str, date], (row["ticker"], row["trade_date"]))
+                if row_key not in returned:
+                    missing.append(row_key)
 
-    missing = tuple(row_key for row_key in requested if row_key not in updated)
-    outcome = FlowUpdateResult(rows_updated=len(updated), missing_keys=missing)
+    outcome = FlowUpdateResult(rows_updated=rows_updated, missing_keys=tuple(missing))
     logger.debug(
         "update_flows %s (%s): %d rows in, %d duplicates dropped, %d written, %d without price row",
         table.name,
@@ -642,15 +711,16 @@ async def upsert_macro(
     """
     _require_source(source, "upsert_macro")
     table = _table(TerminalMacroIndicator)
-    checked = _validate_rows(
+    _validate_rows(
         table, rows, required=_MACRO_KEY, allowed=(*_MACRO_KEY, *MACRO_INDICATOR_COLUMNS)
     )
     written_names = tuple(
-        name for name in MACRO_INDICATOR_COLUMNS if any(name in row for row in checked)
+        name for name in MACRO_INDICATOR_COLUMNS if any(name in row for row in rows)
     )
-    unique, duplicates = _dedupe_sorted(checked, _MACRO_KEY)
-    normalized = _provenance_rows(unique, carried=_MACRO_KEY, written=written_names, source=source)
-    _with_ids(table, normalized)
+    unique, duplicates = _dedupe_sorted(rows, _MACRO_KEY)
+    normalized = _provenance_rows(
+        table, unique, carried=_MACRO_KEY, written=written_names, source=source
+    )
 
     def on_conflict(stmt: Insert) -> Insert:
         return stmt.on_conflict_do_update(
@@ -701,28 +771,26 @@ async def upsert_fundamentals(
     """
     _require_source(source, "upsert_fundamentals")
     table = _table(TerminalFundamental)
-    checked = _validate_rows(
+    _validate_rows(
         table,
         rows,
         required=("ticker", "period_end_date"),
         allowed=(*_FUNDAMENTALS_KEY, "currency", *FUNDAMENTAL_VALUE_COLUMNS),
     )
-    for row in checked:
-        if row.get("period_type") is None:
-            row["period_type"] = _DEFAULT_PERIOD_TYPE
-        if row.get("currency") is None:
-            row["currency"] = DEFAULT_CURRENCY
     written_names = tuple(
-        name for name in FUNDAMENTAL_VALUE_COLUMNS if any(name in row for row in checked)
+        name for name in FUNDAMENTAL_VALUE_COLUMNS if any(name in row for row in rows)
     )
-    unique, duplicates = _dedupe_sorted(checked, _FUNDAMENTALS_KEY)
+    # The defaults are applied to the key and to each written copy, never to the caller's rows.
+    unique, duplicates = _dedupe_sorted(rows, _FUNDAMENTALS_KEY, key_of=_fundamentals_key)
     normalized = _provenance_rows(
-        unique, carried=(*_FUNDAMENTALS_KEY, "currency"), written=written_names, source=source
+        table,
+        unique,
+        carried=("ticker", "period_end_date"),
+        written=written_names,
+        source=source,
+        defaults={"period_type": _DEFAULT_PERIOD_TYPE, "currency": DEFAULT_CURRENCY},
+        extra={"filing_id": filing_id} if filing_id is not None else None,
     )
-    if filing_id is not None:
-        for row in normalized:
-            row["filing_id"] = filing_id
-    _with_ids(table, normalized)
 
     def on_conflict(stmt: Insert) -> Insert:
         set_ = _merge_set(table, stmt, written_names)

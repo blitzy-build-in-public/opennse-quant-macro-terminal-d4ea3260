@@ -24,15 +24,18 @@ import io
 import logging
 import os
 import re
+import tracemalloc
 import uuid
+import zipfile
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 
+import pandas
 import pytest
 from openpyxl import Workbook
 from sqlalchemy import Join
@@ -1378,6 +1381,12 @@ async def test_a_header_without_data_rows_is_below_the_minimum(tmp_path: Path) -
             id="ragged-csv",
         ),
         pytest.param(
+            "prices.csv",
+            b"ticker,trade_date\nSCOM\n\nEQTY,2026-09-28,extra\n",
+            "unreadable_file:ParserError",
+            id="ragged-csv-after-short-and-blank-lines",
+        ),
+        pytest.param(
             "prices.xlsx", b"not a workbook", "unreadable_file:BadZipFile", id="not-a-workbook"
         ),
     ],
@@ -1491,6 +1500,598 @@ async def test_row_limit_rejects_a_file_over_the_limit_without_importing_part(
         pipeline.parse(raw)
     assert failure.value.reason == "too_many_rows"
     assert classify_exception(failure.value)[0] is RunStatus.FAILED
+
+
+async def test_csv_short_and_blank_lines_anywhere_are_widened_to_the_header(
+    tmp_path: Path,
+) -> None:
+    # A short or blank line followed by full rows, which a CSV read in chunks fails on when the
+    # short line starts a chunk; read as one table, every line is widened to the header.
+    path = tmp_path / "prices.csv"
+    path.write_bytes(
+        b"Ticker,Trade Date,Close Price,Volume\n"
+        b"SCOM,2026-09-28,28.45,1000\n"
+        b"\n"
+        b"EQTY,2026-09-28\n"
+        b"KCB,2026-09-28,40.10,500\n"
+        b"ABSA\n"
+    )
+    staged = await _stage("daily_prices", path)
+    assert [record.row_number for record in staged.records] == [2, 4, 5, 6]
+    assert [tuple(record.raw) for record in staged.records] == [
+        ("ticker", "trade_date", "close_price", "volume")
+    ] * 4
+    assert [tuple(record.raw.values()) for record in staged.records] == [
+        ("SCOM", "2026-09-28", "28.45", "1000"),
+        ("EQTY", "2026-09-28", "", ""),
+        ("KCB", "2026-09-28", "40.10", "500"),
+        ("ABSA", "", "", ""),
+    ]
+    assert staged.ctx.details["blank_rows_skipped"] == 1
+
+
+# --- .xlsx archive limits --------------------------------------------------------------------
+
+MANIFEST = "[Content_Types].xml"
+WORKBOOK_PART = "xl/workbook.xml"
+WORKBOOK_RELATIONSHIPS = "xl/_rels/workbook.xml.rels"
+STYLES = "xl/styles.xml"
+WORKSHEET = "xl/worksheets/sheet1.xml"
+ROUTED = "xl/worksheets/sheet2.xml"
+WORKSHEET_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"
+SHARED_STRINGS_TYPE = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"
+)
+TEMPLATE_MACRO_WORKBOOK_TYPE = "application/vnd.ms-excel.template.macroEnabled.main+xml"
+CHARTSHEET_RELATIONSHIP = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet"
+)
+PACKAGE_XML_CAP = 1024 * 1024
+SHARED_STRINGS = b'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"></sst>'
+CHARTSHEET = (
+    b'<chartsheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"></chartsheet>'
+)
+LONG_STREAM_BYTES = 32 * 1024 * 1024
+PARSE_PEAK_BYTES = 8 * 1024 * 1024
+# Offsets of fields in a ZIP central-directory file header (APPNOTE.TXT 4.3.12).
+CENTRAL_FLAGS = 8
+CENTRAL_CRC = 16
+CENTRAL_COMPRESSED_SIZE = 20
+CENTRAL_FILE_SIZE = 24
+CENTRAL_HEADER_OFFSET = 42
+
+
+def _members(path: Path) -> dict[str, bytes]:
+    """Every member of the archive at ``path``, expanded, in archive order."""
+    with zipfile.ZipFile(path) as archive:
+        return {name: archive.read(name) for name in archive.namelist()}
+
+
+def _save_members(
+    path: Path, members: Mapping[str, bytes], compress_types: Mapping[str, int] | None = None
+) -> Path:
+    """Write ``members`` to ``path``, deflated unless ``compress_types`` names another method."""
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, data in members.items():
+            archive.writestr(name, data, compress_type=(compress_types or {}).get(name))
+    return path
+
+
+def _save_with_long_member(
+    path: Path, members: Mapping[str, bytes], name: str, excess: int
+) -> Path:
+    """Write ``members`` to ``path``, deflated, with ``excess`` spaces after the data of member
+    ``name``; they are written 1 MiB at a time, so the long data never exists whole here."""
+    piece = b" " * (1024 * 1024)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for member, data in members.items():
+            if member != name:
+                archive.writestr(member, data)
+                continue
+            with archive.open(member, "w") as part:
+                part.write(data)
+                for written in range(0, excess, len(piece)):
+                    part.write(piece[: excess - written])
+    return path
+
+
+def _member_info(path: Path, name: str) -> zipfile.ZipInfo:
+    with zipfile.ZipFile(path) as archive:
+        return archive.getinfo(name)
+
+
+def _member_sizes(path: Path) -> dict[str, int]:
+    with zipfile.ZipFile(path) as archive:
+        return {member.filename: member.file_size for member in archive.infolist()}
+
+
+def _patch_central_entry(raw: bytes, name: str, field: int, value: int, width: int = 4) -> bytes:
+    """``raw`` with the ``width``-byte little-endian field at offset ``field`` of the
+    central-directory file header of member ``name`` set to ``value``."""
+    encoded = name.encode()
+    entry = raw.find(b"PK\x01\x02")
+    while entry >= 0:
+        name_length = int.from_bytes(raw[entry + 28 : entry + 30], "little")
+        if raw[entry + 46 : entry + 46 + name_length] == encoded:
+            start = entry + field
+            return raw[:start] + value.to_bytes(width, "little") + raw[start + width :]
+        entry = raw.find(b"PK\x01\x02", entry + 4)
+    raise AssertionError(f"{name} is not a member of the archive")
+
+
+def _override(name: str, content_type: str) -> bytes:
+    return f'<Override PartName="/{name}" ContentType="{content_type}"/>'.encode()
+
+
+def _append_child(part: bytes, closing_tag: bytes, *children: bytes) -> bytes:
+    """``part`` with ``children`` inserted before its root's closing tag."""
+    assert part.count(closing_tag) == 1
+    return part.replace(closing_tag, b"".join(children) + closing_tag)
+
+
+def _chartsheet_relationship(target: str, tag: str = "Relationship") -> bytes:
+    return f'<{tag} Type="{CHARTSHEET_RELATIONSHIP}" Target="{target}" Id="rId9"/>'.encode()
+
+
+def _padded(part: bytes, closing_tag: bytes, size: int) -> bytes:
+    """``part`` padded with whitespace before its root's closing tag to exactly ``size`` bytes."""
+    return _append_child(part, closing_tag, b" " * (size - len(part)))
+
+
+def _xlsx_extent(path: Path) -> dict[str, int]:
+    """What each ``MAX_XLSX_*`` limit measures in a workbook openpyxl wrote, from its central
+    directory: the member count, the members other than its one (streamed) worksheet summed, that
+    worksheet, and every member summed, expanded."""
+    sizes = _member_sizes(path)
+    return {
+        "MAX_XLSX_MEMBERS": len(sizes),
+        "MAX_XLSX_PARTS_BYTES": sum(sizes.values()) - sizes[WORKSHEET],
+        "MAX_XLSX_WORKSHEET_BYTES": sizes[WORKSHEET],
+        "MAX_XLSX_EXPANDED_BYTES": sum(sizes.values()),
+    }
+
+
+def _record_excel_opens(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Replace ``pandas.ExcelFile`` by a recorder: a workbook rejected before it opens leaves the
+    returned list empty."""
+    opened: list[object] = []
+    monkeypatch.setattr(pandas, "ExcelFile", lambda *args, **kwargs: opened.append(args))
+    return opened
+
+
+async def _preflight_failure(path: Path) -> FetchFailed:
+    return (await _traced_preflight_failure(path))[0]
+
+
+async def _traced_preflight_failure(path: Path) -> tuple[FetchFailed, int]:
+    """Fetch ``path`` and parse it, which must fail the run; the failure, and the peak bytes
+    ``tracemalloc`` saw allocated while parsing."""
+    pipeline, ctx = _open("daily_prices", path)
+    raw = await pipeline.fetch(ctx)
+    tracemalloc.start()
+    try:
+        with pytest.raises(FetchFailed) as failure:
+            pipeline.parse(raw)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert classify_exception(failure.value)[0] is RunStatus.FAILED
+    return failure.value, peak
+
+
+@pytest.mark.parametrize(
+    ("limit", "reason"),
+    [
+        pytest.param("MAX_XLSX_MEMBERS", "xlsx_too_many_members", id="members"),
+        pytest.param("MAX_XLSX_PARTS_BYTES", "xlsx_parts_too_large", id="parts-summed"),
+        pytest.param("MAX_XLSX_WORKSHEET_BYTES", "xlsx_worksheet_too_large", id="worksheet"),
+        pytest.param("MAX_XLSX_EXPANDED_BYTES", "xlsx_expanded_too_large", id="total"),
+    ],
+)
+async def test_xlsx_one_past_an_archive_limit_fails_before_the_workbook_opens(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, limit: str, reason: str
+) -> None:
+    path = _write_sample(tmp_path, "daily_prices", ".xlsx")
+    monkeypatch.setattr(tabular_import, limit, _xlsx_extent(path)[limit] - 1)
+    opened = _record_excel_opens(monkeypatch)
+    assert (await _preflight_failure(path)).reason == reason
+    assert opened == []
+
+
+async def test_xlsx_at_every_archive_limit_still_imports(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = _write_sample(tmp_path, "daily_prices", ".xlsx")
+    for limit, extent in _xlsx_extent(path).items():
+        monkeypatch.setattr(tabular_import, limit, extent)
+    staged = await _stage("daily_prices", path)
+    assert staged.outcome.rejected == []
+    assert _values(staged.outcome.valid) == list(SAMPLES["daily_prices"].expected)
+
+
+async def test_xlsx_worksheet_larger_than_the_parts_budget_still_imports(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The budget is the other parts' sum; the declared worksheet is streamed and outside it.
+    rows = [("SCOM", date(2025, 1, 1) + timedelta(days=day), "28.45", 1_000) for day in range(400)]
+    path = _write_table(tmp_path / "prices.xlsx", [PRICE_HEADER, *rows])
+    sizes = _member_sizes(path)
+    budget = sum(sizes.values()) - sizes[WORKSHEET]
+    assert sizes[WORKSHEET] > budget
+    monkeypatch.setattr(tabular_import, "MAX_XLSX_PARTS_BYTES", budget)
+    staged = await _stage("daily_prices", path)
+    assert staged.outcome.rejected == []
+    assert len(staged.outcome.valid) == 400
+
+
+def _route_shared_strings(members: dict[str, bytes], size: int) -> None:
+    # openpyxl opens the first sharedStrings Override, whatever the name it routes to.
+    members[ROUTED] = _padded(SHARED_STRINGS, b"</sst>", size)
+    members[MANIFEST] = _append_child(
+        members[MANIFEST],
+        b"</Types>",
+        _override(ROUTED, WORKSHEET_TYPE),
+        _override(ROUTED, SHARED_STRINGS_TYPE),
+    )
+
+
+def _route_workbook(members: dict[str, bytes], size: int) -> None:
+    # openpyxl opens the workbook its Override names, and that workbook's relationships.
+    members[ROUTED] = _padded(members.pop(WORKBOOK_PART), b"</workbook>", size)
+    relationships = members.pop(WORKBOOK_RELATIONSHIPS)
+    members["xl/worksheets/_rels/sheet2.xml.rels"] = relationships.replace(
+        b'Target="styles.xml"', b'Target="../styles.xml"'
+    ).replace(b'Target="theme/theme1.xml"', b'Target="../theme/theme1.xml"')
+    members[MANIFEST] = _append_child(
+        members[MANIFEST].replace(
+            f'PartName="/{WORKBOOK_PART}"'.encode(), f'PartName="/{ROUTED}"'.encode()
+        ),
+        b"</Types>",
+        _override(ROUTED, WORKSHEET_TYPE),
+    )
+
+
+def _route_chartsheet(members: dict[str, bytes], size: int) -> None:
+    # openpyxl parses a chartsheet relationship's target whole, whatever its name.
+    members[ROUTED] = _padded(CHARTSHEET, b"</chartsheet>", size)
+    members[MANIFEST] = _append_child(
+        members[MANIFEST], b"</Types>", _override(ROUTED, WORKSHEET_TYPE)
+    )
+    members[WORKBOOK_RELATIONSHIPS] = _append_child(
+        members[WORKBOOK_RELATIONSHIPS],
+        b"</Relationships>",
+        _chartsheet_relationship("worksheets/sheet2.xml"),
+    )
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        pytest.param(_route_shared_strings, id="shared-strings-override"),
+        pytest.param(_route_workbook, id="workbook-override"),
+        pytest.param(_route_chartsheet, id="chartsheet-relationship"),
+    ],
+)
+async def test_xlsx_part_routed_to_a_worksheet_name_counts_toward_the_parts_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    route: Callable[[dict[str, bytes], int], None],
+) -> None:
+    # The routed member is named and declared like a worksheet, but openpyxl parses it whole;
+    # it exceeds the parts budget (every member not named like a worksheet) and is far below
+    # the worksheet cap, so a name-based limit would let it through.
+    path = _write_sample(tmp_path, "daily_prices", ".xlsx")
+    members = _members(path)
+    route(members, 64 * 1024)
+    _save_members(path, members)
+    sizes = _member_sizes(path)
+    budget = sum(size for name, size in sizes.items() if name not in (WORKSHEET, ROUTED))
+    assert budget < sizes[ROUTED] < tabular_import.MAX_XLSX_WORKSHEET_BYTES
+    monkeypatch.setattr(tabular_import, "MAX_XLSX_PARTS_BYTES", budget)
+    opened = _record_excel_opens(monkeypatch)
+    assert (await _preflight_failure(path)).reason == "xlsx_parts_too_large"
+    assert opened == []
+
+
+def _prefix_doctype(name: str, root: str) -> Callable[[dict[str, bytes]], None]:
+    def edit(members: dict[str, bytes]) -> None:
+        members[name] = f"<!DOCTYPE {root}>".encode() + members[name]
+
+    return edit
+
+
+def _utf16_manifest_with_doctype(members: dict[str, bytes]) -> None:
+    declaration = '<?xml version="1.0" encoding="UTF-16"?><!DOCTYPE Types>'
+    members[MANIFEST] = (declaration + members[MANIFEST].decode()).encode("utf-16")
+
+
+def _chartsheet_under_any_tag(members: dict[str, bytes]) -> None:
+    # openpyxl reads every child of a relationships part as a relationship, whatever its tag.
+    members[WORKBOOK_RELATIONSHIPS] = _append_child(
+        members[WORKBOOK_RELATIONSHIPS],
+        b"</Relationships>",
+        _chartsheet_relationship("chartsheets/sheet1.xml", tag="Chart"),
+    )
+
+
+def _oversized_relationships(members: dict[str, bytes]) -> None:
+    members[WORKBOOK_RELATIONSHIPS] = _padded(
+        members[WORKBOOK_RELATIONSHIPS], b"</Relationships>", PACKAGE_XML_CAP + 1
+    )
+
+
+def _malformed_relationships(members: dict[str, bytes]) -> None:
+    members[WORKBOOK_RELATIONSHIPS] = members[WORKBOOK_RELATIONSHIPS][:-1]
+
+
+def _absent_relationships(members: dict[str, bytes]) -> None:
+    del members[WORKBOOK_RELATIONSHIPS]
+
+
+def _template_macro_workbook_first(members: dict[str, bytes]) -> None:
+    # openpyxl tries the template-macro workbook type before the plain one, so this second
+    # workbook, declared after the first, is the one it opens, with its own relationships.
+    members["xl/book2.xml"] = members[WORKBOOK_PART]
+    members["xl/_rels/book2.xml.rels"] = _append_child(
+        members[WORKBOOK_RELATIONSHIPS],
+        b"</Relationships>",
+        _chartsheet_relationship("chartsheets/sheet1.xml"),
+    )
+    members[MANIFEST] = _append_child(
+        members[MANIFEST], b"</Types>", _override("xl/book2.xml", TEMPLATE_MACRO_WORKBOOK_TYPE)
+    )
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        pytest.param(_prefix_doctype(MANIFEST, "Types"), id="manifest-doctype"),
+        pytest.param(_utf16_manifest_with_doctype, id="manifest-doctype-utf-16"),
+        pytest.param(_prefix_doctype(WORKBOOK_RELATIONSHIPS, "Relationships"), id="rels-doctype"),
+        pytest.param(_chartsheet_under_any_tag, id="rels-chartsheet-any-tag"),
+        pytest.param(_oversized_relationships, id="rels-over-1-mib"),
+        pytest.param(_malformed_relationships, id="rels-not-well-formed"),
+        pytest.param(_absent_relationships, id="rels-absent"),
+        pytest.param(_template_macro_workbook_first, id="template-macro-workbook-rels"),
+    ],
+)
+async def test_xlsx_package_parts_that_cannot_be_trusted_withhold_every_worksheet_grant(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, edit: Callable[[dict[str, bytes]], None]
+) -> None:
+    # The budget is every member but the worksheet: it holds when the worksheet is streamed and
+    # is exceeded once the worksheet counts as a part.
+    path = _write_sample(tmp_path, "daily_prices", ".xlsx")
+    members = _members(path)
+    edit(members)
+    _save_members(path, members)
+    sizes = _member_sizes(path)
+    monkeypatch.setattr(
+        tabular_import, "MAX_XLSX_PARTS_BYTES", sum(sizes.values()) - sizes[WORKSHEET]
+    )
+    opened = _record_excel_opens(monkeypatch)
+    assert (await _preflight_failure(path)).reason == "xlsx_parts_too_large"
+    assert opened == []
+
+
+@pytest.mark.parametrize(
+    ("size", "imports"),
+    [
+        pytest.param(PACKAGE_XML_CAP, True, id="at-1-mib"),
+        pytest.param(PACKAGE_XML_CAP + 1, False, id="over-1-mib"),
+    ],
+)
+async def test_xlsx_manifest_over_1_mib_fails_before_it_is_parsed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, size: int, imports: bool
+) -> None:
+    path = _write_sample(tmp_path, "daily_prices", ".xlsx")
+    members = _members(path)
+    members[MANIFEST] = _padded(members[MANIFEST], b"</Types>", size)
+    _save_members(path, members)
+    assert _member_sizes(path)[MANIFEST] == size
+    if imports:
+        staged = await _stage("daily_prices", path)
+        assert _values(staged.outcome.valid) == list(SAMPLES["daily_prices"].expected)
+        return
+    opened = _record_excel_opens(monkeypatch)
+    assert (await _preflight_failure(path)).reason == "xlsx_parts_too_large"
+    assert opened == []
+
+
+@pytest.mark.parametrize(
+    ("manifest", "reason"),
+    [
+        pytest.param(b"<Types>", "unreadable_file:ParseError", id="not-well-formed"),
+        pytest.param(None, "unreadable_file:KeyError", id="absent"),
+    ],
+)
+async def test_xlsx_unreadable_manifest_fails_the_run_by_error_type(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, manifest: bytes | None, reason: str
+) -> None:
+    path = _write_sample(tmp_path, "daily_prices", ".xlsx")
+    members = _members(path)
+    if manifest is None:
+        del members[MANIFEST]
+    else:
+        members[MANIFEST] = manifest
+    _save_members(path, members)
+    opened = _record_excel_opens(monkeypatch)
+    assert (await _preflight_failure(path)).reason == reason
+    assert opened == []
+
+
+LONGER_DATA = [
+    pytest.param(1, id="one-byte-longer"),
+    pytest.param(LONG_STREAM_BYTES, id="32-mib-longer"),
+]
+
+
+def _with_long_member(path: Path, member: str, excess: int) -> Path:
+    """Rewrite the workbook at ``path`` with ``excess`` bytes more data in ``member`` than its
+    central-directory entry declares (the CRC-32 describes the longer data)."""
+    members = _members(path)
+    _save_with_long_member(path, members, member, excess)
+    declared = len(members[member])
+    path.write_bytes(_patch_central_entry(path.read_bytes(), member, CENTRAL_FILE_SIZE, declared))
+    assert _member_sizes(path)[member] == declared
+    return path
+
+
+@pytest.mark.parametrize("excess", LONGER_DATA)
+@pytest.mark.parametrize(
+    "member",
+    [
+        pytest.param(MANIFEST, id="manifest-parsed-by-the-preflight"),
+        pytest.param(WORKBOOK_PART, id="workbook-parsed-on-open"),
+        pytest.param(STYLES, id="styles-parsed-on-open"),
+    ],
+)
+async def test_xlsx_member_longer_than_its_declared_size_is_unreadable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, member: str, excess: int
+) -> None:
+    # A whole read (ZipFile.read) inflates all of a member's data in one step and only then cuts
+    # it at the declared size, so the preflight inflates every member openpyxl may read whole a
+    # bounded chunk at a time first, and stops at the first byte past the declared size.
+    path = _with_long_member(_write_sample(tmp_path, "daily_prices", ".xlsx"), member, excess)
+    opened = _record_excel_opens(monkeypatch)
+    failure, peak = await _traced_preflight_failure(path)
+    assert failure.reason == "xlsx_size_mismatch"
+    assert opened == []
+    assert peak < PARSE_PEAK_BYTES
+
+
+@pytest.mark.parametrize("excess", LONGER_DATA)
+async def test_xlsx_streamed_worksheet_longer_than_its_declared_size_is_unreadable(
+    tmp_path: Path, excess: int
+) -> None:
+    # openpyxl streams a worksheet in reads of a bounded size, which zipfile inflates a bounded
+    # chunk at a time and cuts at the declared size; the CRC-32 of the cut data then fails.
+    path = _with_long_member(_write_sample(tmp_path, "daily_prices", ".xlsx"), WORKSHEET, excess)
+    failure, peak = await _traced_preflight_failure(path)
+    assert failure.reason == "unreadable_file:BadZipFile"
+    assert peak < PARSE_PEAK_BYTES
+
+
+def _central_field(
+    field: int, value: Callable[[zipfile.ZipInfo, bytes], int]
+) -> Callable[[bytes, zipfile.ZipInfo], bytes]:
+    def edit(raw: bytes, member: zipfile.ZipInfo) -> bytes:
+        return _patch_central_entry(raw, member.filename, field, value(member, raw))
+
+    return edit
+
+
+def _invalid_deflate_stream(raw: bytes, member: zipfile.ZipInfo) -> bytes:
+    # A first byte of 0xFF opens a final block of the reserved type 3, which no inflater accepts.
+    lengths = member.header_offset + 26
+    start = (
+        member.header_offset
+        + 30
+        + int.from_bytes(raw[lengths : lengths + 2], "little")
+        + int.from_bytes(raw[lengths + 2 : lengths + 4], "little")
+    )
+    return raw[:start] + b"\xff" + raw[start + 1 :]
+
+
+@pytest.mark.parametrize(
+    ("member", "compress_type", "edit"),
+    [
+        pytest.param(
+            STYLES,
+            zipfile.ZIP_DEFLATED,
+            _central_field(CENTRAL_FILE_SIZE, lambda member, raw: member.file_size + 1),
+            id="size-overstated",
+        ),
+        pytest.param(
+            STYLES,
+            zipfile.ZIP_STORED,
+            _central_field(CENTRAL_FILE_SIZE, lambda member, raw: member.file_size - 1),
+            id="stored-sizes-differ",
+        ),
+        pytest.param(
+            WORKBOOK_PART,
+            zipfile.ZIP_DEFLATED,
+            _central_field(CENTRAL_CRC, lambda member, raw: member.CRC ^ 1),
+            id="crc-differs",
+        ),
+        pytest.param(
+            MANIFEST,
+            zipfile.ZIP_STORED,
+            _central_field(CENTRAL_CRC, lambda member, raw: member.CRC ^ 1),
+            id="stored-manifest-crc-differs",
+        ),
+        pytest.param(
+            WORKBOOK_RELATIONSHIPS,
+            zipfile.ZIP_DEFLATED,
+            _central_field(CENTRAL_CRC, lambda member, raw: member.CRC ^ 1),
+            id="rels-crc-differs",
+        ),
+        pytest.param(
+            STYLES,
+            zipfile.ZIP_DEFLATED,
+            _central_field(CENTRAL_COMPRESSED_SIZE, lambda member, raw: len(raw)),
+            id="data-past-the-end",
+        ),
+        pytest.param(
+            STYLES,
+            zipfile.ZIP_DEFLATED,
+            _central_field(CENTRAL_HEADER_OFFSET, lambda member, raw: member.header_offset + 1),
+            id="no-local-header",
+        ),
+        pytest.param(STYLES, zipfile.ZIP_DEFLATED, _invalid_deflate_stream, id="invalid-deflate"),
+    ],
+)
+async def test_xlsx_member_unlike_its_central_directory_entry_fails_before_the_workbook_opens(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    member: str,
+    compress_type: int,
+    edit: Callable[[bytes, zipfile.ZipInfo], bytes],
+) -> None:
+    path = _write_sample(tmp_path, "daily_prices", ".xlsx")
+    _save_members(path, _members(path), {member: compress_type})
+    path.write_bytes(edit(path.read_bytes(), _member_info(path, member)))
+    opened = _record_excel_opens(monkeypatch)
+    assert (await _preflight_failure(path)).reason == "xlsx_size_mismatch"
+    assert opened == []
+
+
+@pytest.mark.parametrize(
+    ("member", "compress_type", "encrypted"),
+    [
+        pytest.param(STYLES, zipfile.ZIP_BZIP2, False, id="bzip2"),
+        pytest.param(WORKSHEET, zipfile.ZIP_LZMA, False, id="lzma-worksheet"),
+        pytest.param(WORKSHEET, zipfile.ZIP_DEFLATED, True, id="encrypted-worksheet"),
+        pytest.param(MANIFEST, zipfile.ZIP_STORED, True, id="encrypted-stored-manifest"),
+    ],
+)
+async def test_xlsx_member_outside_the_package_format_fails_before_the_workbook_opens(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    member: str,
+    compress_type: int,
+    encrypted: bool,
+) -> None:
+    # Open Packaging Conventions allow only stored and deflated, unencrypted members.
+    path = _write_sample(tmp_path, "daily_prices", ".xlsx")
+    _save_members(path, _members(path), {member: compress_type})
+    if encrypted:
+        flags = _member_info(path, member).flag_bits | 0x1
+        path.write_bytes(_patch_central_entry(path.read_bytes(), member, CENTRAL_FLAGS, flags, 2))
+    assert _member_info(path, member).compress_type == compress_type
+    opened = _record_excel_opens(monkeypatch)
+    assert (await _preflight_failure(path)).reason == "xlsx_unsupported_member"
+    assert opened == []
+
+
+async def test_xlsx_with_stored_members_still_imports(tmp_path: Path) -> None:
+    path = _write_sample(tmp_path, "daily_prices", ".xlsx")
+    members = _members(path)
+    _save_members(path, members, dict.fromkeys(members, zipfile.ZIP_STORED))
+    with zipfile.ZipFile(path) as archive:
+        assert {info.compress_type for info in archive.infolist()} == {zipfile.ZIP_STORED}
+    staged = await _stage("daily_prices", path)
+    assert staged.outcome.rejected == []
+    assert _values(staged.outcome.valid) == list(SAMPLES["daily_prices"].expected)
 
 
 # --- Validate --------------------------------------------------------------------------------
@@ -2179,7 +2780,8 @@ class _Writers:
 @pytest.fixture
 def writers(monkeypatch: pytest.MonkeyPatch) -> _Writers:
     """Replace the five ``db.upsert`` writers with recorders that keep their signatures and report
-    every row as written; ``update_flows`` reports ``missing_flow_keys`` as without a price row."""
+    every row as written; ``update_flows`` reports the ``missing_flow_keys`` its rows request as
+    without a price row."""
     recorded = _Writers()
 
     def keep(
@@ -2228,7 +2830,8 @@ def writers(monkeypatch: pytest.MonkeyPatch) -> _Writers:
         executor: object, rows: Sequence[Mapping[str, object]], *, flow_source: str
     ) -> FlowUpdateResult:
         written = keep("update_flows", executor, rows, flow_source=flow_source)
-        missing = recorded.missing_flow_keys
+        requested = {(row["ticker"], row["trade_date"]) for row in rows}
+        missing = tuple(key for key in recorded.missing_flow_keys if key in requested)
         return FlowUpdateResult(rows_updated=written - len(missing), missing_keys=missing)
 
     monkeypatch.setattr(tabular_import, "upsert_rows", upsert_rows)
@@ -2288,12 +2891,75 @@ async def test_upsert_hands_each_kind_to_its_writer_as_csv_import(
     [call] = writers.calls
     assert (call.writer, call.conn, call.options) == (writer, write_conn, options)
     columns = WRITE_COLUMNS[kind]
+    # Rows reach the writer in conflict-key order, whatever the file order.
+    in_key_order = sorted(
+        SAMPLES[kind].expected,
+        key=lambda expected: tuple(expected[column] for column in CONFLICT_KEYS[kind]),
+    )
     assert call.rows == [
         {**{column: expected.get(column) for column in columns}, **stamped}
-        for expected in SAMPLES[kind].expected
+        for expected in in_key_order
     ]
     assert [tuple(row) for row in call.rows] == [(*columns, *stamped)] * 2
     assert write_conn.statements == []
+
+
+# Each sample file lists its two rows in descending key order.
+KEYS_IN_ORDER: Mapping[ImportKind, list[tuple[object, ...]]] = {
+    "equities": [("EQTY",), ("SCOM",)],
+    "daily_prices": [("EQTY", SESSION), ("SCOM", SESSION)],
+    "fundamentals": [("EQTY", date(2025, 12, 31), "FY"), ("SCOM", date(2026, 3, 31), "FY")],
+    "macro_indicators": [(date(2026, 8, 31),), (date(2026, 9, 30),)],
+    "foreign_flows": [("EQTY", SESSION), ("SCOM", SESSION)],
+}
+
+
+@pytest.mark.parametrize("kind", KINDS)
+async def test_upsert_writes_bounded_batches_in_key_order_on_the_run_connection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, writers: _Writers, kind: ImportKind
+) -> None:
+    monkeypatch.setattr(tabular_import, "_WRITE_BATCH_ROWS", 1)
+    staged = await _stage(kind, _write_sample(tmp_path, kind))
+    write_conn = _ScriptedConnection()
+    written = await staged.pipeline.upsert(
+        cast(AsyncConnection, write_conn), staged.outcome.valid, RUN_ID
+    )
+    assert written == 2
+    assert [(call.conn, len(call.rows)) for call in writers.calls] == [(write_conn, 1)] * 2
+    assert [
+        tuple(call.rows[0][column] for column in CONFLICT_KEYS[kind]) for call in writers.calls
+    ] == KEYS_IN_ORDER[kind]
+
+
+@pytest.mark.parametrize(
+    ("sample_limit", "sample"),
+    [
+        pytest.param(50, [["EQTY", SESSION], ["SCOM", SESSION]], id="every-key"),
+        pytest.param(1, [["EQTY", SESSION]], id="first-key-only"),
+    ],
+)
+async def test_foreign_flows_batches_report_their_missing_keys_together(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    writers: _Writers,
+    caplog: pytest.LogCaptureFixture,
+    sample_limit: int,
+    sample: list[list[object]],
+) -> None:
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    monkeypatch.setattr(tabular_import, "_WRITE_BATCH_ROWS", 1)
+    monkeypatch.setattr(tabular_import, "_MISSING_KEYS_SAMPLE", sample_limit)
+    staged = await _stage("foreign_flows", _write_sample(tmp_path, "foreign_flows"))
+    writers.missing_flow_keys = (("EQTY", SESSION), ("SCOM", SESSION))
+    written = await staged.pipeline.upsert(
+        cast(AsyncConnection, _ScriptedConnection()), staged.outcome.valid, RUN_ID
+    )
+    assert written == 0
+    assert len(writers.calls) == 2
+    assert staged.ctx.details["flow_missing_keys"] == {"count": 2, "sample": sample}
+    assert caplog.messages == [
+        "foreign_flows import found 2 keys without a price row at write time"
+    ]
 
 
 async def test_foreign_flows_upsert_records_keys_that_lost_their_price_row(
