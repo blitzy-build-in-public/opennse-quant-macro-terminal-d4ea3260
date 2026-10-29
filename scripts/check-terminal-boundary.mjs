@@ -3,21 +3,29 @@
  *
  * `src/components/terminal/` must stay self-contained so a host application can copy or import
  * it (Rule 1, Tech Stack & Modularity Constraints; AAP 0.4.4). The rule is checked on resolved
- * paths, not on specifier patterns:
+ * paths, not on specifier patterns, in every .ts, .tsx, .mts, .cts, .js, .jsx, .mjs and .cjs file
+ * in the folder, at any depth:
  *   - a relative specifier passes only if it resolves inside `src/components/terminal/`, at any
  *     nesting depth;
  *   - a non-relative specifier passes only if it is `react`, `react-dom` or `recharts`, or a
- *     subpath of one of them (`react/jsx-runtime`). `next`, `next/*`, `@/…` aliases, host
- *     packages and data libraries are rejected.
+ *     subpath of one of them (`react/jsx-runtime`) with no `.`, `..` or empty segment. `next`,
+ *     `next/*`, `@/…` aliases, host packages and data libraries are rejected;
+ *   - `import()` and `require()` must take a string literal, since any other argument can name
+ *     any module.
+ * A violation prints the file, the specifier, the resolved path and its reason
+ * (`outside-terminal-folder`, `disallowed-package` or `non-literal-specifier`). A file TypeScript
+ * cannot parse prints `cannot parse` with the diagnostic, because it may hide imports.
  *
  * Usage:
- *   node scripts/check-terminal-boundary.mjs              check every .ts/.tsx file in the folder
+ *   node scripts/check-terminal-boundary.mjs              check every source file in the folder
  *   node scripts/check-terminal-boundary.mjs --self-test  run the in-memory checker cases
+ *   node scripts/check-terminal-boundary.mjs --help       print this help (or -h)
  *
  * Exit codes:
- *   0  no violation (or every self-test case passed)
+ *   0  no violation (or every self-test case passed, or help was printed)
  *   1  at least one violation (or a self-test case failed)
- *   2  usage error, or the folder is missing, holds no source files or cannot be read
+ *   2  usage error; the folder is missing or holds no source files; a file cannot be read or
+ *      cannot be parsed (2 outranks 1, because the check could not run completely)
  *
  * `npm run lint` runs ESLint, then this script, then this script with `--self-test`.
  */
@@ -34,26 +42,51 @@ const TERMINAL_ROOT = path.join(REPO_ROOT, "src", "components", "terminal");
 
 /** Packages a widget may import. `react-is` is a Recharts peer that widgets never import. */
 const ALLOWED_PACKAGES = ["react", "react-dom", "recharts"];
-/** Checked file extensions; `.d.ts` files end in `.ts` and are included. */
-const SOURCE_EXTENSIONS = [".ts", ".tsx"];
+/**
+ * Checked file extensions: every TypeScript and JavaScript module kind, because `allowJs` lets a
+ * `.js` file in the folder re-export host code to a widget. `.d.ts`, `.d.mts` and `.d.cts` files
+ * end in a listed extension and are included.
+ */
+const SOURCE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
 
 const REASON_OUTSIDE = "outside-terminal-folder";
 const REASON_PACKAGE = "disallowed-package";
+const REASON_NON_LITERAL = "non-literal-specifier";
 const NON_RELATIVE_NOTE =
   `(non-relative specifier; allowed: ${ALLOWED_PACKAGES.join(", ")} and their subpaths)`;
+const NON_LITERAL_NOTE = "(non-literal specifier; the resolved path cannot be determined)";
+const MISSING_ARGUMENT_NOTE = "(no specifier argument; the resolved path cannot be determined)";
 
 /**
+ * `call` is set only on an `import()` or `require()` whose first argument is not a string
+ * literal; `specifier` then holds that argument's source text, or "" when there is no argument.
  * @typedef {"import" | "reference-path" | "reference-types"} SpecifierKind
- * @typedef {{ specifier: string, pos: number, kind: SpecifierKind }} SpecifierRef
+ * @typedef {"import" | "require"} SpecifierCall
+ * @typedef {{
+ *   specifier: string,
+ *   pos: number,
+ *   kind: SpecifierKind,
+ *   call?: SpecifierCall,
+ * }} SpecifierRef
  * @typedef {{
  *   file: string,
  *   line: number,
  *   column: number,
  *   specifier: string,
  *   kind: SpecifierKind,
+ *   call?: SpecifierCall,
  *   resolved: string,
  *   reason: string,
  * }} Violation
+ * @typedef {{
+ *   file: string,
+ *   line: number,
+ *   column: number,
+ *   code: number,
+ *   message: string,
+ * }} ParseError
+ *   `message` is `TS<code> <text>`, for example `TS1185 Merge conflict marker encountered.`
+ * @typedef {{ violations: Violation[], parseErrors: ParseError[] }} CheckResult
  */
 
 /**
@@ -66,6 +99,29 @@ function toPosix(p) {
 }
 
 /**
+ * The one test of which files the walk checks, shared with the self-test so its cases use only
+ * names a real run would collect.
+ * @param {string} name file name or path
+ * @returns {boolean}
+ */
+function isSourceFileName(name) {
+  return SOURCE_EXTENSIONS.some((ext) => name.endsWith(ext));
+}
+
+/**
+ * The script kind tsc gives each extension: `.ts`, `.mts` and `.cts` are TypeScript without JSX,
+ * and `.js`, `.mjs` and `.cjs` are JavaScript, where type syntax is an error.
+ * @param {string} fileName
+ * @returns {import("typescript").ScriptKind}
+ */
+function scriptKindFor(fileName) {
+  if (fileName.endsWith(".tsx")) return ts.ScriptKind.TSX;
+  if (fileName.endsWith(".jsx")) return ts.ScriptKind.JSX;
+  if ([".js", ".mjs", ".cjs"].some((ext) => fileName.endsWith(ext))) return ts.ScriptKind.JS;
+  return ts.ScriptKind.TS;
+}
+
+/**
  * @param {string} spec
  * @returns {boolean} true for `.`, `..`, `./…` and `../…`
  */
@@ -74,11 +130,31 @@ function isRelativeSpecifier(spec) {
 }
 
 /**
- * Exact name or `name/` subpath match: a bare prefix test would accept `recharts-extra`.
+ * True for a character some resolver turns into a separator or a dot segment, so the specifier's
+ * path cannot be judged from its text: `\` (a separator on Windows), `%` (Node's ESM resolver
+ * decodes `%2e` to `.`), and ASCII controls and space (URL parsing drops tab and newline, so
+ * `.<tab>.` becomes `..`, and trims trailing spaces).
+ * @param {string} spec
+ * @returns {boolean}
+ */
+function hasAmbiguousPathCharacter(spec) {
+  for (const ch of spec) {
+    if (ch === "\\" || ch === "%" || ch <= " " || ch === "\u007f") return true;
+  }
+  return false;
+}
+
+/**
+ * Exact name or `name/` subpath match (a bare prefix test would accept `recharts-extra`), on a
+ * specifier that is already in normal form. A `.` or `..` segment or an empty segment
+ * (`recharts/../../src/app/page`, `react/./x`, `react//x`) changes under
+ * `path.posix.normalize` and is rejected, because bundlers resolve it out of the package and into
+ * host code. A trailing slash (`react/`) is kept by normalization and still passes.
  * @param {string} spec
  * @returns {boolean}
  */
 function isAllowedPackage(spec) {
+  if (hasAmbiguousPathCharacter(spec) || path.posix.normalize(spec) !== spec) return false;
   return ALLOWED_PACKAGES.some((name) => spec === name || spec.startsWith(`${name}/`));
 }
 
@@ -106,23 +182,66 @@ function isInsideTerminal(resolvedAbs, terminalRoot) {
 }
 
 /**
+ * Parses one file, once, for both the AST backstop and the parse check.
+ * @param {string} fileName its extension decides the script kind (see scriptKindFor)
+ * @param {string} sourceText
+ * @returns {import("typescript").SourceFile} named with `/` separators, as TypeScript names
+ *   program files, so `listParseErrors` can find it again by name
+ */
+function parseSource(fileName, sourceText) {
+  return ts.createSourceFile(
+    toPosix(fileName),
+    sourceText,
+    ts.ScriptTarget.Latest,
+    false,
+    scriptKindFor(fileName),
+  );
+}
+
+/**
+ * Syntax errors in a parsed file, from a one-file program over a host that serves only that
+ * file, so nothing is read from or written to disk. A file with any of these may hide imports
+ * (a merge-conflict marker or a binary-looking file ends the parse early), so its check is
+ * incomplete.
+ * @param {import("typescript").SourceFile} sourceFile
+ * @returns {{ pos: number, code: number, message: string }[]}
+ */
+function listParseErrors(sourceFile) {
+  /** @type {import("typescript").CompilerHost} */
+  const host = {
+    getSourceFile: (name) => (name === sourceFile.fileName ? sourceFile : undefined),
+    getDefaultLibFileName: () => "lib.d.ts",
+    writeFile: () => {
+      throw new Error("the parse check never emits");
+    },
+    getCurrentDirectory: () => path.posix.dirname(sourceFile.fileName),
+    getCanonicalFileName: (name) => name,
+    useCaseSensitiveFileNames: () => true,
+    getNewLine: () => "\n",
+    fileExists: (name) => name === sourceFile.fileName,
+    readFile: () => undefined,
+  };
+  const program = ts.createProgram({
+    rootNames: [sourceFile.fileName],
+    options: { noLib: true, noResolve: true, types: [], allowJs: true, noEmit: true },
+    host,
+  });
+  return program.getSyntacticDiagnostics(sourceFile).map((d) => ({
+    pos: d.start ?? 0,
+    code: d.code,
+    message: `TS${d.code} ${ts.flattenDiagnosticMessageText(d.messageText, " ")}`,
+  }));
+}
+
+/**
  * Module specifiers found by parsing the source into an AST. This backs up `ts.preProcessFile`,
  * whose token scanner does not report `export * as ns from "x"`, `export type * as ns from "x"`
  * or `import defer * as ns from "x"` in TypeScript 5.9; without it those forms would bypass the
  * boundary.
- * @param {string} sourceText
- * @param {string} fileName decides between TS and TSX parsing
+ * @param {import("typescript").SourceFile} sourceFile
  * @returns {SpecifierRef[]} positions of the first character of each specifier's text
  */
-function listAstSpecifiers(sourceText, fileName) {
-  const scriptKind = fileName.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
-  const sourceFile = ts.createSourceFile(
-    fileName,
-    sourceText,
-    ts.ScriptTarget.Latest,
-    false,
-    scriptKind,
-  );
+function listAstSpecifiers(sourceFile) {
   /** @type {SpecifierRef[]} */
   const found = [];
   /** @param {import("typescript").Node | undefined} literal */
@@ -147,7 +266,24 @@ function listAstSpecifiers(sourceText, fileName) {
       (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
         (ts.isIdentifier(node.expression) && node.expression.text === "require"))
     ) {
-      record(node.arguments[0]);
+      const argument = node.arguments[0];
+      const isLiteral =
+        argument !== undefined &&
+        (ts.isStringLiteral(argument) || ts.isNoSubstitutionTemplateLiteral(argument));
+      if (isLiteral) {
+        record(argument);
+      } else {
+        // A computed or missing specifier can name any module, so it is reported rather than
+        // skipped. preProcessFile does not list these calls.
+        found.push({
+          // Whitespace is collapsed so a multi-line argument still prints on one line.
+          specifier: argument ? argument.getText(sourceFile).replace(/\s+/g, " ") : "",
+          // `arguments.pos` is the offset just after `(`.
+          pos: argument ? argument.getStart(sourceFile) : node.arguments.pos,
+          kind: "import",
+          call: node.expression.kind === ts.SyntaxKind.ImportKeyword ? "import" : "require",
+        });
+      }
     } else if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) {
       record(node.argument.literal);
     }
@@ -164,13 +300,12 @@ function listAstSpecifiers(sourceText, fileName) {
  * `import()` anywhere (type positions included), `import x = require()`, `require()` and module
  * augmentations. `/// <reference path>` and `/// <reference types>` are kept as their own kinds.
  * Ambient `declare module` names in a script file are declarations, not imports, and are skipped.
- * @param {string} sourceText
- * @param {string} [fileName]
+ * @param {import("typescript").SourceFile} sourceFile
  * @returns {SpecifierRef[]} sorted by position; `pos` is the first character of the specifier
  */
-function listSpecifiers(sourceText, fileName = "module.tsx") {
+function listSpecifiers(sourceFile) {
   const info = ts.preProcessFile(
-    sourceText,
+    sourceFile.text,
     /* readImportFiles */ true,
     /* detectJavaScriptImports */ true,
   );
@@ -186,14 +321,14 @@ function listSpecifiers(sourceText, fileName = "module.tsx") {
   const refs = [
     // preProcessFile reports an import at its opening quote, a reference at its path text.
     ...fromReferences(info.importedFiles, "import", 1),
-    ...listAstSpecifiers(sourceText, fileName),
+    ...listAstSpecifiers(sourceFile),
     ...fromReferences(info.referencedFiles, "reference-path", 0),
     ...fromReferences(info.typeReferenceDirectives, "reference-types", 0),
   ];
   const seen = new Set();
   return refs
     .filter((ref) => {
-      const key = `${ref.kind}\u0000${ref.pos}\u0000${ref.specifier}`;
+      const key = `${ref.kind}\u0000${ref.call ?? ""}\u0000${ref.pos}\u0000${ref.specifier}`;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
@@ -219,21 +354,32 @@ function lineCol(sourceText, pos) {
 }
 
 /**
- * Checks one file's specifiers against the boundary. Performs no filesystem access, so the
- * self-test can call it with virtual paths.
+ * Checks one file's specifiers against the boundary and reports any syntax error that may hide
+ * one. Performs no filesystem access, so the self-test can call it with virtual paths.
  * @param {string} absFile absolute path of the file (real or virtual)
  * @param {string} sourceText
  * @param {string} terminalRoot absolute path of the widget folder
- * @returns {Violation[]}
+ * @returns {CheckResult}
  */
 function checkSource(absFile, sourceText, terminalRoot) {
+  const sourceFile = parseSource(absFile, sourceText);
+  /** @type {ParseError[]} */
+  const parseErrors = listParseErrors(sourceFile).map(({ pos, code, message }) => ({
+    file: absFile,
+    ...lineCol(sourceText, pos),
+    code,
+    message,
+  }));
   /** @type {Violation[]} */
   const violations = [];
-  for (const ref of listSpecifiers(sourceText, absFile)) {
+  for (const ref of listSpecifiers(sourceFile)) {
     const { line, column } = lineCol(sourceText, ref.pos);
     const base = { file: absFile, line, column, specifier: ref.specifier, kind: ref.kind };
-    // A reference path is file-relative even without a `./` prefix, so it resolves like one.
-    if (ref.kind === "reference-path" || isRelativeSpecifier(ref.specifier)) {
+    if (ref.call !== undefined) {
+      const resolved = ref.specifier === "" ? MISSING_ARGUMENT_NOTE : NON_LITERAL_NOTE;
+      violations.push({ ...base, call: ref.call, resolved, reason: REASON_NON_LITERAL });
+    } else if (ref.kind === "reference-path" || isRelativeSpecifier(ref.specifier)) {
+      // A reference path is file-relative even without a `./` prefix, so it resolves like one.
       const resolved = path.resolve(path.dirname(absFile), ref.specifier);
       if (!isInsideTerminal(resolved, terminalRoot)) {
         violations.push({ ...base, resolved, reason: REASON_OUTSIDE });
@@ -243,13 +389,13 @@ function checkSource(absFile, sourceText, terminalRoot) {
       violations.push({ ...base, resolved: NON_RELATIVE_NOTE, reason: REASON_PACKAGE });
     }
   }
-  return violations;
+  return { violations, parseErrors };
 }
 
 /**
  * Recursive walk, sorted by name at every level so output order is deterministic.
  * @param {string} dir
- * @returns {string[]} absolute paths of regular `.ts`/`.tsx` files
+ * @returns {string[]} absolute paths of regular files with a SOURCE_EXTENSIONS extension
  */
 function collectSourceFiles(dir) {
   const entries = fs
@@ -261,7 +407,7 @@ function collectSourceFiles(dir) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       files.push(...collectSourceFiles(full));
-    } else if (entry.isFile() && SOURCE_EXTENSIONS.some((ext) => entry.name.endsWith(ext))) {
+    } else if (entry.isFile() && isSourceFileName(entry.name)) {
       files.push(full);
     }
   }
@@ -279,14 +425,44 @@ function displayPath(absPath) {
 }
 
 /**
+ * Writes ASCII control characters as `\u00XX` (a tab as `\u0009`, a newline as `\u000a`), so a
+ * specifier holding one still prints as one line and cannot be mistaken for a backslash
+ * sequence. Every other character prints as written.
+ * @param {string} text
+ * @returns {string}
+ */
+function escapeControlCharacters(text) {
+  let out = "";
+  for (const ch of text) {
+    const code = ch.charCodeAt(0);
+    out += code < 0x20 || code === 0x7f ? `\\u${code.toString(16).padStart(4, "0")}` : ch;
+  }
+  return out;
+}
+
+/**
  * @param {Violation} v
- * @returns {string} `<file>:<line>:<col>  import "<spec>" -> <resolved>  [<reason>]`
+ * @returns {string} `<file>:<line>:<col>  import "<spec>" -> <resolved>  [<reason>]`; a
+ *   non-literal specifier prints as its call, `<file>:<line>:<col>  import(<expr>) -> …`
  */
 function formatViolation(v) {
   const label = v.kind === "import" ? "import" : v.kind.replace("-", " ");
   const resolved = v.reason === REASON_OUTSIDE ? displayPath(v.resolved) : v.resolved;
   const location = `${displayPath(v.file)}:${v.line}:${v.column}`;
-  return `${location}  ${label} "${v.specifier}" -> ${resolved}  [${v.reason}]`;
+  const specifier = escapeControlCharacters(v.specifier);
+  // The argument is source text, not a string, so it is shown inside its call instead of quotes.
+  if (v.call !== undefined) {
+    return `${location}  ${v.call}(${specifier}) -> ${resolved}  [${v.reason}]`;
+  }
+  return `${location}  ${label} "${specifier}" -> ${resolved}  [${v.reason}]`;
+}
+
+/**
+ * @param {ParseError} e
+ * @returns {string} `<file>:<line>:<col>  cannot parse: TS<code> <message>`
+ */
+function formatParseError(e) {
+  return `${displayPath(e.file)}:${e.line}:${e.column}  cannot parse: ${e.message}`;
 }
 
 /**
@@ -319,18 +495,32 @@ function runCheck() {
 
   /** @type {Violation[]} */
   const violations = [];
+  /** @type {ParseError[]} */
+  const parseErrors = [];
   for (const file of files) {
-    violations.push(...checkSource(file, fs.readFileSync(file, "utf8"), TERMINAL_ROOT));
+    const result = checkSource(file, fs.readFileSync(file, "utf8"), TERMINAL_ROOT);
+    violations.push(...result.violations);
+    parseErrors.push(...result.parseErrors);
   }
 
+  for (const v of violations) console.error(formatViolation(v));
+  for (const e of parseErrors) console.error(formatParseError(e));
   if (violations.length > 0) {
-    for (const v of violations) console.error(formatViolation(v));
     const fileCount = new Set(violations.map((v) => v.file)).size;
     console.error(
       `check-terminal-boundary: ${violations.length} violation(s) in ${fileCount} file(s)`,
     );
-    return 1;
   }
+  if (parseErrors.length > 0) {
+    // Code 2 (the check could not run completely) outranks 1: an unparsed file may hide imports.
+    const fileCount = new Set(parseErrors.map((e) => e.file)).size;
+    console.error(
+      `check-terminal-boundary: ${fileCount} file(s) cannot be parsed ` +
+        `(${parseErrors.length} error(s)); their imports may be incomplete`,
+    );
+    return 2;
+  }
+  if (violations.length > 0) return 1;
 
   console.log(`check-terminal-boundary: OK (${files.length} files in ${TERMINAL_REL} checked)`);
   return 0;
@@ -342,12 +532,15 @@ function runCheck() {
  *   name: string,
  *   file: string,
  *   source: string,
- *   expect: "reject" | "accept",
+ *   expect: "reject" | "accept" | "unparseable",
  *   specifier?: string,
  *   reason?: string,
+ *   diagnostic?: number,
  * }} SelfTestCase
- * `file` is relative to the widget folder and becomes a virtual path under it; a reject case
- * names the specifier (and reason) that must be reported.
+ * `file` is relative to the widget folder and becomes a virtual path under it. An accept case
+ * must give no violation and no parse error; a reject case names the specifier (and reason) that
+ * must be reported from a source that parses; an unparseable case names the TypeScript
+ * diagnostic code that must be reported.
  */
 
 /** @type {SelfTestCase[]} */
@@ -490,6 +683,38 @@ const SELF_TEST_CASES = [
     reason: REASON_PACKAGE,
   },
   {
+    name: "dynamic import() of a variable",
+    file: "X.tsx",
+    source: "export async function load(m: string) {\n  return import(m);\n}\n",
+    expect: "reject",
+    specifier: "m",
+    reason: REASON_NON_LITERAL,
+  },
+  {
+    name: "dynamic import() of a template with a substitution",
+    file: "X.tsx",
+    source: "export async function load(x: string) {\n  return import(`next/${x}`);\n}\n",
+    expect: "reject",
+    specifier: "`next/${x}`",
+    reason: REASON_NON_LITERAL,
+  },
+  {
+    name: "require() of a variable",
+    file: "lib/x.ts",
+    source: "export function load(x: string) {\n  return require(x);\n}\n",
+    expect: "reject",
+    specifier: "x",
+    reason: REASON_NON_LITERAL,
+  },
+  {
+    name: "import() with no argument",
+    file: "X.tsx",
+    source: "export const load = () => import();\n",
+    expect: "reject",
+    specifier: "",
+    reason: REASON_NON_LITERAL,
+  },
+  {
     name: "module augmentation of a host package",
     file: "X.tsx",
     source:
@@ -535,6 +760,70 @@ const SELF_TEST_CASES = [
     reason: REASON_PACKAGE,
   },
   {
+    name: "allowlisted package climbing into host pages with ..",
+    file: "X.tsx",
+    source: 'import Page from "recharts/../../src/app/page";\n',
+    expect: "reject",
+    specifier: "recharts/../../src/app/page",
+    reason: REASON_PACKAGE,
+  },
+  {
+    name: "allowlisted package climbing into a sibling package with ..",
+    file: "X.tsx",
+    source: 'import Link from "react/../next/link";\n',
+    expect: "reject",
+    specifier: "react/../next/link",
+    reason: REASON_PACKAGE,
+  },
+  {
+    name: "allowlisted package with a . segment",
+    file: "X.tsx",
+    source: 'import debounce from "react/./../lodash";\n',
+    expect: "reject",
+    specifier: "react/./../lodash",
+    reason: REASON_PACKAGE,
+  },
+  {
+    name: "allowlisted package with an empty segment",
+    file: "X.tsx",
+    source: 'import { jsx } from "react//jsx-runtime";\n',
+    expect: "reject",
+    specifier: "react//jsx-runtime",
+    reason: REASON_PACKAGE,
+  },
+  {
+    name: "allowlisted package with a backslash separator",
+    file: "X.tsx",
+    source: 'import Link from "react/..\\\\next";\n',
+    expect: "reject",
+    specifier: "react/..\\next",
+    reason: REASON_PACKAGE,
+  },
+  {
+    name: "allowlisted package with percent-encoded dot segments",
+    file: "X.tsx",
+    source: 'import Page from "recharts/%2e%2e/%2e%2e/src/app/page";\n',
+    expect: "reject",
+    specifier: "recharts/%2e%2e/%2e%2e/src/app/page",
+    reason: REASON_PACKAGE,
+  },
+  {
+    name: "allowlisted package with dot segments split by tabs",
+    file: "X.tsx",
+    source: 'import Page from "recharts/.\\t./.\\t./src/app/page";\n',
+    expect: "reject",
+    specifier: "recharts/.\t./.\t./src/app/page",
+    reason: REASON_PACKAGE,
+  },
+  {
+    name: "/// <reference types> climbing out of react",
+    file: "types.ts",
+    source: '/// <reference types="react/../node" />\nexport {};\n',
+    expect: "reject",
+    specifier: "react/../node",
+    reason: REASON_PACKAGE,
+  },
+  {
     name: "react/jsx-runtime subpath",
     file: "X.tsx",
     source: 'import { jsx } from "react/jsx-runtime";\n',
@@ -544,6 +833,12 @@ const SELF_TEST_CASES = [
     name: "react-dom",
     file: "X.tsx",
     source: 'import { createPortal } from "react-dom";\n',
+    expect: "accept",
+  },
+  {
+    name: "react/ with a trailing slash",
+    file: "X.tsx",
+    source: 'import React from "react/";\n',
     expect: "accept",
   },
   {
@@ -594,6 +889,85 @@ const SELF_TEST_CASES = [
       "}\n",
     expect: "accept",
   },
+
+  // Every module extension beyond .ts and .tsx; the walk collects each, so each must be checked.
+  ...[".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"].map(
+    (ext) =>
+      /** @type {SelfTestCase} */ ({
+        name: `next/link in a ${ext} file`,
+        file: `X${ext}`,
+        source: 'import "next/link";\n',
+        expect: "reject",
+        specifier: "next/link",
+        reason: REASON_PACKAGE,
+      }),
+  ),
+  {
+    name: "JavaScript helper re-exporting host code",
+    file: "lib/helper.js",
+    source: 'export { HOST_SECRET } from "../../app/hostSecret";\n',
+    expect: "reject",
+    specifier: "../../app/hostSecret",
+    reason: REASON_OUTSIDE,
+  },
+  {
+    name: "JSX component in a .jsx file",
+    file: "X.jsx",
+    source:
+      'import { useState } from "react";\n' +
+      "export const Counter = () => <div>{String(useState)}</div>;\n",
+    expect: "accept",
+  },
+
+  // Sources TypeScript cannot parse. Each may hide imports, so a run must not report them clean.
+  {
+    name: "merge-conflict markers hiding a host import",
+    file: "X.ts",
+    source:
+      "<<<<<<< HEAD\n" +
+      'import { useState } from "react";\n' +
+      "=======\n" +
+      'import Link from "next/link";\n' +
+      ">>>>>>> branch\n" +
+      "export {};\n",
+    expect: "unparseable",
+    diagnostic: 1185,
+  },
+  {
+    name: "binary-looking file hiding a host import",
+    file: "X.ts",
+    source: '\uFFFD\uFFFD\u0000garbage\u0000\nimport Link from "next/link";\n',
+    expect: "unparseable",
+    diagnostic: 1490,
+  },
+  {
+    name: "malformed object literal",
+    file: "X.ts",
+    source: "export const x = {;\n",
+    expect: "unparseable",
+    diagnostic: 1136,
+  },
+  {
+    name: "unterminated template literal",
+    file: "X.ts",
+    source: "export const x = `abc\n",
+    expect: "unparseable",
+    diagnostic: 1160,
+  },
+  {
+    name: "unclosed block comment hiding a host import",
+    file: "X.ts",
+    source: '/* unclosed\nimport Link from "next/link";\n',
+    expect: "unparseable",
+    diagnostic: 1010,
+  },
+  {
+    name: "type annotation in a .js file",
+    file: "X.js",
+    source: "export const x: number = 1;\n",
+    expect: "unparseable",
+    diagnostic: 8010,
+  },
 ];
 
 /**
@@ -605,22 +979,36 @@ function runSelfTest() {
   let passed = 0;
   for (const testCase of SELF_TEST_CASES) {
     const virtualFile = path.join(TERMINAL_ROOT, ...testCase.file.split("/"));
-    const violations = checkSource(virtualFile, testCase.source, TERMINAL_ROOT);
-    const ok =
-      testCase.expect === "accept"
-        ? violations.length === 0
-        : violations.some(
-            (v) =>
-              v.specifier === testCase.specifier &&
-              (testCase.reason === undefined || v.reason === testCase.reason),
-          );
+    // A case under a name the walk skips would pass here while real files like it go unchecked.
+    const collected = isSourceFileName(virtualFile);
+    const { violations, parseErrors } = checkSource(virtualFile, testCase.source, TERMINAL_ROOT);
+    let ok = false;
+    if (testCase.expect === "accept") {
+      ok = violations.length === 0 && parseErrors.length === 0;
+    } else if (testCase.expect === "reject") {
+      ok =
+        parseErrors.length === 0 &&
+        violations.some(
+          (v) =>
+            v.specifier === testCase.specifier &&
+            (testCase.reason === undefined || v.reason === testCase.reason),
+        );
+    } else {
+      ok = parseErrors.some((e) => e.code === testCase.diagnostic);
+    }
+    ok = ok && collected;
     if (ok) {
       passed += 1;
       console.log(`PASS ${testCase.name}`);
+    } else if (!collected) {
+      console.log(`FAIL ${testCase.name} (${testCase.file} is not a file the check collects)`);
     } else {
       const found =
         violations.map((v) => `"${v.specifier}" [${v.reason}]`).join(", ") || "none";
-      const got = `got ${violations.length} violations: ${found}`;
+      const errors = parseErrors.map((e) => `TS${e.code}`).join(", ") || "none";
+      const got =
+        `got ${violations.length} violations: ${found}; ` +
+        `${parseErrors.length} parse errors: ${errors}`;
       console.log(`FAIL ${testCase.name} (expected ${testCase.expect}, ${got})`);
     }
   }
@@ -632,6 +1020,32 @@ function runSelfTest() {
 const USAGE = [
   "usage: node scripts/check-terminal-boundary.mjs              check src/components/terminal",
   "       node scripts/check-terminal-boundary.mjs --self-test  run the checker's self-test",
+  "       node scripts/check-terminal-boundary.mjs --help       print this help (or -h)",
+].join("\n");
+
+/** The header comment's account of the check, printed by `--help` and `-h`. */
+const HELP = [
+  "check-terminal-boundary: import boundary of the embeddable widget folder",
+  "",
+  USAGE,
+  "",
+  `Checks every ${SOURCE_EXTENSIONS.join(", ")} file in ${TERMINAL_REL}/,`,
+  "at any depth, on resolved paths rather than specifier patterns:",
+  `  - a relative specifier passes only if it resolves inside ${TERMINAL_REL}/;`,
+  `  - a non-relative specifier passes only if it is ${ALLOWED_PACKAGES.join(", ")} or a subpath`,
+  "    of one of them (react/jsx-runtime) with no '.', '..' or empty segment;",
+  "  - import() and require() must take a string literal.",
+  "A violation prints <file>:<line>:<col>, the specifier, the resolved path and its reason",
+  `(${REASON_OUTSIDE}, ${REASON_PACKAGE} or ${REASON_NON_LITERAL}). A file TypeScript`,
+  "cannot parse prints <file>:<line>:<col>  cannot parse: <diagnostic>, as it may hide imports.",
+  "",
+  "Exit codes:",
+  "  0  no violation (or every self-test case passed, or help was printed)",
+  "  1  at least one violation (or a self-test case failed)",
+  "  2  usage error; the folder is missing or holds no source files; a file cannot be read or",
+  "     cannot be parsed (2 outranks 1, because the check could not run completely)",
+  "",
+  "`npm run lint` runs `eslint .`, then this script, then this script with --self-test.",
 ].join("\n");
 
 /**
@@ -641,6 +1055,10 @@ const USAGE = [
 function main(args) {
   if (args.length === 0) return runCheck();
   if (args.length === 1 && args[0] === "--self-test") return runSelfTest();
+  if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) {
+    console.log(HELP);
+    return 0;
+  }
   console.error(USAGE);
   return 2;
 }
