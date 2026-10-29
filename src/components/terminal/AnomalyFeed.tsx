@@ -42,6 +42,13 @@ const EMPTY_FEED_MESSAGE =
 // Every class below is a complete static string, never assembled from fragments, so Tailwind's
 // source scan and a host's `@source` directive or `content` glob find each one.
 const SUMMARY_CLASS = "mb-2 text-xs text-slate-400";
+// While a request for new props, or a refetch, is in flight, the previous feed stays on screen,
+// dimmed and marked busy; the opacity change runs only when the user has not asked for reduced
+// motion.
+const BODY_CLASS = "motion-safe:transition-opacity motion-safe:duration-200 motion-safe:ease-out";
+const BODY_DIMMED_CLASS =
+  "opacity-60 motion-safe:transition-opacity motion-safe:duration-200 motion-safe:ease-out";
+const UPDATING_CLASS = "text-xs text-slate-400";
 // The list scrolls inside the card so a busy session does not stretch the host's layout; the
 // region is focusable so the scroll is keyboard-reachable when the tickers are not buttons. Its
 // p-1, and the tickers' scroll-my-1 when focus scrolls one into view, equal the focus outline's
@@ -57,11 +64,13 @@ const ITEM_LEAD_CLASS = "flex min-w-0 items-center gap-2";
 const ITEM_FIGURES_CLASS = "ms-auto flex items-center gap-3 text-end tabular-nums";
 // The button keeps the 44×44 px minimum target; its look matches plain text apart from colour,
 // even in a host without a CSS reset. Hover is a Tailwind 4 `hover:` variant, which applies only
-// under `(hover: hover)`, so it never sticks on touch screens. Button and plain ticker share
-// min-w-16, which fits the usual 3–5 letter NSE ticker, and the date's min-w-20 fits
-// "29 Sep 2026", so the date and badge columns align across rows.
+// under `(hover: hover)`, so it never sticks on touch screens. The pressed `active:` state, which
+// touch screens apply without `:hover`, deepens the background one step past hover to slate-700
+// and sets its own sky-200 text, 7.8:1. Button and plain ticker share min-w-16, which fits the
+// usual 3–5 letter NSE ticker, and the date's min-w-20 fits "29 Sep 2026", so the date and badge
+// columns align across rows.
 const TICKER_BUTTON_CLASS =
-  "inline-flex min-h-11 min-w-16 scroll-my-1 cursor-pointer items-center justify-start rounded border-0 bg-transparent px-2 font-mono text-sm font-semibold text-sky-300 hover:bg-slate-800 hover:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "inline-flex min-h-11 min-w-16 scroll-my-1 cursor-pointer items-center justify-start rounded border-0 bg-transparent px-2 font-mono text-sm font-semibold text-sky-300 hover:bg-slate-800 hover:text-sky-200 active:bg-slate-700 active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const TICKER_TEXT_CLASS =
   "inline-flex min-w-16 items-center px-2 font-mono text-sm font-semibold text-slate-100";
 const DATE_CLASS = "min-w-20 whitespace-nowrap text-xs text-slate-400";
@@ -69,15 +78,21 @@ const VALUE_CLASS = "block text-sm text-slate-100";
 const MEAN_CLASS = "block text-xs text-slate-400";
 const Z_CLASS = "whitespace-nowrap text-sm font-semibold text-slate-50";
 
-/** Label and badge classes of each metric; the label text carries the meaning, not the colour. */
+/**
+ * Label and badge classes of each metric; the label text carries the meaning, not the colour.
+ * Both class strings mirror EquityScreener's VOLUME_BADGE_CLASS and TURNOVER_BADGE_CLASS, which
+ * badge the same spikes on the same page, and must stay identical to them in colour, opacity,
+ * padding, radius and text. Only the screener's whitespace-nowrap is left out: it keeps that
+ * table's two-word labels on one line, and these one-word labels cannot wrap.
+ */
 const METRIC_BADGES: Record<AnomalyItem["metric"], { label: string; className: string }> = {
   volume: {
     label: "Volume",
-    className: "rounded bg-amber-900/40 px-1.5 py-0.5 text-xs font-medium text-amber-200",
+    className: "rounded bg-amber-900/60 px-1.5 py-0.5 text-xs font-medium text-amber-200",
   },
   turnover: {
     label: "Turnover",
-    className: "rounded bg-sky-900/40 px-1.5 py-0.5 text-xs font-medium text-sky-200",
+    className: "rounded bg-sky-900/60 px-1.5 py-0.5 text-xs font-medium text-sky-200",
   },
 };
 
@@ -97,6 +112,24 @@ function itemDetails(item: AnomalyItem): string {
   const noun = item.observations_used === 1 ? "observation" : "observations";
   const stdev = formatAmount(item.rolling_stdev, item.metric);
   return `${formatInteger(item.observations_used)} ${noun}, sd ${stdev}`;
+}
+
+/** Read out by the header's live status region while a request runs over a retained feed. */
+const UPDATING_STATUS_TEXT = "Updating spikes…";
+
+/**
+ * The settled feed as the header's live status region announces it, built from the server's
+ * echo of its threshold and window, for example "29 spikes at z ≥ 2 over a 20-session window",
+ * or "No spikes at …" for an empty feed.
+ */
+function settledStatusText(data: AnomaliesResponse): string {
+  const count = data.items.length;
+  const threshold = formatDecimal(data.threshold, "z");
+  const criteria = `at z ≥ ${threshold} over a ${formatInteger(data.window)}-session window`;
+  if (count === 0) {
+    return `No spikes ${criteria}`;
+  }
+  return `${formatInteger(count)} ${count === 1 ? "spike" : "spikes"} ${criteria}`;
 }
 
 interface AnomalyRowProps {
@@ -150,8 +183,16 @@ function AnomalyRow({ item, onSelectTicker }: AnomalyRowProps): ReactElement {
  * is at or above `threshold`. Rows keep the server's order, newest session first and then the
  * highest Z-score, and every value is shown from its exact decimal string.
  *
+ * When `metric` or `threshold` changes, or a refetch runs, the previous feed stays on screen,
+ * dimmed and marked `aria-busy="true"`, with a visible "Updating…" in the header until the new
+ * response arrives. A polite live status region in the header, mounted in every state, reads
+ * "Updating spikes…" meanwhile and then announces the settled feed from the server's echo, for
+ * example "29 spikes at z ≥ 2 over a 20-session window", or "No spikes at …" when it is empty.
+ *
  * Works with no props. The root carries `data-testid="terminal-anomaly-feed"` and
- * `data-state`, and each row `data-testid="anomaly-item"` with its ticker, date and metric.
+ * `data-state`, and each row `data-testid="anomaly-item"` with its ticker, date and metric. The
+ * status region is `data-testid="anomaly-feed-status"` and the visible indicator
+ * `data-testid="anomaly-feed-updating"`.
  */
 export function AnomalyFeed({
   metric = DEFAULT_METRIC,
@@ -161,13 +202,24 @@ export function AnomalyFeed({
   getHeaders,
   className,
 }: AnomalyFeedProps): ReactElement {
-  const { state, data, error, refetch } = useTerminalQuery<AnomaliesResponse>({
+  const { state, data, error, isFetching, refetch } = useTerminalQuery<AnomaliesResponse>({
     path: "/market/anomalies",
     query: { metric, threshold },
     apiBaseUrl,
     getHeaders,
     isEmpty: (response) => response.items.length === 0,
   });
+
+  // A request for new props, or a refetch, is pending while the previous feed stays on screen.
+  const updating = isFetching && data !== undefined;
+  // Left empty during the first load, which WidgetFrame announces as "Loading…", and in the error
+  // state, whose alert announces itself.
+  let statusText = "";
+  if (updating) {
+    statusText = UPDATING_STATUS_TEXT;
+  } else if (data !== undefined && (state === "ready" || state === "empty")) {
+    statusText = settledStatusText(data);
+  }
 
   return (
     <WidgetFrame
@@ -179,9 +231,29 @@ export function AnomalyFeed({
       emptyMessage={EMPTY_FEED_MESSAGE}
       skeletonClassName="h-48"
       className={className}
+      actions={
+        // The header renders in every state, so the status region stays mounted, and keeps its
+        // announcement, when the empty state replaces the feed. The visible indicator is hidden
+        // from screen readers, which hear the region instead.
+        <>
+          {updating ? (
+            <span aria-hidden="true" data-testid="anomaly-feed-updating" className={UPDATING_CLASS}>
+              Updating…
+            </span>
+          ) : null}
+          <span
+            role="status"
+            aria-live="polite"
+            data-testid="anomaly-feed-status"
+            className="sr-only"
+          >
+            {statusText}
+          </span>
+        </>
+      }
     >
       {data === undefined ? null : (
-        <>
+        <div className={updating ? BODY_DIMMED_CLASS : BODY_CLASS} aria-busy={updating}>
           {/* The server's echo of its window and threshold describes the rows on screen, even
               while a request for new props is still in flight. */}
           <p className={SUMMARY_CLASS}>
@@ -204,7 +276,7 @@ export function AnomalyFeed({
               ))}
             </ul>
           </div>
-        </>
+        </div>
       )}
     </WidgetFrame>
   );

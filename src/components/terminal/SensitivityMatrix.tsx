@@ -36,7 +36,22 @@ export interface SensitivityMatrixProps {
 }
 
 // The root sets its own surface and font family, so a host's body font never reaches the table.
-const ROOT_CLASS = "bg-slate-900 text-slate-100 font-sans overflow-x-auto";
+// It does not scroll and uses no containment, so in a host that sizes it by its content (a
+// non-growing flex item, an inline block, an auto grid track) it keeps the table's width.
+// `min-w-0` lets a flex or grid host narrower than the table still shrink it, leaving the table
+// to scroll inside its region; in block flow it changes nothing.
+const ROOT_CLASS = "min-w-0 bg-slate-900 text-slate-100 font-sans";
+// The table's description: the visible text above the scroll region, and the screen-reader-only
+// caption that names both the table and the region. A visible caption box is as wide as its
+// table, so on a narrow screen its text would run past the scrollport; above the scroller the
+// text wraps to the root's width instead.
+const CAPTION_TEXT = "Fair value per share (KES) by WACC × base EBITDA margin";
+// Only the table scrolls. The scroller is a keyboard-focusable region named by the caption, so
+// the columns can be scrolled without a pointer even in a browser that never focuses a scroll
+// container by itself. `relative` makes it the containing block of the absolutely positioned
+// `sr-only` caption, which would otherwise escape the overflow clip and widen the host page.
+const SCROLL_REGION_CLASS =
+  "relative overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 
 // Every class below is a complete static string, never assembled from fragments, so Tailwind's
 // source scan and a host's `@source` directive find each one.
@@ -51,20 +66,22 @@ const EXPLAINED_CELL_CLASS = "relative";
 // The explanation trigger looks like the plain cell content, even in a host without a CSS reset,
 // and shows a slate-100 focus ring distinct from the selected cell's sky ring. The transparent
 // outline (written out, since `outline-none` differs between Tailwind 3 and 4) keeps a focus
-// indicator in forced-colors mode, where box-shadow rings are not drawn.
+// indicator in forced-colors mode, where box-shadow rings are not drawn. Hover underlines the
+// value (dotted), pressing dims it and a disabled trigger fades with a not-allowed cursor; none of
+// these touches the cell's comparison colours.
 const EXPLANATION_TRIGGER_CLASS =
-  "peer m-0 block w-full cursor-help appearance-none rounded border-0 bg-transparent p-0 text-end text-inherit [font:inherit] [letter-spacing:inherit] focus-visible:ring-2 focus-visible:ring-slate-100 focus-visible:[outline:2px_solid_transparent]";
+  "peer m-0 block w-full cursor-help appearance-none rounded border-0 bg-transparent p-0 text-end text-inherit decoration-dotted underline-offset-2 [font:inherit] [letter-spacing:inherit] enabled:hover:underline enabled:active:opacity-80 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-slate-100 focus-visible:[outline:2px_solid_transparent]";
 const EXPLANATION_TIP_CLASS =
   "pointer-events-none absolute z-10 w-max max-w-[14rem] whitespace-normal break-words rounded-md border border-slate-600 bg-slate-950 px-2 py-1 text-start text-xs font-normal text-slate-100 shadow-lg";
-// A tooltip sits above its cell, except on the first body row. The root's horizontal scrolling
-// makes it a scroll container, and content overflowing a scroll container's top can never be
-// scrolled to, so a multi-line tooltip above a first-row cell, with only the caption and header
-// row over it, would lose its top. Below the cell, any overflow past the root's bottom stays
-// reachable, and focusing scrolls it into view.
+// A tooltip sits above its cell, except on the first body row. The table's scroll region is a
+// scroll container, and content overflowing a scroll container's top can never be scrolled to,
+// so a multi-line tooltip above a first-row cell, with only the header row over it, would lose
+// its top. Below the cell, any overflow past the region's bottom stays reachable, and focusing
+// scrolls it into view.
 const EXPLANATION_TIP_ABOVE = "bottom-full mb-1";
 const EXPLANATION_TIP_BELOW = "top-full mt-1";
 // Left-half columns extend the tooltip rightward and right-half columns leftward, so it spreads
-// across the table rather than past the root's left edge, which the scroll container clips.
+// across the table rather than past the scroll region's left edge, which clips it.
 const EXPLANATION_TIP_ANCHOR_LEFT = "left-0";
 const EXPLANATION_TIP_ANCHOR_RIGHT = "right-0";
 const EXPLANATION_TIP_ON_FOCUS = "hidden peer-focus-visible:block";
@@ -134,8 +151,8 @@ interface CellExplanationProps {
    */
   anchorRight: boolean;
   /**
-   * Places the tooltip below the cell, for a cell in the first body row, where the matrix's
-   * scrolling root would cut off the top of a tooltip above it; otherwise it is placed above.
+   * Places the tooltip below the cell, for a cell in the first body row, where the table's scroll
+   * region would cut off the top of a tooltip above it; otherwise it is placed above.
    */
   placeBelow: boolean;
   /** The cell's visible and screen-reader content, rendered unchanged inside the trigger. */
@@ -145,11 +162,11 @@ interface CellExplanationProps {
 /**
  * Keyboard access to a cell's explanation, which a pointer user gets from the cell's `title`. The
  * cell's content becomes a focusable button, described by a tooltip that shows while the button
- * has keyboard focus: above the cell, or below it on the first body row, since the scrolling root
- * cannot scroll to a tooltip overflowing its top. Focusing scrolls the tooltip into view, which a
- * narrow, horizontally scrolled host, or a below-cell tooltip running past the root's bottom,
- * would otherwise cut off. Escape hides the tooltip without moving focus, so it no longer covers
- * neighbouring cells, and leaving the button restores it for the next visit.
+ * has keyboard focus: above the cell, or below it on the first body row, since the table's scroll
+ * region cannot scroll to a tooltip overflowing its top. Focusing scrolls the tooltip into view,
+ * which a narrow, horizontally scrolled region, or a below-cell tooltip running past the region's
+ * bottom, would otherwise cut off. Escape hides the tooltip without moving focus, so it no longer
+ * covers neighbouring cells, and leaving the button restores it for the next visit.
  */
 function CellExplanation({
   explanation,
@@ -284,6 +301,7 @@ export function SensitivityMatrix({
   selected,
   className,
 }: SensitivityMatrixProps): ReactElement {
+  const captionId = useId();
   const rootClass =
     className === undefined || className === "" ? ROOT_CLASS : `${ROOT_CLASS} ${className}`;
 
@@ -301,54 +319,59 @@ export function SensitivityMatrix({
 
   return (
     <div data-testid="terminal-sensitivity-matrix" className={rootClass}>
-      <table className="min-w-full border-collapse text-sm tabular-nums">
-        <caption className="pb-2 text-start text-sm font-medium text-slate-300">
-          Fair value per share (KES) by WACC × base EBITDA margin
-        </caption>
-        <thead>
-          <tr>
-            {/* w-px with the headers' nowrap shrinks the label column to its text, so a wide
-                container gives its spare width to the value columns rather than the labels. */}
-            <th scope="col" className={`${HEADER_CLASS} w-px text-start`}>
-              WACC <span aria-hidden="true">↓</span> / Margin <span aria-hidden="true">→</span>
-            </th>
-            {cols.map((col) => (
-              <th key={col.key} scope="col" className={`${HEADER_CLASS} text-end`}>
-                {formatDecimal(col.value, "pct")}
+      {/* The visible description; screen readers get the same text once, as the caption. */}
+      <p aria-hidden="true" className="pb-2 text-start text-sm font-medium text-slate-300">
+        {CAPTION_TEXT}
+      </p>
+      <div role="region" aria-labelledby={captionId} tabIndex={0} className={SCROLL_REGION_CLASS}>
+        <table className="min-w-full border-collapse text-sm tabular-nums">
+          <caption id={captionId} className="sr-only">{CAPTION_TEXT}</caption>
+          <thead>
+            <tr>
+              {/* w-px with the headers' nowrap shrinks the label column to its text, so a wide
+                  container gives its spare width to the value columns rather than the labels. */}
+              <th scope="col" className={`${HEADER_CLASS} w-px text-start`}>
+                WACC <span aria-hidden="true">↓</span> / Margin <span aria-hidden="true">→</span>
               </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row, i) => {
-            const rowCells = data.cells[i];
-            return (
-              <tr key={row.key}>
-                <th scope="row" className={`${HEADER_CLASS} text-start`}>
-                  {formatDecimal(row.value, "pct")}
+              {cols.map((col) => (
+                <th key={col.key} scope="col" className={`${HEADER_CLASS} text-end`}>
+                  {formatDecimal(col.value, "pct")}
                 </th>
-                {cols.map((col, j) => {
-                  const cellKey = `${row.key}|${col.key}`;
-                  const cell = rowCells?.[j];
-                  return cell === undefined ? (
-                    <td key={cellKey} className={`${CELL_CLASS} ${TONE_NOT_COMPARABLE}`} />
-                  ) : (
-                    <MatrixCell
-                      key={cellKey}
-                      cell={cell}
-                      offerPriceKes={offerPriceKes}
-                      offerText={offerText}
-                      selected={selected}
-                      inRightHalf={j >= cols.length / 2}
-                      inFirstRow={i === 0}
-                    />
-                  );
-                })}
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row, i) => {
+              const rowCells = data.cells[i];
+              return (
+                <tr key={row.key}>
+                  <th scope="row" className={`${HEADER_CLASS} text-start`}>
+                    {formatDecimal(row.value, "pct")}
+                  </th>
+                  {cols.map((col, j) => {
+                    const cellKey = `${row.key}|${col.key}`;
+                    const cell = rowCells?.[j];
+                    return cell === undefined ? (
+                      <td key={cellKey} className={`${CELL_CLASS} ${TONE_NOT_COMPARABLE}`} />
+                    ) : (
+                      <MatrixCell
+                        key={cellKey}
+                        cell={cell}
+                        offerPriceKes={offerPriceKes}
+                        offerText={offerText}
+                        selected={selected}
+                        inRightHalf={j >= cols.length / 2}
+                        inFirstRow={i === 0}
+                      />
+                    );
+                  })}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      {/* Outside the scroll region, so the legend stays in view while the columns scroll. */}
       <p className="mt-2 text-xs text-slate-400">
         Green: at or above offer KES {offerText}; rose: below
       </p>

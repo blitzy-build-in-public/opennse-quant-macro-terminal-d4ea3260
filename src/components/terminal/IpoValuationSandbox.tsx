@@ -258,7 +258,9 @@ type LocalErrors = Partial<Record<InputField, string>>;
 // Every class name is written out in full, never assembled from fragments, so Tailwind's source
 // scan and a host's `@source` directive or `content` glob find each one. Inputs, the slider and
 // the preset selector are 44px tall (h-11), the minimum touch target, since no design source
-// sets a smaller one. Focus indicators are outlines, which forced-colors mode keeps.
+// sets a smaller one. Focus indicators are outlines, which forced-colors mode keeps. Hover and
+// press lighten a control (an invalid input stays rose) only while it is enabled; a disabled one
+// dims and shows a not-allowed cursor.
 const SECTION_HEADING_CLASS = "text-xs font-semibold uppercase tracking-wide text-slate-300";
 const LABEL_CLASS = "text-xs font-medium text-slate-300";
 const FOCUS_CLASS =
@@ -266,22 +268,38 @@ const FOCUS_CLASS =
 // The slider's 44px box is mostly empty space around its track, so its focus outline is drawn
 // inside the box, where it can never overlap the label row above.
 const RANGE_CLASS =
-  "block h-11 w-full cursor-pointer rounded accent-sky-400 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-sky-400";
+  "block h-11 w-full cursor-pointer rounded accent-sky-400 enabled:hover:accent-sky-300 enabled:active:accent-sky-200 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-sky-400";
 const TEXT_INPUT_BASE_CLASS =
-  "mt-1 block h-11 w-full rounded border bg-slate-950 px-3 text-sm tabular-nums text-slate-100 motion-safe:transition-[border-color] motion-safe:duration-150 motion-safe:ease-out";
-const TEXT_INPUT_CLASS = `${TEXT_INPUT_BASE_CLASS} border-slate-700 hover:border-slate-500 ${FOCUS_CLASS}`;
-const TEXT_INPUT_INVALID_CLASS = `${TEXT_INPUT_BASE_CLASS} border-rose-500 ${FOCUS_CLASS}`;
-const SELECT_CLASS = `h-11 rounded border border-slate-700 bg-slate-950 px-2 text-sm text-slate-100 hover:border-slate-500 ${FOCUS_CLASS}`;
+  "mt-1 block h-11 w-full rounded border bg-slate-950 px-3 text-sm tabular-nums text-slate-100 disabled:cursor-not-allowed disabled:opacity-50 motion-safe:transition-[border-color] motion-safe:duration-150 motion-safe:ease-out";
+const TEXT_INPUT_CLASS = `${TEXT_INPUT_BASE_CLASS} border-slate-700 enabled:hover:border-slate-500 enabled:active:border-slate-400 ${FOCUS_CLASS}`;
+const TEXT_INPUT_INVALID_CLASS = `${TEXT_INPUT_BASE_CLASS} border-rose-500 enabled:hover:border-rose-400 enabled:active:border-rose-300 ${FOCUS_CLASS}`;
+const SELECT_CLASS = `h-11 rounded border border-slate-700 bg-slate-950 px-2 text-sm text-slate-100 enabled:hover:border-slate-500 enabled:active:border-slate-400 disabled:cursor-not-allowed disabled:opacity-50 motion-safe:transition-[border-color] motion-safe:duration-150 motion-safe:ease-out ${FOCUS_CLASS}`;
+// The layout follows the widget's own width, never the viewport's: a host may place the widget in
+// a narrow card on a wide screen, and Tailwind 3 has no container-query variants without a plugin.
+// The inputs column starts at 24rem and the output column takes the rest while it keeps at least
+// 28rem; otherwise the output wraps beneath the inputs and both span the widget. The card and
+// advanced-input grids fit as many tracks as their own width allows, the cards at most three (a
+// fourth 30% track never fits).
+const WORKSPACE_CLASS = "flex flex-wrap gap-6";
+const INPUTS_COLUMN_CLASS = "flex min-w-0 grow basis-96 flex-col gap-6";
+const OUTPUT_COLUMN_CLASS = "flex min-w-[min(100%,28rem)] grow-[999] basis-0 flex-col gap-6";
+const ADVANCED_GRID_CLASS = "mt-2 grid grid-cols-[repeat(auto-fill,minmax(11rem,1fr))] gap-3";
+const CARD_GRID_CLASS = "grid grid-cols-[repeat(auto-fill,minmax(max(9rem,30%),1fr))] gap-3";
 const OUTPUT_CLASS =
   "flex min-w-0 flex-col gap-4 motion-safe:transition-opacity motion-safe:duration-200 motion-safe:ease-out";
 const CARD_CLASS = "min-w-0 rounded border border-slate-800 bg-slate-950 p-3";
 const CARD_PRIMARY_VALUE_CLASS = "mt-1 text-lg font-semibold tabular-nums break-words";
 const CARD_VALUE_CLASS = "mt-1 text-sm font-medium tabular-nums break-words";
+// Keyboard focus on the chart's `<svg tabindex="0">` gets the controls' sky outline. A mouse click
+// focuses the svg or one of Recharts' internal layers (tabindex -1) without :focus-visible, and
+// that focus draws no ring.
+const FAIR_VALUE_CHART_CLASS =
+  "mt-2 h-56 w-full [&_*:focus:not(:focus-visible)]:outline-none [&_svg:focus-visible]:outline-2 [&_svg:focus-visible]:outline-offset-2 [&_svg:focus-visible]:outline-sky-400";
 const FLAG_CLASS =
   "rounded border border-amber-800 bg-amber-950 px-2 py-0.5 font-mono text-xs text-amber-200";
 const GENERAL_ERROR_CLASS =
   "flex flex-col gap-1 rounded border border-rose-900 bg-slate-950 p-3 text-sm text-rose-300";
-const RETRY_CLASS = `mt-1 h-11 self-start rounded border border-slate-700 bg-slate-800 px-4 text-xs font-medium text-slate-100 hover:bg-slate-700 motion-safe:transition-[background-color] motion-safe:duration-150 motion-safe:ease-out ${FOCUS_CLASS}`;
+const RETRY_CLASS = `mt-1 h-11 self-start rounded border border-slate-700 bg-slate-800 px-4 text-xs font-medium text-slate-100 enabled:hover:bg-slate-700 enabled:active:bg-slate-600 disabled:cursor-not-allowed disabled:opacity-50 motion-safe:transition-[background-color] motion-safe:duration-150 motion-safe:ease-out ${FOCUS_CLASS}`;
 
 // ---------------------------------------------------------------------------------------------
 // Pure helpers (BigInt scaled integers; the only float boundary is the chart's toChartNumber)
@@ -526,7 +544,7 @@ function FairValueChart({ response }: { response: IpoValuationResponse }): React
       <figcaption className={SECTION_HEADING_CLASS}>
         Fair value per share by method (KES) against the offer
       </figcaption>
-      <div className="mt-2 h-56 w-full" data-testid="ipo-fair-value-chart">
+      <div className={FAIR_VALUE_CHART_CLASS} data-testid="ipo-fair-value-chart">
         <ResponsiveContainer width="100%" height="100%">
           {/* The right margin holds the offer line's label beside the plot, where it cannot
               cover the Blended bar. */}
@@ -747,7 +765,7 @@ function ValuationOutput({ result, isRecalculating }: ValuationOutputProps): Rea
       {/* The live region covers the headline figures only: announcing the 35-cell matrix and
           the chart on every slider change would drown them out. */}
       <div aria-live="polite" className="flex flex-col gap-3">
-        <dl className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+        <dl className={CARD_GRID_CLASS}>
           <OutputCard
             label="Blended fair value"
             testId="ipo-blended-fair-value"
@@ -828,6 +846,14 @@ function ValuationOutput({ result, isRecalculating }: ValuationOutputProps): Rea
 // ---------------------------------------------------------------------------------------------
 
 const RECALCULATION_FAILED = "Could not recalculate the valuation";
+// The Valuation heading takes focus from a Retry button that disappears while focused, so it
+// draws the controls' keyboard focus outline.
+const VALUATION_HEADING_CLASS = `${SECTION_HEADING_CLASS} ${FOCUS_CLASS}`;
+
+/** Whether the element is rendered and holds focus, in whichever document or shadow root. */
+function holdsFocus(element: HTMLElement | null): boolean {
+  return element !== null && element.matches(":focus");
+}
 
 interface SandboxWorkspaceProps {
   scenario: IpoScenario;
@@ -843,11 +869,15 @@ interface SandboxWorkspaceProps {
  *
  * Recalculation: every change updates only its own input state, so a slider's `<output>` follows
  * each input event. The derived request key changes, and once it has been stable for
- * `debounceMs` the body is posted. A newer request aborts the one in flight and a sequence
+ * `debounceMs` the body is posted. The moment the key changes, before the debounce elapses, the
+ * request in flight is aborted and its sequence number retired; that includes a change to a null
+ * key, when a text input fails its single-field check and nothing is sent, and unmounting. A
+ * response or error for inputs that have since changed is therefore never applied. A newer
+ * request, such as a Retry of the same key, likewise aborts the one in flight, and the sequence
  * counter discards any response that is not the latest. The last valid result stays on screen,
  * dimmed with "Recalculating…", until the latest request settles. A field error from the server
- * appears beneath its input and leaves the last result in place; while any text input fails its
- * single-field check, nothing is sent.
+ * appears beneath its input and leaves the last result in place. When a settled request clears
+ * the general error while its Retry button holds focus, focus moves to the Valuation heading.
  */
 function SandboxWorkspace({
   scenario,
@@ -868,6 +898,12 @@ function SandboxWorkspace({
 
   const controllerRef = useRef<AbortController | null>(null);
   const sequenceRef = useRef(0);
+  const retryButtonRef = useRef<HTMLButtonElement>(null);
+  const valuationHeadingRef = useRef<HTMLHeadingElement>(null);
+  // Set when a settled request clears the general error, and with it the Retry button, while that
+  // button holds focus; the effect after the commit then moves focus to the Valuation heading
+  // rather than leaving it to fall back to the document body.
+  const focusValuationRef = useRef(false);
   // The request options are read through a ref so that a host passing a new `getHeaders`
   // function on every render does not restart the debounce, which would re-post endlessly.
   const optionsRef = useRef({ apiBaseUrl, getHeaders });
@@ -900,15 +936,19 @@ function SandboxWorkspace({
         getHeaders: options.getHeaders,
         signal: controller.signal,
       });
-      if (sequence !== sequenceRef.current) return;
+      if (controller.signal.aborted || sequence !== sequenceRef.current) return;
+      focusValuationRef.current = holdsFocus(retryButtonRef.current);
       setResult({ request, response });
       setServerFieldErrors({});
       setGeneralError(null);
       setSettledKey(key);
     } catch (error) {
-      if (isAbortError(error) || sequence !== sequenceRef.current) return;
+      if (isAbortError(error) || controller.signal.aborted || sequence !== sequenceRef.current) {
+        return;
+      }
       const fieldErrors = fieldErrorMap(error);
       if (Object.keys(fieldErrors).length > 0) {
+        focusValuationRef.current = holdsFocus(retryButtonRef.current);
         setServerFieldErrors(fieldErrors);
         setGeneralError(null);
       } else {
@@ -921,13 +961,20 @@ function SandboxWorkspace({
     }
   }, []);
 
+  /**
+   * Aborts the request in flight and retires its sequence number, so neither its response nor
+   * its error is applied, even one that has already arrived and is waiting to be handled.
+   */
   const abortInFlight = useCallback((): void => {
     controllerRef.current?.abort();
     controllerRef.current = null;
+    sequenceRef.current += 1;
   }, []);
 
   // `apiBaseUrl` is a dependency so that pointing the widget at another API revalues the
-  // current assumptions there; `send` reads it from the ref, updated by the effect above.
+  // current assumptions there; `send` reads it from the ref, updated by the effect above. The
+  // cleanup runs whenever the request key changes, to a new body or to null, so it retires the
+  // request for the superseded inputs at once rather than when the next one is posted.
   useEffect(() => {
     if (requestKey === null) return undefined;
     const timer = setTimeout(() => {
@@ -935,10 +982,18 @@ function SandboxWorkspace({
     }, debounceMs);
     return () => {
       clearTimeout(timer);
+      abortInFlight();
     };
-  }, [requestKey, debounceMs, apiBaseUrl, send]);
+  }, [requestKey, debounceMs, apiBaseUrl, send, abortInFlight]);
 
   useEffect(() => abortInFlight, [abortInFlight]);
+
+  // Runs after the commit that cleared the general error, once the Retry button has left the DOM.
+  useEffect(() => {
+    if (!focusValuationRef.current) return;
+    focusValuationRef.current = false;
+    valuationHeadingRef.current?.focus();
+  }, [generalError]);
 
   const handlePositionChange = useCallback((field: SliderField, raw: string): void => {
     const next = inputPosition(SLIDERS[field], raw);
@@ -974,8 +1029,8 @@ function SandboxWorkspace({
         </p>
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,24rem)_minmax(0,1fr)]">
-        <div className="flex min-w-0 flex-col gap-6">
+      <div className={WORKSPACE_CLASS}>
+        <div className={INPUTS_COLUMN_CLASS}>
           <section aria-labelledby={assumptionsHeadingId}>
             <h3 id={assumptionsHeadingId} className={SECTION_HEADING_CLASS}>
               Assumptions
@@ -998,7 +1053,7 @@ function SandboxWorkspace({
             <h3 id={advancedHeadingId} className={SECTION_HEADING_CLASS}>
               Advanced assumptions
             </h3>
-            <div className="mt-2 grid gap-3 sm:grid-cols-2">
+            <div className={ADVANCED_GRID_CLASS}>
               {TEXT_FIELDS.map((field) => (
                 <TextControl
                   key={field}
@@ -1014,10 +1069,15 @@ function SandboxWorkspace({
           </section>
         </div>
 
-        <div className="flex min-w-0 flex-col gap-6">
+        <div className={OUTPUT_COLUMN_CLASS}>
           <section aria-labelledby={valuationHeadingId} className="flex flex-col gap-3">
             <div className="flex min-h-5 items-center justify-between gap-2">
-              <h3 id={valuationHeadingId} className={SECTION_HEADING_CLASS}>
+              <h3
+                ref={valuationHeadingRef}
+                id={valuationHeadingId}
+                tabIndex={-1}
+                className={VALUATION_HEADING_CLASS}
+              >
                 Valuation
               </h3>
               <p role="status" className="text-xs text-sky-300">
@@ -1037,6 +1097,7 @@ function SandboxWorkspace({
                 ))}
                 {generalError === null || requestKey === null ? null : (
                   <button
+                    ref={retryButtonRef}
                     type="button"
                     data-testid="ipo-retry"
                     onClick={() => {

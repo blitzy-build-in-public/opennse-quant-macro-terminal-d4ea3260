@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useId, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type { KeyboardEvent, ReactElement } from "react";
 
 import { fieldErrorMap } from "./lib/apiClient";
@@ -304,9 +304,21 @@ const FILTER_FOOTER_CLASS = "mt-3 flex flex-wrap items-center justify-between ga
 const CHECKBOX_LABEL_CLASS = "inline-flex items-center gap-2 text-sm text-slate-200";
 const CHECKBOX_CLASS =
   "h-4 w-4 accent-sky-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
+// Buttons have a pressed `active:` state one step past their hover, so a press also shows on
+// touch screens, which apply `:active` without `:hover`. Reset steps its background slate
+// 800 → 700 → 600 under slate-100 text, at least 6.9:1 in every state.
 const RESET_CLASS =
-  "rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-slate-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-slate-700 active:bg-slate-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const OTHER_ERRORS_CLASS = "mt-2";
+// The watchlist selector's own failure notice, beneath it: the counters stay usable, so the list
+// is retried here rather than through the card's error state. Its text matches field errors
+// (rose-400 on the slate-900 card, about 6.6:1). Retry steps slate 800 → 700 → 600 like Reset;
+// while a retry runs it stays focusable but aria-disabled, with slate-400 text (about 5.7:1)
+// and no hover or press change.
+const WATCHLISTS_NOTICE_CLASS = "mt-1 flex flex-wrap items-center gap-x-2 gap-y-1";
+const WATCHLISTS_NOTICE_TEXT_CLASS = "text-xs text-rose-400";
+const WATCHLISTS_RETRY_CLASS =
+  "rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-slate-700 active:bg-slate-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 aria-[disabled=true]:cursor-wait aria-[disabled=true]:text-slate-400 aria-[disabled=true]:hover:bg-slate-800 aria-[disabled=true]:active:bg-slate-800 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 
 const BODY_CLASS = "flex flex-col gap-4 motion-safe:transition-opacity motion-safe:duration-200";
 const BODY_DIMMED_CLASS =
@@ -317,22 +329,28 @@ const SCROLL_REGION_CLASS =
   "overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 const TABLE_CLASS = "min-w-full border-collapse text-sm";
 const TBODY_CLASS = "divide-y divide-slate-800";
+// The header divider is written as the arbitrary property `[border-block-end-width:1px]`
+// because Tailwind 3 and Tailwind 4 hosts both generate it; the named block-end border width
+// utility exists only in Tailwind 4.
 const TH_CLASS =
-  "whitespace-nowrap border-be border-slate-700 px-2 py-1.5 text-start align-bottom text-xs font-medium text-slate-400";
+  "whitespace-nowrap [border-block-end-width:1px] border-slate-700 px-2 py-1.5 text-start align-bottom text-xs font-medium text-slate-400";
 // The first column (ticker or sector) stays in view while a wide table scrolls sideways; its
 // opaque background matches the card surface so scrolled cells pass beneath it.
 const TH_STICKY_CLASS =
-  "sticky start-0 z-10 whitespace-nowrap border-be border-slate-700 bg-slate-900 px-2 py-1.5 text-start align-bottom text-xs font-medium text-slate-400";
+  "sticky start-0 z-10 whitespace-nowrap [border-block-end-width:1px] border-slate-700 bg-slate-900 px-2 py-1.5 text-start align-bottom text-xs font-medium text-slate-400";
 const TH_NUMERIC_CLASS =
-  "whitespace-nowrap border-be border-slate-700 px-2 py-1.5 text-end align-bottom text-xs font-medium text-slate-400";
+  "whitespace-nowrap [border-block-end-width:1px] border-slate-700 px-2 py-1.5 text-end align-bottom text-xs font-medium text-slate-400";
+// Sort and ticker buttons are text only, so their pressed state is the sky-200 text shade, 13.4:1
+// on the card surface and distinct from every resting and hover colour. The selected sort button,
+// already slate-100, dims to slate-300 on hover.
 const SORT_BUTTON_CLASS =
-  "inline-flex min-h-6 items-center gap-1 rounded text-xs font-medium text-slate-400 hover:text-slate-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "inline-flex min-h-6 items-center gap-1 rounded text-xs font-medium text-slate-400 hover:text-slate-100 active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const SORT_BUTTON_ACTIVE_CLASS =
-  "inline-flex min-h-6 items-center gap-1 rounded text-xs font-semibold text-slate-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
+  "inline-flex min-h-6 items-center gap-1 rounded text-xs font-semibold text-slate-100 hover:text-slate-300 active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const ROW_HEADER_CLASS =
   "sticky start-0 z-10 whitespace-nowrap bg-slate-900 px-2 py-1.5 text-start font-semibold text-slate-100";
 const TICKER_BUTTON_CLASS =
-  "min-h-6 rounded font-semibold text-sky-300 underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
+  "min-h-6 rounded font-semibold text-sky-300 underline-offset-2 hover:underline active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 const TEXT_CELL_CLASS = "px-2 py-1.5 text-start text-slate-200";
 // A minimum width keeps company names to about two lines instead of one word per line.
 const COMPANY_CELL_CLASS = "min-w-[12rem] px-2 py-1.5 text-start text-slate-200";
@@ -681,6 +699,13 @@ function isFieldError(error: TerminalApiError | null): error is TerminalApiError
   return error !== null && error.fieldErrors.length > 0;
 }
 
+/**
+ * `useLayoutEffect` in the browser, so focus moves within the commit that removed its element,
+ * before the browser paints or handles another event. During server rendering, where neither
+ * effect runs and React 18 warns about layout effects, it is `useEffect`.
+ */
+const useBrowserLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
+
 
 /**
  * Equity screener of `GET /market/screener`: filters on sector, watchlist, P/E, P/B, EV/EBITDA,
@@ -692,7 +717,10 @@ function isFieldError(error: TerminalApiError | null): error is TerminalApiError
  * to a request field, such as `min_exceeds_max` on `min_pe`, appear beneath that field while the
  * last result stays on screen; any other failure shows the frame's error state with Retry. The
  * filter panel is rendered in every state. The watchlist selector lists the calling principal's
- * watchlists from `GET /watchlists`; its failure only disables the selector.
+ * watchlists from `GET /watchlists` and refreshes them whenever it is focused. That request is
+ * independent of the counters: if it fails before any list has loaded, the selector is disabled
+ * and a message with its own Retry appears beneath it while the counters stay usable, and a list
+ * that loaded earlier stays selectable after a later failure.
  */
 export function EquityScreener({
   apiBaseUrl,
@@ -729,6 +757,15 @@ export function EquityScreener({
     isEmpty: (response) => response.rows.length === 0 && !hasActiveFilter(applied),
   });
   const watchlists = useTerminalQuery<Watchlist[]>({ path: "/watchlists", apiBaseUrl, getHeaders });
+  // Set once a retry of the watchlist request is asked for, so the list's own Retry stays mounted
+  // (as "Retrying…") while a retry of a list that never loaded is in flight.
+  const [watchlistsRetryRequested, setWatchlistsRetryRequested] = useState(false);
+  const watchlistSelectRef = useRef<HTMLSelectElement>(null);
+  const watchlistsRetryButton = useRef<HTMLButtonElement | null>(null);
+  // Whether the list's Retry held focus when it was removed, so focus moves to the selector.
+  const restoreWatchlistFocus = useRef(false);
+  // Set while focus is moved to the selector programmatically, so that focus does not refetch.
+  const skipWatchlistFocusRefetch = useRef(false);
 
   const error = screener.error;
   const hasFieldErrors = isFieldError(error);
@@ -749,6 +786,47 @@ export function EquityScreener({
 
   const watchlistItems = watchlists.data ?? [];
   const watchlistsUnavailable = watchlists.state === "error" && watchlists.data === undefined;
+  // The list's message and Retry, shown until a list first loads: after a failure, and while a
+  // requested retry is in flight. A list that loaded once is kept, so they never return after it.
+  const showWatchlistsNotice =
+    watchlists.data === undefined &&
+    (watchlists.state === "error" || (watchlistsRetryRequested && watchlists.isFetching));
+  const watchlistsRetrying = showWatchlistsNotice && watchlists.isFetching;
+
+  // React detaches a ref before it removes the node, so the node still holds focus here when the
+  // notice goes away because a list loaded.
+  const setWatchlistsRetryButton = useCallback((node: HTMLButtonElement | null) => {
+    const previous = watchlistsRetryButton.current;
+    if (node === null && previous !== null) {
+      restoreWatchlistFocus.current = previous.ownerDocument.activeElement === previous;
+    }
+    watchlistsRetryButton.current = node;
+  }, []);
+
+  // Focus that sat on the list's Retry moves to the selector the loaded list has enabled, in the
+  // same commit, rather than staying on the document body. The move does not refetch the list
+  // that just arrived.
+  useBrowserLayoutEffect(() => {
+    if (showWatchlistsNotice || !restoreWatchlistFocus.current) {
+      return;
+    }
+    restoreWatchlistFocus.current = false;
+    const select = watchlistSelectRef.current;
+    if (select === null || select.disabled) {
+      return;
+    }
+    const active = select.ownerDocument.activeElement;
+    if (active !== null && active !== select.ownerDocument.body) {
+      return;
+    }
+    skipWatchlistFocusRefetch.current = true;
+    try {
+      select.focus();
+    } finally {
+      skipWatchlistFocusRefetch.current = false;
+    }
+  }, [showWatchlistsNotice]);
+
   const selectedWatchlist = applied.watchlist_id;
   const showUnlistedWatchlist =
     selectedWatchlist !== undefined &&
@@ -764,6 +842,11 @@ export function EquityScreener({
     fieldErrors[field] === undefined ? undefined : errorIdOf(field);
   const invalidOf = (field: string): true | undefined =>
     fieldErrors[field] === undefined ? undefined : true;
+  const watchlistsNoticeId = `${baseId}-watchlists-notice`;
+  const watchlistDescribedBy =
+    [describedByOf("watchlist_id"), showWatchlistsNotice ? watchlistsNoticeId : undefined]
+      .filter((id): id is string => id !== undefined)
+      .join(" ") || undefined;
 
   const handleDraftChange = (key: NumericFilterKey, value: string): void => {
     setDrafts((current) => ({ ...current, [key]: value }));
@@ -783,8 +866,26 @@ export function EquityScreener({
   const handleRetry = (): void => {
     screener.refetch();
     if (watchlists.state === "error") {
+      setWatchlistsRetryRequested(true);
       watchlists.refetch();
     }
+  };
+  // The list's own Retry is aria-disabled, not disabled, while a retry runs, so it keeps focus;
+  // a press then is ignored rather than restarting the request.
+  const handleWatchlistsRetry = (): void => {
+    if (watchlists.isFetching) {
+      return;
+    }
+    setWatchlistsRetryRequested(true);
+    watchlists.refetch();
+  };
+  // A request already in flight brings the current list, so focusing the selector then does not
+  // abort and repeat it; nor does the focus moved to it after a retry has just loaded the list.
+  const handleWatchlistFocus = (): void => {
+    if (skipWatchlistFocusRefetch.current || watchlists.isFetching) {
+      return;
+    }
+    watchlists.refetch();
   };
   const handleSort = (column: ScreenerSort): void => {
     setApplied((current) => withSort(current, column));
@@ -823,6 +924,7 @@ export function EquityScreener({
             Watchlist
           </label>
           <select
+            ref={watchlistSelectRef}
             id={watchlistId}
             data-testid="screener-filter-watchlist"
             value={watchlistsUnavailable ? "" : (selectedWatchlist ?? "")}
@@ -833,9 +935,9 @@ export function EquityScreener({
             }}
             // Watchlists can change in a sibling WatchlistManager, so the list is refreshed
             // whenever the selector is focused; the current options stay while it loads.
-            onFocus={watchlists.refetch}
+            onFocus={handleWatchlistFocus}
             aria-invalid={invalidOf("watchlist_id")}
-            aria-describedby={describedByOf("watchlist_id")}
+            aria-describedby={watchlistDescribedBy}
             className={INPUT_CLASS}
           >
             {watchlistsUnavailable ? (
@@ -859,6 +961,31 @@ export function EquityScreener({
             message={fieldErrors.watchlist_id}
             id={errorIdOf("watchlist_id")}
           />
+          {showWatchlistsNotice ? (
+            <div className={WATCHLISTS_NOTICE_CLASS}>
+              {/* The detail is removed while a retry runs, so a repeated failure is re-announced. */}
+              <p
+                id={watchlistsNoticeId}
+                data-testid="screener-watchlists-error"
+                role="alert"
+                className={WATCHLISTS_NOTICE_TEXT_CLASS}
+              >
+                Watchlists could not be loaded
+                {watchlists.error !== null ? <span>: {watchlists.error.message}</span> : null}
+              </p>
+              <button
+                ref={setWatchlistsRetryButton}
+                type="button"
+                data-testid="screener-watchlists-retry"
+                aria-label="Retry loading watchlists"
+                aria-disabled={watchlistsRetrying ? true : undefined}
+                onClick={handleWatchlistsRetry}
+                className={WATCHLISTS_RETRY_CLASS}
+              >
+                {watchlistsRetrying ? "Retrying…" : "Retry"}
+              </button>
+            </div>
+          ) : null}
         </div>
         {NUMERIC_FILTERS.map(({ key, label }) => {
           const inputId = `${baseId}-${key}`;

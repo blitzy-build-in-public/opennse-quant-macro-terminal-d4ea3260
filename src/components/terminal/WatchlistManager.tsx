@@ -1,9 +1,16 @@
 "use client";
 
-import { useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent, MouseEvent, ReactElement } from "react";
 
-import { apiSend, fieldErrorMap, pathSegment, TerminalApiError } from "./lib/apiClient";
+import {
+  apiSend,
+  buildUrl,
+  fieldErrorMap,
+  isAbortError,
+  pathSegment,
+  TerminalApiError,
+} from "./lib/apiClient";
 import type { RequestOptions } from "./lib/apiClient";
 import { formatDate } from "./lib/format";
 import { useTerminalQuery } from "./lib/useTerminalQuery";
@@ -15,8 +22,9 @@ export interface WatchlistManagerProps extends TerminalWidgetProps {
   /**
    * Called after every successful create, delete, ticker addition or ticker removal, with the
    * caller's full updated list of watchlists as the server returned it. Not called for the
-   * initial load or for a failed request, so a host can keep, for example, a screener's
-   * watchlist selector in step without refetching.
+   * initial load, for a failed request, or for a request abandoned because the widget unmounted
+   * or its `apiBaseUrl` changed, so a host can keep, for example, a screener's watchlist selector
+   * in step without refetching.
    */
   onWatchlistsChange?: (lists: Watchlist[]) => void;
 }
@@ -50,22 +58,29 @@ const FIELD_CLASS = "flex min-w-0 flex-1 basis-48 flex-col gap-1";
 const ADD_FIELD_CLASS = "flex min-w-0 flex-1 basis-32 flex-col gap-1";
 const LABEL_CLASS = "text-xs font-medium text-slate-300";
 // Input borders use slate-500, which keeps the 3:1 non-text contrast against the card surface.
+// The error border uses the `aria-[invalid=true]:` variant because Tailwind 3 and Tailwind 4
+// hosts both generate it; Tailwind 3 has no named `aria-invalid:` variant.
 const INPUT_CLASS =
-  "w-full min-w-0 rounded border border-slate-500 bg-slate-950 px-2 py-1 text-sm text-slate-100 placeholder:text-slate-400 aria-invalid:border-rose-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
+  "w-full min-w-0 rounded border border-slate-500 bg-slate-950 px-2 py-1 text-sm text-slate-100 placeholder:text-slate-400 aria-[invalid=true]:border-rose-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 /* BLITZY [A11Y]: buttons keep the compact size of the card's other text controls (about 26px
    tall, the chip remove buttons 24px square), meeting WCAG 2.2 AA's 24px target minimum but below
    the 44px guideline. Flagged for designer review. */
 // While a request is in flight buttons are `aria-disabled` rather than `disabled`: a button that
 // becomes `disabled` loses keyboard focus to the page body, whereas `aria-disabled` keeps it in
 // place, and the handlers refuse to start a second request.
+// Every button has a pressed `active:` state one step past its hover, so a press also shows on
+// touch screens, which apply `:active` without `:hover`. Filled buttons step their background
+// (slate 800 → 700 → 600, sky and rose 700 → 800 → 900) under slate-100 text, at least 5.3:1 in
+// every state. The delete and chip remove buttons deepen their hover background and set their own
+// light text (rose-200, slate-100), keeping 4.5:1 for text and 3:1 for the remove icon.
 const PRIMARY_BUTTON_CLASS =
-  "self-start rounded border border-sky-600 bg-sky-700 px-3 py-1 text-xs font-medium text-white hover:bg-sky-600 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "self-start rounded border border-sky-600 bg-sky-700 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-sky-800 active:bg-sky-900 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const SECONDARY_BUTTON_CLASS =
-  "rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-slate-700 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-slate-700 active:bg-slate-600 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const DELETE_BUTTON_CLASS =
-  "rounded border border-rose-800 bg-slate-900 px-3 py-1 text-xs font-medium text-rose-300 hover:bg-rose-950 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "rounded border border-rose-800 bg-slate-900 px-3 py-1 text-xs font-medium text-rose-300 hover:bg-rose-950 active:bg-rose-900 active:text-rose-200 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const CONFIRM_BUTTON_CLASS =
-  "rounded border border-rose-600 bg-rose-700 px-3 py-1 text-xs font-medium text-white hover:bg-rose-600 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "rounded border border-rose-600 bg-rose-700 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-rose-800 active:bg-rose-900 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const GENERAL_ERROR_CLASS =
   "rounded border border-rose-900 bg-slate-950 px-3 py-2 text-xs text-rose-300";
 const EMPTY_LISTS_CLASS = "text-sm text-slate-400";
@@ -81,7 +96,7 @@ const NO_TICKERS_CLASS = "mt-2 text-xs text-slate-400";
 const CHIP_CLASS =
   "inline-flex items-center gap-1 rounded-full border border-slate-700 bg-slate-800 ps-2.5 text-xs font-medium text-slate-100";
 const CHIP_REMOVE_CLASS =
-  "inline-flex size-6 items-center justify-center rounded-full text-slate-400 hover:bg-slate-700 hover:text-slate-100 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "inline-flex size-6 items-center justify-center rounded-full text-slate-400 hover:bg-slate-700 hover:text-slate-100 active:bg-slate-600 active:text-slate-100 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const CHIP_ICON_CLASS = "size-3";
 const ADD_FORM_CLASS = "mt-3";
 const ADD_ROW_CLASS = "flex flex-wrap items-end gap-2";
@@ -264,8 +279,17 @@ function RemoveIcon(): ReactElement {
  * `field-error-ticker-<id>`) until that input is edited or the next request succeeds, or else on
  * the widget's own error line, and the lists stay usable.
  *
- * Rendering depends only on props and state, with no effects, dates or locale formatting, so
- * server-rendered markup hydrates without a mismatch.
+ * One mutation runs at a time. Unmounting the widget, or changing its `apiBaseUrl` to a
+ * different API target, aborts the pending one; a new `getHeaders` identity does not, because
+ * hosts often pass an inline function. Aborting only stops the widget tracking the response: it
+ * cannot undo a write the server has already committed, which a later `GET /watchlists` from
+ * that API returns. The response of an abandoned mutation changes nothing on screen, moves no
+ * focus, shows no error and never reaches `onWatchlistsChange`, and the controls are released at
+ * once. A successful create or ticker addition clears only the inputs that still hold the
+ * submitted text, so a draft typed while the request was pending survives.
+ *
+ * Rendering depends only on props and state, with no dates or locale formatting; the one effect
+ * only aborts a pending mutation. Server-rendered markup therefore hydrates without a mismatch.
  */
 export function WatchlistManager({
   apiBaseUrl,
@@ -291,16 +315,45 @@ export function WatchlistManager({
   // Set synchronously by the handlers, so a second submit arriving before the busy state renders
   // cannot start an overlapping request. Read and written only in event handlers and callbacks.
   const inFlight = useRef(false);
+  // The controller of the pending mutation, or `null` when none is pending. Read and written only
+  // in event handlers, request callbacks and effect cleanup.
+  const mutationController = useRef<AbortController | null>(null);
   const nameInputRef = useRef<HTMLInputElement>(null);
   const baseId = useId();
+  // The API target, normalized as the watchlist query normalizes it, so an `apiBaseUrl` naming
+  // the same base (the default spelled out, or a trailing slash) is not a new target.
+  const target = buildUrl(apiBaseUrl, "/watchlists");
+
+  // Abandons the pending mutation when the widget unmounts or its API target changes. Aborting
+  // only stops the widget tracking the response: a write the server has already committed stays
+  // committed. The cleanup also releases the busy state, so a widget repointed mid-request
+  // accepts its next mutation at once. Nothing is recorded across cleanups, so StrictMode's
+  // mount, cleanup and mount sequence leaves the widget fully working.
+  useEffect(() => {
+    return () => {
+      const controller = mutationController.current;
+      if (controller === null) return;
+      mutationController.current = null;
+      inFlight.current = false;
+      controller.abort();
+      setBusy(false);
+    };
+  }, [target]);
 
   const lists = local !== null && local.base === query.data ? local.lists : (query.data ?? []);
 
   /**
    * Run one mutation. On success the returned lists become the shown lists, every error is
-   * cleared, `onSuccess` resets its inputs and returns the status announcement, and
-   * `onWatchlistsChange` receives the lists. On failure the error is placed by {@link errorsFor};
-   * `watchlist_not_found` instead drops the vanished list and reloads the watchlists.
+   * cleared, `onSuccess` clears the inputs that still hold the submitted text and returns the
+   * status announcement, and `onWatchlistsChange` receives the lists. On failure the error is
+   * placed by {@link errorsFor}; `watchlist_not_found` instead drops the vanished list and
+   * reloads the watchlists.
+   *
+   * The request carries the signal of its own controller, which the abort effect aborts on
+   * unmount or a target change. A completion whose controller was aborted, or is no longer the
+   * pending one, is ignored entirely: the widget stopped tracking that response, although the
+   * server may have committed its write. An `AbortError` is a cancellation rather than a failed
+   * save, so it shows no error.
    */
   function runMutation(
     mutation: Mutation,
@@ -309,23 +362,35 @@ export function WatchlistManager({
   ): void {
     if (inFlight.current) return;
     inFlight.current = true;
+    const controller = new AbortController();
+    mutationController.current = controller;
     const base = query.data;
     setBusy(true);
     setConfirmDeleteId(null);
     setNotice("");
 
-    request({ apiBaseUrl, getHeaders }).then(
+    /** Claim this completion, or report `false` when the widget abandoned the request. */
+    const settle = (): boolean => {
+      if (controller.signal.aborted || mutationController.current !== controller) return false;
+      mutationController.current = null;
+      inFlight.current = false;
+      setBusy(false);
+      return true;
+    };
+
+    request({ apiBaseUrl, getHeaders, signal: controller.signal }).then(
       (next) => {
-        inFlight.current = false;
-        setBusy(false);
+        if (!settle()) return;
         setLocal({ base, lists: next });
         setErrors({});
         setNotice(onSuccess());
         onWatchlistsChange?.(next);
       },
       (error: unknown) => {
-        inFlight.current = false;
-        setBusy(false);
+        if (!settle()) return;
+        // An abort the widget did not start, such as one raised by the host's `getHeaders`, is a
+        // cancellation rather than a failed save, so it only releases the controls.
+        if (isAbortError(error)) return;
         if (error instanceof TerminalApiError && error.code === "watchlist_not_found") {
           if (mutation.kind !== "create") {
             const vanishedId = mutation.list.id;
@@ -362,6 +427,10 @@ export function WatchlistManager({
       parsed.tickers.length > 0
         ? { name: trimmedName, tickers: parsed.tickers }
         : { name: trimmedName };
+    // The inputs stay editable while the request is pending, so success clears each one only if
+    // it still holds exactly the text submitted, and a draft typed in the meantime survives.
+    const submittedName = name;
+    const submittedTickers = tickersText;
     runMutation(
       { kind: "create" },
       async (options) => {
@@ -369,8 +438,8 @@ export function WatchlistManager({
         return sortByName([...lists.filter((list) => list.id !== created.id), created]);
       },
       () => {
-        setName("");
-        setTickersText("");
+        setName((current) => (current === submittedName ? "" : current));
+        setTickersText((current) => (current === submittedTickers ? "" : current));
         return `Created watchlist ${trimmedName}`;
       },
     );
@@ -432,7 +501,8 @@ export function WatchlistManager({
   function handleAdd(event: FormEvent<HTMLFormElement>, list: Watchlist): void {
     event.preventDefault();
     if (inFlight.current) return;
-    const ticker = (addTicker[list.id] ?? "").trim().toUpperCase();
+    const submittedTicker = addTicker[list.id] ?? "";
+    const ticker = submittedTicker.trim().toUpperCase();
     const problem = tickerProblem(ticker);
     if (problem !== null) {
       setErrors({ [tickerErrorKey(list.id)]: problem });
@@ -451,7 +521,10 @@ export function WatchlistManager({
         return withList(lists, updated);
       },
       () => {
-        setAddTicker((current) => ({ ...current, [list.id]: "" }));
+        // As for creation: a ticker typed while the request was pending survives its success.
+        setAddTicker((current) =>
+          current[list.id] === submittedTicker ? { ...current, [list.id]: "" } : current,
+        );
         return `Added ${ticker} to ${list.name}`;
       },
     );
