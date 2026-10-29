@@ -1,7 +1,8 @@
 """Tests for the CSV/Excel importer (``opennse_terminal.ingestion.files.tabular_import``).
 
-Every case runs without PostgreSQL or a network. Operator-style CSV and ``.xlsx`` files are written
-into ``tmp_path`` (the workbooks with openpyxl) and the importer runs stage by stage:
+Every case before the last section runs without PostgreSQL or a network. Operator-style CSV and
+``.xlsx`` files are written into ``tmp_path`` (the workbooks with openpyxl) and the importer runs
+stage by stage:
 
 * ``fetch`` with a ``RunContext`` whose HTTP client fails the test if it is touched, then
   ``parse`` and ``validate``;
@@ -10,11 +11,18 @@ into ``tmp_path`` (the workbooks with openpyxl) and the importer runs stage by s
 * ``upsert`` with the ``db.upsert`` writers replaced by recorders that keep their signatures;
 * ``import_file`` with the engine factory and ``execute_pipeline`` replaced.
 
-The shared row thresholds are applied to the counts the stages produce. Writing rows, the run row,
-the advisory lock and precedence over stored rows need PostgreSQL and are not exercised here.
+The shared row thresholds are applied to the counts the stages produce.
+
+The last section runs ``import_file`` end to end against a fresh seeded clone per test (the root
+conftest's ``seeded_database``, which marks those tests ``integration``): the recorded sample
+``fixtures/files/daily_prices_sample.csv`` and files written into ``tmp_path`` are imported, and
+the run row, the shared thresholds and the precedence of the ``db.upsert`` writers over seeded and
+scraped rows are read back through the ``terminal_`` models.
 
 Expected values are literals from the importer's contract, never recomputed with the code under
-test. Amounts are ``Decimal`` and volumes and share counts ``int``.
+test. The one exception is the recorded sample: its cells are read with the stdlib ``csv`` module
+and converted with the cell helpers the literal cases above verify, so its 22 rows are not
+restated here. Amounts are ``Decimal`` and volumes and share counts ``int``.
 """
 
 import asyncio
@@ -28,22 +36,22 @@ import tracemalloc
 import uuid
 import zipfile
 from collections import deque
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from decimal import ROUND_DOWN, Context, Decimal, localcontext
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Context, Decimal, localcontext
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import pandas
 import pytest
 from openpyxl import Workbook
-from sqlalchemy import Join
+from sqlalchemy import ColumnElement, Join, func, select
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from opennse_terminal.config import TerminalSettings
-from opennse_terminal.db.upsert import FlowUpdateResult
+from opennse_terminal.db.upsert import FlowUpdateResult, upsert_prices
 from opennse_terminal.ingestion.base import (
     FetchFailed,
     RejectedRow,
@@ -71,7 +79,13 @@ from opennse_terminal.ingestion.files.tabular_import import (
     parse_decimal_cell,
     parse_int_cell,
 )
-from opennse_terminal.models import TerminalEquity
+from opennse_terminal.models import (
+    TerminalDailyPrice,
+    TerminalEquity,
+    TerminalFundamental,
+    TerminalIngestionRun,
+    TerminalMacroIndicator,
+)
 
 LOGGER = "opennse_terminal.ingestion.files.tabular_import"
 UNREACHABLE_DATABASE_URL = "postgresql+asyncpg://nobody:x@127.0.0.1:1/none"
@@ -3348,3 +3362,662 @@ async def test_foreign_flows_upsert_records_keys_that_lost_their_price_row(
         "sample": [["EQTY", SESSION]],
     }
     assert "foreign_flows import found 1 keys without a price row at write time" in caplog.messages
+
+
+# --- Imports into a seeded database ----------------------------------------------------------
+#
+# Each test below requests ``seeded_database``, a fresh clone of the migrated and seeded template,
+# so it can run alone or in any order. The importer builds its own engine from the clone's
+# settings; the tests read and pre-insert rows through the clone's engine with the ``terminal_``
+# models and the ``db.upsert`` writers only.
+
+
+class _Clone(Protocol):
+    """The part of the root conftest's ``seeded_database`` handle these tests use."""
+
+    @property
+    def settings(self) -> TerminalSettings: ...
+
+    @property
+    def engine(self) -> AsyncEngine: ...
+
+
+SAMPLE_CSV = Path("files") / "daily_prices_sample.csv"
+SAMPLE_START = date(2026, 9, 24)
+"""The earliest trade date in the sample; snapshots read every price row from here on."""
+NEW_SESSION = date(2026, 10, 27)
+"""The sample's session after the seeded history, which ends on 2026-09-30."""
+INVALID_SAMPLE_ROWS: Mapping[tuple[str, date], str] = {
+    ("ABSA", SAMPLE_START): "non_positive:close_price",
+    ("SBIC", SAMPLE_START): "out_of_range:volume",
+}
+"""The sample's two invalid rows (close 0, volume 1000000000001) and their rejection codes."""
+CENT = Decimal("0.01")
+
+PRICE_KEY = ("ticker", "trade_date")
+PRICE_VALUE_COLUMNS = (
+    "open_price",
+    "high_price",
+    "low_price",
+    "close_price",
+    "volume",
+    "turnover_kes",
+    "turnover_estimated",
+    "foreign_net_flow_kes",
+    "source",
+    "flow_source",
+)
+"""What an import may change on a price row, ``ingestion_run_id`` and ``ingested_at`` aside."""
+PRICE_READ_COLUMNS = (*PRICE_VALUE_COLUMNS, "ingestion_run_id", "ingested_at")
+FLOW_COLUMNS = ("foreign_net_flow_kes", "flow_source")
+FUNDAMENTAL_KEY = ("ticker", "period_end_date", "period_type")
+FUNDAMENTAL_READ_COLUMNS = (
+    *FUNDAMENTAL_VALUE_COLUMNS,
+    "currency",
+    "filing_id",
+    "source_by_field",
+    "updated_at",
+)
+MACRO_READ_COLUMNS = (*MACRO_COLUMNS, "source_by_field", "updated_at")
+
+StoredRows = dict[tuple[Any, ...], dict[str, Any]]
+
+
+@dataclass(frozen=True, slots=True)
+class _FixtureRow:
+    """One data row of the recorded sample: its line, key and cell texts by normalized column."""
+
+    line: int
+    ticker: str
+    trade_date: date
+    texts: tuple[str, ...]
+    cells: Mapping[str, str]
+
+    @property
+    def key(self) -> tuple[str, date]:
+        return (self.ticker, self.trade_date)
+
+
+def _read_sample(fixtures_dir: Path) -> tuple[list[str], list[_FixtureRow]]:
+    """The sample's header as written and its rows, read with the stdlib ``csv`` module."""
+    with (fixtures_dir / SAMPLE_CSV).open(newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        header = next(reader)
+        columns = [normalize_column_name(name) for name in header]
+        rows: list[_FixtureRow] = []
+        for line, texts in enumerate(reader, start=2):
+            cells = dict(zip(columns, texts, strict=True))
+            trade_date = parse_date_cell(cells["trade_date"])
+            assert trade_date is not None
+            rows.append(_FixtureRow(line, cells["ticker"], trade_date, tuple(texts), cells))
+    return header, rows
+
+
+def _valid_sample_rows(rows: Sequence[_FixtureRow]) -> list[_FixtureRow]:
+    return [row for row in rows if row.key not in INVALID_SAMPLE_ROWS]
+
+
+def _expected_price_columns(row: _FixtureRow) -> dict[str, object]:
+    """The price columns and ``source`` an import stores for a valid sample row.
+
+    An empty turnover is volume x close rounded ``ROUND_HALF_UP`` to the cent, flagged estimated.
+    """
+    cells = row.cells
+    close = parse_decimal_cell(cells["close_price"], "close_price")
+    volume = parse_int_cell(cells["volume"])
+    assert close is not None
+    assert volume is not None
+    turnover = parse_decimal_cell(cells["turnover_kes"], "turnover_kes")
+    estimated = turnover is None
+    if turnover is None:
+        turnover = (Decimal(volume) * close).quantize(CENT, rounding=ROUND_HALF_UP)
+    return {
+        "open_price": parse_decimal_cell(cells["open_price"], "open_price"),
+        "high_price": parse_decimal_cell(cells["high_price"], "high_price"),
+        "low_price": parse_decimal_cell(cells["low_price"], "low_price"),
+        "close_price": close,
+        "volume": volume,
+        "turnover_kes": turnover,
+        "turnover_estimated": estimated,
+        "source": "csv_import",
+    }
+
+
+async def _rows_by_key(
+    engine: AsyncEngine,
+    model: type[Any],
+    key: Sequence[str],
+    columns: Sequence[str],
+    *conditions: ColumnElement[bool],
+) -> StoredRows:
+    """Stored rows of ``model``'s table keyed by ``key``, each holding ``columns``."""
+    statement = select(*(getattr(model, name) for name in (*key, *columns)))
+    if conditions:
+        statement = statement.where(*conditions)
+    async with engine.connect() as conn:
+        result = await conn.execute(statement)
+        return {
+            tuple(mapping[name] for name in key): {name: mapping[name] for name in columns}
+            for mapping in result.mappings()
+        }
+
+
+async def _stored_prices(engine: AsyncEngine, *, since: date | None = None) -> StoredRows:
+    """Every ``terminal_daily_prices`` row, or those traded on or after ``since``."""
+    conditions = () if since is None else (TerminalDailyPrice.trade_date >= since,)
+    return await _rows_by_key(
+        engine, TerminalDailyPrice, PRICE_KEY, PRICE_READ_COLUMNS, *conditions
+    )
+
+
+def _price_values(rows: StoredRows, keys: Iterable[tuple[Any, ...]]) -> StoredRows:
+    """The :data:`PRICE_VALUE_COLUMNS` of ``rows`` at ``keys``."""
+    return {key: {name: rows[key][name] for name in PRICE_VALUE_COLUMNS} for key in keys}
+
+
+async def _run_row(engine: AsyncEngine, run_id: uuid.UUID) -> dict[str, object]:
+    """The recorded ``terminal_ingestion_runs`` row of a run."""
+    statement = select(
+        TerminalIngestionRun.pipeline,
+        TerminalIngestionRun.trigger,
+        TerminalIngestionRun.status,
+        TerminalIngestionRun.rows_fetched,
+        TerminalIngestionRun.rows_written,
+        TerminalIngestionRun.rows_rejected,
+    ).where(TerminalIngestionRun.id == run_id)
+    async with engine.connect() as conn:
+        return dict((await conn.execute(statement)).mappings().one())
+
+
+async def _run_count(engine: AsyncEngine) -> int:
+    async with engine.connect() as conn:
+        result = await conn.execute(select(func.count()).select_from(TerminalIngestionRun))
+        return int(result.scalar_one())
+
+
+def _rejections(
+    result: RunResult, key: Sequence[str]
+) -> dict[tuple[object, ...], tuple[object, object]]:
+    """``details.rejected`` as ``(line, reason)`` by the rejected row's raw ``key`` cells."""
+    entries = result.details["rejected"]
+    rejected = {
+        tuple(entry["row"][name] for name in key): (entry["index"], entry["reason"])
+        for entry in entries
+    }
+    assert len(rejected) == len(entries)
+    return rejected
+
+
+def _amount_text(value: Decimal) -> str:
+    """An amount as an accounting export writes it: separators, parentheses for a negative."""
+    return f"({-value:,})" if value < 0 else f"{value:,}"
+
+
+def test_sample_fixture_exercises_every_cell_form(fixtures_dir: Path) -> None:
+    header, rows = _read_sample(fixtures_dir)
+    assert "Close Price" in header
+    assert len(rows) == 22
+    assert {row.key for row in rows} >= set(INVALID_SAMPLE_ROWS)
+    valid = _valid_sample_rows(rows)
+    assert len(valid) == 20
+    assert len({row.key for row in valid}) == 20
+    assert sum(1 for row in valid if not row.cells["turnover_kes"]) >= 5
+    assert sum(1 for row in valid if not row.cells["foreign_net_flow_kes"]) >= 5
+    assert sum(1 for row in valid if row.cells["foreign_net_flow_kes"].startswith("(")) >= 3
+    assert sum(1 for row in valid if "/" in row.cells["trade_date"]) >= 4
+    assert sum(1 for row in valid if "," in row.cells["volume"]) >= 4
+    assert {row.ticker for row in valid if row.trade_date == NEW_SESSION} == {"SCOM", "KCB", "KEGN"}
+
+
+async def test_bad_arguments_leave_no_run_row_in_the_database(
+    seeded_database: _Clone, tmp_path: Path
+) -> None:
+    engine = seeded_database.engine
+    before = await _run_count(engine)
+    csv_path = _write_csv(tmp_path / "prices.csv", [PRICE_HEADER, ("SCOM", SESSION, "33.15", "1")])
+    with pytest.raises(ValueError, match=re.escape("unknown import kind 'bogus'")):
+        await import_file("bogus", csv_path, settings=seeded_database.settings)
+    with pytest.raises(ValueError, match=re.escape("unsupported file type '.json'")):
+        await import_file("daily_prices", tmp_path / "x.json", settings=seeded_database.settings)
+    assert await _run_count(engine) == before
+
+
+async def _insert_scraped_session(engine: AsyncEngine) -> None:
+    """SCOM on :data:`NEW_SESSION` as the NSE pipeline writes it: close, volume and an estimated
+    turnover, with no OHLC and no flow."""
+    close, volume = Decimal("33.25"), 2_754_329
+    row = {
+        "ticker": "SCOM",
+        "trade_date": NEW_SESSION,
+        "close_price": close,
+        "volume": volume,
+        "turnover_kes": (Decimal(volume) * close).quantize(CENT, rounding=ROUND_HALF_UP),
+        "turnover_estimated": True,
+    }
+    async with engine.begin() as conn:
+        written = await upsert_prices(
+            conn, [row], source="nse_market_statistics", ingestion_run_id=None
+        )
+    assert written == 1
+
+
+async def test_daily_prices_sample_overwrites_seeded_and_scraped_prices(
+    seeded_database: _Clone, fixtures_dir: Path
+) -> None:
+    engine = seeded_database.engine
+    _header, sample = _read_sample(fixtures_dir)
+    valid = _valid_sample_rows(sample)
+    csv_keys = {row.key for row in valid}
+    await _insert_scraped_session(engine)
+    before = await _stored_prices(engine, since=SAMPLE_START)
+    scraped = before[("SCOM", NEW_SESSION)]
+    assert (scraped["source"], scraped["foreign_net_flow_kes"], scraped["flow_source"]) == (
+        "nse_market_statistics",
+        None,
+        None,
+    )
+    for row in sample:
+        if row.trade_date != NEW_SESSION:
+            seeded = before[row.key]
+            assert (seeded["source"], seeded["flow_source"]) == ("seed", "seed")
+            assert seeded["foreign_net_flow_kes"] is not None
+
+    result = await import_file(
+        "daily_prices", fixtures_dir / SAMPLE_CSV, settings=seeded_database.settings
+    )
+
+    assert result.pipeline == "csv_import:daily_prices"
+    assert (result.status, result.rows_fetched, result.rows_written, result.rows_rejected) == (
+        RunStatus.PARTIAL,
+        22,
+        20,
+        2,
+    )
+    assert len(result.details["rejected"]) == 2
+    assert _rejections(result, PRICE_KEY) == {
+        (row.ticker, row.cells["trade_date"]): (row.line, INVALID_SAMPLE_ROWS[row.key])
+        for row in sample
+        if row.key in INVALID_SAMPLE_ROWS
+    }
+    assert await _run_row(engine, result.run_id) == {
+        "pipeline": "csv_import:daily_prices",
+        "trigger": "cli",
+        "status": "partial",
+        "rows_fetched": 22,
+        "rows_written": 20,
+        "rows_rejected": 2,
+    }
+
+    after = await _stored_prices(engine, since=SAMPLE_START)
+    for row in valid:
+        stored = after[row.key]
+        expected = _expected_price_columns(row)
+        flow = parse_decimal_cell(row.cells["foreign_net_flow_kes"], "foreign_net_flow_kes")
+        if flow is None:
+            # An empty flow cell keeps the stored flow: the seeded one, or none on a new session.
+            previous = before.get(row.key, dict.fromkeys(FLOW_COLUMNS))
+            expected.update({name: previous[name] for name in FLOW_COLUMNS})
+        else:
+            expected.update(foreign_net_flow_kes=flow, flow_source="csv_import")
+        assert {name: stored[name] for name in PRICE_VALUE_COLUMNS} == expected, row.key
+        assert type(stored["volume"]) is int
+        assert stored["ingestion_run_id"] == result.run_id
+
+    equity = after[("EQTY", SESSION)]
+    assert (equity["close_price"], equity["source"]) == (Decimal("95.75"), "csv_import")
+    kengen = after[("KEGN", SESSION)]
+    # 987241 x 10.605 = 10469690.805, rounded half up.
+    assert (kengen["turnover_kes"], kengen["turnover_estimated"]) == (Decimal("10469690.81"), True)
+    outflow = after[("SCOM", date(2026, 9, 25))]
+    assert (outflow["foreign_net_flow_kes"], outflow["flow_source"]) == (
+        Decimal("-1250000.00"),
+        "csv_import",
+    )
+    kept_flow = after[("SCOM", date(2026, 9, 30))]
+    assert (kept_flow["turnover_kes"], kept_flow["turnover_estimated"]) == (
+        Decimal("89412377.25"),
+        False,
+    )
+    assert (kept_flow["foreign_net_flow_kes"], kept_flow["flow_source"]) == (
+        before[("SCOM", date(2026, 9, 30))]["foreign_net_flow_kes"],
+        "seed",
+    )
+    overwritten_scrape = after[("SCOM", NEW_SESSION)]
+    assert (
+        overwritten_scrape["close_price"],
+        overwritten_scrape["volume"],
+        overwritten_scrape["source"],
+    ) == (Decimal("33.40"), 2_810_455, "csv_import")
+    for ticker in ("SCOM", "KCB", "KEGN"):
+        new_session = after[(ticker, NEW_SESSION)]
+        assert (new_session["foreign_net_flow_kes"], new_session["flow_source"]) == (None, None)
+
+    untouched = set(before) - csv_keys
+    assert set(INVALID_SAMPLE_ROWS) <= untouched
+    assert {key: after[key] for key in untouched} == {key: before[key] for key in untouched}
+    assert all(after[key]["source"] == "seed" for key in INVALID_SAMPLE_ROWS)
+    assert set(after) == set(before) | csv_keys
+
+
+async def test_reimporting_the_daily_prices_sample_changes_no_stored_value(
+    seeded_database: _Clone, fixtures_dir: Path
+) -> None:
+    engine = seeded_database.engine
+    _header, sample = _read_sample(fixtures_dir)
+    csv_keys = {row.key for row in _valid_sample_rows(sample)}
+    path = fixtures_dir / SAMPLE_CSV
+    first = await import_file("daily_prices", path, settings=seeded_database.settings)
+    after_first = await _stored_prices(engine, since=SAMPLE_START)
+
+    second = await import_file("daily_prices", path, settings=seeded_database.settings)
+
+    assert second.run_id != first.run_id
+    for result in (first, second):
+        assert (result.status, result.rows_written, result.rows_rejected) == (
+            RunStatus.PARTIAL,
+            20,
+            2,
+        )
+    after_second = await _stored_prices(engine, since=SAMPLE_START)
+    assert set(after_second) == set(after_first)
+    assert _price_values(after_second, csv_keys) == _price_values(after_first, csv_keys)
+    untouched = set(after_first) - csv_keys
+    assert {key: after_second[key] for key in untouched} == {
+        key: after_first[key] for key in untouched
+    }
+
+
+LAYOUT_CHANGED_FILES = [
+    pytest.param(
+        [
+            PRICE_HEADER,
+            *(
+                (ticker, NEXT_SESSION, "50.00", "1,000")
+                for ticker in ("SCOM", "EQTY", "KCB", "EABL", "KEGN", "COOP", "ABSA", "SBIC")
+            ),
+            ("SCOM", date(2026, 9, 30), "0", "1,000"),
+            ("EQTY", date(2026, 9, 30), "50.00", "-5"),
+        ],
+        10,
+        2,
+        id="two-of-ten-rows-invalid",
+    ),
+    pytest.param(
+        [PRICE_HEADER[:3], ("SCOM", NEXT_SESSION, "50.00"), ("EQTY", NEXT_SESSION, "95.75")],
+        0,
+        0,
+        id="volume-header-missing",
+    ),
+]
+
+
+@pytest.mark.parametrize(("rows", "fetched", "rejected"), LAYOUT_CHANGED_FILES)
+async def test_daily_prices_layout_change_writes_nothing(
+    seeded_database: _Clone,
+    tmp_path: Path,
+    rows: list[tuple[object, ...]],
+    fetched: int,
+    rejected: int,
+) -> None:
+    engine = seeded_database.engine
+    before = await _stored_prices(engine)
+    path = _write_csv(tmp_path / "prices.csv", rows)
+
+    result = await import_file("daily_prices", path, settings=seeded_database.settings)
+
+    assert (result.status, result.rows_fetched, result.rows_written, result.rows_rejected) == (
+        RunStatus.LAYOUT_CHANGED,
+        fetched,
+        0,
+        rejected,
+    )
+    assert len(result.details.get("rejected", [])) == rejected
+    assert await _run_row(engine, result.run_id) == {
+        "pipeline": "csv_import:daily_prices",
+        "trigger": "cli",
+        "status": "layout_changed",
+        "rows_fetched": fetched,
+        "rows_written": 0,
+        "rows_rejected": rejected,
+    }
+    assert await _stored_prices(engine) == before
+
+
+FLOW_UPDATES: Mapping[tuple[str, date], Decimal] = {
+    ("SCOM", NEXT_SESSION): Decimal("-1250000.50"),
+    ("EQTY", NEXT_SESSION): Decimal("2340500.00"),
+    ("KCB", NEXT_SESSION): Decimal("-612250.25"),
+    ("EABL", NEXT_SESSION): Decimal("125000.00"),
+    ("KEGN", NEXT_SESSION): Decimal("-48500.00"),
+    ("COOP", NEXT_SESSION): Decimal("210000.75"),
+    ("ABSA", NEXT_SESSION): Decimal("0.00"),
+    ("SBIC", NEXT_SESSION): Decimal("35000.00"),
+    ("SCOM", date(2026, 9, 30)): Decimal("-415000.00"),
+    ("EQTY", date(2026, 9, 30)): Decimal("980000.10"),
+}
+"""Flows for ten seeded price rows: every ticker on 2026-09-29 and two on 2026-09-30."""
+
+
+async def test_foreign_flows_set_only_the_flow_of_existing_price_rows(
+    seeded_database: _Clone, tmp_path: Path
+) -> None:
+    engine = seeded_database.engine
+    flows = [(ticker, day, _amount_text(flow)) for (ticker, day), flow in FLOW_UPDATES.items()]
+    # Line 7 has no price row: SCOM did not trade on 2026-10-30 in the seeded history.
+    path = _write_csv(
+        tmp_path / "flows.csv",
+        [
+            ("Ticker", "Trade Date", "Foreign Net Flow KES"),
+            *flows[:5],
+            ("SCOM", date(2026, 10, 30), "1,000.00"),
+            *flows[5:],
+        ],
+    )
+    before = await _stored_prices(engine, since=SAMPLE_START)
+    assert all(before[key]["foreign_net_flow_kes"] != flow for key, flow in FLOW_UPDATES.items())
+
+    result = await import_file("foreign_flows", path, settings=seeded_database.settings)
+
+    assert (result.status, result.rows_fetched, result.rows_written, result.rows_rejected) == (
+        RunStatus.PARTIAL,
+        11,
+        10,
+        1,
+    )
+    assert _rejections(result, PRICE_KEY) == {("SCOM", "2026-10-30"): (7, "no_price_row")}
+    assert (await _run_row(engine, result.run_id))["pipeline"] == "csv_import:foreign_flows"
+    after = await _stored_prices(engine, since=SAMPLE_START)
+    assert set(after) == set(before)
+    for key, flow in FLOW_UPDATES.items():
+        assert before[key]["source"] == "seed"
+        # Prices, turnover, source, ingestion_run_id and ingested_at are as seeded.
+        assert after[key] == {
+            **before[key],
+            "foreign_net_flow_kes": flow,
+            "flow_source": "csv_import",
+        }
+    untouched = set(before) - set(FLOW_UPDATES)
+    assert {key: after[key] for key in untouched} == {key: before[key] for key in untouched}
+
+
+KCB_REVENUE: Mapping[date, Decimal] = {
+    date(year, 12, 31): Decimal(f"{year}000000000.45") for year in range(2016, 2026)
+}
+"""New revenue for ten seeded KCB fiscal years."""
+SCOM_FY2026 = ("SCOM", date(2026, 3, 31), "FY")
+
+
+async def test_fundamentals_merge_kes_rows_and_reject_a_currency_conflict(
+    seeded_database: _Clone, tmp_path: Path
+) -> None:
+    engine = seeded_database.engine
+    rows: list[tuple[object, ...]] = [
+        ("Ticker", "Period End Date", "Period Type", "Currency", "Revenue KES")
+    ]
+    for index, (period_end, revenue) in enumerate(KCB_REVENUE.items()):
+        if index == 5:
+            # Line 7: a USD statement for a period stored in KES.
+            rows.append(("SCOM", SCOM_FY2026[1], "FY", "USD", "1,000,000.00"))
+        # Every other KCB row leaves period_type and currency empty: they default to FY and KES.
+        explicit = index % 2 == 1
+        rows.append(
+            (
+                "KCB",
+                period_end,
+                "FY" if explicit else None,
+                "KES" if explicit else None,
+                _amount_text(revenue),
+            )
+        )
+    path = _write_csv(tmp_path / "fundamentals.csv", rows)
+
+    async def stored() -> StoredRows:
+        return await _rows_by_key(
+            engine,
+            TerminalFundamental,
+            FUNDAMENTAL_KEY,
+            FUNDAMENTAL_READ_COLUMNS,
+            TerminalFundamental.ticker.in_(("KCB", "SCOM")),
+        )
+
+    before = await stored()
+
+    result = await import_file("fundamentals", path, settings=seeded_database.settings)
+
+    assert (result.status, result.rows_fetched, result.rows_written, result.rows_rejected) == (
+        RunStatus.PARTIAL,
+        11,
+        10,
+        1,
+    )
+    assert _rejections(result, ("ticker", "period_end_date", "currency")) == {
+        ("SCOM", "2026-03-31", "USD"): (7, "currency_conflict")
+    }
+    after = await stored()
+    assert set(after) == set(before)
+    assert after[SCOM_FY2026] == before[SCOM_FY2026]
+    assert after[SCOM_FY2026]["currency"] == "KES"
+    changed = ("revenue_kes", "source_by_field", "updated_at")
+    kept = [name for name in FUNDAMENTAL_READ_COLUMNS if name not in changed]
+    for period_end, revenue in KCB_REVENUE.items():
+        old, new = before[("KCB", period_end, "FY")], after[("KCB", period_end, "FY")]
+        assert old["source_by_field"]["revenue_kes"] == "seed"
+        assert new["revenue_kes"] == revenue
+        assert new["revenue_kes"] != old["revenue_kes"]
+        assert new["source_by_field"] == {**old["source_by_field"], "revenue_kes": "csv_import"}
+        # COALESCE: the columns the file leaves out keep their values, nulls included.
+        assert {name: new[name] for name in kept} == {name: old[name] for name in kept}
+        assert new["currency"] == "KES"
+    untouched = set(before) - {("KCB", period_end, "FY") for period_end in KCB_REVENUE}
+    assert {key: after[key] for key in untouched} == {key: before[key] for key in untouched}
+
+
+async def test_macro_indicators_merge_one_column_and_insert_a_new_month(
+    seeded_database: _Clone, tmp_path: Path
+) -> None:
+    engine = seeded_database.engine
+    september, october = date(2026, 9, 30), date(2026, 10, 31)
+    path = _write_csv(
+        tmp_path / "macro.csv",
+        [("observation_date", "inflation_yoy_pct"), (september, "6.85"), (october, "6.90")],
+    )
+
+    async def stored() -> StoredRows:
+        return await _rows_by_key(
+            engine,
+            TerminalMacroIndicator,
+            ("observation_date",),
+            MACRO_READ_COLUMNS,
+            TerminalMacroIndicator.observation_date >= september,
+        )
+
+    before = await stored()
+    assert set(before) == {(september,)}
+
+    result = await import_file("macro_indicators", path, settings=seeded_database.settings)
+
+    assert (result.status, result.rows_fetched, result.rows_written, result.rows_rejected) == (
+        RunStatus.SUCCEEDED,
+        2,
+        2,
+        0,
+    )
+    assert (await _run_row(engine, result.run_id))["pipeline"] == "csv_import:macro_indicators"
+    after = await stored()
+    seeded, merged = before[(september,)], after[(september,)]
+    assert seeded["source_by_field"] == dict.fromkeys(MACRO_COLUMNS, "seed")
+    others = [name for name in MACRO_COLUMNS if name != "inflation_yoy_pct"]
+    assert merged["inflation_yoy_pct"] == Decimal("6.85")
+    assert merged["source_by_field"] == {
+        **seeded["source_by_field"],
+        "inflation_yoy_pct": "csv_import",
+    }
+    assert {name: merged[name] for name in others} == {name: seeded[name] for name in others}
+    inserted = after[(october,)]
+    assert inserted["inflation_yoy_pct"] == Decimal("6.90")
+    assert {name: inserted[name] for name in others} == dict.fromkeys(others)
+    assert inserted["source_by_field"] == {"inflation_yoy_pct": "csv_import"}
+
+
+def _spreadsheet_cell(column: str, text: str) -> object:
+    """A sample cell as a workbook holds it: a ``date`` for the trade date, an ``int`` volume, a
+    number for each price, and the export's own text for turnover and flows (separators and
+    parentheses included); an empty cell is ``None``."""
+    if not text:
+        return None
+    if column == "trade_date":
+        return parse_date_cell(text)
+    if column == "volume":
+        return parse_int_cell(text)
+    if column.endswith("_price"):
+        # The deliberate floats: Excel stores every number as a binary double, so a typed 95.75
+        # reaches the importer through openpyxl as a float and must read back exactly.
+        return float(text)
+    return text
+
+
+async def test_xlsx_twin_of_the_sample_stores_what_the_csv_stores(
+    seeded_database: _Clone, fixtures_dir: Path, tmp_path: Path
+) -> None:
+    engine = seeded_database.engine
+    header, sample = _read_sample(fixtures_dir)
+    valid = _valid_sample_rows(sample)
+    keys = {row.key for row in valid}
+    columns = [normalize_column_name(name) for name in header]
+    workbook = _write_xlsx(
+        tmp_path / "prices.xlsx",
+        {
+            "Prices": [
+                header,
+                *(
+                    [
+                        _spreadsheet_cell(column, text)
+                        for column, text in zip(columns, row.texts, strict=True)
+                    ]
+                    for row in valid
+                ),
+            ]
+        },
+    )
+    csv_run = await import_file(
+        "daily_prices", fixtures_dir / SAMPLE_CSV, settings=seeded_database.settings
+    )
+    assert csv_run.status is RunStatus.PARTIAL
+    from_csv = _price_values(await _stored_prices(engine, since=SAMPLE_START), keys)
+
+    # No sheet named: the first worksheet is read.
+    xlsx_run = await import_file("daily_prices", workbook, settings=seeded_database.settings)
+
+    assert (
+        xlsx_run.status,
+        xlsx_run.rows_fetched,
+        xlsx_run.rows_written,
+        xlsx_run.rows_rejected,
+    ) == (RunStatus.SUCCEEDED, 20, 20, 0)
+    stored = await _stored_prices(engine, since=SAMPLE_START)
+    # Every key was rewritten by the workbook's run, and to the values the CSV run stored.
+    assert {stored[key]["ingestion_run_id"] for key in keys} == {xlsx_run.run_id}
+    assert _price_values(stored, keys) == from_csv
+    assert stored[("EQTY", SESSION)]["close_price"] == Decimal("95.75")
+    assert stored[("KEGN", SESSION)]["turnover_kes"] == Decimal("10469690.81")
+    assert stored[("SCOM", date(2026, 9, 25))]["foreign_net_flow_kes"] == Decimal("-1250000.00")
