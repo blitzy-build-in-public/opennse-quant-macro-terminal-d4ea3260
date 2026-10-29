@@ -19,10 +19,14 @@ whose published reference results are asserted exactly.
 
 Every input is a ``Decimal`` built from a string literal and every expected value is a
 hand-computed literal. Formulas never round, so values are compared after a single
-:func:`quantize_out` (ROUND_HALF_UP) or, where the hand computation is exact, unrounded. The
-request schema's single-field bounds are Pydantic constraints outside these pure functions; here
-the quant layer's own guards are checked instead (zero shares, zero forecast years, WACC <= g_T
-and a zero offer raise as caller errors). No database, network or filesystem is touched.
+:func:`quantize_out` (ROUND_HALF_UP) or, where the hand computation is exact, unrounded.
+
+Validation has two layers. Single-field bounds (zero shares, revenue above 10^14, unknown fields,
+oversized sensitivity axes) are Pydantic constraints of ``IpoValuationRequest``, checked here on
+the request model alone. Rules relating two fields pass that model and are reported by
+``assumption_violations`` instead. The quant layer's own guards (zero shares, zero forecast years,
+WACC <= g_T and a zero offer raise as caller errors) are checked as well. No database, network or
+filesystem is touched.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from opennse_terminal.quant.dcf import (
     DEFAULT_SENSITIVITY_MARGIN,
@@ -50,6 +55,9 @@ from opennse_terminal.quant.dcf import (
     value_ipo,
 )
 from opennse_terminal.quant.numeric import QuantizeKind, quantize_out
+from opennse_terminal.schemas.ipo import IpoValuationRequest
+
+SENSITIVITY_AXIS_FIELDS = frozenset({"sensitivity_wacc_pct", "sensitivity_margin_pct"})
 
 NEGATIVE_TERMINAL_FCF = "negative_terminal_fcf"
 NEGATIVE_EQUITY_VALUE = "negative_equity_value"
@@ -105,6 +113,37 @@ def toy(**overrides: Any) -> DcfAssumptions:
         primary_proceeds_kes=Decimal("0"),
     )
     return replace(base, **overrides)
+
+
+def request_payload(**overrides: object) -> dict[str, object]:
+    """The Quickmart preset as an ``IpoValuationRequest`` JSON body: decimal strings, int counts."""
+    payload: dict[str, object] = {
+        "offer_price_kes": "7.50",
+        "revenue_growth_pct": "10.00",
+        "ebitda_margin_pct": "4.50",
+        "margin_expansion_pct": "0.50",
+        "wacc_pct": "18.00",
+        "terminal_growth_pct": "5.00",
+        "net_debt_kes": "4000000000",
+        "nwc_pct_revenue": "-3.00",
+        "peer_ev_ebitda_multiple": "6.00",
+        "dcf_weight_pct": "50",
+        "capex_pct_revenue": "2.00",
+        "da_pct_revenue": "1.50",
+        "tax_rate_pct": "30.00",
+        "forecast_years": 5,
+        "base_revenue_kes": "45000000000",
+        "shares_outstanding": 1_000_000_000,
+        "shares_offered": 500_000_000,
+        "primary_proceeds_kes": "0.00",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def to_assumptions(request: IpoValuationRequest) -> DcfAssumptions:
+    """The request's 18 assumption fields, one-to-one, without the optional sensitivity axes."""
+    return DcfAssumptions(**request.model_dump(exclude=set(SENSITIVITY_AXIS_FIELDS)))
 
 
 def rounded(value: Decimal | None, kind: QuantizeKind) -> Decimal | None:
@@ -267,6 +306,43 @@ def test_toy_value_ipo(
     assert cell.fair_value_per_share_kes == result.blended_fair_value_per_share_kes
     assert cell.upside_pct == result.upside_pct
     assert result.flags == []
+
+
+@pytest.mark.parametrize(
+    "assumptions",
+    [
+        pytest.param(toy(), id="toy"),
+        pytest.param(toy(primary_proceeds_kes=Decimal("100")), id="toy_primary_100"),
+        pytest.param(quickmart(), id="quickmart"),
+        pytest.param(quickmart(primary_proceeds_kes=Decimal("1000000000")), id="quickmart_primary"),
+    ],
+)
+def test_valuation_output_identities(assumptions: DcfAssumptions) -> None:
+    """The unit's own unrounded outputs reconcile exactly, with and without primary proceeds.
+
+    ``EV = sum(PV_t) + PV_TV``; ``PV_TV = TV x DF_N``; ``PV_t = FCF_t x DF_t``;
+    ``Equity = EV - net debt + primary`` for both the DCF and the comparables; and
+    ``secondary = offer size - primary``.
+    """
+    result = value_ipo(assumptions)
+    dcf = result.dcf
+    comps = result.comparables
+
+    assert dcf.enterprise_value_kes == dcf.pv_explicit_fcf_kes + dcf.pv_terminal_value_kes
+    assert dcf.pv_explicit_fcf_kes == sum(
+        (year.pv_fcf_kes for year in dcf.projections), start=Decimal("0")
+    )
+    assert dcf.pv_terminal_value_kes == dcf.terminal_value_kes * dcf.projections[-1].discount_factor
+    for year in dcf.projections:
+        assert year.pv_fcf_kes == year.fcf_kes * year.discount_factor
+    assert dcf.equity_value_kes == (
+        dcf.enterprise_value_kes - assumptions.net_debt_kes + assumptions.primary_proceeds_kes
+    )
+    assert comps.enterprise_value_kes is not None
+    assert comps.equity_value_kes == (
+        comps.enterprise_value_kes - assumptions.net_debt_kes + assumptions.primary_proceeds_kes
+    )
+    assert result.secondary_proceeds_kes == result.offer_size_kes - result.primary_proceeds_kes
 
 
 # ---------------------------------------------------------------------------------------------
@@ -620,6 +696,7 @@ def test_quickmart_preset_has_no_violations() -> None:
 @pytest.mark.parametrize(
     ("wacc", "terminal_growth", "reported"),
     [
+        pytest.param("4.00", "5.00", True, id="well_below"),
         pytest.param("4.99", "5.00", True, id="below"),
         pytest.param("5.00", "5.00", True, id="equal"),
         pytest.param("5.01", "5.00", False, id="just_above"),
@@ -724,6 +801,138 @@ def test_value_ipo_raises_the_first_violation() -> None:
 
 
 # ---------------------------------------------------------------------------------------------
+# Request schema: single-field bounds are Pydantic constraints, cross-field rules are not
+# ---------------------------------------------------------------------------------------------
+
+
+def test_request_fields_map_one_to_one_onto_the_assumptions() -> None:
+    """The preset body validates, and its 18 fields are exactly those of ``DcfAssumptions``.
+
+    Apart from the two optional sensitivity axes (null by default), the request converts
+    field-for-field into the preset assumptions, so the services need no renaming layer.
+    """
+    request = IpoValuationRequest.model_validate(request_payload())
+
+    assert set(IpoValuationRequest.model_fields) - SENSITIVITY_AXIS_FIELDS == {
+        field.name for field in fields(DcfAssumptions)
+    }
+    assert set(request_payload()) == {field.name for field in fields(DcfAssumptions)}
+    assert request.sensitivity_wacc_pct is None
+    assert request.sensitivity_margin_pct is None
+    assert to_assumptions(request) == quickmart()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "loc", "error_type"),
+    [
+        pytest.param(
+            {"shares_outstanding": 0},
+            ("shares_outstanding",),
+            "greater_than_equal",
+            id="zero_shares_outstanding",
+        ),
+        pytest.param(
+            {"shares_outstanding": 10**12 + 1},
+            ("shares_outstanding",),
+            "less_than_equal",
+            id="shares_outstanding_above_10^12",
+        ),
+        pytest.param(
+            {"base_revenue_kes": "0"},
+            ("base_revenue_kes",),
+            "greater_than",
+            id="zero_base_revenue",
+        ),
+        pytest.param(
+            {"base_revenue_kes": "100000000000000.01"},
+            ("base_revenue_kes",),
+            "less_than_equal",
+            id="base_revenue_above_10^14",
+        ),
+        pytest.param(
+            {"unexpected_field": "1"},
+            ("unexpected_field",),
+            "extra_forbidden",
+            id="unknown_field",
+        ),
+        pytest.param(
+            {"sensitivity_wacc_pct": [str(10 + i) for i in range(10)]},
+            ("sensitivity_wacc_pct",),
+            "too_long",
+            id="ten_wacc_axis_values",
+        ),
+    ],
+)
+def test_single_field_bounds_are_request_constraints(
+    overrides: dict[str, object], loc: tuple[str, ...], error_type: str
+) -> None:
+    """Zero or more than 10^12 shares, revenue of 0 or above 10^14 KES, an unknown field and a
+    10-value sensitivity axis (1 to 9 allowed) fail on that one field in FastAPI's standard list.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        IpoValuationRequest.model_validate(request_payload(**overrides))
+
+    assert [(error["loc"], error["type"]) for error in excinfo.value.errors()] == [
+        (loc, error_type)
+    ]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"shares_outstanding": 10**12}, id="shares_outstanding_10^12"),
+        pytest.param({"base_revenue_kes": "100000000000000"}, id="base_revenue_10^14"),
+        pytest.param({"shares_offered": 0}, id="nothing_offered"),
+        pytest.param(
+            {"sensitivity_wacc_pct": [str(10 + i) for i in range(9)]}, id="nine_wacc_axis_values"
+        ),
+    ],
+)
+def test_single_field_bounds_are_inclusive(overrides: dict[str, object]) -> None:
+    """10^12 shares, revenue of exactly 10^14 KES, no shares offered and 9 axis values validate."""
+    request = IpoValuationRequest.model_validate(request_payload(**overrides))
+
+    assert assumption_violations(to_assumptions(request)) == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "code", "field"),
+    [
+        pytest.param(
+            {"primary_proceeds_kes": "3750000000.01"},
+            "primary_exceeds_offer_size",
+            "primary_proceeds_kes",
+            id="primary_one_cent_over_offer_size",
+        ),
+        # WACC must be at least 8.00, so equality with g_T is tested at 8.00 = 8.00.
+        pytest.param(
+            {"wacc_pct": "8.00", "terminal_growth_pct": "8.00"},
+            WACC_NOT_ABOVE_TERMINAL_GROWTH,
+            "wacc_pct",
+            id="wacc_equal_to_terminal_growth",
+        ),
+        pytest.param(
+            {"shares_offered": 1_000_000_001},
+            "shares_offered_exceeds_outstanding",
+            "shares_offered",
+            id="shares_offered_over_outstanding",
+        ),
+    ],
+)
+def test_cross_field_rules_pass_the_request_model(
+    overrides: dict[str, object], code: str, field: str
+) -> None:
+    """Every field is within its own bounds, so Pydantic accepts the body; the rule relating two
+    fields is reported by ``assumption_violations``, which the route raises as a coded 422.
+    """
+    request = IpoValuationRequest.model_validate(request_payload(**overrides))
+
+    assert [(v.code, v.field) for v in assumption_violations(to_assumptions(request))] == [
+        (code, field)
+    ]
+
+
+# ---------------------------------------------------------------------------------------------
 # Edge cases: terminal FCF, equity, comparables fallback, tax floor and the flag union
 # ---------------------------------------------------------------------------------------------
 
@@ -816,6 +1025,32 @@ def test_negative_equity_is_returned_with_flag() -> None:
     assert result.comparables.flags == []
     assert rounded(result.blended_fair_value_per_share_kes, "per_share") == Decimal("-7.00")
     assert rounded(result.upside_pct, "pct") == Decimal("-170.00")
+    assert result.flags == [NEGATIVE_EQUITY_VALUE]
+
+
+def test_quickmart_negative_equity_at_maximum_net_debt() -> None:
+    """Net debt 40,000,000,000, the request maximum, on the Quickmart preset.
+
+    DCF equity = 9,484,146,704.50 - 40,000,000,000 = -30,515,853,295.50, FV -30.52. Comparables
+    equity = 12,150,000,000 - 40,000,000,000 = -27,850,000,000, FV -27.85. Blended
+    (-30.5159 - 27.85) / 2 = -29.18; upside (-29.1829 - 7.50) / 7.50 x 100 = -489.11%. Implied
+    EV/EBITDA at the offer (7,500,000,000 + 40,000,000,000) / 2,025,000,000 = 23.46. FCF_N stays
+    positive, so ``negative_equity_value`` is the only flag, and every matrix cell repeats it.
+    """
+    result = value_ipo(quickmart(net_debt_kes=Decimal("40000000000")))
+
+    assert result.dcf.equity_value_kes < Decimal("0")
+    assert rounded(result.dcf.equity_value_kes, "money") == Decimal("-30515853295.50")
+    assert rounded(result.dcf.fair_value_per_share_kes, "per_share") == Decimal("-30.52")
+    assert result.dcf.flags == [NEGATIVE_EQUITY_VALUE]
+    assert result.comparables.equity_value_kes == Decimal("-27850000000")
+    assert rounded(result.comparables.fair_value_per_share_kes, "per_share") == Decimal("-27.85")
+    assert rounded(result.blended_fair_value_per_share_kes, "per_share") == Decimal("-29.18")
+    assert rounded(result.upside_pct, "pct") == Decimal("-489.11")
+    assert rounded(result.implied_ev_ebitda_at_offer, "ratio") == Decimal("23.46")
+    assert all(
+        cell.flags == [NEGATIVE_EQUITY_VALUE] for row in result.sensitivity.cells for cell in row
+    )
     assert result.flags == [NEGATIVE_EQUITY_VALUE]
 
 
