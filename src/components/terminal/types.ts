@@ -671,7 +671,12 @@ export interface CycleResult {
   window_end: string;
   /** Data state of the cycle. */
   status: BacktestStatus;
-  /** First market session in the window, where every index is 100. */
+  /**
+   * First market session in the window; null when the window holds no session. Each defined
+   * normalized index (`price_index`, `turnover_index`, `pe_index`) is 100 at the anchor. An index
+   * that cannot be normalized (zero anchor capitalization, insufficient or zero anchor turnover,
+   * unavailable anchor P/E) stays null throughout, with the matching code in `flags`.
+   */
   anchor_date: string | null;
   /** Calendar days until the window opens, for an `awaiting_data` cycle; null otherwise. */
   days_until_window_start: number | null;

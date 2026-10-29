@@ -276,8 +276,11 @@ class CycleResult(TerminalResponseModel):
     )
     anchor_date: dt.date | None = Field(
         description=(
-            "First market session in the window, where every index is 100; null when the "
-            "window holds no session."
+            "First market session in the window; null when the window holds no session. Each "
+            "defined normalized index (price_index, turnover_index, pe_index) is 100 at the "
+            "anchor. An index that cannot be normalized (zero anchor capitalization, "
+            "insufficient or zero anchor turnover, unavailable anchor P/E) stays null "
+            "throughout, with the matching code in flags."
         ),
     )
     days_until_window_start: int | None = Field(

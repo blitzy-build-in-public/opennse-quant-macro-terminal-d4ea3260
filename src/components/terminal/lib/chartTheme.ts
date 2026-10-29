@@ -2,36 +2,59 @@
  * Colour and style constants for Recharts props (`stroke`, `fill`, `contentStyle`, `tick`),
  * which take colour strings rather than Tailwind classes.
  *
- * Each hex value is the sRGB approximation of a Tailwind default-palette shade (Tailwind v4
- * defines the palette in OKLCH), so chart strokes match the widgets' utility classes. Only the
- * slate, emerald, rose, amber and sky families are used: a host that customizes its Tailwind
- * colours must keep those families. No CSS variables or global CSS are read, so the values do
- * not depend on host styles.
+ * Each hex value is the sRGB approximation of a Tailwind default-palette shade, so chart strokes
+ * match the widgets' utility classes. Only the slate, emerald, rose, amber and sky families are
+ * used: a host that customizes its Tailwind colours must keep those families. No CSS variables
+ * or global CSS are read, so the values do not depend on host styles.
+ *
+ * Source: the `--color-<family>-<shade>` OKLCH tokens in `tailwindcss/theme.css` of tailwindcss
+ * 4.3.3, the pinned version. Each token is converted with the CSS Color 4 matrices, OKLCH to
+ * OKLab to LMS (cubed) to linear sRGB, then sRGB gamma-encoded. Gamut policy: a channel outside
+ * [0, 1] is clipped to that range on its own, which is how browsers paint an out-of-gamut
+ * `oklch()` utility colour on an sRGB display; each channel is then rounded to the nearest 8-bit
+ * value and written as lowercase `#rrggbb`. Seven shades lie outside sRGB and are clipped:
+ * emerald-400, emerald-500, rose-200, rose-400, rose-500, sky-400 and amber-400. The compiled
+ * stylesheet's legacy hex fallbacks, gamut-mapped by Lightning CSS and used only by browsers
+ * without `lab()`/`oklch()` support, can differ by a few 8-bit units for clipped shades; these
+ * values match the `lab()`/`oklch()` colour that supporting browsers paint for the utility
+ * classes. Regenerate every value with this conversion whenever the tailwindcss pin changes.
  */
 import type { CSSProperties } from "react";
 
 /** Named chart colours, each mirroring one Tailwind default shade. */
 export const CHART_COLORS = {
-  /** slate-700: `CartesianGrid` `stroke`. */
-  grid: "#334155",
-  /** slate-400: axis lines and tick labels (`XAxis`/`YAxis` `stroke`, tick `fill`). */
-  axis: "#94a3b8",
-  /** slate-300: legend and tooltip text. */
-  text: "#cbd5e1",
-  /** slate-500: secondary series and reference lines (`ReferenceLine` `stroke`). */
-  muted: "#64748b",
-  /** slate-900: tooltip background, the widget surface colour. */
-  tooltipBg: "#0f172a",
-  /** slate-700: tooltip border. */
-  tooltipBorder: "#334155",
-  /** emerald-500: gains and inflows (`Bar`/`Cell` `fill`). */
-  positive: "#10b981",
-  /** rose-500: losses and outflows (`Bar`/`Cell` `fill`). */
-  negative: "#f43f5e",
-  /** sky-400: primary series (`Line` `stroke`) and the fallback series colour. */
-  accent: "#38bdf8",
-  /** amber-400: warnings and highlighted markers (`ReferenceDot` `fill`). */
-  warning: "#fbbf24",
+  /** slate-700, `oklch(37.2% 0.044 257.287)`: `CartesianGrid` `stroke`. */
+  grid: "#314158",
+  /**
+   * slate-400, `oklch(70.4% 0.04 256.788)`: axis lines and tick labels (`XAxis`/`YAxis`
+   * `stroke`, tick `fill`).
+   */
+  axis: "#90a1b9",
+  /** slate-300, `oklch(86.9% 0.022 252.894)`: legend and tooltip text. */
+  text: "#cad5e2",
+  /**
+   * slate-500, `oklch(55.4% 0.046 257.417)`: secondary series and reference lines
+   * (`ReferenceLine` `stroke`).
+   */
+  muted: "#62748e",
+  /** slate-900, `oklch(20.8% 0.042 265.755)`: tooltip background, the widget surface colour. */
+  tooltipBg: "#0f172b",
+  /** slate-700, `oklch(37.2% 0.044 257.287)`: tooltip border. */
+  tooltipBorder: "#314158",
+  /** emerald-500, `oklch(69.6% 0.17 162.48)`, clipped: gains and inflows (`Bar`/`Cell` `fill`). */
+  positive: "#00bc7d",
+  /** rose-500, `oklch(64.5% 0.246 16.439)`, clipped: losses and outflows (`Bar`/`Cell` `fill`). */
+  negative: "#ff2056",
+  /**
+   * sky-400, `oklch(74.6% 0.16 232.661)`, clipped: primary series (`Line` `stroke`) and the
+   * fallback series colour.
+   */
+  accent: "#00bcff",
+  /**
+   * amber-400, `oklch(82.8% 0.189 84.429)`, clipped: warnings and highlighted markers
+   * (`ReferenceDot` `fill`).
+   */
+  warning: "#ffb900",
 } as const;
 
 /**
@@ -43,14 +66,14 @@ export const CHART_COLORS = {
  * `noUncheckedIndexedAccess` types every index read as `string | undefined`.
  */
 export const SERIES_PALETTE: readonly string[] = [
-  "#38bdf8",
-  "#34d399",
-  "#fbbf24",
-  "#fb7185",
-  "#bae6fd",
-  "#a7f3d0",
-  "#fde68a",
-  "#fecdd3",
+  "#00bcff", // sky-400, oklch(74.6% 0.16 232.661), clipped
+  "#00d492", // emerald-400, oklch(76.5% 0.177 163.223), clipped
+  "#ffb900", // amber-400, oklch(82.8% 0.189 84.429), clipped
+  "#ff637e", // rose-400, oklch(71.2% 0.194 13.428), clipped
+  "#b8e6fe", // sky-200, oklch(90.1% 0.058 230.902)
+  "#a4f4cf", // emerald-200, oklch(90.5% 0.093 164.15)
+  "#fee685", // amber-200, oklch(92.4% 0.12 95.746)
+  "#ffccd3", // rose-200, oklch(89.2% 0.058 10.001), clipped
 ];
 
 /** `Line` `strokeDasharray` for projection lines, so projections read as not observed. */
