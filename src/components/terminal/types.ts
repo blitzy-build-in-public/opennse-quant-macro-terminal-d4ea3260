@@ -1025,9 +1025,19 @@ export interface ExtractedItem {
  * Body of a successful (HTTP 200) multipart `POST /ingest/pdf`, with or without `commit`. A
  * `commit=false` preview always returns the full extraction, even for a USD statement; with
  * `commit=true` the `found` and `derived` items are merged into the `terminal_fundamentals` row
- * of the ticker and period. Every rejection (413, 415, 422, 409, 404 or 429) is a coded
- * {@link TerminalErrorDetail} body that carries no extraction. Ingestion is API-only: this
- * folder ships no upload widget.
+ * of the ticker and period. No error body carries an extraction. The endpoint's coded and
+ * field-validation rejections are told apart by the JSON type of `detail`:
+ * - an object, the coded {@link TerminalErrorDetail}: 413 `request_too_large` or
+ *   `file_too_large`, 415 `not_a_pdf`, 422 `pdf_encrypted`, `pdf_unreadable`, `too_many_pages`,
+ *   `commit_requires_ticker_and_period` or `commit_requires_kes`, 409 `currency_conflict`,
+ *   404 `unknown_ticker`, 429 `ingest_busy` (with `Retry-After: 5`) and 500 `internal_error`;
+ * - a list of {@link FastApiValidationItem} entries with no stable code: FastAPI's standard 422
+ *   for a missing `file` or an invalid form field, such as an unknown `document_type` or `items`
+ *   value, an over-long `ticker` or a malformed `period_end_date`.
+ *
+ * A body FastAPI cannot parse as multipart gets FastAPI's own 400 with a string `detail`, and a
+ * host's auth override answers in the host's own shape. Ingestion is API-only: this folder ships
+ * no upload widget.
  */
 export interface IngestPdfResponse {
   /** The `terminal_corporate_filings` row (UUID), upserted on `file_sha256` by every upload. */
