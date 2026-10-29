@@ -45,9 +45,11 @@ const SUMMARY_CLASS = "mb-2 text-xs text-slate-400";
 // The list scrolls inside the card so a busy session does not stretch the host's layout; the
 // region is focusable so the scroll is keyboard-reachable when the tickers are not buttons. Its
 // p-1, and the tickers' scroll-my-1 when focus scrolls one into view, equal the focus outline's
-// width plus offset, which the scroll box would otherwise clip.
+// width plus offset, which the scroll box would otherwise clip. `relative` makes the box the
+// containing block of each row's absolutely positioned `sr-only` span; without it those spans
+// escape the overflow clip and stretch the host page below the feed.
 const SCROLL_REGION_CLASS =
-  "max-h-96 overflow-y-auto rounded p-1 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
+  "relative max-h-96 overflow-y-auto rounded p-1 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 const LIST_CLASS = "m-0 list-none p-0";
 const ITEM_CLASS =
   "flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-slate-800 py-1 last:border-b-0";
