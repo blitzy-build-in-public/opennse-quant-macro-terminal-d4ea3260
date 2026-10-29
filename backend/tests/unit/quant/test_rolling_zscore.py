@@ -14,11 +14,12 @@ recomputes a mean or standard deviation. Values enter as exact ``Decimal`` (volu
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import date, timedelta
+from datetime import date
 from decimal import Decimal
 
 import pytest
 
+from helpers.sessions import weekdays
 from opennse_terminal.quant.numeric import quantize_out
 from opennse_terminal.quant.zscore import (
     DEFAULT_SPIKE_THRESHOLD,
@@ -36,17 +37,6 @@ THRESHOLD = Decimal("2.00")
 FIRST_MONDAY = date(2026, 1, 5)
 # Twenty prior volumes alternating 100 and 300: mean 200, squared deviations 20 x 100^2.
 REFERENCE_HISTORY: list[int] = [100, 300] * 10
-
-
-def weekdays(start: date, count: int) -> list[date]:
-    """Return ``count`` consecutive Monday-Friday dates from ``start``, with no holiday logic."""
-    days: list[date] = []
-    day = start
-    while len(days) < count:
-        if day.weekday() < 5:
-            days.append(day)
-        day += timedelta(days=1)
-    return days
 
 
 def obs(dates: Sequence[date], values: Sequence[int | Decimal]) -> list[Observation]:

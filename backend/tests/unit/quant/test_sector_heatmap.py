@@ -162,6 +162,44 @@ def test_multiple_periods_in_boundary_order() -> None:
     assert [pct(cell.relative_return_pct) for cell in b_cells] == ["13.89", "-10.00"]
 
 
+def test_unequal_share_members_are_capitalization_weighted() -> None:
+    """A: (100x11 + 300x18) / (100x10 + 300x20) - 1 = 6,500 / 7,000 - 1 = -7.14%.
+
+    B: 100x20 / 100x10 - 1 = +100.00%. Market: (6,500 + 2,000) / (7,000 + 1,000) - 1 = +6.25%.
+    Relative: A -7.14... - 6.25 = -13.39%, B 100 - 6.25 = +93.75%. A's two members differ in
+    shares, start price and return, so equal share counts (29 / 30 - 1 = -3.33%), share-weighted
+    member returns ((100x10 - 300x10) / 400 = -5.00%) or AAA alone (+10.00%) give other A returns.
+    """
+    members = [
+        member("AAA", "A", 100, {S: "10.00", E: "11.00"}),
+        member("AAB", "A", 300, {S: "20.00", E: "18.00"}),
+        member("BBB", "B", 100, {S: "10.00", E: "20.00"}),
+    ]
+
+    result = sector_returns(members, [S, E])
+
+    assert result.period_ends == [E]
+    assert [row.sector for row in result.sectors] == ["A", "B"]
+
+    [a_cell] = sector_row(result, "A").cells
+    assert a_cell.period_end == E
+    assert pct(a_cell.return_pct) == "-7.14"
+    assert pct(a_cell.relative_return_pct) == "-13.39"
+    assert a_cell.constituents == 2
+
+    [b_cell] = sector_row(result, "B").cells
+    assert b_cell.period_end == E
+    assert pct(b_cell.return_pct) == "100.00"
+    assert pct(b_cell.relative_return_pct) == "93.75"
+    assert b_cell.constituents == 1
+
+    [market_cell] = result.market
+    assert market_cell.period_end == E
+    assert pct(market_cell.return_pct) == "6.25"
+    assert market_cell.relative_return_pct is None
+    assert market_cell.constituents == 3
+
+
 def test_sector_without_priced_constituent_is_null_and_leaves_market_unchanged() -> None:
     """C has no price rows, so no member qualifies: its cell is null with 0 constituents.
 

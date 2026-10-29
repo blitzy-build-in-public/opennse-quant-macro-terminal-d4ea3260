@@ -780,7 +780,10 @@ export interface IpoScenario {
   company_name: string;
   /** Issuer sector; null when not recorded. */
   sector: string | null;
-  /** ISO 4217 currency of every amount in the preset; KES by default. */
+  /**
+   * ISO 4217 currency of every amount in the preset; always KES, because a preset stored in
+   * another currency is left out of `GET /ipo/scenarios`, never converted.
+   */
   currency: string;
   /** Qualitative risk notes, in stored order. */
   risk_scenarios: RiskScenario[];
@@ -904,6 +907,153 @@ export interface IpoValuationResponse {
   sensitivity: SensitivityMatrixData;
   /** Union of the DCF, comparables and sensitivity-cell reason codes. */
   flags: string[];
+}
+
+// ---------------------------------------------------------------------------------------------
+// PDF ingestion (schemas/ingest.py): POST /ingest/pdf
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The six line items the PDF parser can extract, each committed to the `terminal_fundamentals`
+ * column `<item>_kes` (`shares_outstanding` to `shares_outstanding`).
+ */
+export type LineItemName =
+  | "revenue"
+  | "ebitda"
+  | "net_income"
+  | "total_debt"
+  | "operating_cash_flow"
+  | "shares_outstanding";
+
+/**
+ * Outcome for one line item: `found` on a matched label, `derived` from component lines,
+ * `ambiguous` when the column or candidate evidence is insufficient, `not_found` otherwise.
+ */
+export type ExtractedItemStatus = "found" | "derived" | "ambiguous" | "not_found";
+
+/**
+ * Unit of an extracted value: the filing's currency for monetary items, `shares` for
+ * `shares_outstanding`.
+ */
+export type ItemUnit = "KES" | "USD" | "shares";
+
+/**
+ * Overall extraction outcome: `extracted` when no requested item is `not_found`, `partial` when
+ * some are, `no_items` when all are.
+ */
+export type FilingStatus = "extracted" | "partial" | "no_items";
+
+/**
+ * One statement line a `derived` item was summed from: operating profit and depreciation and
+ * amortisation for EBITDA, or one current and one non-current borrowings component for total
+ * debt.
+ */
+export interface DerivationEntry {
+  /** Statement label of the component line, as printed. */
+  label: string;
+  /** 1-based PDF page the component line was read from. */
+  page_number: number;
+  /**
+   * Component value after scale normalization (printed token × page scale), in the filing's
+   * currency.
+   */
+  value: DecimalString;
+}
+
+/** One conflicting match of an `ambiguous` item; at most five are returned per item. */
+export interface Candidate {
+  /** Statement label of the matching line, as printed. */
+  label: string;
+  /** 1-based PDF page of the matching line. */
+  page_number: number;
+  /** The numeric token exactly as printed in the PDF text layer, for example `"(1,234)"`. */
+  raw_value: string;
+  /** The token after sign handling and scale normalization; null when it is not a number. */
+  value: DecimalString | null;
+}
+
+/**
+ * Extraction result for one requested line item. Only `found` and `derived` items are ever
+ * committed to `terminal_fundamentals`; an `ambiguous` item is reported with its candidates but
+ * never written.
+ */
+export interface ExtractedItem {
+  /** Requested line item. */
+  item: LineItemName;
+  /** `found`, `derived`, `ambiguous` (insufficient evidence, never committed) or `not_found`. */
+  status: ExtractedItemStatus;
+  /**
+   * Value after scale normalization: whole units of the filing's currency for monetary items, a
+   * share count for `shares_outstanding`. For `ambiguous`, the first match on the primary
+   * statement page, null when that match has no single readable token; null for `not_found`.
+   */
+  value: DecimalString | null;
+  /**
+   * `KES` or `USD` for monetary items (the filing's currency, never converted); `shares` for
+   * `shares_outstanding`.
+   */
+  unit: ItemUnit;
+  /**
+   * The selected numeric token exactly as printed, before sign and scale handling; null when no
+   * single token was selected, as for `not_found` items or a derived sum.
+   */
+  raw_value: string | null;
+  /**
+   * Multiplier applied to the printed figures: 1, 1000, 1000000 or 1000000000; null for
+   * `not_found` items.
+   */
+  scale_applied: number | null;
+  /** 1-based PDF page of the selected line; null for `not_found`. */
+  page_number: number | null;
+  /** Statement label that matched, as printed; null for `not_found`. */
+  matched_label: string | null;
+  /** Component lines summed into a `derived` value; empty for other statuses. */
+  derivation: DerivationEntry[];
+  /** Up to five conflicting matches of an `ambiguous` item; empty otherwise. */
+  candidates: Candidate[];
+}
+
+/**
+ * Body of a successful (HTTP 200) multipart `POST /ingest/pdf`, with or without `commit`. A
+ * `commit=false` preview always returns the full extraction, even for a USD statement; with
+ * `commit=true` the `found` and `derived` items are merged into the `terminal_fundamentals` row
+ * of the ticker and period. Every rejection (413, 415, 422, 409, 404 or 429) is a coded
+ * {@link TerminalErrorDetail} body that carries no extraction. Ingestion is API-only: this
+ * folder ships no upload widget.
+ */
+export interface IngestPdfResponse {
+  /** The `terminal_corporate_filings` row (UUID), upserted on `file_sha256` by every upload. */
+  filing_id: string;
+  /** SHA-256 of the uploaded bytes as 64 lowercase hex characters; the file is never stored. */
+  file_sha256: string;
+  /** Number of pages in the uploaded PDF. */
+  page_count: number;
+  /**
+   * Statement scale detected from the page headers (1, 1000, 1000000 or 1000000000), the most
+   * frequent across pages; 1 with the `scale_not_detected` warning when no page carries a
+   * marker; null when the PDF has no text layer.
+   */
+  detected_scale: number | null;
+  /**
+   * ISO 4217 currency of the statements: KES unless a USD or US$ header was detected. Values are
+   * never converted.
+   */
+  currency: string;
+  /** `extracted` if no requested item is `not_found`, `partial` if some are, `no_items` if all. */
+  status: FilingStatus;
+  /** One result per requested line item. */
+  items: ExtractedItem[];
+  /** The requested items whose status is `not_found`. */
+  missing_items: LineItemName[];
+  /** True when the `found` and `derived` items were written to `terminal_fundamentals`. */
+  committed: boolean;
+  /** The `terminal_fundamentals` row (UUID) written by the commit; null when not committed. */
+  fundamentals_id: string | null;
+  /**
+   * Extraction warning codes, open-ended like `flags`: `no_text_layer` (the PDF has no text layer
+   * and no OCR is attempted), `scale_not_detected` and `non_kes_currency`.
+   */
+  warnings: string[];
 }
 
 // ---------------------------------------------------------------------------------------------

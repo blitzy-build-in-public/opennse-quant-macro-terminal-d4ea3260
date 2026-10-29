@@ -9,8 +9,10 @@ building the response.
 
 Units: ``*_kes`` amounts are whole KES, fair values and the offer price are KES per share,
 ``*_pct`` values are percentage points and multiples are times (x). Values stay ``Decimal`` from
-the request to the response; no ``float`` is involved. Presets are read-only and a valuation
-writes nothing, so the module has no create, update or delete function.
+the request to the response; no ``float`` is involved. Only KES presets are listed, because FX
+conversion is not supported: a preset stored in another currency is left out, never converted.
+Presets are read-only and a valuation writes nothing, so the module has no create, update or
+delete function.
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ from opennse_terminal.quant.dcf import (
     assumption_violations,
 )
 from opennse_terminal.quant.dcf import value_ipo as quant_value_ipo
-from opennse_terminal.quant.numeric import HUNDRED, ZERO, quantize_out
+from opennse_terminal.quant.numeric import ANALYTICS_CURRENCY, HUNDRED, ZERO, quantize_out
 from opennse_terminal.schemas.common import ErrorDetail
 from opennse_terminal.schemas.ipo import (
     ComparablesResult,
@@ -71,7 +73,10 @@ async def list_scenarios(session: AsyncSession) -> list[IpoScenario]:
     stored and is derived as ``base_ebitda_kes / base_revenue_kes * 100``. Both sensitivity axes
     are left null so the defaults apply.
 
-    Returns ``[]`` when no preset exists; the endpoint has no error codes.
+    Only KES presets are returned: a preset stored in another currency is left out, logged at
+    WARNING and never converted, as is any other row that cannot form a valid request (see
+    :func:`_scenario_from_row`). Returns ``[]`` when no preset qualifies; the endpoint has no
+    error codes.
     """
     rows = (
         await session.scalars(
@@ -92,11 +97,21 @@ def _scenario_from_row(row: TerminalIpoScenario) -> IpoScenario | None:
     """Build the :class:`IpoScenario` of one stored preset, or ``None`` if it cannot form one.
 
     Presets are seeded reference data with no write endpoint, so a row that cannot form a valid
-    request (a non-positive base revenue, a value outside its slider range, a ``risk_scenarios``
-    value that is not a JSON array, or a malformed risk note) is a data error. It is logged once
-    at WARNING, naming the preset and the fields but never the stored values, and left out, so
-    one bad row does not fail the whole preset list.
+    request (a ``currency`` other than KES, a non-positive base revenue, a value outside its slider
+    range, a ``risk_scenarios`` value that is not a JSON array, or a malformed risk note) is a
+    data error. It is logged once at WARNING, naming the preset and the fields but never the
+    stored values, and left out, so one bad row does not fail the whole preset list. The currency
+    is checked first: every ``IpoValuationRequest`` amount is KES and FX conversion is not
+    supported, so a preset stored in another currency is refused (``currency_mismatch``) and its
+    amounts are never converted or relabelled as KES.
     """
+    if row.currency != ANALYTICS_CURRENCY:
+        logger.warning(
+            "skipping IPO preset %r: currency must be KES (currency_mismatch); preset amounts "
+            "are never converted",
+            row.company_name,
+        )
+        return None
     if row.base_revenue_kes <= ZERO:
         logger.warning(
             "skipping IPO preset %r: base_revenue_kes must be positive to derive the base "

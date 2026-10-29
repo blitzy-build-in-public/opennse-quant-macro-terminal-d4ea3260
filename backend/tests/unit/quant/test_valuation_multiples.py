@@ -285,6 +285,26 @@ def test_negative_enterprise_value_is_returned_as_computed_and_flagged() -> None
     ) == Metric(Decimal("-5000000"), "negative_enterprise_value")
 
 
+def test_zero_enterprise_value_is_returned_as_computed_and_flagged() -> None:
+    """EV ≤ 0 includes zero. Debt 0, cash 25,000,000: EV 25,000,000 + 0 − 25,000,000 = 0.00 and
+    EV/EBITDA 0 ÷ 4,000,000 = 0.00, both defined (not None), plus negative_enterprise_value.
+    """
+    result = valued(total_debt_kes=Decimal("0"), cash_and_equivalents_kes=Decimal("25000000"))
+
+    assert result.enterprise_value_kes is not None
+    assert result.enterprise_value_kes == Decimal("0")
+    assert rounded(result.enterprise_value_kes, "money") == "0.00"
+    assert result.ev_ebitda is not None
+    assert result.ev_ebitda == Decimal("0")
+    assert rounded(result.ev_ebitda, "ratio") == "0.00"
+    assert "negative_enterprise_value" in result.flags
+    assert not any(flag.startswith("ev_ebitda_") for flag in result.flags)
+    assert result.flags == ["negative_enterprise_value", "dy_missing_dps"]
+    assert enterprise_value(
+        Decimal("25000000"), Decimal("0"), Decimal("25000000"), sector="Telecommunications"
+    ) == Metric(Decimal("0"), "negative_enterprise_value")
+
+
 # --- Shares, currency, availability and staleness -----------------------------------------------
 
 
@@ -698,6 +718,80 @@ def test_sector_ev_ebitda_is_null_when_summed_ebitda_is_not_positive() -> None:
     assert "sector_ev_ebitda_unavailable" in aggregate.flags
     assert aggregate.ev_ebitda_eligible_count == 2
     assert rounded(aggregate.pe, "ratio") == "10.00"
+
+
+@pytest.mark.parametrize(
+    ("field", "first", "second", "undefined", "flag"),
+    [
+        pytest.param(
+            "net_income_kes", "0", "0", "pe", "sector_pe_unavailable", id="net-income-all-zero"
+        ),
+        pytest.param(
+            "net_income_kes",
+            "-1000000",
+            "1000000",
+            "pe",
+            "sector_pe_unavailable",
+            id="net-income-canceling",
+        ),
+        pytest.param(
+            "total_equity_kes", "0", "0", "pb", "sector_pb_unavailable", id="equity-all-zero"
+        ),
+        pytest.param(
+            "total_equity_kes",
+            "-1000000",
+            "1000000",
+            "pb",
+            "sector_pb_unavailable",
+            id="equity-canceling",
+        ),
+        pytest.param(
+            "ebitda_kes",
+            "0",
+            "0",
+            "ev_ebitda",
+            "sector_ev_ebitda_unavailable",
+            id="ebitda-all-zero",
+        ),
+        pytest.param(
+            "ebitda_kes",
+            "-1000000",
+            "1000000",
+            "ev_ebitda",
+            "sector_ev_ebitda_unavailable",
+            id="ebitda-canceling",
+        ),
+    ],
+)
+def test_sector_aggregate_is_null_when_summed_denominator_is_exactly_zero(
+    field: str, first: str, second: str, undefined: str, flag: str
+) -> None:
+    """Two base-equity members whose NI, equity or EBITDA is 0 and 0, or −1,000,000 and
+    +1,000,000: Σ = 0 ≤ 0, so that aggregate is undefined (None with its flag), never an exception
+    from 50,000,000 ÷ 0 or 56,000,000 ÷ 0, and both members stay in its eligible set. The others
+    stand: sector P/E 50,000,000 ÷ 5,000,000 = 10.00, P/B 50,000,000 ÷ 25,000,000 = 2.00 and
+    EV/EBITDA 56,000,000 ÷ 8,000,000 = 7.00. dps is missing, so the dividend yield is undefined too.
+    """
+    members = [
+        with_fundamentals("ONE", **{field: Decimal(first)}),
+        with_fundamentals("TWO", **{field: Decimal(second)}),
+    ]
+
+    aggregate = sector_aggregates("Telecommunications", members)
+
+    ratios = {"pe": aggregate.pe, "pb": aggregate.pb, "ev_ebitda": aggregate.ev_ebitda}
+    assert ratios.pop(undefined) is None
+    defined = {"pe": "10.00", "pb": "2.00", "ev_ebitda": "7.00"}
+    del defined[undefined]
+    assert {name: rounded(value, "ratio") for name, value in ratios.items()} == defined
+    assert aggregate.flags == [flag, "sector_dy_unavailable"]
+    assert aggregate.constituent_count == 2
+    assert (
+        aggregate.pe_eligible_count,
+        aggregate.pb_eligible_count,
+        aggregate.ev_ebitda_eligible_count,
+        aggregate.dy_eligible_count,
+    ) == (2, 2, 2, 0)
 
 
 def test_banking_sector_ev_ebitda_is_never_aggregated() -> None:

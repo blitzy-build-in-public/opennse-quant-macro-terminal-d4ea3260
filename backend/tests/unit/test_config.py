@@ -1,16 +1,20 @@
-"""Tests for the scraper duration bounds of ``TerminalSettings`` (``opennse_terminal.config``).
+"""Tests for ``TerminalSettings`` (``opennse_terminal.config``): duration bounds and repr.
 
 ``scraper_min_interval_seconds`` feeds ``asyncio.sleep`` and ``scraper_timeout_seconds`` feeds
 ``httpx.Timeout`` in the polite client, so both must load as finite numbers: zero spacing is
-allowed, the timeout must be positive, and neither has an upper bound. Every case runs through
+allowed, the timeout must be positive, and neither has an upper bound. ``repr()`` and ``str()``
+must leave out ``database_url``, which carries the database password. Every case runs through
 keyword arguments and through the ``TERMINAL_*`` environment variables, with ``_env_file=None`` so
 the checkout's ``.env`` is never read. Offline and synchronous: no network, no database.
 """
 
+import secrets
 import sys
+from collections.abc import Callable
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy.engine import URL
 
 from opennse_terminal.config import TerminalSettings
 
@@ -102,3 +106,29 @@ def test_duration_below_lower_bound_is_rejected(
     errors = exc_info.value.errors()
     assert [(error["loc"], error["type"]) for error in errors] == [((field,), error_type)]
     assert field in str(exc_info.value)
+
+
+@pytest.mark.parametrize("source", SOURCES)
+@pytest.mark.parametrize("render", [repr, str], ids=["repr", "str"])
+def test_rendered_settings_omit_database_url(
+    monkeypatch: pytest.MonkeyPatch, render: Callable[[object], str], source: str
+) -> None:
+    # The password is generated per run, so no credential sits in this file.
+    password = secrets.token_hex(16)
+    url = URL.create(
+        "postgresql+asyncpg",
+        username="opennse",
+        password=password,
+        host="localhost",
+        port=5432,
+        database="opennse",
+    ).render_as_string(hide_password=False)
+    monkeypatch.delenv(_env_var("database_url"), raising=False)
+
+    settings = _load(monkeypatch, source, "database_url", url)
+    rendered = render(settings)
+
+    assert password not in rendered
+    assert "database_url" not in rendered
+    assert "pdf_max_bytes=" in rendered
+    assert settings.database_url == url

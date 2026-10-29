@@ -49,6 +49,7 @@ class TerminalSettings(BaseSettings):
     URL; log ``opennse_terminal.db.session.database_log_label(url)`` instead, which keeps only the
     driver, host, port and database. ``render_as_string(hide_password=True)`` is not a safe
     substitute: it prints query values, and asyncpg accepts the password as ``?password=...``.
+    ``repr()`` and ``str()`` leave ``database_url`` out, but ``model_dump()`` still includes it.
     """
 
     # hide_input_in_errors keeps a rejected database_url, password included, out of the
@@ -68,6 +69,7 @@ class TerminalSettings(BaseSettings):
             "SQLAlchemy async database URL using the asyncpg driver; also used by migrations, "
             "the seeder, the ingestion CLI and the scheduler."
         ),
+        repr=False,
     )
     default_owner_key: str = Field(
         default="local",

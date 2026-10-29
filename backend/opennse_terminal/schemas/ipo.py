@@ -287,7 +287,10 @@ class IpoScenario(TerminalResponseModel):
     sector: str | None = Field(description="Issuer sector; null when not recorded.")
     currency: str = Field(
         default=DEFAULT_CURRENCY,
-        description="ISO 4217 currency of every KES amount in the preset; KES by default.",
+        description=(
+            "ISO 4217 currency of every amount in the preset; always KES, because a preset stored "
+            "in another currency is left out of GET /ipo/scenarios, never converted."
+        ),
     )
     risk_scenarios: list[RiskScenario] = Field(
         description="Qualitative risk notes shown beside the sandbox, in stored order.",
