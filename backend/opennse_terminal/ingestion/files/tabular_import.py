@@ -1071,7 +1071,20 @@ _WRITE_COLUMNS: Final[Mapping[ImportKind, tuple[str, ...]]] = MappingProxyType(
     }
 )
 """The columns each kind passes to its ``db.upsert`` writer: one uniform key set per kind, with
-``None`` for an empty cell, which the writers treat as "not supplied"."""
+``None`` for an empty cell. What a ``None`` does depends on the kind:
+
+- ``daily_prices``: the price columns are replaced as a set, because the row's ``source``
+  describes them all, so an empty ``open_price``, ``high_price`` or ``low_price`` stores NULL and
+  clears a stored value. An empty ``turnover_kes`` never reaches the writer:
+  :meth:`TabularImportPipeline.validate` derives it as volume x close with
+  ``turnover_estimated = True``. An empty ``foreign_net_flow_kes`` keeps the stored flow and
+  ``flow_source`` (COALESCE).
+- ``fundamentals`` and ``macro_indicators``: COALESCE merges, so an empty value cell keeps the
+  stored value and its ``source_by_field`` entry.
+- ``equities``: :meth:`TabularImportPipeline.reconcile` has already filled empty ``isin``,
+  ``free_float_pct`` and ``currency`` cells with the stored values (``currency`` defaulting to
+  KES), so the full-row update keeps them.
+- ``foreign_flows``: the flow is required, so no ``None`` is passed."""
 
 _FORMAT_CHECKED: Final = frozenset({"isin", "currency", "period_type"})
 _PRICE_BOUNDS: Final = ("open_price", "high_price", "low_price", "turnover_kes")

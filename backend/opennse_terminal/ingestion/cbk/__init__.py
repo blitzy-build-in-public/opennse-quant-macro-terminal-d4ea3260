@@ -33,6 +33,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from itertools import groupby
 from types import MappingProxyType
 from typing import Final
 from urllib.parse import SplitResult, quote, unquote, urljoin, urlsplit
@@ -683,12 +684,17 @@ async def upsert_macro_records(
 
     Records sharing a date are collapsed with the **last** one winning, because one
     ``INSERT ... ON CONFLICT DO UPDATE`` cannot touch a row twice; ``cbk_reserves`` passes its
-    bulletins oldest first, so the newest bulletin's value for a header date is kept. Each row
-    carries only the columns the record supplied (never padded with nulls). Rows are grouped by
-    column set and written through ``db.upsert.upsert_macro`` in chunks of
-    :data:`UPSERT_CHUNK_ROWS`, which sets ``col = COALESCE(EXCLUDED.col, stored)`` and records
-    ``source`` in ``source_by_field`` for each written column. Nothing is committed here: the
-    run's transaction, which holds its advisory lock, does that.
+    bulletins oldest first, so the newest bulletin's value for a header date is kept. A record
+    without values writes nothing. Each row carries only the columns the record supplied (never
+    padded with nulls). The rows are sorted by ``observation_date`` and written through
+    ``db.upsert.upsert_macro`` as contiguous runs of dates that share a column set, each run in
+    date order in chunks of :data:`UPSERT_CHUNK_ROWS`. Every statement therefore covers dates
+    above the previous one's, so concurrent pipelines, each under its own advisory lock, lock
+    ``terminal_macro_indicators`` rows in one ascending date order, which rules out a deadlock
+    between them on overlapping dates. ``upsert_macro`` sets
+    ``col = COALESCE(EXCLUDED.col, stored)`` and records ``source`` in ``source_by_field`` for
+    each written column. Nothing is committed here: the run's transaction, which holds its
+    advisory lock, does that.
 
     Raises:
         ValueError: ``source`` is empty, or a record has no ``observation_date`` (validation
@@ -703,16 +709,24 @@ async def upsert_macro_records(
             f"(lines {undated[:10]})"
         )
     unique, duplicates = dedupe_by_key(records, lambda record: record.observation_date)
-    groups: dict[tuple[str, ...], list[dict[str, object]]] = {}
-    for record in unique:
-        if not record.values:
-            continue
-        row: dict[str, object] = {"observation_date": record.observation_date}
-        row.update(record.values)
-        groups.setdefault(tuple(sorted(record.values)), []).append(row)
+    # Undated records were refused above; the ``is not None`` test only narrows the type.
+    dated = sorted(
+        (
+            (record.observation_date, record)
+            for record in unique
+            if record.observation_date is not None and record.values
+        ),
+        key=lambda pair: pair[0],
+    )
     written = 0
-    for columns in sorted(groups):
-        rows = groups[columns]
+    # Contiguous runs in date order, never a partition by column set: statements must follow the
+    # global date order, or two pipelines writing overlapping dates can lock rows in opposite
+    # orders and deadlock.
+    for _columns, run in groupby(dated, key=lambda pair: frozenset(pair[1].values)):
+        rows: list[dict[str, object]] = [
+            {"observation_date": observation_date, **record.values}
+            for observation_date, record in run
+        ]
         for start in range(0, len(rows), UPSERT_CHUNK_ROWS):
             written += await upsert_macro(
                 conn, rows[start : start + UPSERT_CHUNK_ROWS], source=source

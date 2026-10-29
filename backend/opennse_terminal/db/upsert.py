@@ -101,8 +101,9 @@ UpsertMode: TypeAlias = Literal["do_nothing", "do_update"]
 """Conflict behaviour of ``upsert_rows``."""
 
 PRICE_SOURCE_PRECEDENCE: Final[tuple[str, ...]] = ("seed", "nse_market_statistics", "csv_import")
-"""Writers of the ``terminal_daily_prices`` price columns, lowest rank first. A writer overwrites
-rows whose ``source`` ranks at or below its own."""
+"""Writers of the ``terminal_daily_prices`` price columns, lowest rank first. ``csv_import``, the
+highest rank, overwrites a row whatever its stored ``source``, including a value outside this
+tuple; a lower writer overwrites only rows whose ``source`` is listed at or below its own rank."""
 
 PRICE_COLUMNS: Final[tuple[str, ...]] = (
     "open_price",
@@ -534,11 +535,15 @@ async def upsert_prices(
     - Any other writer: the flow columns are not written, so a new row has both NULL and an existing
       row keeps its flow and ``flow_source``.
 
-    Precedence: ``source`` must be in ``PRICE_SOURCE_PRECEDENCE``. An existing row is updated only
-    when its ``source`` ranks at or below the writer's: ``nse_market_statistics`` replaces ``seed``
-    and ``nse_market_statistics`` rows but never ``csv_import`` rows, and ``csv_import`` replaces
-    any row. Guarded-out rows are not counted. Identical re-runs rewrite identical values and are
-    counted. Returns the number of rows inserted or updated.
+    Precedence: ``source`` must be in ``PRICE_SOURCE_PRECEDENCE``. ``csv_import``, the highest
+    rank, replaces an existing row whatever its stored ``source``, including a value outside that
+    tuple, so its ``ON CONFLICT DO UPDATE`` has no ``WHERE``. A lower writer updates an existing
+    row only when its stored ``source`` is listed at or below the writer's rank
+    (``WHERE source IN (...)``): ``nse_market_statistics`` replaces ``seed`` and
+    ``nse_market_statistics`` rows but never ``csv_import`` rows or a source the tuple does not
+    list, and ``seed`` replaces only ``seed`` rows. Guarded-out rows are not counted. Identical
+    re-runs rewrite identical values and are counted. Returns the number of rows inserted or
+    updated.
     """
     if source not in PRICE_SOURCE_PRECEDENCE:
         raise ValueError(
@@ -571,7 +576,13 @@ async def upsert_prices(
             yield out
 
     rank = PRICE_SOURCE_PRECEDENCE.index(source)
-    overwritable = PRICE_SOURCE_PRECEDENCE[: rank + 1]
+    # The top-ranked writer replaces a row whatever its stored source, including one outside the
+    # tuple; a lower writer updates only rows whose source is listed at or below its rank.
+    guard = (
+        None
+        if rank == len(PRICE_SOURCE_PRECEDENCE) - 1
+        else table.c["source"].in_(PRICE_SOURCE_PRECEDENCE[: rank + 1])
+    )
 
     def on_conflict(stmt: Insert) -> Insert:
         excluded = stmt.excluded
@@ -588,7 +599,7 @@ async def upsert_prices(
         return stmt.on_conflict_do_update(
             index_elements=list(_PRICE_KEY),
             set_=set_,
-            where=table.c["source"].in_(overwritable),
+            where=guard,
         )
 
     written = await _insert_all(executor, table, normalized(), _PRICE_KEY, on_conflict)

@@ -561,6 +561,52 @@ def test_two_ticker_cycle_index_pe_turnover_and_summary() -> None:
     )
 
 
+def test_price_index_weights_each_member_by_its_capitalization() -> None:
+    """X: 100 shares at 10.00 through the anchor, then 12.00 (+20%); Y: 150 shares at 20.00
+    through T, then 18.00 (-10%).
+
+    The members enter with unequal capitalizations, 1,000 and 3,000 (4,000 at the anchor), so Y
+    weighs three times as much as X: the index is 100 * (1,200 + 3,000) / 4,000 = 105.00 from Tue
+    2022-08-02 through T and 100 * (1,200 + 2,700) / 4,000 = 97.50 after it. An equal-weight mean
+    of the members' returns would give 100 * (1.20 + 1.00) / 2 = 110.00, then
+    100 * (1.20 + 0.90) / 2 = 105.00. Index at T is 105.00: pre-event return +5.00% (not
+    +10.00%), post-event return 97.50 / 105.00 - 1 = -7.14% (not -4.55%) and max drawdown -7.14%
+    from the 105.00 peak. Neither member reports earnings, so P/E is null throughout, the
+    valuation floor falls back to the lowest price index, 97.50 on Wed 2022-08-10 (not the
+    anchor's 100.00), and P/E compression is null. Turnover is 2,000 a session, so the turnover
+    index stays at 100.00.
+    """
+    result = run_standard(
+        pair(
+            x_close=after(ANCHOR, "10.00", "12.00"),
+            y_close=after(EVENT.event_date, "20.00", "18.00"),
+            shares=(100, 150),
+        )
+    )
+
+    assert result.status == "complete"
+    assert result.constituents == ["X", "Y"]
+    assert result.excluded_constituents == []
+    assert result.flags == ["pe_anchor_unavailable"]
+
+    points = result.points
+    assert [point.offset_days for point in points] == OFFSETS
+    assert column(points, "price_index", "index") == ["100.00"] + ["105.00"] * 6 + ["97.50"] * 8
+    assert column(points, "pe_ratio", "ratio") == [None] * 15
+    assert column(points, "turnover_index", "index") == ["100.00"] * 15
+
+    assert result.summary is not None
+    assert q(result.summary.pre_event_return_pct, "pct") == "5.00"
+    assert q(result.summary.post_event_return_pct, "pct") == "-7.14"
+    assert q(result.summary.max_drawdown_pct, "pct") == "-7.14"
+    assert result.summary.pe_compression_pct is None
+
+    assert result.markers == CycleMarkersResult(
+        valuation_floor=CycleMarkerResult(1, date(2022, 8, 10), "price_index", Decimal("97.50")),
+        volume_exhaustion=CycleMarkerResult(-8, ANCHOR, "turnover_index", Decimal("100.00")),
+    )
+
+
 def test_counter_first_trading_after_the_anchor_is_excluded() -> None:
     """Z (1,000,000 shares at 50.00) first trades on 2022-08-02, the session after the anchor.
 
@@ -1156,6 +1202,83 @@ def test_markers_are_the_earliest_minima_of_the_returned_points(
     assert q(result.summary.pe_compression_pct, "pct") == expected_compression
 
 
+@pytest.mark.parametrize(
+    ("close", "expected_index", "post_event", "max_drawdown", "expected_floor"),
+    [
+        pytest.param(
+            piecewise(
+                "10.00",
+                {
+                    date(2022, 8, 2): "12.00",
+                    date(2022, 8, 10): "15.00",
+                    date(2022, 8, 19): "9.00",
+                },
+            ),
+            ["100.00"] + ["120.00"] * 6 + ["150.00"] * 7 + ["90.00"],
+            "-25.00",
+            "-40.00",
+            CycleMarkerResult(10, date(2022, 8, 19), "price_index", Decimal("90.00")),
+            id="new-peak-after-t-then-a-fall",
+        ),
+        pytest.param(
+            piecewise(
+                "10.00",
+                {
+                    date(2022, 8, 2): "12.00",
+                    date(2022, 8, 10): "9.00",
+                    date(2022, 8, 15): "15.00",
+                    date(2022, 8, 19): "13.50",
+                },
+            ),
+            ["100.00"] + ["120.00"] * 6 + ["90.00"] * 3 + ["150.00"] * 4 + ["135.00"],
+            "12.50",
+            "-25.00",
+            CycleMarkerResult(1, date(2022, 8, 10), "price_index", Decimal("90.00")),
+            id="trough-before-a-higher-peak",
+        ),
+    ],
+)
+def test_summary_measures_returns_from_the_index_at_t_and_drawdown_from_the_running_peak(
+    close: Callable[[date], str],
+    expected_index: list[str],
+    post_event: str,
+    max_drawdown: str,
+    expected_floor: CycleMarkerResult,
+) -> None:
+    """One ticker X (100 shares, no fundamentals) closes 10.00 at the anchor and 12.00 from Tue
+    2022-08-02 through T (Tue 2022-08-09), so the index at T is 100 * 1,200 / 1,000 = 120.00 and
+    the pre-event return is (120 / 100 - 1) * 100 = +20.00% on both paths.
+
+    * New peak after T, then a fall: 15.00 from Wed 2022-08-10 through Thu 2022-08-18 and 9.00 on
+      Fri 2022-08-19 give 100, then 120 (6 points), 150 (7 points) and 90. Post-event return
+      (90 / 120 - 1) * 100 = -25.00%; max drawdown from the running maximum 150 is
+      (90 / 150 - 1) * 100 = -40.00%, not the anchor-relative (90 / 100 - 1) * 100 = -10.00%.
+    * Trough before a higher peak: 9.00 from Wed 2022-08-10, 15.00 from Mon 2022-08-15 and 13.50
+      on Fri 2022-08-19 give 100, then 120 (6 points), 90 (3 points), 150 (4 points) and 135.
+      Post-event return (135 / 120 - 1) * 100 = +12.50%; max drawdown is the fall to 90 from the
+      running maximum 120 then, (90 / 120 - 1) * 100 = -25.00%, not the global range
+      (90 / 150 - 1) * 100 = -40.00%, the anchor-relative -10.00% or the last point against its
+      running maximum, (135 / 150 - 1) * 100 = -10.00%.
+
+    P/E is null throughout, so the valuation floor falls back to the earliest minimum price index
+    (90.00) and P/E compression is null.
+    """
+    result = run_standard([candidate("X", 100, prices("X", SESSIONS, close))])
+
+    assert result.status == "complete"
+    assert result.flags == ["pe_anchor_unavailable"]
+    assert [point.trade_date for point in result.points] == WINDOW_DAYS
+    assert column(result.points, "price_index", "index") == expected_index
+
+    assert result.summary is not None
+    assert q(result.summary.pre_event_return_pct, "pct") == "20.00"
+    assert q(result.summary.post_event_return_pct, "pct") == post_event
+    assert q(result.summary.max_drawdown_pct, "pct") == max_drawdown
+    assert result.summary.pe_compression_pct is None
+    assert result.markers is not None
+    assert result.markers.valuation_floor == expected_floor
+
+
 def test_macro_overlays_are_as_of_and_at_most_62_days_old() -> None:
     """The only macro row is 2022-05-31 (inflation 7.10, 91-day 7.90, 364-day 9.80). At the
     anchor, Mon 2022-08-01, it is 62 days old and every overlay carries it; from Tue 2022-08-02
@@ -1388,6 +1511,164 @@ def test_projection_holds_no_value_outside_the_complete_cycles_windows() -> None
     assert [point.offset_days for point in projection.points] == list(range(-10, 41))
     assert q(projection_at(projection, -10).price_index, "index") == "100.00"
     assert q(projection_at(projection, 40).price_index, "index") == "100.00"
+
+
+def stepped_cycle(
+    event: CycleEvent,
+    post_days: int,
+    sessions: Sequence[date],
+    a_close: Callable[[date], str],
+    turnover: Callable[[date], str],
+    a_fundamentals: Sequence[FundamentalsRow],
+) -> CycleBacktestResult:
+    """A (100 shares) closing ``a_close`` with ``a_fundamentals`` and B (100 shares) flat at
+    10.00 without fundamentals, each trading ``turnover`` KES a session, over a
+    T-10 .. T+``post_days`` window with data past the window end. Both start at 1,000 KES of
+    capitalization; only A has earnings, so P/E follows A alone while the price index follows
+    A + B."""
+    result = run_cycle_backtest(
+        event,
+        days_window(event.event_date, 10, post_days),
+        [
+            candidate("A", 100, prices("A", sessions, a_close, turnover=turnover), a_fundamentals),
+            candidate("B", 100, prices("B", sessions, "10.00", turnover=turnover)),
+        ],
+        sessions,
+        [],
+        data_available_through=sessions[-1],
+    )
+    assert result.status == "complete"
+    assert result.flags == []
+    return result
+
+
+def stepped_cycle_2013() -> CycleBacktestResult:
+    """Mon 2013-03-04, window T-10 .. T+40 = 2013-02-22 .. 2013-04-13, anchored on Fri
+    2013-02-22 (-10). No ticker trades on Wed 2013-03-06 (+2), so it is not a session.
+
+    * A closes 10.00 through Tue 2013-03-05 (+1) and 14.00 from Thu 2013-03-07 (+3): the price
+      index is 100.00, then 100 * (1,400 + 1,000) / 2,000 = 120.00.
+    * A reports FY2011 NI 100 and FY2012 NI 200; FY2012 is usable from 2012-12-31 + 90 days =
+      Sun 2013-03-31 (+27), so first on Mon 2013-04-01 (+28). P/E is 1,000 / 100 = 10 at the
+      anchor, 1,400 / 100 = 14 (P/E index 140.00) from +3 and 1,400 / 200 = 7 (70.00) from +28.
+    * Each ticker trades 1,000 KES a session, then 2,000 from Mon 2013-03-11 (+7). MA20 is 2,000
+      at the anchor and 2,000 + 100k after k sessions at 4,000, a turnover index of 100 + 5k:
+      105.00 at +7, 115.00 at +9, 125.00 at +11, 150.00 at +18, 155.00 at +21, 175.00 at +25,
+      180.00 at +28 and 200.00 from +32 (k = 20).
+    """
+    return stepped_cycle(
+        CycleEvent("2013 Cycle", date(2013, 3, 4)),
+        40,
+        drop(weekdays(date(2013, 1, 21), date(2013, 4, 15)), date(2013, 3, 6)),
+        after(date(2013, 3, 5), "10.00", "14.00"),
+        after(date(2013, 3, 10), "1000", "2000"),
+        [fy(date(2011, 12, 31), "100"), fy(date(2012, 12, 31), "200")],
+    )
+
+
+def stepped_cycle_2017() -> CycleBacktestResult:
+    """Tue 2017-08-08, window T-10 .. T+20 = 2017-07-29 .. 2017-08-28, 20 days shorter than
+    2013's, anchored on Mon 2017-07-31 (-8).
+
+    * A closes 10.00 through Fri 2017-08-18 (+10) and 8.00 from Mon 2017-08-21 (+13): the price
+      index is 100.00, then 100 * (800 + 1,000) / 2,000 = 90.00.
+    * A reports FY2016 NI 100: P/E is 10 at the anchor and 8 from +13, a P/E index of 80.00.
+    * Each ticker trades 1,000 KES a session, then 500 from Mon 2017-08-14 (+6). MA20 is 2,000 at
+      the anchor and 2,000 - 50k after k sessions at 1,000, a turnover index of 100 - 2.5k:
+      97.50 at +6, 90.00 at +9, 87.50 at +10, 85.00 at +13 and 72.50 at +20 (k = 11).
+    """
+    return stepped_cycle(
+        CycleEvent("2017 Cycle", date(2017, 8, 8)),
+        20,
+        weekdays(date(2017, 6, 26), date(2017, 8, 29)),
+        after(date(2017, 8, 18), "10.00", "8.00"),
+        after(date(2017, 8, 13), "1000", "500"),
+        [fy(date(2016, 12, 31), "100")],
+    )
+
+
+def stepped_projection() -> CycleBacktestResult:
+    """The 2027 target over T-12 .. T+45 (2027-07-29 .. 2027-09-24), awaiting data, with the
+    projection of the stepped 2013 and 2017 cycles attached."""
+    target = run_cycle_backtest(
+        FUTURE_EVENT,
+        days_window(FUTURE_EVENT.event_date, 12, 45),
+        [],
+        FUTURE_SESSIONS,
+        [],
+        data_available_through=FUTURE_DATA_THROUGH,
+    )
+    assert target.status == "awaiting_data"
+    return with_projection(target, [stepped_cycle_2013(), stepped_cycle_2017()])
+
+
+def test_projection_covers_only_offsets_inside_a_basis_cycles_own_window() -> None:
+    """The target asks for offsets -12 .. 45. 2013's window covers -10 .. 40 and 2017's
+    -10 .. 20, and neither has a point before -10 (2013's anchor; 2017's is at -8), so the
+    projection has a point at every offset from -10 to 40. None lies beyond 40: no basis window
+    reaches there, although both cycles have points before it."""
+    projected = stepped_projection()
+
+    assert projected.status == "awaiting_data"
+    assert projected.points == []
+    assert projected.flags == []
+    assert projected.projection is not None
+    assert projected.projection.is_projection is True
+    assert projected.projection.basis == ["2013 Cycle", "2017 Cycle"]
+    assert [point.offset_days for point in projected.projection.points] == list(range(-10, 41))
+
+
+@pytest.mark.parametrize(
+    ("offset", "price_index", "turnover_index", "pe_index"),
+    [
+        pytest.param(1, "100.00", "100.00", "100.00", id="before-any-change"),
+        pytest.param(2, "100.00", "100.00", "100.00", id="2013-missing-weekday-before-its-rise"),
+        pytest.param(3, "110.00", "100.00", "120.00", id="on-2013-price-and-pe-rise"),
+        pytest.param(5, "110.00", "100.00", "120.00", id="weekend-before-both-turnover-steps"),
+        pytest.param(6, "110.00", "98.75", "120.00", id="on-2017-turnover-step"),
+        pytest.param(9, "110.00", "102.50", "120.00", id="between-changes"),
+        pytest.param(11, "110.00", "106.25", "120.00", id="2017-saturday-before-its-fall"),
+        pytest.param(13, "105.00", "105.00", "110.00", id="on-2017-price-and-pe-fall"),
+        pytest.param(20, "105.00", "111.25", "110.00", id="last-offset-of-2017-window"),
+        pytest.param(21, "120.00", "155.00", "140.00", id="first-offset-only-2013-covers"),
+        pytest.param(27, "120.00", "175.00", "140.00", id="2013-sunday-before-fy2012-earnings"),
+        pytest.param(28, "120.00", "180.00", "70.00", id="on-fy2012-earnings"),
+        pytest.param(40, "120.00", "200.00", "70.00", id="last-offset-of-2013-window"),
+    ],
+)
+def test_projection_means_each_cycles_last_value_at_or_before_the_offset(
+    offset: int, price_index: str, turnover_index: str, pe_index: str
+) -> None:
+    """Each metric is the mean, over the basis cycles whose own window covers the offset, of the
+    cycle's last point on or before it, never its next one (see the stepped 2013 and 2017
+    cycles for their paths):
+
+    * +1: both cycles are still at 100.00 on all three metrics.
+    * +2: 2013 has no session (Wed 2013-03-06) and holds its +1 values; its next session, +3,
+      would give a price of (120 + 100) / 2 = 110.00 and a P/E index of (140 + 100) / 2 = 120.00.
+    * +3: price (120 + 100) / 2 = 110.00 and P/E (140 + 100) / 2 = 120.00; turnover is 100.00.
+    * +5: 2013's Saturday holds Fri +4 and 2017's Sunday Fri +3, so turnover is
+      (100 + 100) / 2 = 100.00, not (105 + 97.5) / 2 = 101.25 from their Monday sessions.
+    * +6: 2013's Sunday still holds +4: turnover (100 + 97.5) / 2 = 98.75.
+    * +9: turnover (115 + 90) / 2 = 102.50.
+    * +11: 2017's Saturday holds Fri +10: price 110.00, turnover (125 + 87.5) / 2 = 106.25 and
+      P/E 120.00, not the 105.00, 105.00 and 110.00 its Monday +13 would give.
+    * +13: price (120 + 90) / 2 = 105.00, turnover (125 + 85) / 2 = 105.00 with 2013's Sunday
+      holding Fri +11 (its Monday +14 would give 107.50), P/E (140 + 80) / 2 = 110.00.
+    * +20: 2017's last covered offset, 2013's Sunday holding Fri +18: turnover
+      (150 + 72.5) / 2 = 111.25.
+    * +21 .. +40: only 2013's window covers them, so its own values are the mean: at +21
+      120.00, 155.00 and 140.00, not (120 + 90) / 2 = 105.00 with 2017's +20 point averaged in;
+      on Sun +27, the day before FY2012 earnings are first used, P/E is still 140.00 (175.00
+      turnover from Fri +25); from +28 it is 70.00; Sat +40 holds Fri +39 (200.00 turnover).
+    """
+    projected = stepped_projection()
+
+    assert projected.projection is not None
+    point = projection_at(projected.projection, offset)
+    assert q(point.price_index, "index") == price_index
+    assert q(point.turnover_index, "index") == turnover_index
+    assert q(point.pe_index, "index") == pe_index
 
 
 def test_projection_ignores_cycles_that_are_not_complete() -> None:

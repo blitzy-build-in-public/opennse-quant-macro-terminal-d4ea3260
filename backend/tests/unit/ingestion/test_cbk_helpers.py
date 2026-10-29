@@ -6,8 +6,8 @@ quantization, text cleaning and decoding, link discovery by anchor text, HTML-ta
 reading, range validation and the macro upsert. Each helper is tested directly against its
 documented contract on small inline HTML and CSV built in the test, with public Central Bank of
 Kenya URLs as base URLs. Nothing touches the network or a database: ``upsert_macro_records`` is
-exercised with ``db.upsert.upsert_macro`` replaced by a recorder, so only its own grouping,
-de-duplication and chunking run.
+exercised with ``db.upsert.upsert_macro`` replaced by a recorder, so only its own de-duplication,
+date ordering, splitting into same-column runs and chunking run.
 
 Expected values are literals taken from the module's docstrings, never recomputed with the code
 under test. Numbers are ``Decimal`` throughout.
@@ -1256,7 +1256,7 @@ async def test_upsert_macro_records_writes_nothing_without_values(
     assert upsert_calls == []
 
 
-async def test_upsert_macro_records_groups_by_column_set_with_the_last_record_winning(
+async def test_upsert_macro_records_writes_column_runs_in_date_order_with_the_last_record_winning(
     upsert_calls: list[_UpsertCall],
 ) -> None:
     records = [
@@ -1278,6 +1278,14 @@ async def test_upsert_macro_records_groups_by_column_set_with_the_last_record_wi
         _UpsertCall(
             conn=CONNECTION,
             rows=[
+                {"observation_date": date(2026, 6, 30), "tbill_91d_pct": Decimal("7.9000")},
+                {"observation_date": date(2026, 7, 31), "tbill_91d_pct": Decimal("8.1000")},
+            ],
+            source="cbk_rates_csv",
+        ),
+        _UpsertCall(
+            conn=CONNECTION,
+            rows=[
                 {
                     "observation_date": date(2026, 8, 31),
                     "interbank_rate_pct": Decimal("8.7000"),
@@ -1286,24 +1294,78 @@ async def test_upsert_macro_records_groups_by_column_set_with_the_last_record_wi
             ],
             source="cbk_rates_csv",
         ),
+    ]
+
+
+async def test_upsert_macro_records_never_writes_a_column_set_out_of_date_order(
+    upsert_calls: list[_UpsertCall],
+) -> None:
+    # A rates row whose 91-day cell is "-" carries fewer columns. One statement holding both full
+    # rows would write either 2026-09-30 before 2026-08-31 or 2026-07-31 after it, against the
+    # ascending date order every other pipeline locks rows in.
+    records = [
+        MacroRecord(
+            date(2026, 7, 31),
+            {"tbill_91d_pct": Decimal("8.8100"), "cbr_rate_pct": Decimal("8.7500")},
+            line=3,
+        ),
+        MacroRecord(date(2026, 8, 31), {"cbr_rate_pct": Decimal("8.7500")}, line=4),
+        MacroRecord(
+            date(2026, 9, 30),
+            {"tbill_91d_pct": Decimal("8.7700"), "cbr_rate_pct": Decimal("8.7500")},
+            line=5,
+        ),
+    ]
+
+    written = await upsert_macro_records(CONNECTION, records, source="cbk_rates_csv")
+
+    assert written == 3
+    assert upsert_calls == [
         _UpsertCall(
             conn=CONNECTION,
             rows=[
-                {"observation_date": date(2026, 7, 31), "tbill_91d_pct": Decimal("8.1000")},
-                {"observation_date": date(2026, 6, 30), "tbill_91d_pct": Decimal("7.9000")},
+                {
+                    "observation_date": date(2026, 7, 31),
+                    "tbill_91d_pct": Decimal("8.8100"),
+                    "cbr_rate_pct": Decimal("8.7500"),
+                }
+            ],
+            source="cbk_rates_csv",
+        ),
+        _UpsertCall(
+            conn=CONNECTION,
+            rows=[{"observation_date": date(2026, 8, 31), "cbr_rate_pct": Decimal("8.7500")}],
+            source="cbk_rates_csv",
+        ),
+        _UpsertCall(
+            conn=CONNECTION,
+            rows=[
+                {
+                    "observation_date": date(2026, 9, 30),
+                    "tbill_91d_pct": Decimal("8.7700"),
+                    "cbr_rate_pct": Decimal("8.7500"),
+                }
             ],
             source="cbk_rates_csv",
         ),
     ]
 
 
-async def test_upsert_macro_records_writes_in_chunks_of_500_rows(
-    upsert_calls: list[_UpsertCall],
+@pytest.mark.parametrize(
+    "offsets",
+    [
+        pytest.param(range(1001), id="ascending-input"),
+        pytest.param(range(1000, -1, -1), id="descending-input"),
+        pytest.param([*range(1, 1001, 2), *range(0, 1001, 2)], id="interleaved-input"),
+    ],
+)
+async def test_upsert_macro_records_writes_in_chunks_of_500_rows_in_date_order(
+    upsert_calls: list[_UpsertCall], offsets: Sequence[int]
 ) -> None:
     first = date(1991, 7, 1)
     records = [
         MacroRecord(first + timedelta(days=offset), {"fx_reserves_usd_m": Decimal("12384.00")})
-        for offset in range(1001)
+        for offset in offsets
     ]
 
     written = await upsert_macro_records(CONNECTION, records, source="cbk_reserves")
@@ -1312,4 +1374,10 @@ async def test_upsert_macro_records_writes_in_chunks_of_500_rows(
     assert [len(call.rows) for call in upsert_calls] == [500, 500, 1]
     assert {call.source for call in upsert_calls} == {"cbk_reserves"}
     dates = [row["observation_date"] for call in upsert_calls for row in call.rows]
-    assert dates == [record.observation_date for record in records]
+    assert dates == [first + timedelta(days=offset) for offset in range(1001)]
+    assert (dates[0], dates[499], dates[500], dates[-1]) == (
+        date(1991, 7, 1),
+        date(1992, 11, 11),
+        date(1992, 11, 12),
+        date(1994, 3, 27),
+    )

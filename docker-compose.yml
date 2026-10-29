@@ -29,7 +29,12 @@ services:
       # data volume; to run it again, recreate the volume (erases data): docker compose down -v
       - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U opennse -d opennse"]
+      # Probes TCP, not the Unix socket. On first boot the entrypoint runs a temporary server that
+      # serves only the socket while it runs the init scripts; TCP 5432 is served only by the final
+      # server, which starts after 01-init.sql has created opennse_test. So the container turns
+      # healthy, and up -d --wait returns, only once the final server is up. pg_isready itself
+      # does not check that the database named by -d exists.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U opennse -d opennse_test"]
       interval: 5s
       timeout: 5s
       retries: 20
