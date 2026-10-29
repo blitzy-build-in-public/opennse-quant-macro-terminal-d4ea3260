@@ -1,0 +1,3 @@
+/* Standalone app only: default Tailwind 4; backend/ fixture markup is kept out of the source scan. */
+@import "tailwindcss";
+@source not "../../backend";
