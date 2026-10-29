@@ -1,0 +1,528 @@
+"""Request and response contract of the ``/market`` endpoints.
+
+It covers ``GET /market/screener``, ``/market/sector-heatmap``, ``/market/valuation-bands``,
+``/market/anomalies`` and ``/market/flows``. Like every schema module it imports only the standard
+library, Pydantic and :mod:`opennse_terminal.schemas.common`.
+
+Money, prices, ratios, percentages, Z-scores and band statistics are ``Decimal`` values, sent as
+JSON strings that the services have already rounded once with ``quant.numeric.quantize_out``
+(2 dp for money, per-share KES, ratios, percentages and Z-scores). Volumes, share counts and
+observation counts are JSON integers. An undefined metric is ``null`` with its reason code in the
+enclosing ``flags`` list, never zero.
+
+Every rule that relates two parameters is checked by the service and raised as a coded 422 rather
+than by a Pydantic validator: ``min_exceeds_max`` (``field`` is the ``min_*`` parameter),
+``exactly_one_subject``, ``conflicting_subjects`` and ``start_after_end``.
+
+The ``as_of`` field of a response is never null. Services echo the request's ``as_of``, else the
+latest stored ``trade_date``, else (no price row exists at all) the current Africa/Nairobi date,
+and then return empty lists.
+"""
+
+import datetime as dt
+import uuid
+from decimal import Decimal
+from typing import Final, Literal
+
+from pydantic import Field
+
+from opennse_terminal.schemas.common import (
+    CoverageMeta,
+    Pct,
+    Ratio,
+    RequestDecimal,
+    SectorName,
+    SeriesPoint,
+    TerminalRequestModel,
+    TerminalResponseModel,
+)
+
+__all__ = [
+    "DEFAULT_THRESHOLD",
+    "DEFAULT_Z_WINDOW",
+    "THRESHOLD_MAX",
+    "THRESHOLD_MIN",
+    "Z_WINDOW_MAX",
+    "Z_WINDOW_MIN",
+    "AnomaliesResponse",
+    "AnomalyItem",
+    "AnomalyMetric",
+    "BandMetric",
+    "BandStats",
+    "BandsStatus",
+    "FlowPoint",
+    "FlowTotals",
+    "FlowsResponse",
+    "FlowsStatus",
+    "HeatmapCell",
+    "HeatmapInterval",
+    "ScreenerParams",
+    "ScreenerResponse",
+    "ScreenerRow",
+    "ScreenerSort",
+    "SectorAggregate",
+    "SectorHeatmapResponse",
+    "SectorHeatmapRow",
+    "SortOrder",
+    "SubjectType",
+    "ValuationBandsResponse",
+]
+
+
+# ---------------------------------------------------------------------------------------------
+# Query literals and limits
+# ---------------------------------------------------------------------------------------------
+
+ScreenerSort = Literal[
+    "ticker", "market_cap_kes", "pe", "pb", "ev_ebitda", "dividend_yield_pct", "volume_z"
+]
+"""Screener columns a caller may sort by."""
+
+SortOrder = Literal["asc", "desc"]
+"""Sort direction of the screener rows."""
+
+HeatmapInterval = Literal["month", "week"]
+"""Period boundaries of the sector heatmap: the last market session on or before each month-end
+or each Friday."""
+
+BandMetric = Literal["pe", "pb"]
+"""The multiple a valuation band is drawn for: P/E or P/B."""
+
+AnomalyMetric = Literal["volume", "turnover", "both"]
+"""Metrics the anomaly feed scans; ``both`` scans volume and turnover."""
+
+SubjectType = Literal["ticker", "sector"]
+"""Whether a valuation band describes one counter or one sector aggregate."""
+
+BandsStatus = Literal["ok", "insufficient_history", "no_positive_earnings", "no_positive_equity"]
+"""Outcome of a valuation-band request; ``stats`` is present only for ``ok``."""
+
+FlowsStatus = Literal["ok", "no_flow_data"]
+"""Outcome of a net-flow request; ``totals`` is absent for ``no_flow_data``."""
+
+Z_WINDOW_MIN: Final[int] = 5
+"""Smallest rolling Z-score window, in the ticker's own rows."""
+
+Z_WINDOW_MAX: Final[int] = 250
+"""Largest rolling Z-score window, in the ticker's own rows."""
+
+DEFAULT_Z_WINDOW: Final[int] = 20
+"""Default rolling Z-score window: the 20-day volume Z-score."""
+
+THRESHOLD_MIN: Final[Decimal] = Decimal("0.5")
+"""Smallest spike threshold a caller may request, in standard deviations."""
+
+THRESHOLD_MAX: Final[Decimal] = Decimal("10")
+"""Largest spike threshold a caller may request, in standard deviations."""
+
+DEFAULT_THRESHOLD: Final[Decimal] = Decimal("2.0")
+"""Default spike threshold: a Z-score of 2.0 or more is an anomaly."""
+
+
+# ---------------------------------------------------------------------------------------------
+# GET /market/screener
+# ---------------------------------------------------------------------------------------------
+
+
+class ScreenerParams(TerminalRequestModel):
+    """Query parameters of ``GET /market/screener``, shared by the route and the service.
+
+    The route declares it as a FastAPI query-parameter model, ``Annotated[ScreenerParams,
+    Query()]`` (supported since FastAPI 0.115), so each field appears as an individual query
+    parameter in OpenAPI and an unknown parameter is FastAPI's standard 422 ``extra_forbidden``.
+
+    Filtering: a row whose metric is null fails every filter on that metric. ``anomalies_only``
+    keeps rows where ``is_volume_anomaly`` or ``is_turnover_anomaly`` is true, which means a
+    Z-score at or above ``anomaly_threshold`` on the positive side only. A ``min_*`` above its
+    ``max_*`` is the service's coded 422 ``min_exceeds_max``, not a validation error here.
+    """
+
+    sector: SectorName | None = Field(
+        default=None,
+        description="Keep only equities in this sector, for example Banking; unknown is a 404.",
+    )
+    watchlist_id: uuid.UUID | None = Field(
+        default=None,
+        description="Keep only the tickers of this watchlist of the caller; unknown is a 404.",
+    )
+    min_pe: Ratio | None = Field(default=None, description="Minimum P/E ratio (x), inclusive.")
+    max_pe: Ratio | None = Field(default=None, description="Maximum P/E ratio (x), inclusive.")
+    min_pb: Ratio | None = Field(default=None, description="Minimum P/B ratio (x), inclusive.")
+    max_pb: Ratio | None = Field(default=None, description="Maximum P/B ratio (x), inclusive.")
+    min_ev_ebitda: Ratio | None = Field(
+        default=None, description="Minimum EV/EBITDA multiple (x), inclusive."
+    )
+    max_ev_ebitda: Ratio | None = Field(
+        default=None, description="Maximum EV/EBITDA multiple (x), inclusive."
+    )
+    min_dividend_yield: Pct | None = Field(
+        default=None,
+        description="Minimum dividend yield in percentage points (5.00 means 5%), inclusive.",
+    )
+    min_volume_z: RequestDecimal | None = Field(
+        default=None,
+        description="Minimum rolling volume Z-score (standard deviations), inclusive.",
+    )
+    anomalies_only: bool = Field(
+        default=False,
+        description="Keep only rows with a positive volume or turnover spike at the threshold.",
+    )
+    anomaly_threshold: RequestDecimal = Field(
+        default=DEFAULT_THRESHOLD,
+        ge=THRESHOLD_MIN,
+        le=THRESHOLD_MAX,
+        description="Spike threshold in standard deviations: z >= threshold is an anomaly.",
+    )
+    z_window: int = Field(
+        default=DEFAULT_Z_WINDOW,
+        ge=Z_WINDOW_MIN,
+        le=Z_WINDOW_MAX,
+        description="Rolling Z-score window N, in the ticker's own prior rows.",
+    )
+    as_of: dt.date | None = Field(
+        default=None,
+        description="Valuation date (YYYY-MM-DD); defaults to the latest stored trade_date.",
+    )
+    sort: ScreenerSort = Field(default="market_cap_kes", description="Column to sort rows by.")
+    order: SortOrder = Field(default="desc", description="Sort direction of the rows.")
+
+
+class ScreenerRow(TerminalResponseModel):
+    """One equity in the screener, valued as of the response's ``as_of``."""
+
+    ticker: str = Field(description="NSE ticker symbol, for example SCOM.")
+    company_name: str = Field(description="Registered company name.")
+    sector: str = Field(description="Sector name as stored, for example Banking.")
+    currency: str = Field(
+        description="ISO 4217 code of the equity's prices and fundamentals; KES by default.",
+    )
+    trade_date: dt.date = Field(description="Date of the latest close on or before as_of.")
+    close_price: Decimal = Field(description="Closing price on trade_date, in KES per share.")
+    change_pct: Decimal | None = Field(
+        description="Change from the previous close, in percent; null without a previous close.",
+    )
+    market_cap_kes: Decimal | None = Field(
+        description="Market capitalization (close x shares outstanding), in KES.",
+    )
+    eps_kes: Decimal | None = Field(description="Earnings per share, in KES per share.")
+    pe: Decimal | None = Field(description="Price-to-earnings ratio (x).")
+    pb: Decimal | None = Field(description="Price-to-book ratio (x).")
+    ev_ebitda: Decimal | None = Field(
+        description="Enterprise value to EBITDA (x); null for every Banking-sector equity.",
+    )
+    dividend_yield_pct: Decimal | None = Field(
+        description="Dividend per share over close, in percent.",
+    )
+    volume: int = Field(description="Shares traded on trade_date.")
+    turnover_kes: Decimal = Field(description="Value traded on trade_date, in KES.")
+    volume_z: Decimal | None = Field(
+        description="Rolling volume Z-score on trade_date (standard deviations).",
+    )
+    turnover_z: Decimal | None = Field(
+        description="Rolling turnover Z-score on trade_date (standard deviations).",
+    )
+    is_volume_anomaly: bool = Field(
+        description="True when volume_z is at or above the threshold (positive side only).",
+    )
+    is_turnover_anomaly: bool = Field(
+        description="True when turnover_z is at or above the threshold (positive side only).",
+    )
+    free_float_pct: Decimal | None = Field(
+        description="Free float as a percentage of shares outstanding.",
+    )
+    fundamentals_period_end: dt.date | None = Field(
+        description=(
+            "Period end of the FY fundamentals used: the latest whose availability lag (90 days "
+            "after period end by default) has passed by as_of; null when none qualifies."
+        ),
+    )
+    flags: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Reason codes for null or qualified values: valuation codes such as "
+            "ev_not_meaningful_for_banks, and Z-score codes prefixed volume_z: or turnover_z:, "
+            "for example volume_z:insufficient_observations."
+        ),
+    )
+
+
+class SectorAggregate(TerminalResponseModel):
+    """Point-in-time valuation of one sector over matched eligible sets.
+
+    Computed over every equity in the sector as of the screener's ``as_of``, independent of the
+    screener's filters. Each multiple sums its numerator and denominator over the same eligible
+    constituents, whose count is reported beside ``constituent_count``.
+    """
+
+    sector: str = Field(description="Sector name as stored, for example Banking.")
+    constituent_count: int = Field(description="Equities in the sector.")
+    market_cap_kes: Decimal | None = Field(
+        description="Market capitalization summed over every constituent, in KES; null if empty.",
+    )
+    pe: Decimal | None = Field(
+        description="Sector P/E (x): sum of market cap over sum of net income, NI-eligible set.",
+    )
+    pb: Decimal | None = Field(
+        description="Sector P/B (x): sum of market cap over sum of equity, equity-eligible set.",
+    )
+    ev_ebitda: Decimal | None = Field(
+        description="Sector EV/EBITDA (x) over non-Banking members with EV and EBITDA.",
+    )
+    dividend_yield_pct: Decimal | None = Field(
+        description="Capitalization-weighted dividend yield of the dps-eligible set, in percent.",
+    )
+    pe_eligible_count: int = Field(description="Constituents with net income, used for pe.")
+    pb_eligible_count: int = Field(description="Constituents with total equity, used for pb.")
+    ev_ebitda_eligible_count: int = Field(
+        description="Non-Banking constituents with EV and EBITDA, used for ev_ebitda.",
+    )
+    dy_eligible_count: int = Field(
+        description="Constituents with a dividend per share, used for dividend_yield_pct.",
+    )
+    flags: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Reason codes for null values, for example ev_not_meaningful_for_banks or "
+            "sector_pe_unavailable."
+        ),
+    )
+
+
+class ScreenerResponse(TerminalResponseModel):
+    """Body of ``GET /market/screener``."""
+
+    as_of: dt.date = Field(
+        description=(
+            "Valuation date: the requested as_of, else the latest stored trade_date, else the "
+            "current Africa/Nairobi date when no price exists (with empty lists)."
+        ),
+    )
+    z_window: int = Field(description="Rolling Z-score window N used, in the ticker's own rows.")
+    anomaly_threshold: Decimal = Field(
+        description="Spike threshold used, in standard deviations.",
+    )
+    count: int = Field(description="Number of rows returned; equals len(rows).")
+    rows: list[ScreenerRow] = Field(description="Equities passing every filter, sorted.")
+    sector_aggregates: list[SectorAggregate] = Field(
+        description="One entry per sector in the universe, independent of the filters.",
+    )
+
+
+# ---------------------------------------------------------------------------------------------
+# GET /market/sector-heatmap and GET /market/valuation-bands
+# ---------------------------------------------------------------------------------------------
+
+
+class HeatmapCell(TerminalResponseModel):
+    """Capitalization-weighted return of one sector, or of the market, over one period."""
+
+    period_end: dt.date = Field(description="Market session closing the period.")
+    return_pct: Decimal | None = Field(
+        description=(
+            "Period return in percent; null when no constituent qualifies or their starting "
+            "capitalization is zero."
+        ),
+    )
+    relative_return_pct: Decimal | None = Field(
+        description=(
+            "Sector return minus market return, in percentage points; null when either is "
+            "undefined, and always on the market row."
+        ),
+    )
+    constituents: int = Field(
+        description="Constituents with a close within 10 days of both period boundaries.",
+    )
+
+
+class SectorHeatmapRow(TerminalResponseModel):
+    """One sector's row of the heatmap, one cell per period."""
+
+    sector: str = Field(description="Sector name as stored, for example Banking.")
+    cells: list[HeatmapCell] = Field(description="One cell per entry of period_ends, in order.")
+
+
+class SectorHeatmapResponse(TerminalResponseModel):
+    """Body of ``GET /market/sector-heatmap``."""
+
+    as_of: dt.date = Field(
+        description=(
+            "Last period boundary: the requested as_of, else the latest stored trade_date, else "
+            "the current Africa/Nairobi date when no price exists (with empty lists)."
+        ),
+    )
+    interval: HeatmapInterval = Field(description="Period length: month or week.")
+    period_ends: list[dt.date] = Field(description="Closing session of each period, ascending.")
+    market: list[HeatmapCell] = Field(description="Whole-market return per period.")
+    sectors: list[SectorHeatmapRow] = Field(description="One row per sector.")
+
+
+class BandStats(TerminalResponseModel):
+    """Statistics of the daily multiple over the lookback.
+
+    Ratios are in x at 2 dp; ``current_percentile`` is in percent at 2 dp. Quantiles use linear
+    interpolation (inclusive method) and the standard deviation is the sample one (n - 1).
+    """
+
+    observations: int = Field(description="Non-null daily values the statistics use.")
+    mean: Decimal = Field(description="Mean of the daily values (x).")
+    stdev: Decimal = Field(description="Sample standard deviation of the daily values (x).")
+    minus_2sd: Decimal = Field(description="Mean minus two standard deviations (x).")
+    minus_1sd: Decimal = Field(description="Mean minus one standard deviation (x).")
+    plus_1sd: Decimal = Field(description="Mean plus one standard deviation (x).")
+    plus_2sd: Decimal = Field(description="Mean plus two standard deviations (x).")
+    min: Decimal = Field(description="Lowest daily value (x).")
+    p25: Decimal = Field(description="25th percentile of the daily values (x).")
+    median: Decimal = Field(description="Median of the daily values (x).")
+    p75: Decimal = Field(description="75th percentile of the daily values (x).")
+    max: Decimal = Field(description="Highest daily value (x).")
+    current: Decimal = Field(description="Latest daily value (x).")
+    current_percentile: Decimal = Field(
+        description="Share of daily values at or below current, in percent.",
+    )
+
+
+class ValuationBandsResponse(TerminalResponseModel):
+    """Body of ``GET /market/valuation-bands`` for one ticker or one sector."""
+
+    subject: str = Field(description="The ticker or sector name the bands describe.")
+    subject_type: SubjectType = Field(description="Whether subject is a ticker or a sector.")
+    metric: BandMetric = Field(description="The banded multiple: pe or pb.")
+    as_of: dt.date = Field(
+        description=(
+            "End of the lookback: the requested as_of, else the latest stored trade_date, else "
+            "the current Africa/Nairobi date when no price exists (with an empty series)."
+        ),
+    )
+    coverage: CoverageMeta = Field(
+        description="Requested lookback start against the first session that has a value.",
+    )
+    status: BandsStatus = Field(
+        description=(
+            "ok, or insufficient_history (under 60 observations), no_positive_earnings (pe) or "
+            "no_positive_equity (pb) when every day is null."
+        ),
+    )
+    flags: list[str] = Field(
+        default_factory=list, description="Reason codes for null or qualified values."
+    )
+    series: list[SeriesPoint] = Field(
+        description=(
+            "The multiple (x) on the last market session of each ISO week, ascending; the "
+            "statistics use the daily values."
+        ),
+    )
+    stats: BandStats | None = Field(
+        description="Band statistics; null for every status other than ok.",
+    )
+
+
+# ---------------------------------------------------------------------------------------------
+# GET /market/anomalies and GET /market/flows
+# ---------------------------------------------------------------------------------------------
+
+
+class AnomalyItem(TerminalResponseModel):
+    """One positive volume or turnover spike: a Z-score at or above the threshold."""
+
+    ticker: str = Field(description="NSE ticker symbol, for example SCOM.")
+    trade_date: dt.date = Field(description="Session of the spike.")
+    metric: Literal["volume", "turnover"] = Field(description="The metric that spiked.")
+    value: Decimal = Field(
+        description="The metric on trade_date: shares for volume, KES for turnover.",
+    )
+    rolling_mean: Decimal = Field(
+        description="Mean of the prior window, in the metric's unit (shares or KES).",
+    )
+    rolling_stdev: Decimal = Field(
+        description="Sample standard deviation of the prior window, in the metric's unit.",
+    )
+    z_score: Decimal = Field(description="Z-score of value against the window, in std devs.")
+    observations_used: int = Field(
+        description="Prior rows of the ticker in the window; missing sessions are skipped.",
+    )
+
+
+class AnomaliesResponse(TerminalResponseModel):
+    """Body of ``GET /market/anomalies``."""
+
+    window: int = Field(description="Rolling Z-score window N used, in the ticker's own rows.")
+    threshold: Decimal = Field(description="Spike threshold used, in standard deviations.")
+    items: list[AnomalyItem] = Field(
+        description=(
+            "Spikes with z >= threshold, sorted by trade_date descending, then z_score descending."
+        ),
+    )
+
+
+class FlowPoint(TerminalResponseModel):
+    """Foreign and local net flow of the subject on one market session, in KES."""
+
+    trade_date: dt.date = Field(description="Market session.")
+    foreign_net_kes: Decimal | None = Field(
+        description="Net foreign buying in KES; null when no constituent has flow data.",
+    )
+    local_net_kes: Decimal | None = Field(
+        description="Estimated net local buying in KES: the negative of foreign_net_kes.",
+    )
+    cumulative_foreign_net_kes: Decimal = Field(
+        description="Running sum of foreign_net_kes from the range start, in KES; null days add 0.",
+    )
+    rolling_foreign_net_kes: Decimal | None = Field(
+        description=(
+            "Sum of foreign_net_kes over the last N market sessions, in KES; null until a full "
+            "window and when no session in it has flow data."
+        ),
+    )
+    turnover_kes: Decimal | None = Field(
+        description="Turnover of the constituents with flow data, in KES.",
+    )
+    foreign_net_pct_of_turnover: Decimal | None = Field(
+        description="foreign_net_kes over turnover_kes, in percent; null when turnover_kes is 0.",
+    )
+
+
+class FlowTotals(TerminalResponseModel):
+    """Net flow totals over the whole range."""
+
+    foreign_net_kes: Decimal = Field(description="Total net foreign buying, in KES.")
+    local_net_kes: Decimal = Field(description="Total estimated net local buying, in KES.")
+    foreign_net_pct_of_turnover: Decimal | None = Field(
+        description=(
+            "foreign_net_kes over the summed turnover of the sessions with data, in percent; "
+            "null when that turnover is 0."
+        ),
+    )
+    sessions_with_data: int = Field(description="Market sessions in the range with flow data.")
+    sessions_in_range: int = Field(description="Market sessions in the range.")
+
+
+class FlowsResponse(TerminalResponseModel):
+    """Body of ``GET /market/flows`` for one ticker, one sector or the whole market."""
+
+    subject: str = Field(
+        description="The ticker, the sector name, or market when neither is given.",
+    )
+    as_of: dt.date = Field(
+        description=(
+            "The requested as_of, else the latest stored trade_date, else the current "
+            "Africa/Nairobi date when no price exists (with an empty series)."
+        ),
+    )
+    start: dt.date = Field(description="First date of the range; defaults to end minus 365 days.")
+    end: dt.date = Field(description="Last date of the range; defaults to as_of.")
+    status: FlowsStatus = Field(
+        description="ok, or no_flow_data when no session in the range has flow data.",
+    )
+    flags: list[str] = Field(
+        default_factory=list, description="Reason codes for null or qualified values."
+    )
+    coverage_pct: Decimal = Field(
+        description=(
+            "Sessions with flow data over market sessions in range, in percent; 0.00 for "
+            "no_flow_data."
+        ),
+    )
+    totals: FlowTotals | None = Field(
+        description="Range totals; null when status is no_flow_data.",
+    )
+    series: list[FlowPoint] = Field(description="One point per market session, ascending.")
