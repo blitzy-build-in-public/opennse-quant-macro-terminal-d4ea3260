@@ -56,12 +56,59 @@ function resolveApiOrigin(raw) {
 // forwards it) or the default.
 const apiOrigin = resolveApiOrigin(process.env.TERMINAL_API_ORIGIN);
 
+// The API's default TERMINAL_PDF_MAX_BYTES (20 MiB), its multipart allowance (1 MiB), and the
+// largest chunk in which Node.js delivers a request body (one 64 KiB socket read).
+const DEFAULT_PDF_MAX_BYTES = 20_971_520;
+const MIB = 1_048_576;
+const BODY_CHUNK_BYTES = 65_536;
+
+/**
+ * The proxy's request-body limit: the API's whole-request bound for POST /ingest/pdf
+ * (TERMINAL_PDF_MAX_BYTES plus 1 MiB) plus one body chunk, so uploads under the bound are
+ * forwarded whole and a longer chunked body still passes the bound and gets the API's own 413.
+ * The API reads and discards up to 1 MiB past its bound before it answers, so the headroom (one
+ * chunk) must stay within that allowance for the whole forwarded body to be consumed and the 413 to
+ * arrive intact. Read, like the origin, from the process environment (Playwright passes its own to
+ * the servers it starts) or the API's default.
+ *
+ * @param {string | undefined} raw
+ * @returns {number} Bytes.
+ */
+function resolveProxyBodyLimit(raw) {
+  const value = raw?.trim() ?? "";
+  const bytes = value === "" ? DEFAULT_PDF_MAX_BYTES : /^\d+$/.test(value) ? Number(value) : NaN;
+  const limit = bytes + MIB + BODY_CHUNK_BYTES;
+  if (!(bytes > 0) || !Number.isSafeInteger(limit)) {
+    throw new Error(
+      `TERMINAL_PDF_MAX_BYTES must be a positive integer number of bytes: "${value}"`,
+    );
+  }
+  return limit;
+}
+
+/**
+ * The proxy's wait on an idle API connection, in milliseconds: 10 minutes, as in the standalone
+ * app. By default Next.js destroys a proxied request after 30 s without traffic from the API,
+ * while POST /ingest/pdf sends nothing until its parse ends: a valid 400-page upload took under
+ * 40 s, alone and as one of two concurrent uploads, and the API stops any parse at 50 s with its
+ * own 422 pdf_unreadable. Ten minutes is twelve times that limit. A client that disconnects still
+ * ends the proxied request at once, and the widget's calls stay bounded by the browser client's
+ * own 20 s REQUEST_TIMEOUT_MS (src/components/terminal/lib/apiClient.ts).
+ */
+const PROXY_TIMEOUT_MS = 600_000;
+
 /** @type {import("next").NextConfig} */
 const nextConfig = {
   experimental: {
     // Lets the webpack bundler (`next dev --webpack`, older hosts) compile TypeScript outside the
     // project directory: ../../src/components/terminal/**.
     externalDir: true,
+    // Part of proxying, so a real host adds it too: Next.js forwards only the first 10 MB of a
+    // rewritten body by default, which turns a larger upload into a plain-text 500.
+    proxyClientMaxBodySize: resolveProxyBodyLimit(process.env.TERMINAL_PDF_MAX_BYTES),
+    // Part of proxying too: with Next.js's 30 s default, a PDF upload whose parse takes longer
+    // fails as a plain-text 500 although the API answers it.
+    proxyTimeout: PROXY_TIMEOUT_MS,
   },
   turbopack: {
     // Turbopack resolves and compiles only files inside its root, and the widget folder lies

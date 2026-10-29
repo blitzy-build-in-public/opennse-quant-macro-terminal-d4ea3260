@@ -47,9 +47,10 @@ export const DEFAULT_API_BASE_URL = "/api/v1/terminal";
  * read. A call still unsettled when it passes is aborted and rejects with `timeout_error`.
  *
  * 20 s is far above the API's design targets (500 ms at p95 for analytic GETs, 100 ms for a
- * valuation), so only a stalled request reaches it. It is also below the 30 s upstream timeout of
- * the Next.js rewrite proxy, so in standalone mode a widget receives this client's own
- * `timeout_error` rather than the proxy's 500 or a reset connection.
+ * valuation), so only a stalled request reaches it. It is also below the upstream timeout of
+ * the Next.js rewrite proxy (10 minutes in the standalone app, 30 s by Next.js's default), so in
+ * standalone mode a widget receives this client's own `timeout_error` rather than the proxy's 500
+ * or a reset connection.
  */
 export const REQUEST_TIMEOUT_MS = 20_000;
 

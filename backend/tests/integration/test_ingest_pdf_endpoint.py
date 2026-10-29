@@ -61,6 +61,7 @@ from sqlalchemy.sql import ClauseElement
 
 from helpers.pdf_builder import Page, StatementRow, build_pdf, statement_page, text_page
 from opennse_terminal.api import get_terminal_session
+from opennse_terminal.api.routes import ingest as ingest_routes
 from opennse_terminal.api.routes.ingest import MULTIPART_OVERHEAD_BYTES
 from opennse_terminal.config import TerminalSettings
 from opennse_terminal.db.base import TerminalBase
@@ -799,6 +800,115 @@ async def test_request_too_large(
 
     coded_error(response, 413, "request_too_large", None)
     assert await run_rows(committed_query, OVERSIZED_REQUEST_PAYLOAD) == []
+
+
+@dataclass(frozen=True)
+class OverBoundBody:
+    """A chunked body that passes the request bound under ``pdf_max_bytes=1024``.
+
+    ``sizes`` are the body lengths of its ``http.request`` messages, the last of which ends the
+    body (``more_body`` false); an ``endless`` body is 64 KiB messages that never end it. A
+    ``stalls`` body sends ``sizes`` without ending the body, and its next ``receive`` never
+    returns: no data, no end and no disconnect.
+    """
+
+    sizes: tuple[int, ...] = ()
+    endless: bool = False
+    stalls: bool = False
+
+
+OVER_BOUND_BODIES: Final = [
+    # The 17th chunk passes the bound; the 25th ends the body within the 1 MiB that follows it.
+    pytest.param(OverBoundBody(sizes=(CHUNK_SIZE,) * 25), id="ends_within_allowance"),
+    # 16 chunks (1 MiB) stay inside the bound; the final 2 KiB pass it and end the body.
+    pytest.param(OverBoundBody(sizes=(CHUNK_SIZE,) * 16 + (2048,)), id="ends_past_bound"),
+    pytest.param(OverBoundBody(endless=True), id="endless"),
+    # The 17th chunk passes the bound and the sender then stalls: only the deadline ends the drain.
+    pytest.param(OverBoundBody(sizes=(CHUNK_SIZE,) * 17, stalls=True), id="stalls_after_bound"),
+]
+
+
+@pytest.mark.parametrize("body", OVER_BOUND_BODIES)
+async def test_request_too_large_drains_chunked_body_within_allowance(
+    app: FastAPI,
+    configure_settings: SettingsConfigurer,
+    monkeypatch: pytest.MonkeyPatch,
+    body: OverBoundBody,
+) -> None:
+    """A chunked body past the bound is read to its end, or to 1 MiB past the bound, before the
+    413 ``request_too_large`` is sent, so a proxy's forwarded body is consumed. A sender that
+    stalls past the bound still gets the 413 once the drain deadline passes.
+
+    The app is driven over raw ASGI so that every ``receive`` is recorded. The guard never reads
+    once the body has ended, where a server's ``receive`` would wait for a disconnect, and never
+    more than one message past the allowance.
+    """
+    configure_settings(pdf_max_bytes=PDF_MAX_BYTES_SMALL)
+    if body.stalls:
+        # Shortened so the stalled case is quick; the other cases drain under the real deadline.
+        monkeypatch.setattr(ingest_routes, "_DRAIN_TIMEOUT_SECONDS", 0.05)
+    allowance_end = REQUEST_LIMIT_SMALL + MULTIPART_OVERHEAD_BYTES
+    events: list[str] = []
+    sent: list[dict[str, Any]] = []
+    read = 0
+    ended = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal read, ended
+        assert not ended, "receive was called after the body ended"
+        index = events.count("receive")
+        if body.stalls and index == len(body.sizes):
+            events.append("receive")
+            await asyncio.Event().wait()  # never set: only the drain deadline ends this wait
+        size = CHUNK_SIZE if body.endless else body.sizes[index]
+        more_body = body.endless or body.stalls or index + 1 < len(body.sizes)
+        read += size
+        assert read <= allowance_end + CHUNK_SIZE, f"{read} bytes read, past the allowance"
+        ended = not more_body
+        events.append("receive")
+        return {"type": "http.request", "body": b"0" * size, "more_body": more_body}
+
+    async def send(message: dict[str, Any]) -> None:
+        events.append(message["type"])
+        sent.append(message)
+
+    scope: dict[str, Any] = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "server": ("test", 80),
+        "client": ("127.0.0.1", 50000),
+        "root_path": "",
+        "path": URL,
+        "raw_path": URL.encode("ascii"),
+        "query_string": b"",
+        "headers": [
+            (b"host", b"test"),
+            (b"content-type", f"multipart/form-data; boundary={BOUNDARY}".encode("ascii")),
+            (b"transfer-encoding", b"chunked"),
+        ],
+    }
+
+    # Bounded, so a guard that waits on a stalled sender fails the test instead of hanging it.
+    async with asyncio.timeout(5):
+        await app(scope, receive, send)
+
+    reads = events.count("receive")
+    assert events == ["receive"] * reads + ["http.response.start", "http.response.body"]
+    start, answer = sent
+    coded_error(
+        httpx.Response(start["status"], content=answer["body"]), 413, "request_too_large", None
+    )
+    if body.endless:
+        assert allowance_end < read <= allowance_end + CHUNK_SIZE
+    elif body.stalls:
+        # The drain awaited the stalled receive, and the deadline abandoned it.
+        assert reads == len(body.sizes) + 1
+    else:
+        assert ended
+        assert reads == len(body.sizes)
 
 
 async def test_concurrency_limit_returns_429(

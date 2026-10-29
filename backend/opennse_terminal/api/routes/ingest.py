@@ -59,7 +59,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from starlette.requests import ClientDisconnect
-from starlette.types import Message
+from starlette.types import Message, Receive
 
 from opennse_terminal.api.deps import (
     SessionDep,
@@ -108,6 +108,9 @@ _NO_NUL_PATTERN: Final = r"^[^\x00]*$"
 _BODY_ERROR_MESSAGE: Final = "There was an error parsing the body"
 # ASGI scope key under which the route hands its mount's parse limiter to the endpoint.
 _PARSE_LIMITER_SCOPE_KEY: Final = "opennse_terminal.pdf_parse_limiter"
+# Seconds an over-limit body is drained at most: long enough for what a proxy that forwarded just
+# past the limit still has in flight, short enough that a stalled sender gets its 413 promptly.
+_DRAIN_TIMEOUT_SECONDS: Final = 1.0
 
 logger = logging.getLogger("opennse_terminal.api.routes.ingest")
 
@@ -160,6 +163,35 @@ def _too_large_response(limit: int) -> JSONResponse:
     )
 
 
+async def _discard_body(receive: Receive, allowance: int) -> None:
+    """Read and drop the rest of a request body whose end has not been received yet.
+
+    Messages are read until one ends the body (``more_body`` false), one is not
+    ``http.request`` (a disconnect), more than ``allowance`` bytes have been read, or
+    :data:`_DRAIN_TIMEOUT_SECONDS` have passed since the drain began; a negative ``allowance``
+    reads nothing. No byte is kept. The deadline bounds the whole drain, so a sender that stalls
+    or trickles cannot hold the request. Never call it once the body has ended: an ASGI server's
+    ``receive`` then waits for the client to disconnect. An external cancellation
+    (``asyncio.CancelledError``) propagates.
+    """
+    discarded = 0
+    deadline = asyncio.timeout(_DRAIN_TIMEOUT_SECONDS)
+    try:
+        async with deadline:
+            while discarded <= allowance:
+                message = await receive()
+                if message["type"] != "http.request":
+                    return
+                discarded += len(message.get("body", b""))
+                if not message.get("more_body", False):
+                    return
+    except TimeoutError:
+        # Only the deadline's own expiry ends the drain; a TimeoutError raised by ``receive``
+        # while the deadline still stood propagates as is.
+        if not deadline.expired():
+            raise
+
+
 class TerminalUploadRoute(APIRoute):
     """Route class of the ingest sub-router: bounds the whole request before the body is parsed.
 
@@ -173,7 +205,12 @@ class TerminalUploadRoute(APIRoute):
       parsed as usual; the server's framing stops it at the declared length.
     * A request without ``Content-Length`` (chunked) is read through a counting ``receive`` that
       stops the stream once the limit is passed. The bounded body is cached on the request, and
-      FastAPI's form parsing reads it from there.
+      FastAPI's form parsing reads it from there. Once the limit is passed, the rest of the body
+      is read and discarded before the 413 is sent, so the connection closes cleanly and a proxy
+      that forwarded slightly past the limit receives the 413 rather than a reset. The drain
+      stops at the body's end, once 1 MiB past the limit has been read, or after one second
+      (``_DRAIN_TIMEOUT_SECONDS``), so a sender that stalls past the limit still gets its 413
+      promptly. The request is still never parsed or spooled.
 
     A router cannot carry middleware, and ``include_router`` preserves the route class, so the
     guard reaches every host that mounts ``terminal_router`` without any ingress setting. A host
@@ -229,12 +266,14 @@ class TerminalUploadRoute(APIRoute):
                 return await original(request)
 
             received = 0
+            body_ended = False
 
             async def counting_receive() -> Message:
-                nonlocal received
+                nonlocal received, body_ended
                 message = await request.receive()
                 if message["type"] == "http.request":
                     received += len(message.get("body", b""))
+                    body_ended = not message.get("more_body", False)
                     if received > limit:
                         raise _RequestTooLargeError
                 return message
@@ -245,6 +284,14 @@ class TerminalUploadRoute(APIRoute):
             try:
                 await counted.body()
             except _RequestTooLargeError:
+                # Answering with body bytes still unread makes the server reset the connection,
+                # so a proxy still forwarding them fails its write and never relays the 413. The
+                # body is drained first, until it ends, 1 MiB past the bound has been read or the
+                # drain deadline passes.
+                if not body_ended:
+                    await _discard_body(
+                        request.receive, limit + MULTIPART_OVERHEAD_BYTES - received
+                    )
                 return _too_large_response(limit)
             except ClientDisconnect as exc:
                 raise HTTPException(

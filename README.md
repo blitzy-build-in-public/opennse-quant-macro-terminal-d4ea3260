@@ -81,8 +81,14 @@ Use `npm run dev` instead of `build` and `start` while developing.
   exits with code 2 and "run `opennse-terminal migrate upgrade head` first" when the schema is not
   at the migration head.
 - `TERMINAL_API_ORIGIN` (default `http://localhost:8000`) is the FastAPI origin to which the
-  Next.js rewrites forward `/api/v1/terminal/*`. Next.js evaluates `rewrites()` at `next build`
-  (and `next dev`), so set it before building; changing it later needs a rebuild.
+  Next.js rewrites forward `/api/v1/terminal/*`. Next.js reads and validates it in `rewrites()`,
+  which it evaluates at `next build` and `next dev` only. `next start` serves the origin baked into
+  the build and ignores, without validating, the value set when it starts, so set it before
+  building; changing it later needs a rebuild.
+- The rewrites forward request bodies up to `TERMINAL_PDF_MAX_BYTES` + 1 MiB + 64 KiB, a limit
+  Next.js sizes from `TERMINAL_PDF_MAX_BYTES` whenever it loads `next.config.ts`, and wait up to
+  10 minutes for the API to answer (`experimental.proxyTimeout`, 30 s by default, which a 400-page
+  parse exceeds), so PDF uploads get the API's own responses, its 413 included.
 - `python -m playwright install --with-deps chromium` is needed only to run the live
   `nse_market_statistics` pipeline. The tests run on recorded fixtures.
 - The API's OpenAPI documentation is served at `http://localhost:8000/docs`.
@@ -433,7 +439,15 @@ import are `react`, `react-dom` and `recharts`. `scripts/check-terminal-boundary
 **Routing the API.** Either proxy `/api/v1/terminal/*` from the host's Next.js app to the host's
 FastAPI app that mounts `terminal_router`, or pass an absolute `apiBaseUrl` and allow that origin in
 the host's CORS settings. The standalone app needs no CORS: its `next.config.ts` rewrites the
-browser's same-origin calls to `TERMINAL_API_ORIGIN`.
+browser's same-origin calls to `TERMINAL_API_ORIGIN`. A host that proxies through Next.js
+rewrites must raise `experimental.proxyClientMaxBodySize` (10 MB by default) above
+`TERMINAL_PDF_MAX_BYTES` + 1 MiB, as `e2e/host-fixture/next.config.mjs` does, or PDF uploads over
+10 MB fail with a plain 500. Keep it within a further 1 MiB, which the API reads and discards
+before answering an over-limit upload, so the proxy relays that 413 rather than a reset. Such a
+host must also raise `experimental.proxyTimeout` (30 s by default) above the API's 50 s parse
+limit, as that file does with 10 minutes, or an upload whose parse takes longer than 30 s, such
+as a 400-page filing, fails with a plain 500 although the API answers it. A client that
+disconnects still ends the proxied request at once.
 
 `e2e/host-fixture/` is a working minimal host: its own layout and CSS, one `@source` line, and a page
 that imports `YieldCurveChart` from the terminal folder.
