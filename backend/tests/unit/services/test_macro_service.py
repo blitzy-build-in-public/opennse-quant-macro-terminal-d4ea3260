@@ -1,4 +1,5 @@
-"""Macro overview service: the indicator list guard, the yield curve at a date, and its bounds.
+"""Macro overview service: the indicator list guard, the yield curve at a date, its read bounds,
+and ``get_macro_overview`` on seeded PostgreSQL.
 
 ``yield_curve_at(macro_rows, sources_by_date, bond_rows, day)`` resolves the curve as it stood on
 ``day``:
@@ -14,25 +15,56 @@
 Points come back in ascending tenor, T-bills first on an equal tenor, with yields and tenors
 quantized to 2 dp (ROUND_HALF_UP). The KPI snapshots are built from each indicator's latest and
 previous non-null values, which the service reads in SQL; the pure step that turns them into
-snapshots is exercised here on literal observations. The loading paths of ``get_macro_overview``
-need a database and belong to the integration suite; only its argument check, which runs before
-any query, is exercised here. Every expected value is a literal, and no database, network or
-filesystem is touched.
+snapshots is exercised here on literal observations.
+
+``get_macro_overview(session, history_months)`` runs on a fresh seeded clone per test (the root
+conftest's ``seeded_database``, which marks the test ``integration``); a test that adds or
+deletes rows changes only its own clone. The contract held there:
+
+- **Window and coverage**: exactly ``history_months`` month-ends ending at the month of the latest
+  macro observation. ``requested_start`` is the first of them (2024-10-31 for 24 months, 2006-10-31
+  for 240), ``coverage_start`` the first window date with any indicator, and coverage is partial
+  when there is none or it falls more than one month later (2012-01-31 at 240 months).
+- **latest**: all eight indicators, each resolved to its own latest and previous non-null values
+  (inflation 6.80 on 2026-09-30 after 6.60, CBR 8.75), so a newer reserves-only row moves the
+  window and the reserves tile but hides no other tile.
+- **Series**: one point per window row that carries the series, oldest first; a row without any
+  rate is left out of ``rates_series``.
+- **Curves**: ``current`` at the later of the latest macro and latest FXD bond dates (3 seeded
+  T-bills and 6 ``seed`` bonds on 2026-09-30), and one snapshot per window month-end. A real FXD
+  bond outranks the seeded ones in its bucket, and codes other than FXD are never read.
+- **Missing data**: with only bonds stored the window ends at the latest bond month and ``latest``
+  and both series are empty; with nothing stored every list is empty and the window ends at the
+  current UTC month.
+- **Argument check**: ``history_months < 1`` raises ``ValueError`` before any query.
+
+Seeded values are those of ``seed/reference_data.py``: the 2026-09-30 row of the attachment
+verbatim with CBR 8.75 filled from CBK, August 2026 inflation 6.60, the other August values from
+the deterministic synthetic history, and bonds of the 364-day yield plus each tenor's spread with
+no noise on 2026-09-30. Every expected value is an exact literal, and no network or filesystem is
+touched.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import sys
-from datetime import date, timedelta
+from calendar import monthrange
+from collections.abc import AsyncIterator, Sequence
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from typing import Protocol
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession
+import pytest_asyncio
+from sqlalchemy import delete
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from opennse_terminal.models import TerminalBondYield, TerminalMacroIndicator
 from opennse_terminal.models import macro as macro_models
 from opennse_terminal.models.macro import MACRO_INDICATOR_COLUMNS
 from opennse_terminal.quant.asof import AsOfValue, MacroRow
+from opennse_terminal.schemas.macro import IndicatorSnapshot, YieldCurvePoint
 from opennse_terminal.services import macro_service
 from opennse_terminal.services.macro_service import (
     INDICATORS,
@@ -653,3 +685,348 @@ async def test_history_months_below_one_is_rejected_before_any_query(history_mon
             ValueError, match=rf"^history_months must be >= 1, got {history_months}$"
         ):
             await get_macro_overview(session, history_months)
+
+
+# ---------------------------------------------------------------------------------------------
+# Endpoint on seeded PostgreSQL
+# ---------------------------------------------------------------------------------------------
+
+SEED_ANCHOR = date(2026, 9, 30)
+SEED_BOND_TENORS = (2, 5, 10, 15, 20, 25)
+
+LatestRow = tuple[str, str | None, str | None, str | None, str | None]
+CurveRow = tuple[str, str, str, str, str | None, str, str]
+SnapshotRow = tuple[str, str | None, str, str]
+
+# (key, value, as_of, previous_value, change): the 2026-09-30 row against the 2026-08-31 one.
+SEEDED_LATEST: list[LatestRow] = [
+    ("inflation_yoy_pct", "6.80", "2026-09-30", "6.60", "0.20"),
+    ("cbr_rate_pct", "8.75", "2026-09-30", "8.92", "-0.17"),
+    ("interbank_rate_pct", "12.85", "2026-09-30", "12.51", "0.34"),
+    ("tbill_91d_pct", "15.72", "2026-09-30", "15.53", "0.19"),
+    ("tbill_182d_pct", "16.58", "2026-09-30", "16.46", "0.12"),
+    ("tbill_364d_pct", "16.84", "2026-09-30", "16.72", "0.12"),
+    ("fx_kes_usd", "129.20", "2026-09-30", "129.17", "0.03"),
+    ("fx_reserves_usd_m", "7850.00", "2026-09-30", "7819.15", "30.85"),
+]
+
+SEEDED_RATES_ON_ANCHOR = {
+    "observation_date": "2026-09-30",
+    "cbr_rate_pct": "8.75",
+    "interbank_rate_pct": "12.85",
+    "tbill_91d_pct": "15.72",
+    "tbill_182d_pct": "16.58",
+    "tbill_364d_pct": "16.84",
+}
+
+# (tenor_label, tenor_years, yield_pct, instrument, bond_code, observation_date, source) on
+# 2026-09-30: bond yields are the 364-day 16.84 plus 0.20, 0.45, 0.70, 0.90, 1.05 and 1.15.
+SEEDED_TBILL_POINTS: list[CurveRow] = [
+    ("91D", "0.25", "15.72", "tbill", None, "2026-09-30", "seed"),
+    ("182D", "0.50", "16.58", "tbill", None, "2026-09-30", "seed"),
+    ("364D", "1.00", "16.84", "tbill", None, "2026-09-30", "seed"),
+]
+SEEDED_BOND_POINTS: list[CurveRow] = [
+    ("2Y", "2.00", "17.04", "bond", "FXD-SEED-2Y-202609", "2026-09-30", "seed"),
+    ("5Y", "5.00", "17.29", "bond", "FXD-SEED-5Y-202609", "2026-09-30", "seed"),
+    ("10Y", "10.00", "17.54", "bond", "FXD-SEED-10Y-202609", "2026-09-30", "seed"),
+    ("15Y", "15.00", "17.74", "bond", "FXD-SEED-15Y-202609", "2026-09-30", "seed"),
+    ("20Y", "20.00", "17.89", "bond", "FXD-SEED-20Y-202609", "2026-09-30", "seed"),
+    ("25Y", "25.00", "17.99", "bond", "FXD-SEED-25Y-202609", "2026-09-30", "seed"),
+]
+SEEDED_CURVE: list[CurveRow] = [*SEEDED_TBILL_POINTS, *SEEDED_BOND_POINTS]
+
+
+class SeededDatabase(Protocol):
+    """The part of the root conftest's ``seeded_database`` handle this module uses."""
+
+    @property
+    def engine(self) -> AsyncEngine: ...
+
+
+@pytest_asyncio.fixture
+async def session(seeded_database: SeededDatabase) -> AsyncIterator[AsyncSession]:
+    """A session on this test's own seeded clone."""
+    factory = async_sessionmaker(seeded_database.engine, expire_on_commit=False)
+    async with factory() as db_session:
+        yield db_session
+
+
+def month_end(day: date, months_later: int = 0) -> date:
+    """The last day of the calendar month ``months_later`` months after ``day``'s month."""
+    year, month_index = divmod(day.year * 12 + day.month - 1 + months_later, 12)
+    return date(year, month_index + 1, monthrange(year, month_index + 1)[1])
+
+
+def month_ends(first: date, count: int) -> list[date]:
+    """``count`` consecutive month-ends, oldest first, starting at ``first``'s month."""
+    return [month_end(first, offset) for offset in range(count)]
+
+
+def latest_fields(snapshot: IndicatorSnapshot) -> LatestRow:
+    """A KPI snapshot as ``(key, value, as_of, previous_value, change)`` JSON strings."""
+    dumped = snapshot.model_dump(mode="json")
+    return (
+        dumped["key"],
+        dumped["value"],
+        dumped["as_of"],
+        dumped["previous_value"],
+        dumped["change"],
+    )
+
+
+def point_fields(point: YieldCurvePoint) -> CurveRow:
+    """A curve point as a :data:`CurveRow` of JSON strings."""
+    dumped = point.model_dump(mode="json")
+    return (
+        dumped["tenor_label"],
+        dumped["tenor_years"],
+        dumped["yield_pct"],
+        dumped["instrument"],
+        dumped["bond_code"],
+        dumped["observation_date"],
+        dumped["source"],
+    )
+
+
+def snapshot_fields(points: Sequence[YieldCurvePoint]) -> list[SnapshotRow]:
+    """Each point's ``(tenor_label, bond_code, observation_date, source)``, in curve order."""
+    return [
+        (point.tenor_label, point.bond_code, point.observation_date.isoformat(), point.source)
+        for point in points
+    ]
+
+
+def seeded_snapshot(day: date) -> list[SnapshotRow]:
+    """The seeded curve at month-end ``day``: that month's three bills and six seed bonds."""
+    observed = day.isoformat()
+    bills: list[SnapshotRow] = [
+        (label, None, observed, "seed") for label in ("91D", "182D", "364D")
+    ]
+    bonds: list[SnapshotRow] = [
+        (f"{tenor}Y", f"FXD-SEED-{tenor}Y-{day:%Y%m}", observed, "seed")
+        for tenor in SEED_BOND_TENORS
+    ]
+    return [*bills, *bonds]
+
+
+@pytest.mark.parametrize(
+    ("history_months", "requested_start", "coverage_start", "is_partial", "observed_months"),
+    [
+        pytest.param(24, date(2024, 10, 31), date(2024, 10, 31), False, 24, id="default_24_months"),
+        pytest.param(1, date(2026, 9, 30), date(2026, 9, 30), False, 1, id="one_month"),
+        pytest.param(
+            240, date(2006, 10, 31), date(2012, 1, 31), True, 177, id="maximum_240_months"
+        ),
+    ],
+)
+async def test_seeded_overview_window_coverage_series_and_curves(
+    session: AsyncSession,
+    history_months: int,
+    requested_start: date,
+    coverage_start: date,
+    is_partial: bool,
+    observed_months: int,
+) -> None:
+    """The seeded overview ends its window at 2026-09-30 for every ``history_months``.
+
+    24 months open at 2024-10-31 and are fully covered: 24 inflation and rates points. The
+    240-month maximum opens at 2006-10-31, but the 177 seeded month-ends start at 2012-01-31,
+    more than one month later, so coverage is partial and the 63 month-end curves before it are
+    empty. ``latest`` holds all eight indicators against August 2026, and the current curve is
+    the 3 T-bills and 6 ``seed`` bonds of 2026-09-30; every other month-end curve takes that
+    month's bills and seed bonds, which shows the reads open early enough for the first one.
+    """
+    overview = await get_macro_overview(session, history_months)
+
+    window = month_ends(requested_start, history_months)
+    observed = month_ends(coverage_start, observed_months)
+    assert window[-1] == observed[-1] == SEED_ANCHOR
+    assert overview.coverage.model_dump(mode="json") == {
+        "requested_start": requested_start.isoformat(),
+        "coverage_start": coverage_start.isoformat(),
+        "is_partial_coverage": is_partial,
+    }
+    assert [latest_fields(snapshot) for snapshot in overview.latest] == SEEDED_LATEST
+    assert [point.date for point in overview.inflation_series] == observed
+    assert overview.inflation_series[-1].model_dump(mode="json") == {
+        "date": "2026-09-30",
+        "value": "6.80",
+    }
+    assert [point.observation_date for point in overview.rates_series] == observed
+    assert overview.rates_series[-1].model_dump(mode="json") == SEEDED_RATES_ON_ANCHOR
+    assert [point_fields(point) for point in overview.yield_curve.current] == SEEDED_CURVE
+    history = overview.yield_curve.history
+    assert [snapshot.as_of for snapshot in history] == window
+    assert [snapshot_fields(snapshot.points) for snapshot in history] == [
+        seeded_snapshot(day) if day >= coverage_start else [] for day in window
+    ]
+    assert [point_fields(point) for point in history[-1].points] == SEEDED_CURVE
+
+
+async def test_newer_reserves_only_row_moves_the_window_and_hides_no_indicator(
+    session: AsyncSession,
+) -> None:
+    """A weekly reserves bulletin dated 2026-10-02 is the latest macro row, so the 24-month window
+    now runs from 2024-11-30 to 2026-10-31.
+
+    Only the reserves tile moves (7901.25 after 7850.00, change 51.25); every other indicator keeps
+    its 2026-09-30 value, because each column is resolved on its own. The row carries no
+    inflation and no rate, so both series stop at 2026-09-30, and the curves at 2026-10-02 and
+    2026-10-31 still take the 2026-09-30 bills, within their 62-day limit.
+    """
+    session.add(
+        TerminalMacroIndicator(
+            observation_date=date(2026, 10, 2),
+            fx_reserves_usd_m=Decimal("7901.25"),
+            source_by_field={"fx_reserves_usd_m": "cbk_reserves"},
+        )
+    )
+    await session.commit()
+
+    overview = await get_macro_overview(session, 24)
+
+    window = month_ends(date(2024, 11, 30), 24)
+    assert window[-1] == date(2026, 10, 31)
+    assert overview.coverage.model_dump(mode="json") == {
+        "requested_start": "2024-11-30",
+        "coverage_start": "2024-11-30",
+        "is_partial_coverage": False,
+    }
+    assert [latest_fields(snapshot) for snapshot in overview.latest] == [
+        *SEEDED_LATEST[:-1],
+        ("fx_reserves_usd_m", "7901.25", "2026-10-02", "7850.00", "51.25"),
+    ]
+    assert [point.date for point in overview.inflation_series] == window[:-1]
+    assert [point.observation_date for point in overview.rates_series] == window[:-1]
+    assert [point_fields(point) for point in overview.yield_curve.current] == SEEDED_CURVE
+    history = overview.yield_curve.history
+    assert [snapshot.as_of for snapshot in history] == window
+    assert [point_fields(point) for point in history[-1].points] == SEEDED_CURVE
+
+
+async def test_real_fxd_bonds_outrank_seeded_ones_and_other_codes_are_never_read(
+    session: AsyncSession,
+) -> None:
+    """Real CBK auctions are stored beside the seeded curve.
+
+    ``FXD1/2026/010`` (2026-06-15, 9.72 years left) takes the 10Y bucket from every later seed
+    bond, from the 2026-06-30 month-end on. ``FXD2/2026/005`` (2026-10-14) is the latest FXD
+    observation, so the current curve is resolved on 2026-10-14 and takes it for 5Y, while the
+    window still ends at the latest macro month, 2026-09, whose curves precede it. The infra
+    bond ``IFB1/2026/012`` (2026-09-15, 9.90 years left) is real and newer than ``FXD1/2026/010``
+    but is never read. Yields round half-up: 13.9050 -> 13.91 and 16.2049 -> 16.20.
+    """
+    session.add_all(
+        [
+            TerminalBondYield(
+                observation_date=date(2026, 6, 15),
+                bond_code="FXD1/2026/010",
+                original_tenor_years=Decimal("10.00"),
+                remaining_tenor_years=Decimal("9.72"),
+                maturity_date=date(2036, 3, 3),
+                yield_pct=Decimal("13.9050"),
+                source="cbk_bonds",
+            ),
+            TerminalBondYield(
+                observation_date=date(2026, 9, 15),
+                bond_code="IFB1/2026/012",
+                original_tenor_years=Decimal("12.00"),
+                remaining_tenor_years=Decimal("9.90"),
+                maturity_date=date(2036, 8, 11),
+                yield_pct=Decimal("14.0000"),
+                source="cbk_bonds",
+            ),
+            TerminalBondYield(
+                observation_date=date(2026, 10, 14),
+                bond_code="FXD2/2026/005",
+                original_tenor_years=Decimal("5.00"),
+                remaining_tenor_years=Decimal("5.00"),
+                maturity_date=date(2031, 10, 6),
+                yield_pct=Decimal("16.2049"),
+                source="cbk_bonds",
+            ),
+        ]
+    )
+    await session.commit()
+
+    overview = await get_macro_overview(session, 24)
+
+    window = month_ends(date(2024, 10, 31), 24)
+    assert overview.coverage.model_dump(mode="json") == {
+        "requested_start": "2024-10-31",
+        "coverage_start": "2024-10-31",
+        "is_partial_coverage": False,
+    }
+    assert [latest_fields(snapshot) for snapshot in overview.latest] == SEEDED_LATEST
+    assert [point_fields(point) for point in overview.yield_curve.current] == [
+        *SEEDED_TBILL_POINTS,
+        SEEDED_BOND_POINTS[0],
+        ("5Y", "5.00", "16.20", "bond", "FXD2/2026/005", "2026-10-14", "cbk_bonds"),
+        ("10Y", "9.72", "13.91", "bond", "FXD1/2026/010", "2026-06-15", "cbk_bonds"),
+        *SEEDED_BOND_POINTS[3:],
+    ]
+    expected_history: list[list[SnapshotRow]] = []
+    for day in window:
+        rows = seeded_snapshot(day)
+        if day >= date(2026, 6, 30):
+            rows[5] = ("10Y", "FXD1/2026/010", "2026-06-15", "cbk_bonds")
+        expected_history.append(rows)
+    history = overview.yield_curve.history
+    assert [snapshot.as_of for snapshot in history] == window
+    assert [snapshot_fields(snapshot.points) for snapshot in history] == expected_history
+
+
+async def test_bonds_only_database_ends_the_window_at_the_latest_bond(
+    session: AsyncSession,
+) -> None:
+    """With every macro row deleted, the curve still renders: the window ends at the latest FXD
+    bond month, 2026-09, and every curve holds that month's six seed bonds. Without an indicator
+    ``latest`` and both series are empty, and coverage is partial with no ``coverage_start``."""
+    await session.execute(delete(TerminalMacroIndicator))
+    await session.commit()
+
+    overview = await get_macro_overview(session, 24)
+
+    window = month_ends(date(2024, 10, 31), 24)
+    assert overview.coverage.model_dump(mode="json") == {
+        "requested_start": "2024-10-31",
+        "coverage_start": None,
+        "is_partial_coverage": True,
+    }
+    assert overview.latest == []
+    assert overview.inflation_series == []
+    assert overview.rates_series == []
+    assert [point_fields(point) for point in overview.yield_curve.current] == SEEDED_BOND_POINTS
+    history = overview.yield_curve.history
+    assert [snapshot.as_of for snapshot in history] == window
+    assert [snapshot_fields(snapshot.points) for snapshot in history] == [
+        seeded_snapshot(day)[3:] for day in window
+    ]
+
+
+async def test_empty_database_returns_empty_lists_ending_at_the_current_month(
+    session: AsyncSession,
+) -> None:
+    """With no macro row and no bond, nothing raises: every list is empty, coverage is partial
+    with no ``coverage_start``, and the 24-month window ends at the current UTC month, so it
+    opens at the month-end 23 months earlier. The date is read before and after the call, so a
+    month boundary crossed during it cannot fail the test."""
+    await session.execute(delete(TerminalMacroIndicator))
+    await session.execute(delete(TerminalBondYield))
+    await session.commit()
+
+    before = datetime.now(UTC).date()
+    overview = await get_macro_overview(session, 24)
+    after = datetime.now(UTC).date()
+
+    dumped = overview.model_dump(mode="json")
+    requested_start = dumped["coverage"].pop("requested_start")
+    assert requested_start in {month_end(day, -23).isoformat() for day in (before, after)}
+    assert dumped == {
+        "coverage": {"coverage_start": None, "is_partial_coverage": True},
+        "latest": [],
+        "inflation_series": [],
+        "rates_series": [],
+        "yield_curve": {"current": [], "history": []},
+    }

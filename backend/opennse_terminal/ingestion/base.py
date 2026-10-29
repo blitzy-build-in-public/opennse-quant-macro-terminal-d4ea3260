@@ -980,6 +980,13 @@ _FETCH_FAILED_CODES: Final = frozenset(
         "xlsx_worksheet_too_large",
         "xlsx_parts_too_large",
         "xlsx_size_mismatch",
+        # ingestion/nse/market_statistics.py
+        "browser_not_installed",
+        "browser_launch_failed",
+        "navigation_failed",
+        "sector_render_timeout",
+        "run_timeout",
+        "browser_error",
     }
 )
 _HTTP_STATUS_REASON: Final = re.compile(r"(?:robots_)?http_[0-9]{3}")
@@ -1027,7 +1034,12 @@ def _log_code(exc: BaseException) -> str:
                                     ``xlsx_unsupported_member``,
                                     ``xlsx_worksheet_too_large``,
                                     ``xlsx_parts_too_large``,
-                                    ``xlsx_size_mismatch``), then ``:<type>`` of the
+                                    ``xlsx_size_mismatch``,
+                                    ``browser_not_installed``,
+                                    ``browser_launch_failed``,
+                                    ``navigation_failed``,
+                                    ``sector_render_timeout``, ``run_timeout``,
+                                    ``browser_error``), then ``:<type>`` of the
                                     exception it was raised from, for example
                                     ``fetch_failed:http_404``,
                                     ``fetch_failed:unreadable_file:PermissionError``,
