@@ -1,0 +1,52 @@
+<!--
+Source URL: https://www.nse.co.ke/market-statistics/ (Equity Statistics tab), rendered in a headless browser
+Capture date: 2026-10-28
+Session: 2026-10-27
+Source: Nairobi Securities Exchange public market-statistics page; personal or internal use only
+Reconstructed test fixture, not a live capture.
+It reproduces the documented layout of the rendered page as the 07:30 Africa/Nairobi job sees it,
+before the 09:30 open: the date label one day ahead of the values, the 13-option sector dropdown,
+the price-list link dated by its file name, and the equity table the page fills one sector at a
+time, left empty here. Each sector's rendered table is in sectors/<option value>.html.
+Scripts, stylesheets and tracking attributes removed.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Market Statistics - Nairobi Securities Exchange</title>
+</head>
+<body>
+  <header>
+    <nav>
+      <a href="/">Home</a>
+      <a href="/market-statistics/">Market Statistics</a>
+    </nav>
+  </header>
+  <main>
+    <h1>Market Statistics</h1>
+    <section id="equity-statistics">
+      <h2>Equity Statistics</h2>
+      <p class="statistics-as-of">Statistics as of 28 Oct 2026</p>
+      <label for="filtersectors">Sector</label>
+      <select id="filtersectors" name="filtersectors">
+        <option value="agric" selected>Agricultural</option>
+        <option value="auto">Automobiles &amp; Accessories</option>
+        <option value="bank">Banking</option>
+        <option value="comm">Commercial &amp; Services</option>
+        <option value="const">Construction &amp; Allied</option>
+        <option value="energy">Energy &amp; Petroleum</option>
+        <option value="insr">Insurance</option>
+        <option value="invest">Investment</option>
+        <option value="investse">Investment Services</option>
+        <option value="manu">Manufacturing &amp; Allied</option>
+        <option value="tele">Telecommunication</option>
+        <option value="real">Real Estate Investment Trust</option>
+        <option value="exchange">Exchange Traded Funds</option>
+      </select>
+      <p class="price-list"><a href="/wp-content/uploads/27-OCT-26.pdf">Download Daily Equity Price List</a></p>
+      <table class="nsetable"></table>
+    </section>
+  </main>
+</body>
+</html>
