@@ -1,10 +1,16 @@
 """Extract key line items from corporate filing and IPO prospectus PDFs with pdfplumber.
 
 :func:`extract_line_items` reads Revenue, EBITDA, Net Income, Total Debt, operating Cash Flow and
-Shares Outstanding from the text layer of an annual report, interim report or prospectus. It is
-pure and synchronous: no I/O beyond the given bytes, no settings, no module-level mutable state,
-so ``services/filings_service.py`` runs it in a worker thread for ``POST /ingest/pdf``. There is
-no OCR: a PDF without a text layer yields ``no_items`` with the warning ``no_text_layer``.
+Shares Outstanding from the text layer of an annual report, interim report or prospectus. There
+is no OCR: a PDF whose pages carry no text yields ``no_items`` with the warning ``no_text_layer``.
+
+The PDF is untrusted input, so it is parsed in a separate Python process that the calling thread
+supervises and waits for: 50 seconds of wall time, 1 GiB of address space and 8 MiB of decoded
+content per page, with cross-reference sections that list more objects than the file holds
+rejected before any page is enumerated. Exceeding a limit makes the PDF unreadable; the caller
+is never hung or exhausted. ``services/filings_service.py`` therefore still runs it in a worker
+thread for ``POST /ingest/pdf``. It reads no settings and keeps no module-level mutable state;
+the bytes go to that process through a pipe and are never written to disk.
 
 How a value is chosen:
 
@@ -45,12 +51,18 @@ counts of at most ``MAX_SHARE_COUNT``.
 
 import contextlib
 import io
+import json
 import logging
+import math
+import os
 import re
+import subprocess
+import sys
 import types
+import zlib
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date
 from decimal import (
     MAX_EMAX,
@@ -62,9 +74,18 @@ from decimal import (
     InvalidOperation,
     Rounded,
 )
-from typing import Final, Literal, Protocol
+from typing import BinaryIO, Final, Literal, Protocol, TypeGuard, TypeVar, get_args
 
 import pdfplumber
+
+# pdfplumber is the parser (Rule 2); these are the pdfminer.six objects underneath it, the exact
+# version pdfplumber pins and re-exports. Bounding page enumeration and decoding needs pdfminer's
+# page generator, cross-reference and stream objects, which pdfplumber does not expose lazily.
+from pdfminer.pdfdocument import PDFDocument, PDFXRef, PDFXRefStream
+from pdfminer.pdfpage import PDFPage
+from pdfminer.pdftypes import LITERALS_FLATE_DECODE, PDFStream, resolve1
+from pdfminer.psparser import LIT
+from pdfplumber.page import Page as _PlumberPage
 
 from opennse_terminal.config import DEFAULT_CURRENCY, MAX_SHARE_COUNT
 from opennse_terminal.ingestion.base import parse_decimal_text
@@ -215,6 +236,32 @@ class ExtractionResult:
     items: list[ExtractedLineItem]
     missing_items: list[str]
     warnings: list[str]
+
+
+# ---------------------------------------------------------------------------------------------
+# Parse limits
+# ---------------------------------------------------------------------------------------------
+
+_MIB: Final = 1 << 20
+_MAX_PAGE_CONTENT_BYTES: Final = 8 * _MIB
+"""Largest decoded size of one page's content streams plus every Form XObject they can draw,
+each stream counted once. Statement pages hold tens of KiB; a page over this is rejected before
+pdfminer decodes or interprets it, which bounds decompression bombs and operator floods."""
+_PARSE_TIME_LIMIT_SECONDS: Final = 50.0
+"""Wall-clock limit of one parse, the PDF parser process included. 400 dense statement pages
+take under 40 seconds; the parser process is killed at the limit and the PDF is unreadable."""
+_PARSE_MEMORY_LIMIT_BYTES: Final = 1 << 30
+"""Address-space limit (``RLIMIT_AS``) of the PDF parser process, about 100 MiB of it taken by
+the interpreter and imports. A parse that needs more fails there, never in the caller."""
+_CPU_LIMIT_MARGIN_SECONDS: Final = 5
+# The parser process's own CPU limit exceeds the wall-clock limit by this margin: it only takes
+# effect if the supervising process is gone and cannot kill it.
+_MEMORY_RESERVE_BYTES: Final = 4 * _MIB
+# Address space the parser process holds back and releases when a parse fails, so a failure at
+# the memory limit can still be reported.
+_MAX_REQUEST_HEADER_BYTES: Final = 4096
+_MAX_ERROR_MESSAGE_CHARS: Final = 500
+_LITERAL_FORM: Final = LIT("Form")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -611,28 +658,42 @@ def _token_amount(norm: str) -> Decimal | None:
     return parse_decimal_text(norm)
 
 
-def _is_encryption_error(exc: BaseException) -> bool:
-    """Whether ``exc`` or an exception it wraps is a pdfminer password or encryption error.
-
-    pdfplumber wraps pdfminer errors in ``PdfminerException`` (the original is its argument and
-    context), so the chain is walked by class name and message instead of importing pdfminer.
-    """
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    """``exc`` and the exceptions it wraps (cause, context and exception arguments), breadth
+    first, at most ``_MAX_EXCEPTION_CHAIN`` of them."""
+    chain: list[BaseException] = []
     pending: list[BaseException] = [exc]
     seen: set[int] = set()
-    while pending and len(seen) < _MAX_EXCEPTION_CHAIN:
+    while pending and len(chain) < _MAX_EXCEPTION_CHAIN:
         current = pending.pop(0)
         if id(current) in seen:
             continue
         seen.add(id(current))
+        chain.append(current)
+        for linked in (current.__cause__, current.__context__, *current.args):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+    return chain
+
+
+def _is_encryption_error(exc: BaseException) -> bool:
+    """Whether ``exc`` or an exception it wraps is a pdfminer password or encryption error.
+
+    pdfplumber wraps pdfminer errors in ``PdfminerException`` (the original is its argument and
+    context), so the whole chain is checked, by pdfminer class name and by message.
+    """
+    for current in _exception_chain(exc):
         if type(current).__name__ in {"PDFPasswordIncorrect", "PDFEncryptionError"}:
             return True
         message = str(current).lower()
         if "password" in message or "encrypt" in message:
             return True
-        for linked in (current.__cause__, current.__context__, *current.args):
-            if isinstance(linked, BaseException):
-                pending.append(linked)
     return False
+
+
+def _is_memory_exhaustion(exc: BaseException) -> bool:
+    """Whether ``exc`` or an exception it wraps is a :class:`MemoryError`."""
+    return any(isinstance(current, MemoryError) for current in _exception_chain(exc))
 
 
 def _open_failure(exc: Exception) -> ValueError:
@@ -689,43 +750,190 @@ def _page_words(page: _PdfPage, page_number: int) -> list[_Word]:
     return words
 
 
+def _is_count(value: object) -> TypeGuard[int]:
+    """A non-negative integer (a PDF boolean is not one)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _check_cross_references(document: PDFDocument, file_size: int) -> None:
+    """Reject cross-reference sections that list more objects than the file can hold.
+
+    pdfminer enumerates every listed object id when the page tree cannot be found, about 20
+    microseconds each, so an 800-byte cross-reference stream claiming 10^9 objects would take
+    hours. Each stream's ranges must be non-negative and backed by an entry in its data, and the
+    objects of all sections together may not outnumber the bytes of the file.
+    """
+    claimed = 0
+    for xref in document.xrefs:
+        if isinstance(xref, PDFXRefStream):
+            ranges_valid = all(
+                _is_count(start) and _is_count(count) for start, count in xref.ranges
+            )
+            listed = sum(count for _, count in xref.ranges) if ranges_valid else 0
+            entry_length = xref.entlen
+            if not ranges_valid or (
+                listed > 0
+                and (
+                    not _is_count(entry_length)
+                    or entry_length == 0
+                    or listed * entry_length > len(xref.data or b"")
+                )
+            ):
+                raise PdfUnreadable(
+                    "the PDF's cross-reference stream lists more objects than it holds entries for"
+                )
+            claimed += listed
+        elif isinstance(xref, PDFXRef):
+            claimed += len(xref.offsets)
+    if claimed > file_size:
+        raise PdfUnreadable("the PDF's cross-reference sections list more objects than it holds")
+
+
+def _declared_page_count(document: PDFDocument, counted: int) -> int:
+    """The page count reported by :class:`TooManyPages` once ``counted`` pages were enumerated:
+    the root page tree's ``/Count`` when it is an integer no smaller, else ``counted``."""
+    try:
+        tree = resolve1(document.catalog.get("Pages"))
+        declared = resolve1(tree.get("Count")) if isinstance(tree, dict) else None
+    except Exception:
+        return counted
+    if _is_count(declared) and declared >= counted:
+        return declared
+    return counted
+
+
+def _flate_size(data: bytes, stages: int, limit: int) -> int | None:
+    """The size of ``data`` after ``stages`` zlib decodings, or ``limit + 1`` as soon as a stage
+    exceeds ``limit``: no stage ever decodes more than ``limit + 1`` bytes. ``None`` when the
+    data is not valid zlib, which pdfminer recovers from its own way."""
+    try:
+        for _ in range(stages):
+            data = zlib.decompressobj().decompress(data, limit + 1)
+            if len(data) > limit:
+                return limit + 1
+    except zlib.error:
+        return None
+    return len(data)
+
+
+def _decoded_size(stream: PDFStream, limit: int) -> int:
+    """The decoded size of ``stream``, or more than ``limit`` once it is known to exceed it.
+
+    A FlateDecode-only stream is measured without decoding past ``limit``, so a decompression
+    bomb is never expanded. Any other filter chain is decoded as pdfminer would decode it for the
+    page anyway; the parser process's memory limit bounds that.
+    """
+    if stream.data is not None:
+        return len(stream.data)
+    filters = stream.get_filters()
+    if (
+        stream.rawdata is not None
+        and stream.decipher is None
+        and filters
+        and all(name in LITERALS_FLATE_DECODE for name, _ in filters)
+    ):
+        size = _flate_size(stream.rawdata, len(filters), limit)
+        if size is not None:
+            return size
+    return len(stream.get_data())
+
+
+def _page_content_size(page: PDFPage, limit: int) -> int:
+    """Decoded bytes of a page's content streams and of every Form XObject reachable from its
+    resources, through each form's own resources, each stream counted once; more than ``limit``
+    as soon as the total exceeds it. Images are not counted: text extraction never decodes them.
+    """
+    total = 0
+    streams: list[object] = list(page.contents)
+    resources: list[object] = [page.resources]
+    seen_streams: dict[int, PDFStream] = {}
+    seen_resources: dict[int, dict[object, object]] = {}
+    while streams or resources:
+        if resources:
+            entry = resolve1(resources.pop())
+            if not isinstance(entry, dict) or id(entry) in seen_resources:
+                continue
+            seen_resources[id(entry)] = entry
+            xobjects = resolve1(entry.get("XObject"))
+            if not isinstance(xobjects, dict):
+                continue
+            for value in xobjects.values():
+                xobject = resolve1(value)
+                if (
+                    isinstance(xobject, PDFStream)
+                    and id(xobject) not in seen_streams
+                    and resolve1(xobject.get("Subtype")) is _LITERAL_FORM
+                ):
+                    streams.append(xobject)
+                    resources.append(xobject.get("Resources"))
+            continue
+        stream = resolve1(streams.pop())
+        if not isinstance(stream, PDFStream) or id(stream) in seen_streams:
+            continue
+        seen_streams[id(stream)] = stream
+        total += _decoded_size(stream, limit - total)
+        if total > limit:
+            return total
+    return total
+
+
+def _check_page_content(page: PDFPage, number: int) -> None:
+    """Reject page ``number`` when its decoded content exceeds ``_MAX_PAGE_CONTENT_BYTES``,
+    before pdfminer decodes and interprets it; a stream that cannot be decoded makes the page
+    unreadable."""
+    try:
+        size = _page_content_size(page, _MAX_PAGE_CONTENT_BYTES)
+    except Exception as exc:
+        raise PdfUnreadable(f"page {number} of the PDF could not be parsed") from exc
+    if size > _MAX_PAGE_CONTENT_BYTES:
+        raise PdfUnreadable(
+            f"page {number} has more than {_MAX_PAGE_CONTENT_BYTES // _MIB} MiB of decoded content"
+        )
+
+
 def _read_pages(pdf_bytes: bytes, max_pages: int) -> list[list[_Word]]:
-    """Open the PDF, apply the encryption and page-count guards, and read each page's words.
+    """Open the PDF, apply the encryption, cross-reference, page-count and page-content guards,
+    and read each page's words.
 
-    The document is closed on every path. Encrypted files are rejected even when they open with
-    an empty password, and the page count is checked before any text is extracted.
+    Encrypted files are rejected even when they open with an empty password. Pages are
+    enumerated lazily, so :class:`TooManyPages` is raised once ``max_pages + 1`` pages have been
+    found and before any text is extracted; a document without pages is unreadable. Each page's
+    decoded content is bounded before its words are read.
 
-    Closing never replaces the outcome. pdfplumber's ``close()`` lists the pages again, so a
-    document whose pages could not be listed fails to close with that same error; a close failure
-    while an error is already being raised is suppressed, and that error propagates. A close
-    failure after every page was read is mapped like a failure to open, normally to
-    :class:`PdfUnreadable`.
+    Neither ``pdf.pages`` nor ``pdf.close()`` is used: pdfplumber builds the page list for the
+    whole document, and ``close()`` flushes its caches and lists every page again through
+    pdfminer, the unbounded work these guards exist to avoid. Each page is closed after its words
+    are read, and the in-memory stream is owned here, so nothing is left open.
     """
     try:
         pdf = pdfplumber.open(io.BytesIO(pdf_bytes))
     except Exception as exc:
         raise _open_failure(exc) from exc
+    document: object = getattr(pdf, "doc", None)
+    if not isinstance(document, PDFDocument):
+        raise PdfUnreadable()
+    if document.encryption is not None:
+        raise PdfEncrypted()
+    _check_cross_references(document, len(pdf_bytes))
+    pages: list[tuple[PDFPage, _PdfPage]] = []
+    doctop: float = 0.0
     try:
-        try:
-            encryption: object = getattr(getattr(pdf, "doc", None), "encryption", None)
-            pages: list[_PdfPage] = list(pdf.pages)
-        except Exception as exc:
-            raise _open_failure(exc) from exc
-        if encryption is not None:
-            raise PdfEncrypted()
-        if len(pages) > max_pages:
-            raise TooManyPages(len(pages), max_pages)
-        page_words = [_page_words(page, number) for number, page in enumerate(pages, start=1)]
-    except BaseException:
-        # Closing re-lists the pages and can fail with the very error raised above; that
-        # failure must not take the place of the error already propagating.
-        with contextlib.suppress(Exception):
-            pdf.close()
+        for number, page_obj in enumerate(PDFPage.create_pages(document), start=1):
+            if number > max_pages:
+                raise TooManyPages(_declared_page_count(document, number), max_pages)
+            page = _PlumberPage(pdf, page_obj, page_number=number, initial_doctop=doctop)
+            doctop += page.height
+            pages.append((page_obj, page))
+    except TooManyPages:
         raise
-    try:
-        pdf.close()
     except Exception as exc:
         raise _open_failure(exc) from exc
+    if not pages:
+        raise PdfUnreadable("the PDF has no pages")
+    page_words: list[list[_Word]] = []
+    for number, (page_obj, text_page) in enumerate(pages, start=1):
+        _check_page_content(page_obj, number)
+        page_words.append(_page_words(text_page, number))
     return page_words
 
 
@@ -1592,7 +1800,7 @@ def _extract_item(document: _Document, name: str, money_unit: ItemUnit) -> Extra
 
 
 # ---------------------------------------------------------------------------------------------
-# Public entry point
+# Requested items and the document result
 # ---------------------------------------------------------------------------------------------
 
 
@@ -1661,47 +1869,20 @@ def _log_result(result: ExtractionResult) -> None:
     )
 
 
-def extract_line_items(
+def _extract(
     pdf_bytes: bytes,
-    items: Sequence[str] = LINE_ITEMS,
-    *,
-    period_end_date: date | None = None,
-    max_pages: int = 400,
+    requested: Sequence[str],
+    period_end_date: date | None,
+    max_pages: int,
 ) -> ExtractionResult:
-    """Extract the requested line items from a filing or prospectus PDF.
-
-    Args:
-        pdf_bytes: The whole PDF. Size, the ``%PDF-`` magic bytes and concurrency are the
-            caller's checks; nothing but these bytes is read.
-        items: Names from :data:`LINE_ITEMS`, results in this order (duplicates dropped).
-        period_end_date: Selects the period column by its year; without it the latest year is
-            read.
-        max_pages: Largest page count parsed.
-
-    Returns:
-        One :class:`ExtractedLineItem` per requested item. Monetary values are whole KES after
-        the page scale, or whole USD when a statement header is in USD (``currency="USD"`` and
-        the warning ``non_kes_currency``; never converted). ``shares_outstanding`` is an
-        integral count, scaled only by its own unit hint. Item statuses are ``found``,
-        ``derived`` (summed from component lines listed in ``derivation``), ``ambiguous``
-        (insufficient evidence, with up to five ``candidates``; never to be committed) and
-        ``not_found``. Warnings: ``no_text_layer`` (no OCR is attempted), ``scale_not_detected``
-        and ``non_kes_currency``.
-
-    Raises:
-        ValueError: An unknown item name, no item, or ``max_pages`` below 1.
-        PdfEncrypted: The PDF is encrypted, even with an empty user password.
-        PdfUnreadable: The bytes cannot be parsed, or a page's text cannot be read.
-        TooManyPages: More than ``max_pages`` pages; raised before any text is extracted.
-    """
-    requested = _requested_items(items)
-    if max_pages < 1:
-        raise ValueError(f"max_pages must be at least 1, got {max_pages}")
+    """Read the PDF and extract the ``requested`` items (validated, de-duplicated names): the
+    work :func:`extract_line_items` runs in the parser process. Nothing is logged here."""
     page_words = _read_pages(pdf_bytes, max_pages)
     page_count = len(page_words)
 
+    # The pages exist (a document without pages is unreadable) but none has a word.
     if not any(page_words):
-        result = ExtractionResult(
+        return ExtractionResult(
             page_count=page_count,
             detected_scale=None,
             currency=DEFAULT_CURRENCY,
@@ -1713,8 +1894,6 @@ def extract_line_items(
             missing_items=list(requested),
             warnings=["no_text_layer"],
         )
-        _log_result(result)
-        return result
 
     analysed = [_analyse_page(number, words) for number, words in enumerate(page_words, start=1)]
     document_scale, marked = _document_scale(analysed)
@@ -1739,7 +1918,7 @@ def extract_line_items(
     )
     money_unit: ItemUnit = "USD" if is_usd else "KES"
     extracted = [_extract_item(document, name, money_unit) for name in requested]
-    result = ExtractionResult(
+    return ExtractionResult(
         page_count=page_count,
         # With no marker the scale applied is 1, reported as 1 beside scale_not_detected; None
         # is reserved for a PDF without a text layer, as the response schema documents.
@@ -1750,5 +1929,449 @@ def extract_line_items(
         missing_items=[item.item for item in extracted if item.status == "not_found"],
         warnings=warnings,
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# The PDF parser process
+# ---------------------------------------------------------------------------------------------
+
+_Choice = TypeVar("_Choice", bound=str)
+_ITEM_STATUSES: Final[tuple[ItemStatus, ...]] = get_args(ItemStatus)
+_ITEM_UNITS: Final[tuple[ItemUnit, ...]] = get_args(ItemUnit)
+_FILING_STATUSES: Final[tuple[FilingStatus, ...]] = get_args(FilingStatus)
+
+
+@dataclass(frozen=True, slots=True)
+class _ParseRequest:
+    """What the parser process is asked to do: :func:`_extract`'s arguments and its limits."""
+
+    pdf_bytes: bytes
+    items: list[str]
+    period_end_date: date | None
+    max_pages: int
+    time_limit: float
+    memory_limit: int
+
+
+def _json_default(value: object) -> str:
+    """Encode a ``Decimal`` as its exact string form, sign, digits and exponent kept."""
+    if isinstance(value, Decimal):
+        return str(value)
+    raise TypeError(f"{type(value).__name__} is not part of an extraction result")
+
+
+def _record(value: object, name: str) -> Mapping[str, object]:
+    """A JSON object of the request or reply; ``ValueError`` names what is malformed."""
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} is not a JSON object")
+    return value
+
+
+def _get(data: Mapping[str, object], key: str) -> object:
+    if key not in data:
+        raise ValueError(f"the field {key!r} is missing")
+    return data[key]
+
+
+def _integer(data: Mapping[str, object], key: str) -> int:
+    value = _get(data, key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"the field {key!r} is not an integer")
+    return value
+
+
+def _optional_integer(data: Mapping[str, object], key: str) -> int | None:
+    return None if _get(data, key) is None else _integer(data, key)
+
+
+def _number(data: Mapping[str, object], key: str) -> float:
+    """A limit in seconds, integer or not; it is never a monetary value."""
+    value = _get(data, key)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"the field {key!r} is not a number")
+    return value
+
+
+def _text(data: Mapping[str, object], key: str) -> str:
+    value = _get(data, key)
+    if not isinstance(value, str):
+        raise ValueError(f"the field {key!r} is not a string")
+    return value
+
+
+def _optional_text(data: Mapping[str, object], key: str) -> str | None:
+    return None if _get(data, key) is None else _text(data, key)
+
+
+def _texts(data: Mapping[str, object], key: str) -> list[str]:
+    values = _array(data, key)
+    if not all(isinstance(value, str) for value in values):
+        raise ValueError(f"the field {key!r} is not a list of strings")
+    return [str(value) for value in values]
+
+
+def _decimal(data: Mapping[str, object], key: str) -> Decimal:
+    """An exact decimal sent as its string form; constructing it uses no context precision."""
+    text = _text(data, key)
+    try:
+        value = Decimal(text)
+    except InvalidOperation as exc:
+        raise ValueError(f"the field {key!r} is not a decimal") from exc
+    if not value.is_finite():
+        raise ValueError(f"the field {key!r} is not a finite decimal")
+    return value
+
+
+def _optional_decimal(data: Mapping[str, object], key: str) -> Decimal | None:
+    return None if _get(data, key) is None else _decimal(data, key)
+
+
+def _array(data: Mapping[str, object], key: str) -> list[object]:
+    value = _get(data, key)
+    if not isinstance(value, list):
+        raise ValueError(f"the field {key!r} is not a list")
+    return value
+
+
+def _choice(data: Mapping[str, object], key: str, options: tuple[_Choice, ...]) -> _Choice:
+    value = _get(data, key)
+    for option in options:
+        if value == option:
+            return option
+    raise ValueError(f"the field {key!r} is not one of {', '.join(options)}")
+
+
+def _decode_item(data: Mapping[str, object]) -> ExtractedLineItem:
+    """Rebuild one :class:`ExtractedLineItem` from its ``dataclasses.asdict`` form."""
+    parts = [_record(entry, "a derivation part") for entry in _array(data, "derivation")]
+    candidates = [_record(entry, "a candidate") for entry in _array(data, "candidates")]
+    return ExtractedLineItem(
+        item=_text(data, "item"),
+        status=_choice(data, "status", _ITEM_STATUSES),
+        value=_optional_decimal(data, "value"),
+        unit=_choice(data, "unit", _ITEM_UNITS),
+        raw_value=_optional_text(data, "raw_value"),
+        scale_applied=_optional_integer(data, "scale_applied"),
+        page_number=_optional_integer(data, "page_number"),
+        matched_label=_optional_text(data, "matched_label"),
+        derivation=[
+            DerivationPart(
+                label=_text(part, "label"),
+                page_number=_integer(part, "page_number"),
+                value=_decimal(part, "value"),
+            )
+            for part in parts
+        ],
+        candidates=[
+            Candidate(
+                label=_text(candidate, "label"),
+                page_number=_integer(candidate, "page_number"),
+                raw_value=_text(candidate, "raw_value"),
+                value=_optional_decimal(candidate, "value"),
+            )
+            for candidate in candidates
+        ],
+    )
+
+
+def _decode_result(data: Mapping[str, object]) -> ExtractionResult:
+    """Rebuild an :class:`ExtractionResult` from its ``dataclasses.asdict`` form, validating
+    every field, so the reply is exactly the result the parser process computed."""
+    return ExtractionResult(
+        page_count=_integer(data, "page_count"),
+        detected_scale=_optional_integer(data, "detected_scale"),
+        currency=_text(data, "currency"),
+        status=_choice(data, "status", _FILING_STATUSES),
+        items=[_decode_item(_record(entry, "an item")) for entry in _array(data, "items")],
+        missing_items=_texts(data, "missing_items"),
+        warnings=_texts(data, "warnings"),
+    )
+
+
+def _failure_reply(exc: BaseException, memory_limit: int) -> dict[str, object]:
+    """The parser process's reply for a parse that raised ``exc``.
+
+    ``kind`` is the rejection to raise in the caller (``PdfEncrypted``, ``PdfUnreadable`` or
+    ``TooManyPages``), or ``internal`` for a fault of the parser itself; ``type`` names the
+    exception. Running out of memory anywhere in the exception chain makes the PDF unreadable.
+    """
+    page_count: int | None = None
+    max_pages: int | None = None
+    message = str(exc)
+    if _is_memory_exhaustion(exc):
+        kind, name = "PdfUnreadable", "MemoryError"
+        message = f"the PDF needs more than {memory_limit // _MIB} MiB of memory to parse"
+    elif isinstance(exc, TooManyPages):
+        kind, name = "TooManyPages", type(exc).__name__
+        page_count, max_pages = exc.page_count, exc.max_pages
+    elif isinstance(exc, PdfEncrypted):
+        kind, name = "PdfEncrypted", type(exc).__name__
+    elif isinstance(exc, PdfUnreadable):
+        kind, name = "PdfUnreadable", type(exc).__name__
+    else:
+        kind, name = "internal", type(exc).__name__
+        message = message[:_MAX_ERROR_MESSAGE_CHARS]
+    return {
+        "error": {
+            "kind": kind,
+            "type": name,
+            "message": message,
+            "page_count": page_count,
+            "max_pages": max_pages,
+        }
+    }
+
+
+def _decode_failure(error: Mapping[str, object], memory_limit: int) -> Exception:
+    """The exception to raise in the caller for the parser process's error reply."""
+    kind = _text(error, "kind")
+    message = _text(error, "message")
+    if kind == "PdfEncrypted":
+        return PdfEncrypted(message)
+    if kind == "PdfUnreadable":
+        if _text(error, "type") == "MemoryError":
+            logger.warning("PDF parse stopped at the memory limit of %d MiB", memory_limit // _MIB)
+        return PdfUnreadable(message)
+    if kind == "TooManyPages":
+        return TooManyPages(_integer(error, "page_count"), _integer(error, "max_pages"))
+    if kind == "internal":
+        return RuntimeError(f"the PDF parser failed with {_text(error, 'type')}: {message}")
+    raise ValueError(f"the error kind {kind!r} is unknown")
+
+
+def _read_request(stream: BinaryIO) -> _ParseRequest:
+    """Read the request :func:`_run_isolated` writes: one JSON header line, then exactly
+    ``length`` PDF bytes."""
+    line = stream.readline(_MAX_REQUEST_HEADER_BYTES)
+    if not line.endswith(b"\n"):
+        raise ValueError("the parse request has no header line")
+    header = _record(json.loads(line), "the parse request header")
+    length = _integer(header, "length")
+    pdf_bytes = stream.read(length)
+    if len(pdf_bytes) != length:
+        raise ValueError(f"the parse request holds {len(pdf_bytes)} of {length} PDF bytes")
+    period = _optional_text(header, "period_end_date")
+    return _ParseRequest(
+        pdf_bytes=pdf_bytes,
+        items=_requested_items(_texts(header, "items")),
+        period_end_date=None if period is None else date.fromisoformat(period),
+        max_pages=_integer(header, "max_pages"),
+        time_limit=_number(header, "time_limit"),
+        memory_limit=_integer(header, "memory_limit"),
+    )
+
+
+def _apply_limits(time_limit: float, memory_limit: int) -> None:
+    """Limit the parser process: no core file, ``memory_limit`` bytes of address space, and CPU
+    time ``time_limit`` plus a margin, a backstop for when the supervising process is gone (it
+    kills this one at ``time_limit`` of wall time). A limit the platform rejects is skipped, and
+    Windows has none of them: there the wall-clock limit alone applies."""
+    if sys.platform == "win32":
+        return
+    import resource
+
+    limits = (
+        (resource.RLIMIT_CORE, 0),
+        (resource.RLIMIT_CPU, math.ceil(time_limit) + _CPU_LIMIT_MARGIN_SECONDS),
+        (resource.RLIMIT_AS, memory_limit),
+    )
+    for kind, wanted in limits:
+        with contextlib.suppress(ValueError, OSError):
+            _, hard = resource.getrlimit(kind)
+            value = wanted if hard == resource.RLIM_INFINITY else min(wanted, hard)
+            resource.setrlimit(kind, (value, value))
+
+
+def _child_main() -> None:
+    """Entry point of the PDF parser process that :func:`_run_isolated` starts.
+
+    Reads one request from standard input, limits the process, runs :func:`_extract` and writes
+    one JSON reply to standard output: ``{"result": ...}`` with the result's fields, decimals as
+    exact strings, or ``{"error": ...}`` (see :func:`_failure_reply`). Logging is disabled in
+    this process; the caller logs the outcome.
+    """
+    logging.disable(logging.CRITICAL)
+    reply_stream = sys.stdout.buffer
+    # Anything else printed goes to the discarded error stream, never into the reply.
+    sys.stdout = sys.stderr
+    reserve = bytearray(_MEMORY_RESERVE_BYTES)
+    memory_limit = _PARSE_MEMORY_LIMIT_BYTES
+    reply: dict[str, object]
+    try:
+        request = _read_request(sys.stdin.buffer)
+        memory_limit = request.memory_limit
+        _apply_limits(request.time_limit, request.memory_limit)
+        result = _extract(
+            request.pdf_bytes, request.items, request.period_end_date, request.max_pages
+        )
+        reply = {"result": asdict(result)}
+    except BaseException as exc:
+        # Gives back address space, so a failure at the memory limit can still be reported.
+        reserve.clear()
+        reply = _failure_reply(exc, memory_limit)
+    reply_stream.write(
+        json.dumps(reply, default=_json_default, separators=(",", ":")).encode("ascii")
+    )
+    reply_stream.flush()
+
+
+def _child_environment() -> dict[str, str]:
+    """The parser process's environment: the caller's, with ``PYTHONPATH`` set to the caller's
+    import path, so the process imports this same package."""
+    path = os.pathsep.join(entry for entry in sys.path if isinstance(entry, str) and entry)
+    return {**os.environ, "PYTHONPATH": path}
+
+
+def _run_isolated(
+    pdf_bytes: bytes,
+    requested: Sequence[str],
+    period_end_date: date | None,
+    max_pages: int,
+    *,
+    time_limit: float = _PARSE_TIME_LIMIT_SECONDS,
+    memory_limit: int = _PARSE_MEMORY_LIMIT_BYTES,
+) -> ExtractionResult:
+    """Run :func:`_extract` in a separate Python process and return its result.
+
+    The calling thread supervises the process and blocks until it ends. The process gets
+    ``time_limit`` seconds of wall time, after which it is killed, and ``memory_limit`` bytes of
+    address space. The request (a JSON header line, then the PDF bytes) is written to its
+    standard input and the reply read from its standard output, so the PDF never touches the
+    disk; decimals cross as exact strings and every field of the reply is validated.
+
+    Raises:
+        PdfEncrypted, PdfUnreadable, TooManyPages: As :func:`_extract` raised them, rebuilt.
+        PdfUnreadable: Also when the parse needed more time or memory than its limits allow.
+        RuntimeError: The process could not be started, failed, or sent a malformed reply: a
+            fault of the server, not of the PDF.
+    """
+    if not sys.executable:
+        raise RuntimeError("no Python interpreter is available to start the PDF parser process")
+    # Only the calendar date crosses: a datetime, which is also a date, selects by its year too.
+    period = (
+        None
+        if period_end_date is None
+        else date(period_end_date.year, period_end_date.month, period_end_date.day)
+    )
+    header = {
+        "items": list(requested),
+        "period_end_date": None if period is None else period.isoformat(),
+        "max_pages": max_pages,
+        "length": len(pdf_bytes),
+        "time_limit": time_limit,
+        "memory_limit": memory_limit,
+    }
+    request = json.dumps(header, separators=(",", ":")).encode("ascii") + b"\n" + pdf_bytes
+    try:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-B",
+                "-P",
+                "-c",
+                "from opennse_terminal.ingestion.files.pdf_line_items import _child_main; "
+                "_child_main()",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=_child_environment(),
+        )
+    except OSError as exc:
+        raise RuntimeError("the PDF parser process could not be started") from exc
+    with process:
+        try:
+            output, _ = process.communicate(request, timeout=time_limit)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            process.communicate()
+            logger.warning("PDF parse stopped at the time limit of %g seconds", time_limit)
+            raise PdfUnreadable(
+                f"the PDF could not be parsed within {time_limit:g} seconds"
+            ) from exc
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+    if process.returncode < 0:
+        logger.warning(
+            "PDF parse stopped by signal %d at the limits of %g seconds and %d MiB",
+            -process.returncode,
+            time_limit,
+            memory_limit // _MIB,
+        )
+        raise PdfUnreadable(
+            f"the PDF could not be parsed within {time_limit:g} seconds and "
+            f"{memory_limit // _MIB} MiB of memory"
+        )
+    if process.returncode != 0:
+        raise RuntimeError(f"the PDF parser process exited with status {process.returncode}")
+    outcome: ExtractionResult | Exception
+    try:
+        reply = _record(json.loads(output), "the parse reply")
+        if "error" in reply:
+            outcome = _decode_failure(_record(reply["error"], "the parse error"), memory_limit)
+        else:
+            outcome = _decode_result(_record(_get(reply, "result"), "the parse result"))
+    except (ValueError, RecursionError) as exc:
+        raise RuntimeError("the PDF parser process sent a malformed reply") from exc
+    if isinstance(outcome, ExtractionResult):
+        return outcome
+    raise outcome
+
+
+# ---------------------------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------------------------
+
+
+def extract_line_items(
+    pdf_bytes: bytes,
+    items: Sequence[str] = LINE_ITEMS,
+    *,
+    period_end_date: date | None = None,
+    max_pages: int = 400,
+) -> ExtractionResult:
+    """Extract the requested line items from a filing or prospectus PDF.
+
+    The arguments are validated here; the PDF is then parsed in a separate Python process with
+    bounded wall time (``_PARSE_TIME_LIMIT_SECONDS``, 50 s), address space
+    (``_PARSE_MEMORY_LIMIT_BYTES``, 1 GiB) and decoded content per page
+    (``_MAX_PAGE_CONTENT_BYTES``, 8 MiB), so a hostile file can neither hang nor exhaust the
+    caller. The calling thread waits for that process, so services still call this in a worker
+    thread (``run_in_threadpool``). The INFO summary is logged once, here.
+
+    Args:
+        pdf_bytes: The whole PDF. Size, the ``%PDF-`` magic bytes and concurrency are the
+            caller's checks; nothing but these bytes is read, and they are never written to disk.
+        items: Names from :data:`LINE_ITEMS`, results in this order (duplicates dropped).
+        period_end_date: Selects the period column by its year; without it the latest year is
+            read.
+        max_pages: Largest page count parsed.
+
+    Returns:
+        One :class:`ExtractedLineItem` per requested item. Monetary values are whole KES after
+        the page scale, or whole USD when a statement header is in USD (``currency="USD"`` and
+        the warning ``non_kes_currency``; never converted). ``shares_outstanding`` is an
+        integral count, scaled only by its own unit hint. Values are exact ``Decimal`` values.
+        Item statuses are ``found``, ``derived`` (summed from component lines listed in
+        ``derivation``), ``ambiguous`` (insufficient evidence, with up to five ``candidates``;
+        never to be committed) and ``not_found``. Warnings: ``no_text_layer`` (pages without a
+        word; no OCR is attempted), ``scale_not_detected`` and ``non_kes_currency``.
+
+    Raises:
+        ValueError: An unknown item name, no item, or ``max_pages`` below 1.
+        PdfEncrypted: The PDF is encrypted, even with an empty user password.
+        PdfUnreadable: The bytes cannot be parsed; a cross-reference section lists more objects
+            than it holds; the PDF has no pages; a page's content cannot be read or decodes to
+            more than 8 MiB; or the parse exceeds its time or memory limit.
+        TooManyPages: More than ``max_pages`` pages, found after enumerating at most
+            ``max_pages + 1`` of them and before any text is extracted.
+        RuntimeError: The parser process could not run or failed: a server fault.
+    """
+    requested = _requested_items(items)
+    if max_pages < 1:
+        raise ValueError(f"max_pages must be at least 1, got {max_pages}")
+    result = _run_isolated(pdf_bytes, requested, period_end_date, max_pages)
     _log_result(result)
     return result

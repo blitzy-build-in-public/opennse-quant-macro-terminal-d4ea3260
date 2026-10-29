@@ -1,8 +1,9 @@
 """File-based ingestion: corporate PDFs and operator-supplied CSV/Excel files.
 
 - ``pdf_line_items`` extracts Revenue, EBITDA, Net Income, Total Debt, operating Cash Flow and
-  Shares Outstanding from corporate filing and IPO prospectus PDFs with pdfplumber. It is pure and
-  synchronous; ``services/filings_service.py`` runs it in a thread pool for
+  Shares Outstanding from corporate filing and IPO prospectus PDFs with pdfplumber. It parses in a
+  separate, time- and memory-limited Python process and blocks the calling thread until that
+  process ends, so ``services/filings_service.py`` runs it in a thread pool for
   ``POST /api/v1/terminal/ingest/pdf``.
 - ``tabular_import`` backs ``opennse-terminal import <kind> <path> [--sheet NAME]``, importing
   CSV/Excel equities, daily prices, fundamentals, macro indicators and foreign flows into the

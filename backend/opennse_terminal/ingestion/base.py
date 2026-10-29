@@ -974,6 +974,12 @@ _FETCH_FAILED_CODES: Final = frozenset(
         "file_not_found",
         "not_a_file",
         "unreadable_file",
+        "xlsx_too_many_members",
+        "xlsx_expanded_too_large",
+        "xlsx_unsupported_member",
+        "xlsx_worksheet_too_large",
+        "xlsx_parts_too_large",
+        "xlsx_size_mismatch",
     }
 )
 _HTTP_STATUS_REASON: Final = re.compile(r"(?:robots_)?http_[0-9]{3}")
@@ -1015,10 +1021,17 @@ def _log_code(exc: BaseException) -> str:
                                     ``too_many_redirects``, ``invalid_redirect``,
                                     ``response_too_large``, ``too_many_rows``,
                                     ``file_too_large``, ``file_not_found``,
-                                    ``not_a_file``, ``unreadable_file``), then
-                                    ``:<type>`` of the exception it was raised from,
-                                    for example ``fetch_failed:http_404``,
-                                    ``fetch_failed:unreadable_file:PermissionError``
+                                    ``not_a_file``, ``unreadable_file``,
+                                    ``xlsx_too_many_members``,
+                                    ``xlsx_expanded_too_large``,
+                                    ``xlsx_unsupported_member``,
+                                    ``xlsx_worksheet_too_large``,
+                                    ``xlsx_parts_too_large``,
+                                    ``xlsx_size_mismatch``), then ``:<type>`` of the
+                                    exception it was raised from, for example
+                                    ``fetch_failed:http_404``,
+                                    ``fetch_failed:unreadable_file:PermissionError``,
+                                    ``fetch_failed:xlsx_size_mismatch:error``
                                     or ``fetch_failed:ConnectTimeout``
     ``CalendarNotVerified``         ``calendar_not_verified:<year>``
     :class:`RobotsDisallowed`       its ``reason`` when it is ``disallowed`` or

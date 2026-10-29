@@ -14,6 +14,7 @@ recomputed with the code under test. Numbers are ``Decimal`` throughout.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import gc
 import importlib.util
@@ -21,12 +22,14 @@ import json
 import logging
 import threading
 import uuid
+import zlib
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import FrozenInstanceError, dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Context, Decimal, localcontext
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, cast, get_args
 from zoneinfo import ZoneInfo
@@ -2664,6 +2667,33 @@ def _raised_from(error: FetchFailed, cause: BaseException) -> FetchFailed:
             "SECRET-RETRY-MARKER",
             id="fetch-failed-after-retries-raised-from-its-cause",
         ),
+        *(
+            pytest.param(
+                FetchFailed(f"/srv/imports/SECRET-XLSX-MARKER/{code}.xlsx", code),
+                logging.ERROR,
+                f"failed: fetch_failed:{code}",
+                "SECRET-XLSX-MARKER",
+                id=f"fetch-failed-with-the-xlsx-limit-code-{code}",
+            )
+            for code in (
+                "xlsx_too_many_members",
+                "xlsx_expanded_too_large",
+                "xlsx_unsupported_member",
+                "xlsx_worksheet_too_large",
+                "xlsx_parts_too_large",
+                "xlsx_size_mismatch",
+            )
+        ),
+        pytest.param(
+            _raised_from(
+                FetchFailed("/srv/imports/SECRET-INFLATE-MARKER/prices.xlsx", "xlsx_size_mismatch"),
+                zlib.error("Error -3 while decompressing data: invalid block type"),
+            ),
+            logging.ERROR,
+            "failed: fetch_failed:xlsx_size_mismatch:error",
+            "SECRET-INFLATE-MARKER",
+            id="fetch-failed-xlsx-size-mismatch-raised-from-an-inflate-error",
+        ),
         pytest.param(
             RuntimeError("token=SECRET-TOKEN-MARKER"),
             logging.ERROR,
@@ -2733,3 +2763,54 @@ async def test_run_logs_name_failures_by_code_without_their_text_or_traceback(
     assert all(entry.exc_info is None for entry in caplog.records)
     assert marker not in caplog.text
     assert "Traceback" not in caplog.text
+
+
+def _literal_fetch_failed_reasons() -> dict[str, str]:
+    """Each string literal a module of the ingestion package passes to ``FetchFailed`` as its
+    reason, mapped to the first module (its path within the package) that raises it. A reason
+    built at run time, such as ``f"http_{status}"`` or ``f"unreadable_file:{type}"``, is not a
+    literal; the cases above cover those."""
+    package = Path(base.__file__).parent
+    reasons: dict[str, str] = {}
+    for module in sorted(package.rglob("*.py")):
+        for node in ast.walk(ast.parse(module.read_text(encoding="utf-8"), filename=str(module))):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name | ast.Attribute)
+                and (node.func.id if isinstance(node.func, ast.Name) else node.func.attr)
+                == "FetchFailed"
+            ):
+                continue
+            reason = next(
+                (keyword.value for keyword in node.keywords if keyword.arg == "reason"),
+                node.args[1] if len(node.args) > 1 else None,
+            )
+            if isinstance(reason, ast.Constant) and isinstance(reason.value, str):
+                reasons.setdefault(reason.value, module.relative_to(package).as_posix())
+    return reasons
+
+
+async def test_every_literal_fetch_failed_reason_of_the_ingestion_package_is_logged_by_its_code(
+    settings: TerminalSettings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed run names each reason code an ingestion module raises, so a code added to a
+    module but not to the codes a log line may carry fails here rather than logging a bare
+    ``fetch_failed``."""
+    reasons = _literal_fetch_failed_reasons()
+    assert {"http.py", "files/tabular_import.py"} <= set(reasons.values())
+    caplog.set_level(logging.DEBUG, logger=LOGGER)
+    for reason, module in sorted(reasons.items()):
+        caplog.clear()
+        error = FetchFailed("/srv/imports/SECRET-GUARD-MARKER/prices.xlsx", reason)
+        pipeline = _QuotePipeline(settings, cells=["1.00"], fetch_error=error)
+
+        result = await _execute(pipeline, _EngineDouble(), _HttpDouble())
+
+        # The documented code is the reason up to any ":".
+        code = reason.partition(":")[0]
+        (record,) = _warnings_and_errors(caplog)
+        assert (record.levelno, record.getMessage()) == (
+            logging.ERROR,
+            f"ingestion run {result.run_id} (test_quotes) failed: fetch_failed:{code}",
+        ), f"{reason!r}, raised in {module}"
+        assert "SECRET-GUARD-MARKER" not in caplog.text

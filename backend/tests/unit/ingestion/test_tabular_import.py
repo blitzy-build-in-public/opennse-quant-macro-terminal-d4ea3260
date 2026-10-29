@@ -31,7 +31,7 @@ from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Context, Decimal, localcontext
 from pathlib import Path
 from typing import Any, cast
 
@@ -659,6 +659,8 @@ def test_file_limits_and_formats() -> None:
         ("\ufeffTicker", "ticker"),
         ("Foreign\u00a0 Net\nFlow KES", "foreign_net_flow_kes"),
         (95, "95"),
+        # NUL is shown as U+2400 SYMBOL FOR NULL: the name never matches and can be recorded.
+        ("Close\x00 Price", "close\u2400_price"),
     ],
 )
 def test_normalize_column_name(header: object, column: str) -> None:
@@ -1348,14 +1350,54 @@ async def test_parse_rejects_a_repeated_header(tmp_path: Path) -> None:
     assert failure.value.found == ["ticker", "ticker", "trade_date", "close_price", "volume"]
 
 
-async def test_parse_rejects_an_empty_worksheet(tmp_path: Path) -> None:
-    pipeline, ctx = _open("equities", _write_xlsx(tmp_path / "equities.xlsx", {"Empty": []}))
+async def test_a_required_header_holding_nul_is_a_layout_change(tmp_path: Path) -> None:
+    # Cut at its NUL, "Close" would not match either; read whole, the header is recorded with
+    # the NUL shown as U+2400, which details.found (JSONB) can store.
+    path = tmp_path / "prices.csv"
+    path.write_bytes(b"Ticker,Trade Date,Close\x00 Price,Volume\nSCOM,2026-09-28,28.45,1000\n")
+    pipeline, ctx = _open("daily_prices", path)
+    raw = await pipeline.fetch(ctx)
+    with pytest.raises(SourceLayoutChanged) as failure:
+        pipeline.parse(raw)
+    assert (failure.value.expected, failure.value.found, failure.value.message) == (
+        ["ticker", "trade_date", "close_price", "volume"],
+        ["ticker", "trade_date", "close\u2400_price", "volume"],
+        "missing required columns for daily_prices: close_price",
+    )
+
+
+@pytest.mark.parametrize(
+    ("file_name", "write"),
+    [
+        pytest.param(
+            "equities.xlsx",
+            lambda path: _write_xlsx(path, {"Empty": []}),
+            id="empty-worksheet",
+        ),
+        pytest.param("equities.csv", lambda path: path.write_bytes(b""), id="zero-byte-csv"),
+        pytest.param(
+            "equities.csv", lambda path: path.write_bytes(b"\xef\xbb\xbf"), id="bom-only-csv"
+        ),
+        pytest.param(
+            "equities.csv", lambda path: path.write_bytes(b"\n\n"), id="line-breaks-only-csv"
+        ),
+        pytest.param("equities.csv", lambda path: path.write_bytes(b"\r\n"), id="crlf-only-csv"),
+    ],
+)
+async def test_parse_reports_an_empty_file_as_a_layout_change(
+    tmp_path: Path, file_name: str, write: Callable[[Path], object]
+) -> None:
+    # A CSV file without a cell is classified as an empty worksheet is, never as unreadable.
+    path = tmp_path / file_name
+    write(path)
+    pipeline, ctx = _open("equities", path)
     raw = await pipeline.fetch(ctx)
     with pytest.raises(SourceLayoutChanged) as failure:
         pipeline.parse(raw)
     assert failure.value.message == "the file is empty"
     assert failure.value.expected == ["ticker", "company_name", "sector", "shares_outstanding"]
     assert failure.value.found == []
+    assert classify_exception(failure.value) == (RunStatus.LAYOUT_CHANGED, "the file is empty")
 
 
 async def test_a_header_without_data_rows_is_below_the_minimum(tmp_path: Path) -> None:
@@ -1367,7 +1409,6 @@ async def test_a_header_without_data_rows_is_below_the_minimum(tmp_path: Path) -
 @pytest.mark.parametrize(
     ("file_name", "content", "reason"),
     [
-        pytest.param("prices.csv", b"", "unreadable_file:EmptyDataError", id="empty-csv"),
         pytest.param(
             "prices.csv",
             b"\xff\xfe\x00ticker",
@@ -1388,6 +1429,13 @@ async def test_a_header_without_data_rows_is_below_the_minimum(tmp_path: Path) -
         ),
         pytest.param(
             "prices.xlsx", b"not a workbook", "unreadable_file:BadZipFile", id="not-a-workbook"
+        ),
+        # Every private-use character U+E000..U+F8FF is taken, so none can stand in for NUL.
+        pytest.param(
+            "prices.csv",
+            b"ticker\n" + "".join(map(chr, range(0xE000, 0xF900))).encode() + b"\x00\n",
+            "unreadable_file:nul_byte",
+            id="nul-with-every-private-use-character",
         ),
     ],
 )
@@ -2327,6 +2375,162 @@ async def test_validate_rejects_a_row_with_its_reason_codes(
     assert staged.outcome.rejected == [RejectedRow(index=2, reason=reason, row=row)]
 
 
+PRICES_CSV_HEADER = b"Ticker,Trade Date,Close Price,Volume\n"
+KCB_PRICE_ROW = b"KCB,2026-09-28,40.10,500\n"
+KCB_PRICE_VALUES = {
+    "ticker": "KCB",
+    "trade_date": SESSION,
+    "close_price": Decimal("40.10"),
+    "volume": 500,
+    "turnover_kes": Decimal("20050.00"),
+    "turnover_estimated": True,
+}
+NUL_CELL_CASES = [
+    pytest.param(
+        "daily_prices",
+        b"ticker,trade_date,close_price,volume\n"
+        b"EQTY,2026-09-17,12\x0034.56,1\n"
+        b"KCB,2026-09-17,85.00,7\x00000\n",
+        [],
+        [
+            RejectedRow(
+                index=2,
+                reason="invalid_character:close_price",
+                row={
+                    "ticker": "EQTY",
+                    "trade_date": "2026-09-17",
+                    "close_price": "12\u240034.56",
+                    "volume": "1",
+                },
+            ),
+            RejectedRow(
+                index=3,
+                reason="invalid_character:volume",
+                row={
+                    "ticker": "KCB",
+                    "trade_date": "2026-09-17",
+                    "close_price": "85.00",
+                    "volume": "7\u2400000",
+                },
+            ),
+        ],
+        None,
+        id="numbers-are-not-cut-at-the-nul",
+    ),
+    pytest.param(
+        "daily_prices",
+        PRICES_CSV_HEADER + b"SCOM\x00,2026-09-28,28.45,1000\n" + KCB_PRICE_ROW,
+        [KCB_PRICE_VALUES],
+        [
+            RejectedRow(
+                index=2,
+                reason="invalid_character:ticker",
+                row={
+                    "ticker": "SCOM\u2400",
+                    "trade_date": "2026-09-28",
+                    "close_price": "28.45",
+                    "volume": "1000",
+                },
+            )
+        ],
+        None,
+        id="ticker-with-a-trailing-nul",
+    ),
+    pytest.param(
+        "daily_prices",
+        PRICES_CSV_HEADER + b"EQTY,2026-09-28,10.60,\x00\n" + KCB_PRICE_ROW,
+        [KCB_PRICE_VALUES],
+        [
+            RejectedRow(
+                index=2,
+                reason="invalid_character:volume",
+                row={
+                    "ticker": "EQTY",
+                    "trade_date": "2026-09-28",
+                    "close_price": "10.60",
+                    "volume": "\u2400",
+                },
+            )
+        ],
+        None,
+        id="nul-only-volume-is-not-an-empty-cell",
+    ),
+    pytest.param(
+        "fundamentals",
+        b"Ticker,Period End Date,Revenue KES\nSCOM,2026-03-31,\x00\n",
+        [],
+        [
+            RejectedRow(
+                index=2,
+                reason="invalid_character:revenue_kes",
+                row={"ticker": "SCOM", "period_end_date": "2026-03-31", "revenue_kes": "\u2400"},
+            )
+        ],
+        None,
+        id="nul-only-value-is-not-no-values",
+    ),
+    # U+E000, the first stand-in candidate, is the file's own text: it is kept verbatim, and only
+    # the cell holding NUL is rejected.
+    pytest.param(
+        "equities",
+        "Ticker,Company Name,Sector,Shares Outstanding\n"
+        "SCOM,Safaricom \ue000 PLC,Telecommunication,40065428000\n"
+        "KCB,Nul\x00Byte Co,Banking,3213462815\n".encode(),
+        [
+            {
+                "ticker": "SCOM",
+                "company_name": "Safaricom \ue000 PLC",
+                "sector": "Telecommunication",
+                "shares_outstanding": 40_065_428_000,
+            }
+        ],
+        [
+            RejectedRow(
+                index=3,
+                reason="invalid_character:company_name",
+                row={
+                    "ticker": "KCB",
+                    "company_name": "Nul\u2400Byte Co",
+                    "sector": "Banking",
+                    "shares_outstanding": "3213462815",
+                },
+            )
+        ],
+        None,
+        id="private-use-text-kept-beside-a-nul-text-cell",
+    ),
+    # A column the kind does not read is ignored, NUL or not; its name is recorded readable.
+    pytest.param(
+        "daily_prices",
+        b"Ticker,Trade Date,Close Price,Volume,No\x00tes\nKCB,2026-09-28,40.10,500,check\x00ed\n",
+        [KCB_PRICE_VALUES],
+        [],
+        ["no\u2400tes"],
+        id="ignored-column",
+    ),
+]
+
+
+@pytest.mark.parametrize(("kind", "content", "valid", "rejected", "ignored"), NUL_CELL_CASES)
+async def test_a_cell_holding_nul_is_rejected_whole_with_readable_evidence(
+    tmp_path: Path,
+    kind: ImportKind,
+    content: bytes,
+    valid: list[dict[str, object]],
+    rejected: list[RejectedRow],
+    ignored: list[str] | None,
+) -> None:
+    """pandas' C parser would cut each cell at its NUL ("12\\x0034.56" read as 12). The cell is
+    rejected instead, whatever its column, and the row's raw cells show the NUL as U+2400, which
+    ``details.rejected`` (JSONB) can store."""
+    path = tmp_path / f"{kind}.csv"
+    path.write_bytes(content)
+    staged = await _stage(kind, path)
+    assert _values(staged.outcome.valid) == valid
+    assert staged.outcome.rejected == rejected
+    assert staged.ctx.details.get("ignored_columns") == ignored
+
+
 async def test_validate_keeps_an_estimated_turnover_that_rounds_to_just_below_the_limit(
     tmp_path: Path,
 ) -> None:
@@ -2439,6 +2643,173 @@ async def test_extreme_cells_and_turnover_overflow_are_rejected_rows_under_the_t
     assert [(row.index, row.reason) for row in staged.outcome.rejected] == rejected
     parsed, count = len(staged.records), len(staged.outcome.rejected)
     assert evaluate_thresholds(parsed, count, TabularImportPipeline.min_rows) is status
+
+
+# --- Compact rows and memory ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "stored_as_int"),
+    [
+        pytest.param("close_price", Decimal("28.4500"), True, id="price-at-its-scale"),
+        pytest.param("close_price", Decimal("0.0000"), True, id="zero-at-its-scale"),
+        pytest.param("foreign_net_flow_kes", Decimal("-1250000.00"), True, id="negative-kes"),
+        pytest.param(
+            "turnover_kes", Decimal("9999999999999999999999.99"), True, id="largest-turnover"
+        ),
+        pytest.param("close_price", Decimal("28.45"), False, id="other-exponent-kept"),
+        pytest.param("close_price", Decimal("-0.0000"), False, id="negative-zero-kept"),
+        pytest.param("turnover_kes", Decimal("1E+3"), False, id="positive-exponent-kept"),
+    ],
+)
+def test_compact_row_reads_back_each_decimal_with_its_value_and_exponent(
+    column: str, value: Decimal, stored_as_int: bool
+) -> None:
+    row = tabular_import._RowLayouts().row({column: value})
+    # A decimal at its column's scale is held as its scaled integer; any other stays as it is.
+    assert (type(row.cells[0]) is int) is stored_as_int
+    # A caller's thread context (3 digits, rounding down) cannot change what is read back.
+    with localcontext(Context(prec=3, rounding=ROUND_DOWN)):
+        read = [row[column], row.get(column), dict(row)[column]]
+    assert [type(item) for item in read] == [Decimal] * 3
+    assert [item.as_tuple() for item in read if isinstance(item, Decimal)] == [value.as_tuple()] * 3
+
+
+def test_compact_row_is_a_read_only_mapping_equal_to_its_dict() -> None:
+    items: dict[str, object] = {
+        "ticker": "SCOM",
+        "trade_date": SESSION,
+        "close_price": Decimal("28.4500"),
+        "volume": 1_000,
+        "open_price": None,
+        "turnover_estimated": True,
+    }
+    row = tabular_import._RowLayouts().row(cast(Any, items))
+    assert row == items
+    assert items == row
+    assert row != {**items, "volume": 1_001}
+    assert row != {**items, "high_price": None}
+    assert list(row) == list(items)
+    assert list(row.items()) == list(items.items())
+    assert len(row) == len(items)
+    assert ("volume" in row, "high_price" in row) == (True, False)
+    assert (row.get("high_price"), row.get("high_price", "-")) == (None, "-")
+    assert row["turnover_estimated"] is True
+    assert type(row["volume"]) is int
+    with pytest.raises(KeyError):
+        _ = row["high_price"]
+    with pytest.raises(TypeError):
+        cast(Any, row)["volume"] = 2
+    # An amount is a Decimal or nothing: a float never enters a row.
+    with pytest.raises(TypeError, match="close_price holds float, expected Decimal"):
+        tabular_import._RowLayouts().row({"close_price": 28.45})
+
+
+def test_updated_compact_row_shares_unchanged_cells_and_keeps_column_places() -> None:
+    layouts = tabular_import._RowLayouts()
+    row = layouts.row({"ticker": "SCOM", "close_price": Decimal("28.4500"), "turnover_kes": None})
+    changes = {"turnover_kes": Decimal("28450.00"), "turnover_estimated": True}
+    updated = layouts.updated(row, changes)
+    assert list(updated.items()) == [
+        ("ticker", "SCOM"),
+        ("close_price", Decimal("28.4500")),
+        ("turnover_kes", Decimal("28450.00")),
+        ("turnover_estimated", True),
+    ]
+    assert [updated.cells[index] is row.cells[index] for index in (0, 1)] == [True, True]
+    assert row == {"ticker": "SCOM", "close_price": Decimal("28.4500"), "turnover_kes": None}
+    assert layouts.updated(row, changes).layout is updated.layout
+
+
+def test_raw_cells_map_each_column_to_its_text_and_refuse_a_nul() -> None:
+    layout = tabular_import._RowLayouts().layout(("ticker", "close_price", "volume"))
+    raw = tabular_import._RawCells(layout, "SCOM\x0028.45\x00")
+    assert raw == {"ticker": "SCOM", "close_price": "28.45", "volume": ""}
+    assert (list(raw), len(raw), "volume" in raw) == (["ticker", "close_price", "volume"], 3, True)
+    with pytest.raises(ValueError, match="must not hold NUL"):
+        tabular_import._RawCells(layout, "SC\x00OM\x0028.45\x00")
+
+
+@pytest.mark.parametrize(
+    ("limit", "shared"),
+    [
+        pytest.param(10_000, True, id="shared"),
+        pytest.param(1, False, id="table-emptied-when-full"),
+    ],
+)
+async def test_parse_shares_a_value_recurring_in_a_column_through_a_bounded_table(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, limit: int, shared: bool
+) -> None:
+    monkeypatch.setattr(tabular_import, "_SHARED_VALUES_LIMIT", limit)
+    path = _write_csv(
+        tmp_path / "prices.csv",
+        [
+            PRICE_HEADER,
+            ("SCOM", SESSION, "28.45", "12.5"),
+            ("SCOM", NEXT_SESSION, "28.45", "12.5"),
+            ("SCOM", SESSION, "28.45", "1,000"),
+        ],
+    )
+    staged = await _stage("daily_prices", path)
+    first, _, third = staged.records
+    # A text that fails is converted, and reported, every time it appears.
+    assert [record.errors for record in staged.records] == [("invalid_integer:volume",)] * 2 + [()]
+    assert third.values["trade_date"] == first.values["trade_date"] == SESSION
+    assert (third.values["trade_date"] is first.values["trade_date"]) is shared
+
+
+MEMORY_ROWS = 5_000
+# Peak bytes per row that tracemalloc sees while parse and validate hold a daily_prices file whose
+# prices, volumes and flows are all distinct, so no value is shared and the bound measures the
+# rows themselves. Measured on Python 3.12 with pandas 3.0.5: about 970 B/row with compact rows,
+# and 1,904 B/row with a dict of Decimals plus a dict of the frame's raw strings per record, which
+# took a 1,000,000-row import to about 1.8 GiB. 1,400 leaves over 40% headroom for allocator and
+# version differences and still fails rows of per-cell Decimals and dicts.
+MEMORY_BOUND_PER_ROW = 1_400
+
+
+def _distinct_price_rows(count: int) -> list[tuple[object, ...]]:
+    """``count`` rows of the daily_prices sample's nine columns, eight tickers per session, an
+    empty turnover (``validate`` estimates it) and a flow on every third row, every amount and
+    volume distinct."""
+    tickers = ("SCOM", "EQTY", "KCB", "EABL", "KEGN", "ABSA", "COOP", "NCBA")
+    rows: list[tuple[object, ...]] = []
+    for index in range(count):
+        close = Decimal(1_000 + index) / 100
+        rows.append(
+            (
+                tickers[index % len(tickers)],
+                date(1990, 1, 1) + timedelta(days=index // len(tickers)),
+                f"{close - Decimal('0.05'):.2f}",
+                f"{close + Decimal('0.50'):.2f}",
+                f"{close - Decimal('0.50'):.2f}",
+                f"{close:.2f}",
+                1_000 + index,
+                None,
+                f"{index - 25_000}.50" if index % 3 == 0 else None,
+            )
+        )
+    return rows
+
+
+async def test_parse_and_validate_hold_a_bounded_number_of_bytes_per_row(tmp_path: Path) -> None:
+    header = SAMPLES["daily_prices"].header
+    # pandas imports parts of itself on first use; a small file first keeps that out of the count.
+    await _stage(
+        "daily_prices", _write_csv(tmp_path / "warm.csv", [header, *_distinct_price_rows(8)])
+    )
+    path = _write_csv(tmp_path / "prices.csv", [header, *_distinct_price_rows(MEMORY_ROWS)])
+    pipeline, ctx = _open("daily_prices", path)
+    raw = await pipeline.fetch(ctx)
+    tracemalloc.start()
+    try:
+        records = pipeline.parse(raw)
+        outcome = pipeline.validate(records)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert (len(records), len(outcome.valid), outcome.rejected) == (MEMORY_ROWS, MEMORY_ROWS, [])
+    assert peak / MEMORY_ROWS < MEMORY_BOUND_PER_ROW
 
 
 # --- Reconcile -------------------------------------------------------------------------------

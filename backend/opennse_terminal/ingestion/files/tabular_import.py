@@ -32,9 +32,11 @@ Value rules (Rule 4): pandas reads every cell as text (``dtype=str``) and each c
 from ``str`` to ``Decimal``, ``int`` or ``date``, never through ``float``. Thousands separators are
 stripped, parentheses mean negative, and an empty cell (or ``-``, ``—``, ``–``, ``n/a``) is null.
 Dates are ``YYYY-MM-DD`` or ``DD/MM/YYYY``. Decimals are quantized ``ROUND_HALF_UP`` to the target
-column's scale. Units: ``*_kes`` whole KES (never thousands), ``*_pct`` percentage points,
-``fx_kes_usd`` KES per USD, ``fx_reserves_usd_m`` USD millions, share counts and volumes integers
-in 0..``MAX_SHARE_COUNT``. Currency defaults to KES.
+column's scale. A cell holding a NUL character is rejected whole (``invalid_character:<column>``),
+never read up to the NUL, and recorded text (headers, a rejected row's raw cells) shows each NUL
+as U+2400, because PostgreSQL stores no U+0000 in the run row. Units: ``*_kes`` whole KES (never
+thousands), ``*_pct`` percentage points, ``fx_kes_usd`` KES per USD, ``fx_reserves_usd_m`` USD
+millions, share counts and volumes integers in 0..``MAX_SHARE_COUNT``. Currency defaults to KES.
 
 Column types, scales, digit limits and text lengths are read from the ORM tables, so the
 pre-write checks mirror the database exactly and a bad row is rejected rather than aborting the
@@ -58,10 +60,21 @@ from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import (
+    MAX_EMAX,
+    MAX_PREC,
+    MIN_EMIN,
+    ROUND_HALF_UP,
+    Context,
+    Decimal,
+    Inexact,
+    InvalidOperation,
+    Overflow,
+    Rounded,
+)
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, ClassVar, Final, Literal, TypeGuard, get_args
+from typing import Any, ClassVar, Final, Literal, TypeGuard, TypeVar, get_args, overload
 
 # ``column`` and ``values`` are aliased: this module's loop variables named ``column`` would
 # shadow the bare names (F402).
@@ -358,6 +371,11 @@ _PCT_SUFFIX: Final = "_pct"
 # period_type is a code like the other three, so "fy" is read as FY rather than rejected.
 _UPPERCASE_COLUMNS: Final = frozenset({"ticker", "isin", "currency", "period_type"})
 _NULL_TOKENS: Final = frozenset({"", "-", "—", "–", "n/a"})
+_NUL: Final = "\x00"
+_NUL_EVIDENCE: Final = "\u2400"
+"""U+2400 SYMBOL FOR NULL: how a NUL character (U+0000) of the file is shown wherever its text is
+recorded, in normalized headers and in a rejected row's raw cells. PostgreSQL stores no U+0000 in
+TEXT or JSONB, so the run row's ``error_message`` and ``details`` must never carry one."""
 _ISIN_RE: Final = re.compile(r"KE[0-9A-Z]{9}[0-9]")
 _CURRENCY_RE: Final = re.compile(r"[A-Z]{3}")
 _ISO_DATE_RE: Final = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?: 00:00:00)?")
@@ -382,16 +400,277 @@ class TabularRecord:
         row_number: The 1-based line of the row in the file or sheet; the header is line 1, so
             the first data row is 2. Reported as ``RejectedRow.index``.
         values: Converted cells of the kind's columns present in the file (``None`` for empty
-            cells), plus values derived during validation and reconciliation.
-        errors: Conversion error codes, for example ``invalid_decimal:close_price`` or
-            ``out_of_range:volume``; a record with any is rejected.
-        raw: The original cell text of the kind's columns, recorded for rejected rows.
+            cells), plus values derived during validation and reconciliation, in that order. The
+            records this module builds hold a read-only compact mapping (:class:`_ValuesRow`) that
+            equals the ``dict`` of the same items and returns every ``Decimal`` with its exact
+            value and exponent.
+        errors: Conversion error codes, for example ``invalid_decimal:close_price``,
+            ``out_of_range:volume`` or ``invalid_character:ticker`` (a cell holding NUL); a record
+            with any is rejected.
+        raw: The original cell text of the kind's columns, in file order, recorded for rejected
+            rows, with each NUL character shown as U+2400. The records this module builds hold a
+            read-only mapping over one string per row (:class:`_RawCells`), never the parsed
+            file's own cell strings, so the parsed frame is freed once :meth:`parse` returns.
     """
 
     row_number: int
     values: Mapping[str, CellValue]
     errors: tuple[str, ...]
     raw: Mapping[str, str]
+
+
+# ---------------------------------------------------------------------------------------------
+# Compact rows
+# ---------------------------------------------------------------------------------------------
+#
+# A file of MAX_ROWS rows becomes as many records, held from parse until the last write. As dicts,
+# with every amount a 104-byte Decimal and the raw cells a second dict keeping the parsed frame's
+# strings alive, they took about 1.7 KB per row (a 1,000,000-row price file peaked near 1.8 GiB).
+# A compact row is one tuple of cells under a layout shared by every row with the same columns:
+# a decimal is stored as its exact scaled integer, a value recurring in a column is one shared
+# object (_SHARED_VALUES_LIMIT), and the raw cells are one string per row.
+
+_EXACT: Final = Context(
+    prec=MAX_PREC,
+    Emax=MAX_EMAX,
+    Emin=MIN_EMIN,
+    traps=[InvalidOperation, Inexact, Rounded, Overflow],
+)
+"""The context compact rows rescale decimals in: wide enough that ``scaleb`` never rounds, and
+trapping any inexact result, so the caller's thread context cannot change a value."""
+
+_SHARED_VALUES_LIMIT: Final = 10_000
+"""Most cell texts per column whose converted value one parse keeps for sharing. Conversion is a
+pure function of the column and the text, so rows holding the same text in a column (a ticker,
+a session date, a price that recurs) share one immutable value, converted once. The table of a
+column is emptied when full and refills from the rows that follow, so it stays bounded whatever
+the file holds and follows the file's order."""
+
+_ABSENT: Final = object()
+
+_T = TypeVar("_T")
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _RowLayout:
+    """The columns of compact rows, shared by every row with the same columns.
+
+    Attributes:
+        columns: The column names, in mapping order.
+        positions: The index of each column in ``columns`` (read-only).
+        scales: Per column, its ``COLUMN_SCALES`` entry for a decimal column, else ``None``.
+    """
+
+    columns: tuple[str, ...]
+    positions: Mapping[str, int]
+    scales: tuple[int | None, ...]
+
+
+def _row_layout(columns: tuple[str, ...]) -> _RowLayout:
+    """The layout of ``columns``; a repeated name raises ``ValueError``."""
+    positions = {column: index for index, column in enumerate(columns)}
+    if len(positions) != len(columns):
+        raise ValueError(f"a row layout repeats a column: {columns!r}")
+    return _RowLayout(
+        columns=columns,
+        positions=MappingProxyType(positions),
+        scales=tuple(COLUMN_SCALES.get(column) for column in columns),
+    )
+
+
+def _compact_cell(column: str, value: CellValue, scale: int | None) -> CellValue:
+    """``value`` as a compact row stores it in ``column``: for a decimal column (``scale`` set), a
+    ``Decimal`` whose exponent is ``-scale``, as every value this module quantizes is, becomes the
+    exact integer ``value * 10**scale``; any other value is stored as it is.
+
+    A negative zero stays a ``Decimal``, because the integer 0 would read back positive.
+
+    Raises:
+        TypeError: A decimal column is given something other than a ``Decimal`` or ``None``.
+    """
+    if scale is None or value is None:
+        return value
+    if not isinstance(value, Decimal):
+        raise TypeError(f"{column} holds {type(value).__name__}, expected Decimal")
+    if value.as_tuple().exponent == -scale and not (value.is_zero() and value.is_signed()):
+        return int(value.scaleb(scale, _EXACT))
+    return value
+
+
+def _expanded_cell(cell: CellValue, scale: int | None) -> CellValue:
+    """The value of a compact ``cell`` (:func:`_compact_cell`): a decimal column's integer back as
+    the identical ``Decimal``, its value and exponent both (``284500`` at scale 4 is
+    ``Decimal("28.4500")``); any other cell as it is."""
+    if scale is not None and type(cell) is int:
+        return Decimal(cell).scaleb(-scale, _EXACT)
+    return cell
+
+
+class _ValuesRow(Mapping[str, CellValue]):
+    """A record's converted values: a read-only mapping of its columns, in order, to their values,
+    equal to any mapping with the same items, a ``dict`` included.
+
+    The cells are one tuple under a shared :class:`_RowLayout`. A decimal cell is held as a scaled
+    integer and read as the identical ``Decimal`` (:func:`_expanded_cell`), whatever the caller's
+    ``decimal`` context.
+
+    Raises:
+        ValueError: ``cells`` does not hold one cell per column of ``layout``.
+    """
+
+    __slots__ = ("_cells", "_layout")
+
+    def __init__(self, layout: _RowLayout, cells: tuple[CellValue, ...]) -> None:
+        if len(cells) != len(layout.columns):
+            raise ValueError(f"{len(cells)} cells for {len(layout.columns)} columns")
+        self._layout = layout
+        self._cells = cells
+
+    @property
+    def layout(self) -> _RowLayout:
+        """The shared layout of the row's columns."""
+        return self._layout
+
+    @property
+    def cells(self) -> tuple[CellValue, ...]:
+        """The compact cells, in column order."""
+        return self._cells
+
+    def __getitem__(self, key: str) -> CellValue:
+        position = self._layout.positions[key]
+        return _expanded_cell(self._cells[position], self._layout.scales[position])
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._layout.columns)
+
+    def __len__(self) -> int:
+        return len(self._cells)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._layout.positions
+
+    @overload
+    def get(self, key: str, /) -> CellValue: ...
+
+    @overload
+    def get(self, key: str, default: CellValue | _T, /) -> CellValue | _T: ...
+
+    def get(self, key: str, default: object = None, /) -> object:
+        """The value of ``key``, or ``default`` when the row has no such column."""
+        position = self._layout.positions.get(key)
+        if position is None:
+            return default
+        return _expanded_cell(self._cells[position], self._layout.scales[position])
+
+    def as_dict(self) -> dict[str, CellValue]:
+        """A new ``dict`` of the row's items, in column order."""
+        layout = self._layout
+        # _expanded_cell, inlined: this runs once per row in validate.
+        return {
+            column: Decimal(cell).scaleb(-scale, _EXACT)
+            if scale is not None and type(cell) is int
+            else cell
+            for column, cell, scale in zip(layout.columns, self._cells, layout.scales, strict=True)
+        }
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self.as_dict()!r})"
+
+
+class _RawCells(Mapping[str, str]):
+    """A record's raw cells: a read-only mapping of the file's columns of the kind, in file order,
+    to their text, each NUL shown as U+2400; equal to any mapping with the same items.
+
+    The texts are held as one string joined by NUL, which none of them can contain, and are split
+    only when read, which happens for rejected rows alone.
+
+    Raises:
+        ValueError: ``joined`` does not hold exactly one text per column of ``layout``, as a text
+            holding NUL would make it.
+    """
+
+    __slots__ = ("_joined", "_layout")
+
+    def __init__(self, layout: _RowLayout, joined: str) -> None:
+        if joined.count(_NUL) != max(len(layout.columns) - 1, 0):
+            raise ValueError(f"raw cells for {len(layout.columns)} columns must not hold NUL")
+        self._layout = layout
+        self._joined = joined
+
+    def __getitem__(self, key: str) -> str:
+        position = self._layout.positions[key]
+        return self._joined.split(_NUL)[position]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._layout.columns)
+
+    def __len__(self) -> int:
+        return len(self._layout.columns)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._layout.positions
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({dict(self)!r})"
+
+
+class _RowLayouts:
+    """The layouts of one pipeline's compact rows, one per distinct column tuple, so that rows with
+    the same columns share one. A run builds a handful: the file's columns, and those the values
+    derived by validation or reconciliation add."""
+
+    __slots__ = ("_extended", "_layouts")
+
+    def __init__(self) -> None:
+        self._layouts: dict[tuple[str, ...], _RowLayout] = {}
+        # The layout of a row of each layout updated with each sequence of changed columns.
+        self._extended: dict[tuple[_RowLayout, tuple[str, ...]], _RowLayout] = {}
+
+    def layout(self, columns: tuple[str, ...]) -> _RowLayout:
+        """The shared layout of ``columns``."""
+        layout = self._layouts.get(columns)
+        if layout is None:
+            layout = self._layouts[columns] = _row_layout(columns)
+        return layout
+
+    def row(self, values: Mapping[str, CellValue]) -> _ValuesRow:
+        """A compact row of ``values``' items, in their order."""
+        layout = self.layout(tuple(values))
+        return _ValuesRow(
+            layout,
+            tuple(
+                _compact_cell(column, values[column], scale)
+                for column, scale in zip(layout.columns, layout.scales, strict=True)
+            ),
+        )
+
+    def updated(
+        self, values: Mapping[str, CellValue], changes: Mapping[str, CellValue]
+    ) -> _ValuesRow:
+        """A compact row of ``values`` updated with ``changes`` as ``dict.update`` would: a column
+        already present keeps its place and a new one is appended, in ``changes`` order. The
+        unchanged cells of a compact ``values`` are shared, never converted again."""
+        if not isinstance(values, _ValuesRow):
+            return self.row({**values, **changes})
+        base = values.layout
+        key = (base, tuple(changes))
+        layout = self._extended.get(key)
+        if layout is None:
+            added = tuple(column for column in changes if column not in base.positions)
+            layout = self._extended[key] = self.layout(base.columns + added)
+        cells = list(values.cells)
+        cells.extend(None for _ in range(len(layout.columns) - len(cells)))
+        positions = layout.positions
+        scales = layout.scales
+        for column, value in changes.items():
+            position = positions[column]
+            cells[position] = _compact_cell(column, value, scales[position])
+        return _ValuesRow(layout, tuple(cells))
+
+
+def _plain_values(values: Mapping[str, CellValue]) -> dict[str, CellValue]:
+    """A new ``dict`` of ``values``' items, in order."""
+    return values.as_dict() if isinstance(values, _ValuesRow) else dict(values)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -406,8 +685,10 @@ class _OutOfRangeError(ValueError):
 def normalize_column_name(name: object) -> str:
     """Normalize a header cell to a column name: BOM and zero-width spaces stripped, trimmed,
     lowercased and every run of whitespace replaced by one ``_`` (``"Close Price"`` gives
-    ``"close_price"``)."""
-    return normalize_header(str(name)).replace(" ", "_")
+    ``"close_price"``). A NUL character is shown as U+2400 (``"Close\\x00 Price"`` gives
+    ``"close␀_price"``), so a header holding one never matches a column name and its name can be
+    recorded."""
+    return normalize_header(str(name).replace(_NUL, _NUL_EVIDENCE)).replace(" ", "_")
 
 
 def _is_null(text: str | None) -> bool:
@@ -522,17 +803,56 @@ def _conversion_error(column: str, exc: ValueError) -> str:
     return f"invalid_{_COLUMN_RULES[column].type}:{column}"
 
 
-def _convert_row(row_number: int, cells: Mapping[str, str]) -> TabularRecord:
-    """Convert the kind's cells of one row; a failed cell becomes ``None`` plus an error code."""
-    values: dict[str, CellValue] = {}
+def _convert_row(
+    row_number: int,
+    layout: _RowLayout,
+    texts: Sequence[str],
+    shared: Sequence[dict[str, CellValue]],
+) -> TabularRecord:
+    """Convert one row's cells of the kind's columns, ``texts`` in ``layout`` order, into a record
+    of compact rows; a failed cell becomes ``None`` plus an error code.
+
+    A cell holding a NUL character fails whatever its column (``invalid_character:<column>``):
+    no prefix or remainder of its text is read as the value. The row's raw cells show each NUL
+    as U+2400, so the evidence of a rejected row stays storable.
+
+    ``shared`` holds, per column, compact values already converted from a text in this parse
+    (:data:`_SHARED_VALUES_LIMIT`); a text found there takes that value instead of a new one.
+    Only cells that convert are kept there, so every failure is converted, and reported, anew.
+    """
+    joined = _NUL.join(texts)
+    holds_nul = joined.count(_NUL) > len(texts) - 1
+    if holds_nul:
+        joined = _NUL.join(text.replace(_NUL, _NUL_EVIDENCE) for text in texts)
+    cells: list[CellValue] = []
     errors: list[str] = []
-    for column, text in cells.items():
+    for column, text, scale, known in zip(
+        layout.columns, texts, layout.scales, shared, strict=True
+    ):
+        if holds_nul and _NUL in text:
+            cells.append(None)
+            errors.append(f"invalid_character:{column}")
+            continue
+        if text in known:
+            cells.append(known[text])
+            continue
         try:
-            values[column] = _convert_cell(column, text)
+            value = _convert_cell(column, text)
         except ValueError as exc:
-            values[column] = None
+            cells.append(None)
             errors.append(_conversion_error(column, exc))
-    return TabularRecord(row_number=row_number, values=values, errors=tuple(errors), raw=cells)
+            continue
+        cell = _compact_cell(column, value, scale)
+        if len(known) >= _SHARED_VALUES_LIMIT:
+            known.clear()
+        known[text] = cell
+        cells.append(cell)
+    return TabularRecord(
+        row_number=row_number,
+        values=_ValuesRow(layout, tuple(cells)),
+        errors=tuple(errors),
+        raw=_RawCells(layout, joined),
+    )
 
 
 # Typed accessors: record values are a union, and the rules below need the concrete type. A
@@ -942,6 +1262,37 @@ def _preflight_xlsx(raw: bytes, source: str) -> None:
             _verify_member(raw, member, source)
 
 
+# pandas' C parser ends every cell at its first NUL byte, silently dropping the rest of the text
+# ("12\x0034.56" reads as "12"). So each NUL of a CSV file is parsed as a character the file does
+# not otherwise contain, drawn from the Basic Multilingual Plane's private-use area, and turned
+# back into NUL in every cell read.
+_PRIVATE_USE_FIRST: Final = 0xE000
+_PRIVATE_USE_LAST: Final = 0xF8FF
+# The UTF-8 forms of U+E000..U+F8FF: EE 80 80 .. EE BF BF, then EF 80 80 .. EF A3 BF. In valid
+# UTF-8 an EE or EF byte only ever starts such a three-byte sequence.
+_PRIVATE_USE_UTF8_RE: Final = re.compile(rb"\xee[\x80-\xbf][\x80-\xbf]|\xef[\x80-\xa3][\x80-\xbf]")
+
+
+def _nul_stand_in(raw: bytes, source: str) -> str:
+    """The lowest private-use character (U+E000..U+F8FF) the file ``raw`` does not contain.
+
+    One pass over ``raw`` collects the private-use characters it holds, each once, so the cost is
+    linear in the file's size whatever it holds. Replacing every NUL byte with the character's
+    UTF-8 form keeps the file exactly as valid or invalid UTF-8 as it was: a NUL is never part of
+    a multi-byte sequence, and the replacement is a whole one.
+
+    Raises:
+        FetchFailed: ``unreadable_file:nul_byte`` when the file holds every private-use character,
+            so none can stand in for NUL.
+    """
+    present = {match.group() for match in _PRIVATE_USE_UTF8_RE.finditer(raw)}
+    for code_point in range(_PRIVATE_USE_FIRST, _PRIVATE_USE_LAST + 1):
+        candidate = chr(code_point)
+        if candidate.encode() not in present:
+            return candidate
+    raise FetchFailed(source, "unreadable_file:nul_byte")
+
+
 def _read_grid(
     raw: bytes, *, suffix: str, sheet: str | None, source: str
 ) -> tuple[int, Iterator[list[str]]]:
@@ -953,6 +1304,11 @@ def _read_grid(
     data row (``header=None``) because pandas would otherwise rename a repeated header to
     ``name.1``, hiding the duplicate. CSV blank lines are kept, so row index + 1 is the line.
 
+    pandas' C parser would cut a CSV cell at its first NUL byte, so a file holding one is parsed
+    with each NUL replaced by a private-use character it does not otherwise contain
+    (:func:`_nul_stand_in`), which every cell read turns back into NUL: each cell text is the
+    file's exactly, NULs included, for :func:`_convert_row` to reject.
+
     The file is parsed as one frame, never in pandas chunks: the C parser widens a short row to
     the table's width only within a chunk, so a chunk starting with a short or blank line fails
     the full rows after it, and one starting with an over-long line silently drops its extra
@@ -962,12 +1318,15 @@ def _read_grid(
         The number of rows, the header line included, and an iterator that converts the frame
         to a list of cell texts one row at a time, in file order. No grid of the whole file is
         built: the frame is the only copy of the file's cells, and it is released once the
-        iterator is exhausted or dropped.
+        iterator is exhausted or dropped. A CSV file in which no line holds a cell (0 bytes, a
+        BOM alone, only line breaks) has 0 rows, like an empty worksheet.
 
     Raises:
         SourceLayoutChanged: The named sheet is not in the workbook.
-        FetchFailed: The file cannot be decoded or parsed (``unreadable_file:<error>``), it
-            has more than :data:`MAX_ROWS` rows after the header (``too_many_rows``), or an
+        FetchFailed: The file cannot be decoded or parsed (``unreadable_file:<error>``), a CSV
+            file holding NUL also holds every private-use character
+            (``unreadable_file:nul_byte``), it has more than :data:`MAX_ROWS` rows after the
+            header (``too_many_rows``), or an
             ``.xlsx`` archive fails a check of :func:`_preflight_xlsx`
             (``xlsx_too_many_members``, ``xlsx_expanded_too_large``,
             ``xlsx_unsupported_member``, ``xlsx_worksheet_too_large``,
@@ -977,17 +1336,26 @@ def _read_grid(
 
     # One row more than allowed after the header, so an oversize file is detected, not cut.
     row_cap = MAX_ROWS + 2
+    stand_in: str | None = None
     try:
         if suffix == ".csv":
-            frame = pd.read_csv(
-                io.BytesIO(raw),
-                header=None,
-                dtype=str,
-                keep_default_na=False,
-                skip_blank_lines=False,
-                encoding="utf-8-sig",
-                nrows=row_cap,
-            )
+            if _NUL.encode() in raw:
+                stand_in = _nul_stand_in(raw, source)
+                raw = raw.replace(_NUL.encode(), stand_in.encode())
+            try:
+                frame = pd.read_csv(
+                    io.BytesIO(raw),
+                    header=None,
+                    dtype=str,
+                    keep_default_na=False,
+                    skip_blank_lines=False,
+                    encoding="utf-8-sig",
+                    nrows=row_cap,
+                )
+            except pd.errors.EmptyDataError:
+                # No line holds a cell (0 bytes, a BOM alone, only line breaks): the file has no
+                # rows, as an empty worksheet has none, and parse reports it as a layout change.
+                return 0, iter(())
         else:
             # openpyxl parses the shared strings and the other non-worksheet parts whole while
             # the workbook opens, before nrows applies, so the archive is bounded first.
@@ -1011,8 +1379,8 @@ def _read_grid(
     except IngestionError:
         raise
     except Exception as exc:
-        # Untrusted input: any decoder or parser failure (ParserError, EmptyDataError,
-        # UnicodeDecodeError, BadZipFile, a corrupt workbook) ends the run failed, named by type.
+        # Untrusted input: any decoder or parser failure (ParserError, UnicodeDecodeError,
+        # BadZipFile, a corrupt workbook) ends the run failed, named by type.
         raise FetchFailed(source, f"unreadable_file:{type(exc).__name__}") from exc
     if len(frame) > MAX_ROWS + 1:
         raise FetchFailed(source, "too_many_rows")
@@ -1021,10 +1389,14 @@ def _read_grid(
         # dtype=str cells are text, or NA for an empty cell or a short row. NA becomes "" here,
         # tested only on cells that are not text, so the frame is never copied to fill it.
         for row in frame.itertuples(index=False, name=None):
-            yield [
+            cells = [
                 cell if isinstance(cell, str) else "" if pd.isna(cell) else str(cell)
                 for cell in row
             ]
+            if stand_in is None:
+                yield cells
+            else:
+                yield [cell.replace(stand_in, _NUL) for cell in cells]
 
     return len(frame), rows()
 
@@ -1177,6 +1549,8 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         # context, and their log lines name the run by its id, never by the file's name.
         self._details: dict[str, Any] = {}
         self._run_id: uuid.UUID | None = None
+        # The layouts of this run's compact rows, shared by every record with the same columns.
+        self._layouts = _RowLayouts()
 
     @property
     def run_name(self) -> str:
@@ -1247,16 +1621,23 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
 
         The rows are taken one at a time from :func:`_read_grid`, the first as the header and the
         rest as data rows numbered from line 2, so only the parsed frame and the records exist
-        at once, never a grid of the whole file. Headers are normalized with
+        at once, never a grid of the whole file. Each record holds compact rows
+        (:class:`TabularRecord`) whose raw cells are one new string per row, so nothing of the
+        frame but the text values themselves outlives this call; a value recurring in a column is
+        converted once and shared (:data:`_SHARED_VALUES_LIMIT`). Headers are normalized with
         :func:`normalize_column_name`. Columns the kind does not read are ignored and named in
         ``details.ignored_columns``; the WARNING logged for them carries only the run id, the kind
-        and their count, never the file's name or its headers. Rows whose kind columns are all
-        empty are skipped (``details.blank_rows_skipped``). Conversion failures are collected on
-        each record for :meth:`validate`; nothing is raised per row.
+        and their count, never the file's name or its headers. A NUL character in a header is
+        shown as U+2400, so that header matches no column. Rows whose kind columns are all empty
+        are skipped (``details.blank_rows_skipped``); a cell holding NUL is not empty.
+        Conversion failures, ``invalid_character:<col>`` for a cell holding NUL included, are
+        collected on each record for :meth:`validate`; nothing is raised per row.
 
         Raises:
-            SourceLayoutChanged: No header row, a repeated header, a missing required header, or
-                (``.xlsx``) a missing sheet.
+            SourceLayoutChanged: No header row (``the file is empty``, with the required headers
+                expected and none found, for a CSV file without a cell as for an empty
+                worksheet), a repeated header, a missing required header, or (``.xlsx``) a
+                missing sheet.
             FetchFailed: The file cannot be read, it has more than :data:`MAX_ROWS` rows, or an
                 ``.xlsx`` archive would expand beyond the ``MAX_XLSX_*`` limits.
         """
@@ -1295,18 +1676,18 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
                 len(ignored),
             )
 
+        layout = self._layouts.layout(tuple(positions))
+        indexes = tuple(positions.values())
+        shared: list[dict[str, CellValue]] = [{} for _ in indexes]
         records: list[TabularRecord] = []
         blank = 0
         # The header is line 1 and has been taken, so the first data row is line 2.
         for line, row in enumerate(rows, start=2):
-            cells = {
-                column: row[index] if index < len(row) else ""
-                for column, index in positions.items()
-            }
-            if all(not text.strip() for text in cells.values()):
+            texts = [row[index] if index < len(row) else "" for index in indexes]
+            if all(not text.strip() for text in texts):
                 blank += 1
                 continue
-            records.append(_convert_row(line, cells))
+            records.append(_convert_row(line, layout, texts, shared))
         if blank:
             self._details["blank_rows_skipped"] = blank
         return records
@@ -1317,7 +1698,8 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         """Reject rows that would break a rule or a database constraint, and derive defaults.
 
         Every kind: a conversion error (``invalid_decimal:<col>``, ``invalid_integer:<col>``,
-        ``invalid_date:<col>``, ``out_of_range:<col>``), an empty required cell
+        ``invalid_date:<col>``, ``out_of_range:<col>``, or ``invalid_character:<col>`` for a cell
+        of any type holding a NUL character), an empty required cell
         (``missing_value:<col>``) or text longer than its column (``too_long:<col>``); an
         ``isin`` not matching ``KE`` + 9 alphanumerics + a digit (``invalid_isin``); a
         ``currency`` that is not three letters (``invalid_currency``).
@@ -1334,13 +1716,19 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
           (``no_values``).
         - ``macro_indicators``: a row with no indicator value (``no_values``).
 
-        Rejected rows are reported with their line number, the codes joined by ``;`` and their
-        raw cells.
+        A cell that failed to convert is reported by its conversion code only, never also as
+        ``missing_value`` or ``no_values``. Rejected rows are reported with their line number, the
+        codes joined by ``;`` and their raw cells (NUL shown as U+2400). An accepted row whose
+        values gained defaults or derived values is a new record whose compact row shares every
+        unchanged cell; any other accepted row is returned as it is.
         """
         valid: list[TabularRecord] = []
         rejected: list[RejectedRow] = []
         for record in records:
-            values = dict(record.values)
+            # The checks read and fill a plain dict, one row at a time; an accepted row keeps a
+            # compact row again, sharing every cell the checks left unchanged.
+            original = _plain_values(record.values)
+            values = dict(original)
             codes = list(record.errors)
             failed = {code.partition(":")[2] for code in record.errors}
             codes.extend(
@@ -1354,8 +1742,17 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
                 rejected.append(
                     RejectedRow(index=record.row_number, reason=";".join(codes), row=record.raw)
                 )
-            else:
-                valid.append(replace(record, values=values))
+                continue
+            changes = {
+                column: value
+                for column, value in values.items()
+                if original.get(column, _ABSENT) is not value
+            }
+            valid.append(
+                replace(record, values=self._layouts.updated(record.values, changes))
+                if changes
+                else record
+            )
         return ValidationOutcome(valid=valid, rejected=rejected)
 
     def _check_kind(self, values: dict[str, CellValue], failed: set[str]) -> list[str]:
@@ -1418,7 +1815,7 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         if not unique:
             return ValidationOutcome(valid=[], rejected=[])
         if self.kind == "equities":
-            return await _reconcile_equities(ctx.conn, unique)
+            return await _reconcile_equities(ctx.conn, unique, self._layouts)
         if self.kind in ("daily_prices", "fundamentals"):
             return await self._reconcile_tickers(ctx.conn, unique)
         if self.kind == "foreign_flows":
@@ -1629,9 +2026,10 @@ def _check_prices(values: dict[str, CellValue]) -> list[str]:
 
 
 async def _reconcile_equities(
-    conn: AsyncConnection, records: list[TabularRecord]
+    conn: AsyncConnection, records: list[TabularRecord], layouts: _RowLayouts
 ) -> ValidationOutcome[TabularRecord]:
-    """Reject ISIN conflicts and complete each row with the stored values it leaves empty."""
+    """Reject ISIN conflicts and complete each row with the stored values it leaves empty; each
+    completed row is a compact row of ``layouts``."""
     tickers = sorted({_required_text(record.values, "ticker") for record in records})
     stored: dict[str, tuple[str | None, Decimal | None, str]] = {}
     for chunk in _chunks(tickers):
@@ -1677,10 +2075,14 @@ async def _reconcile_equities(
         )
         free_float = _decimal(values, "free_float_pct")
         currency = _text(values, "currency")
-        completed = dict(values)
-        completed["isin"] = isin if isin is not None else stored_isin
-        completed["free_float_pct"] = free_float if free_float is not None else stored_free_float
-        completed["currency"] = currency if currency is not None else stored_currency
+        completed = layouts.updated(
+            values,
+            {
+                "isin": isin if isin is not None else stored_isin,
+                "free_float_pct": free_float if free_float is not None else stored_free_float,
+                "currency": currency if currency is not None else stored_currency,
+            },
+        )
         valid.append(replace(record, values=completed))
     return ValidationOutcome(valid=valid, rejected=rejected)
 

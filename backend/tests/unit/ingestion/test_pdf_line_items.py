@@ -2,16 +2,26 @@
 
 Every PDF is written in the test by ``helpers.pdf_builder``: minimal PDF 1.4 text documents that
 draw each cell at a given x-position, so statement column layouts are reproduced without
-committing or downloading any third-party report. The extractor reads them with pdfplumber; no
-OCR is involved. Expected values are literals taken from the extraction contract (scale markers,
-column evidence, the debt rule, EBITDA derivation, share counts, statuses and warnings), never
-recomputed with the code under test. Numbers are exact ``Decimal`` values throughout.
+committing or downloading any third-party report. Hostile documents (decompression bombs,
+operator floods, lying cross-reference streams, page trees without pages) are written by
+``raw_pdf`` below, compressed in the test so each file stays small. The extractor reads them with
+pdfplumber; no OCR is involved. Expected values are literals taken from the extraction contract
+(scale markers, column evidence, the debt rule, EBITDA derivation, share counts, statuses and
+warnings), never recomputed with the code under test. Numbers are exact ``Decimal`` values
+throughout.
 
-Nothing here touches the network, a database or the settings.
+Extraction cases call the in-process ``_extract``; rejections, the parse limits and a full round
+trip go through ``extract_line_items`` and its parser process. Nothing here touches the network,
+a database or the settings.
 """
 
+import functools
 import hashlib
-from collections.abc import Sequence
+import logging
+import sys
+import time
+import zlib
+from collections.abc import Mapping, Sequence
 from datetime import date
 from decimal import Decimal
 
@@ -104,7 +114,10 @@ def extract(
     items: Sequence[str] = LINE_ITEMS,
     period_end_date: date | None = None,
 ) -> ExtractionResult:
-    return extract_line_items(build_pdf(pages), items, period_end_date=period_end_date)
+    """``extract_line_items`` without its parser process: the same validation and extraction,
+    run in this process so a case can observe or patch the module's internals."""
+    requested = pdf_line_items._requested_items(items)
+    return pdf_line_items._extract(build_pdf(pages), requested, period_end_date, 400)
 
 
 def only_item(result: ExtractionResult) -> ExtractedLineItem:
@@ -2091,8 +2104,8 @@ def test_rejection_errors_are_value_errors() -> None:
     assert issubclass(TooManyPages, ValueError)
 
 
-# pdfplumber's close() lists the pages again, so a page tree that cannot be listed also fails to
-# close, with the same raw error; that error must never replace the PdfUnreadable raised for it.
+# Pages are enumerated directly from pdfminer's page generator, so the raw error is the cause; it
+# never escapes as itself or as pdfplumber's wrapper.
 @pytest.mark.parametrize(
     ("old", "new", "raw_error", "message"),
     [
@@ -2111,7 +2124,7 @@ def test_rejection_errors_are_value_errors() -> None:
         (
             b"/MediaBox [0 0 ",
             b"/MediaBox [/a /b ",
-            PdfminerException,
+            TypeError,
             "the PDF could not be parsed (TypeError)",
         ),
     ],
@@ -2123,7 +2136,7 @@ def test_page_tree_that_cannot_be_listed_is_unreadable(
     pdf_bytes = build_pdf([text_page(["Revenue 1,234"])]).replace(old, new)
 
     with pytest.raises(PdfUnreadable) as raised:
-        extract_line_items(pdf_bytes)
+        pdf_line_items._extract(pdf_bytes, list(LINE_ITEMS), None, 400)
 
     assert type(raised.value) is PdfUnreadable
     assert not isinstance(raised.value, TypeError | IndexError | PdfminerException)
@@ -2131,63 +2144,394 @@ def test_page_tree_that_cannot_be_listed_is_unreadable(
     assert type(raised.value.__cause__) is raw_error
 
 
-def _failing_close(monkeypatch: pytest.MonkeyPatch) -> list[pdfplumber.PDF]:
-    """Make pdfplumber's ``PDF.close`` close the document and then raise ``OSError``; the list
-    returned collects every document it was called on."""
-    closed: list[pdfplumber.PDF] = []
-    real_close = pdfplumber.PDF.close
+# ---------------------------------------------------------------------------------------------
+# Hostile PDFs and the parse limits
+# ---------------------------------------------------------------------------------------------
 
-    def close(pdf: pdfplumber.PDF) -> None:
-        closed.append(pdf)
-        real_close(pdf)
-        raise OSError("the document stream could not be closed")
+MIB = 1 << 20
+CATALOG = b"<< /Type /Catalog /Pages 2 0 R >>"
+ONE_PAGE_TREE = b"<< /Type /Pages /Kids [4 0 R] /Count 1 >>"
+HELVETICA = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+# An income statement whose revenue reads 1,234 in KShs '000.
+STATEMENT_TEXT = b"".join(
+    b"BT /F1 9 Tf 1 0 0 1 %d %d Tm (%s) Tj ET\n" % cell
+    for cell in [
+        (50, 800, b"Statement of profit or loss"),
+        (50, 780, b"KShs '000"),
+        (400, 760, b"2025"),
+        (480, 760, b"2024"),
+        (50, 740, b"Revenue"),
+        (400, 740, b"1,234"),
+        (480, 740, b"1,100"),
+    ]
+)
+TEXT_OPERATOR = b"BT /F1 9 Tf 1 0 0 1 50 700 Tm (A) Tj ET\n"
 
-    monkeypatch.setattr(pdfplumber.PDF, "close", close)
-    return closed
+
+def raw_pdf(objects: Mapping[int, bytes], *, offset_shift: int = 0) -> bytes:
+    """A PDF 1.4 file of the numbered object bodies (object 1 is the catalog) with a classic xref
+    table, every offset in it moved by ``offset_shift`` bytes (0: exact)."""
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: dict[int, int] = {}
+    for number in sorted(objects):
+        offsets[number] = len(out)
+        out += b"%d 0 obj\n%s\nendobj\n" % (number, objects[number])
+    size = max(objects) + 1
+    xref_offset = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % size
+    for number in range(1, size):
+        if number in offsets:
+            out += b"%010d 00000 n \n" % (offsets[number] + offset_shift)
+        else:
+            out += b"0000000000 65535 f \n"
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (size, xref_offset)
+    return bytes(out)
+
+
+def stream_object(data: bytes, entries: bytes = b"") -> bytes:
+    return b"<< %s/Length %d >>\nstream\n%s\nendstream" % (entries, len(data), data)
+
+
+def page_object(contents: bytes, resources: bytes = b"") -> bytes:
+    return (
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> "
+        + resources
+        + b">> /Contents "
+        + contents
+        + b" >>"
+    )
+
+
+@functools.cache
+def flate_of_repeated(unit: bytes, size: int) -> bytes:
+    """zlib data decoding to ``unit`` repeated to ``size`` bytes, compressed piece by piece so the
+    decoded form is never held."""
+    compressor = zlib.compressobj(9)
+    piece = unit * (MIB // len(unit))
+    parts: list[bytes] = []
+    written = 0
+    while written < size:
+        chunk = piece[: size - written]
+        parts.append(compressor.compress(chunk))
+        written += len(chunk)
+    parts.append(compressor.flush())
+    return b"".join(parts)
+
+
+def flood_pdf(layout: str, unit: bytes, size: int) -> bytes:
+    """A one-page statement PDF that also draws ``size`` decoded bytes of ``unit``.
+
+    ``content_stream``: a second, Flate-compressed content stream of the page. ``form_xobject``:
+    a Flate-compressed Form XObject the page draws. ``nested_form_xobject``: that form, drawn by
+    another form through the outer form's own resources. ``two_content_streams``: two content
+    streams of ``size // 2`` bytes each.
+    """
+    flood = flate_of_repeated(unit, size)
+    flate = b"/Filter /FlateDecode "
+    form = b"/Type /XObject /Subtype /Form /BBox [0 0 595 842] " + flate
+    objects = {1: CATALOG, 2: ONE_PAGE_TREE, 3: HELVETICA}
+    if layout == "content_stream":
+        objects |= {4: page_object(b"[6 0 R 5 0 R]"), 5: stream_object(flood, flate)}
+        objects[6] = stream_object(STATEMENT_TEXT)
+    elif layout == "two_content_streams":
+        half = flate_of_repeated(unit, size // 2)
+        objects |= {4: page_object(b"[6 0 R 5 0 R 7 0 R]"), 5: stream_object(half, flate)}
+        objects |= {6: stream_object(STATEMENT_TEXT), 7: stream_object(half, flate)}
+    elif layout == "form_xobject":
+        objects |= {4: page_object(b"6 0 R", b"/XObject << /Fm1 5 0 R >> ")}
+        objects |= {5: stream_object(flood, form), 6: stream_object(STATEMENT_TEXT + b"/Fm1 Do\n")}
+    elif layout == "nested_form_xobject":
+        outer = b"/Type /XObject /Subtype /Form /BBox [0 0 595 842] "
+        outer += b"/Resources << /XObject << /Fm1 5 0 R >> >> "
+        objects |= {4: page_object(b"6 0 R", b"/XObject << /Fm2 7 0 R >> ")}
+        objects |= {5: stream_object(flood, form), 6: stream_object(STATEMENT_TEXT + b"/Fm2 Do\n")}
+        objects[7] = stream_object(b"/Fm1 Do\n", outer)
+    else:
+        raise ValueError(f"unknown layout {layout!r}")
+    return raw_pdf(objects)
+
+
+def xref_stream_pdf(widths: bytes, entries: bytes, claimed: int, entries_filter: bytes) -> bytes:
+    """A valid one-page PDF whose cross-reference section is replaced by an xref stream that
+    lists ``claimed`` objects from 0, with the given field ``widths`` and ``entries`` data."""
+    statement = build_pdf([text_page(["Revenue 1,234"])])
+    body = statement[: statement.index(b"xref")]
+    xref = stream_object(
+        entries,
+        b"/Type /XRef /Size %d /W [%s] /Index [0 %d] /Root 1 0 R %s"
+        % (claimed, widths, claimed, entries_filter),
+    )
+    return body + b"9 0 obj\n%s\nendobj\nstartxref\n%d\n%%%%EOF\n" % (xref, len(body))
+
+
+def many_pages_pdf(count: int, count_entry: bytes) -> bytes:
+    """``count`` real page objects sharing one statement content stream, the page tree carrying
+    ``count_entry`` (``/Count n`` or nothing)."""
+    kids = b" ".join(b"%d 0 R" % (5 + index) for index in range(count))
+    objects = {
+        1: CATALOG,
+        2: b"<< /Type /Pages /Kids [" + kids + b"] " + count_entry + b" >>",
+        3: HELVETICA,
+        4: stream_object(STATEMENT_TEXT),
+    }
+    objects |= {5 + index: page_object(b"4 0 R") for index in range(count)}
+    return raw_pdf(objects)
+
+
+def forbid_whole_document_pages(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make pdfplumber's ``PDF.pages`` and ``PDF.close`` fail: both list every page of the
+    document, which the extractor must never do."""
+
+    def fail(*_: object) -> None:
+        raise AssertionError("pdfplumber listed every page of the document")
+
+    monkeypatch.setattr(pdfplumber.PDF, "pages", property(fail))
+    monkeypatch.setattr(pdfplumber.PDF, "close", fail)
+
+
+XREF_STREAM_SHORT = "the PDF's cross-reference stream lists more objects than it holds entries for"
+
+
+# pdfminer enumerates every listed object id when it cannot find the page tree, about 20 us each:
+# these files would take hours. Each is rejected before any page is enumerated.
+@pytest.mark.parametrize(
+    ("widths", "entries", "claimed", "entries_filter", "message"),
+    [
+        (b"1 1000000 1", bytes(16), 999_999_999, b"", XREF_STREAM_SHORT),
+        (b"1 1 1", b"\x01\x00\x00", 999_999_999, b"", XREF_STREAM_SHORT),
+        # Every entry is present, but 3 MB of entries compress to a few KB: a million objects
+        # cannot fit in a file that small.
+        (
+            b"1 1 1",
+            flate_of_repeated(b"\x01\x00\x00", 3_000_000),
+            1_000_000,
+            b"/Filter /FlateDecode",
+            "the PDF's cross-reference sections list more objects than it holds",
+        ),
+    ],
+    ids=["entries_a_megabyte_wide", "one_entry_for_a_billion", "more_objects_than_bytes"],
+)
+def test_cross_reference_stream_claiming_absent_objects_is_unreadable(
+    widths: bytes, entries: bytes, claimed: int, entries_filter: bytes, message: str
+) -> None:
+    pdf_bytes = xref_stream_pdf(widths, entries, claimed, entries_filter)
+    started = time.monotonic()
+
+    with pytest.raises(PdfUnreadable) as raised:
+        extract_line_items(pdf_bytes)
+
+    assert str(raised.value) == message
+    assert time.monotonic() - started < 10
+
+
+@pytest.mark.parametrize("unit", [b" ", b"q Q\n", TEXT_OPERATOR], ids=["spaces", "q_Q", "text"])
+@pytest.mark.parametrize("layout", ["content_stream", "form_xobject"])
+def test_page_content_over_the_budget_is_rejected_before_it_is_decoded(
+    layout: str, unit: bytes
+) -> None:
+    # 16 MiB decoded from a file of a few KB: a decompression bomb of whitespace, and floods of
+    # no-op and text operators that pdfminer would interpret one by one.
+    pdf_bytes = flood_pdf(layout, unit, 16 * MIB)
+    assert len(pdf_bytes) < 200_000
+
+    with pytest.raises(PdfUnreadable) as raised:
+        extract_line_items(pdf_bytes)
+
+    assert str(raised.value) == "page 1 has more than 8 MiB of decoded content"
 
 
 @pytest.mark.parametrize(
-    ("pdf_bytes", "max_pages", "error"),
+    ("layout", "size"),
+    [("nested_form_xobject", 16 * MIB), ("two_content_streams", 16 * MIB)],
+    ids=["form_drawn_by_a_form", "streams_at_the_budget_each"],
+)
+def test_page_content_budget_covers_every_stream_the_page_draws(layout: str, size: int) -> None:
+    with pytest.raises(PdfUnreadable) as raised:
+        pdf_line_items._extract(flood_pdf(layout, b" ", size), ["revenue"], None, 400)
+
+    assert str(raised.value) == "page 1 has more than 8 MiB of decoded content"
+
+
+@pytest.mark.parametrize(
+    "layout", ["content_stream", "form_xobject", "nested_form_xobject", "two_content_streams"]
+)
+def test_page_content_within_the_budget_is_read(layout: str) -> None:
+    result = pdf_line_items._extract(flood_pdf(layout, b" ", MIB), ["revenue"], None, 400)
+
+    revenue = only_item(result)
+    assert (revenue.status, revenue.value) == ("found", Decimal("1234000"))
+
+
+def test_parse_over_the_time_limit_is_unreadable() -> None:
+    # 4 MiB of "q Q" is within the content budget but takes pdfminer several seconds.
+    pdf_bytes = flood_pdf("content_stream", b"q Q\n", 4 * MIB)
+    started = time.monotonic()
+
+    with pytest.raises(PdfUnreadable) as raised:
+        pdf_line_items._run_isolated(pdf_bytes, ["revenue"], None, 400, time_limit=1)
+
+    assert str(raised.value) == "the PDF could not be parsed within 1 seconds"
+    assert time.monotonic() - started < 5
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is enforced on Linux")
+def test_parse_over_the_memory_limit_is_unreadable() -> None:
+    # One string of a million characters: 1 MiB of content, but pdfminer builds a layout object
+    # per character and needs gigabytes for them.
+    text = STATEMENT_TEXT + b"BT /F1 1 Tf 1 0 0 1 10 10 Tm (" + b"A" * 1_000_000 + b") Tj ET\n"
+    pdf_bytes = raw_pdf(
+        {
+            1: CATALOG,
+            2: ONE_PAGE_TREE,
+            3: HELVETICA,
+            4: page_object(b"5 0 R"),
+            5: stream_object(zlib.compress(text), b"/Filter /FlateDecode "),
+        }
+    )
+    started = time.monotonic()
+
+    with pytest.raises(PdfUnreadable) as raised:
+        pdf_line_items._run_isolated(pdf_bytes, ["revenue"], None, 400, memory_limit=384 * MIB)
+
+    assert str(raised.value) == "the PDF needs more than 384 MiB of memory to parse"
+    assert time.monotonic() - started < 30
+
+
+@pytest.mark.parametrize(
+    "pdf_bytes",
     [
-        (build_pdf([Page(cells=()), Page(cells=())]), 1, TooManyPages),
+        raw_pdf({1: CATALOG, 2: b"<< /Type /Pages /Kids [] /Count 0 >>"}),
+        raw_pdf({1: b"<< /Type /Catalog >>"}),
+        raw_pdf(
+            {
+                1: CATALOG,
+                2: ONE_PAGE_TREE,
+                3: HELVETICA,
+                4: page_object(b"5 0 R"),
+                5: stream_object(STATEMENT_TEXT),
+            },
+            offset_shift=7,
+        ),
+    ],
+    ids=["empty_page_tree", "catalog_without_pages", "every_offset_shifted"],
+)
+def test_pdf_without_pages_is_unreadable(pdf_bytes: bytes) -> None:
+    with pytest.raises(PdfUnreadable) as raised:
+        extract_line_items(pdf_bytes)
+
+    assert str(raised.value) == "the PDF has no pages"
+
+
+@pytest.mark.parametrize(
+    ("count_entry", "page_count"),
+    [(b"/Count 2000", 2000), (b"", 3), (b"/Count 1", 3)],
+    ids=["declared_count", "count_missing", "count_below_the_pages_found"],
+)
+def test_too_many_pages_are_found_without_listing_every_page(
+    monkeypatch: pytest.MonkeyPatch, count_entry: bytes, page_count: int
+) -> None:
+    forbid_whole_document_pages(monkeypatch)
+    constructed: list[int] = []
+    plumber_page = pdf_line_items._PlumberPage
+
+    def counting_page(*args: object, **kwargs: object) -> object:
+        constructed.append(len(constructed) + 1)
+        return plumber_page(*args, **kwargs)
+
+    monkeypatch.setattr(pdf_line_items, "_PlumberPage", counting_page)
+    pdf_bytes = many_pages_pdf(2000, count_entry)
+
+    with pytest.raises(TooManyPages) as raised:
+        pdf_line_items._extract(pdf_bytes, list(LINE_ITEMS), None, 2)
+
+    assert (raised.value.page_count, raised.value.max_pages) == (page_count, 2)
+    assert constructed == [1, 2]
+
+
+@pytest.mark.parametrize(
+    ("pdf_bytes", "error"),
+    [
+        (build_pdf([text_page(["Revenue 1,234"])]), None),
         (
             _with_encrypt_dictionary(
                 build_pdf([text_page(["Revenue 1,234"])]), _empty_password_user_entry()
             ),
-            400,
             PdfEncrypted,
         ),
         (
             build_pdf([text_page(["Revenue 1,234"])]).replace(
                 b"<< /Length", b"<< /Filter /LZWDecode /Length"
             ),
-            400,
             PdfUnreadable,
         ),
     ],
-    ids=["too_many_pages", "encrypted", "page_unreadable"],
+    ids=["read", "encrypted", "page_unreadable"],
 )
-def test_close_failure_never_replaces_the_rejection(
-    monkeypatch: pytest.MonkeyPatch, pdf_bytes: bytes, max_pages: int, error: type[ValueError]
+def test_no_path_lists_every_page_of_the_document(
+    monkeypatch: pytest.MonkeyPatch, pdf_bytes: bytes, error: type[ValueError] | None
 ) -> None:
-    closed = _failing_close(monkeypatch)
+    forbid_whole_document_pages(monkeypatch)
 
-    with pytest.raises(error) as raised:
-        extract_line_items(pdf_bytes, max_pages=max_pages)
+    if error is None:
+        assert pdf_line_items._extract(pdf_bytes, ["revenue"], None, 400).page_count == 1
+    else:
+        with pytest.raises(error) as raised:
+            pdf_line_items._extract(pdf_bytes, ["revenue"], None, 400)
+        assert type(raised.value) is error
 
-    assert type(raised.value) is error
-    assert len(closed) == 1
 
-
-def test_close_failure_after_every_page_was_read_is_unreadable(
-    monkeypatch: pytest.MonkeyPatch,
+def test_parser_process_returns_the_in_process_result_exactly(
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    closed = _failing_close(monkeypatch)
+    pdf_bytes = build_pdf(
+        [
+            income_page(
+                [
+                    row("Revenue", "5", "1,234.5", "1,100"),
+                    row("Operating profit", "6", "400", "350"),
+                    row("Depreciation and amortisation", "7", "(50)", "(45)"),
+                    row("Profit for the year", "", "(250)", "200"),
+                ]
+            ),
+            position_page(
+                [
+                    row("Borrowings \u2013 current", "18", "2,000", "1,500"),
+                    row("Borrowings \u2013 non-current", "18", "3,000", "3,500"),
+                ]
+            ),
+            cashflow_page(
+                [row("Net cash generated from operating activities", "1,234", "1,100")],
+                scale_note=None,
+                columns=NO_HEADER_COLS,
+            ),
+        ]
+    )
+    in_process = pdf_line_items._extract(pdf_bytes, list(LINE_ITEMS), date(2025, 12, 31), 400)
 
-    with pytest.raises(PdfUnreadable) as raised:
-        extract_line_items(build_pdf([text_page(["Revenue 1,234"])]))
+    with caplog.at_level(logging.INFO, logger="opennse_terminal.ingestion.files.pdf_line_items"):
+        result = extract_line_items(pdf_bytes, period_end_date=date(2025, 12, 31))
 
-    assert type(raised.value) is PdfUnreadable
-    assert str(raised.value) == "the PDF could not be parsed (OSError)"
-    assert type(raised.value.__cause__) is OSError
-    assert len(closed) == 1
+    assert result == in_process
+    # repr shows each Decimal's digits and exponent, which == alone would not compare.
+    assert repr(result) == repr(in_process)
+    assert [item.status for item in result.items] == [
+        "found",
+        "derived",
+        "found",
+        "derived",
+        "ambiguous",
+        "not_found",
+    ]
+    assert str(item_named(result, "revenue").value) == "1234500"
+    assert item_named(result, "net_income").value == Decimal("-250000")
+    assert len(item_named(result, "total_debt").derivation) == 2
+    assert raw_candidates(item_named(result, "operating_cash_flow")) == ["1,234", "1,100"]
+    summaries = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("PDF line items:")
+    ]
+    assert summaries == [
+        "PDF line items: pages=3 found_or_derived=4 ambiguous=1 missing=1 detected_scale=1000 "
+        "currency=KES status=partial"
+    ]
