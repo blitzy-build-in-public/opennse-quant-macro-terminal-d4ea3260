@@ -11,13 +11,15 @@ Two entry points serve two ownership models:
   creates a terminal engine. :func:`dispose_terminal_engine` releases it at shutdown.
 
 ``database_url`` carries the database password, so URLs are only ever logged or quoted in errors
-through ``render_as_string(hide_password=True)``.
+through :func:`database_log_label`. ``render_as_string(hide_password=True)`` is not enough: it
+masks only the password before ``@`` and prints every query value, and asyncpg accepts the
+password as a query value too (``?password=...``).
 """
 
 import logging
 from typing import Any
 
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -28,9 +30,11 @@ from sqlalchemy.ext.asyncio import (
 
 from opennse_terminal.config import TerminalSettings
 
-__all__ = ["build_engine", "dispose_terminal_engine", "session_factory"]
+__all__ = ["build_engine", "database_log_label", "dispose_terminal_engine", "session_factory"]
 
 logger = logging.getLogger("opennse_terminal.db.session")
+
+_UNPARSEABLE_URL_LABEL = "<unparseable database URL>"
 
 # The only module-level state of the database layer: one engine and sessionmaker per raw
 # database_url, so tests and tools that address several databases in one process each get their
@@ -40,14 +44,43 @@ logger = logging.getLogger("opennse_terminal.db.session")
 _CACHE: dict[str, tuple[AsyncEngine, async_sessionmaker[AsyncSession]]] = {}
 
 
+def database_log_label(url: str | URL) -> str:
+    """Return a credential-free label of ``url`` for log records and error messages.
+
+    The label keeps only the driver, host, port and database, for example
+    ``postgresql+asyncpg://localhost:5432/opennse``. The username, the password and the whole
+    query string are dropped, because asyncpg takes connection arguments, the password included,
+    from query values, which ``URL.render_as_string(hide_password=True)`` prints unchanged. A host
+    given only in the query (a Unix-socket directory or a multi-host list) is therefore omitted
+    too.
+
+    It never raises, and never echoes a URL it cannot take apart reliably: a string that
+    ``make_url`` cannot parse, and a URL whose host or database contains ``@`` (the parser's
+    reading of a username or password with an unescaped ``@`` or ``/``, so that part may hold the
+    credential), both give the fixed label ``<unparseable database URL>``. The URL used to connect
+    is never changed by this function.
+    """
+    try:
+        parsed = make_url(url)
+    except (ArgumentError, ValueError):
+        # ArgumentError: not a URL at all; ValueError: a non-numeric port, which make_url quotes.
+        return _UNPARSEABLE_URL_LABEL
+    if "@" in (parsed.host or "") or "@" in (parsed.database or ""):
+        return _UNPARSEABLE_URL_LABEL
+    label = URL.create(
+        parsed.drivername, host=parsed.host, port=parsed.port, database=parsed.database
+    )
+    return label.render_as_string()
+
+
 def build_engine(settings: TerminalSettings, **engine_options: Any) -> AsyncEngine:
     """Create a new async engine for ``settings.database_url``.
 
     The URL must use the ``postgresql+asyncpg://`` scheme; anything else raises ``ValueError``
-    naming the scheme requirement, with the password masked, rather than SQLAlchemy's later
-    async-driver error. The engine is created with ``pool_pre_ping=True``; ``engine_options`` are
-    passed through to ``create_async_engine`` unchanged (for example ``poolclass=NullPool`` in
-    tests).
+    naming the scheme requirement and quoting only the URL's :func:`database_log_label`, rather
+    than SQLAlchemy's later async-driver error. The engine is created with
+    ``pool_pre_ping=True``; ``engine_options`` are passed through to ``create_async_engine``
+    unchanged (for example ``poolclass=NullPool`` in tests).
 
     Every call returns a new engine, which the caller owns and must release with
     ``await engine.dispose()``. No connection is opened until the engine is first used.
@@ -62,15 +95,15 @@ def build_engine(settings: TerminalSettings, **engine_options: Any) -> AsyncEngi
             "TERMINAL_DATABASE_URL is not a valid database URL; "
             "expected postgresql+asyncpg://user:password@host:port/database"
         ) from None
-    masked = url.render_as_string(hide_password=True)
+    label = database_log_label(url)
     # get_backend_name() is checked first: get_driver_name() loads the dialect for a URL without
     # an explicit driver, which fails for an unknown backend.
     if url.get_backend_name() != "postgresql" or url.get_driver_name() != "asyncpg":
         raise ValueError(
-            f"TERMINAL_DATABASE_URL must use the postgresql+asyncpg:// scheme; got {masked}"
+            f"TERMINAL_DATABASE_URL must use the postgresql+asyncpg:// scheme; got {label}"
         )
     engine = create_async_engine(url, pool_pre_ping=True, **engine_options)
-    logger.debug("created engine for %s", masked)
+    logger.debug("created engine for %s", label)
     return engine
 
 
@@ -95,10 +128,7 @@ def session_factory(settings: TerminalSettings | None = None) -> async_sessionma
     engine = build_engine(settings)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     _CACHE[settings.database_url] = (engine, factory)
-    logger.info(
-        "terminal database engine initialised for %s",
-        engine.url.render_as_string(hide_password=True),
-    )
+    logger.info("terminal database engine initialised for %s", database_log_label(engine.url))
     return factory
 
 
@@ -121,8 +151,7 @@ async def dispose_terminal_engine() -> None:
             await engine.dispose()
         except Exception as exc:
             logger.exception(
-                "failed to dispose terminal database engine for %s",
-                engine.url.render_as_string(hide_password=True),
+                "failed to dispose terminal database engine for %s", database_log_label(engine.url)
             )
             if first_error is None:
                 first_error = exc

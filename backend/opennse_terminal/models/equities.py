@@ -34,7 +34,8 @@ class TerminalEquity(TerminalBase):
     Units: ``shares_outstanding`` is whole shares, bounded to 0..10^12 (``MAX_SHARE_COUNT``) by a
     CHECK; ``free_float_pct`` is percentage points (``25.00`` means 25%), bounded to 0..100 and
     nullable. ``currency`` is the ISO 4217 code of the counter's prices and defaults to KES;
-    analytics refuse fundamentals in a different currency with ``currency_mismatch``.
+    analytics value only KES, so a counter in another currency, or its fundamentals in a currency
+    other than KES, is refused with ``currency_mismatch`` and never converted.
 
     ``sector`` is stored exactly as spelled by the writer (for example ``Banking`` or
     ``Manufacturing & Allied``); sector filters, aggregates and the Banking EV exclusion compare

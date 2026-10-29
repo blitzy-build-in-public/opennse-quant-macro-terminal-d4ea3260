@@ -10,6 +10,9 @@ Conventions shared with the rest of the quant engine:
   index levels with ``"index"``, P/E with ``"ratio"``, percentages with ``"pct"`` and KES with
   ``"money"``.
 * An undefined value is ``None`` and the reason is a code in the cycle's ``flags``.
+* Only KES inputs are aggregated (:data:`~opennse_terminal.quant.numeric.ANALYTICS_CURRENCY`): a
+  candidate listed in another currency never joins a cohort, and a fundamentals row in another
+  currency never enters P/E. Both are flagged ``currency_mismatch`` and never converted.
 * Sessions are the observed market calendar: the distinct trade dates present in the price table.
   Callers pass sessions and price rows starting at least :data:`MA_SESSIONS` market sessions
   before ``window_start`` (the MA20 warm-up and the :data:`BASE_CLOSE_MAX_SESSIONS` base-close
@@ -50,7 +53,7 @@ from opennse_terminal.quant.asof import (
     fundamentals_as_of,
     macro_as_of,
 )
-from opennse_terminal.quant.numeric import HUNDRED, ZERO, Violation, safe_div
+from opennse_terminal.quant.numeric import ANALYTICS_CURRENCY, HUNDRED, ZERO, Violation, safe_div
 
 __all__ = [
     "BASE_CLOSE_MAX_SESSIONS",
@@ -124,7 +127,9 @@ def add_months(d: date, months: int) -> date:
     ``add_months(date(2027, 8, 10), -12)`` is 2026-08-10.
 
     Raises:
-        ValueError: If the result falls outside the years ``date`` supports.
+        ValueError: If the target month falls outside the years ``date`` supports (1-9999).
+            :func:`resolve_window` checks this before calling and reports it as a
+            ``window_out_of_range`` :class:`Violation` instead.
     """
     year, month_index = divmod(d.year * 12 + d.month - 1 + months, 12)
     month = month_index + 1
@@ -154,6 +159,27 @@ def _require_range(name: str, value: int, upper: int) -> None:
         raise ValueError(f"{name} must be between 1 and {upper}, got {value}")
 
 
+def _month_number(d: date) -> int:
+    """Months elapsed since year 0, so whole-month shifts are plain integer additions."""
+    return d.year * 12 + d.month - 1
+
+
+def _window_out_of_range(event_date: date, before: int, after: int, unit: str) -> Violation:
+    def span(count: int) -> str:
+        return f"{count} {unit}" if count == 1 else f"{count} {unit}s"
+
+    return Violation(
+        code="window_out_of_range",
+        field="event_dates",
+        message=(
+            f"The window of {span(before)} before and {span(after)} after the event date "
+            f"{event_date.isoformat()} extends beyond the supported dates "
+            f"{date.min.isoformat()} to {date.max.isoformat()}. Use an event date further from "
+            "those limits or a shorter window."
+        ),
+    )
+
+
 def resolve_window(
     event_date: date,
     *,
@@ -171,9 +197,14 @@ def resolve_window(
     * **days**, used otherwise: calendar days, a missing side defaulting to 180.
 
     Returns:
-        The window, or a ``conflicting_window_units`` :class:`Violation` (reported against
-        ``pre_months``) when a day field and a month field are both supplied. The route raises the
-        violation as a coded 422; it is a returned value because the rule spans several fields.
+        The window, or one of two :class:`Violation` records, which the route raises as a coded
+        422; they are returned values because each rule spans several fields:
+
+        * ``conflicting_window_units`` (reported against ``pre_months``) when a day field and a
+          month field are both supplied;
+        * ``window_out_of_range`` (reported against ``event_dates``) when ``window_start`` or
+          ``window_end`` would fall outside the dates ``date`` represents, 0001-01-01 to
+          9999-12-31, for example the default 180 days before 0001-01-01.
 
     Raises:
         ValueError: If a day value is outside 1-365 or a month value outside 1-12. The API bounds
@@ -195,6 +226,13 @@ def resolve_window(
         after = DEFAULT_POST_MONTHS if post_months is None else post_months
         _require_range("pre_months", before, MAX_WINDOW_MONTHS)
         _require_range("post_months", after, MAX_WINDOW_MONTHS)
+        # Any day of the first and last supported months is representable, so whole-month
+        # bounds decide it before add_months clamps the day.
+        event_month = _month_number(event_date)
+        if event_month - before < _month_number(date.min) or (
+            event_month + after > _month_number(date.max)
+        ):
+            return _window_out_of_range(event_date, before, after, "month")
         return CycleWindow(
             event_date=event_date,
             window_start=add_months(event_date, -before),
@@ -206,6 +244,8 @@ def resolve_window(
     after = DEFAULT_POST_DAYS if post_days is None else post_days
     _require_range("pre_days", before, MAX_WINDOW_DAYS)
     _require_range("post_days", after, MAX_WINDOW_DAYS)
+    if (event_date - date.min).days < before or (date.max - event_date).days < after:
+        return _window_out_of_range(event_date, before, after, "day")
     return CycleWindow(
         event_date=event_date,
         window_start=event_date - timedelta(days=before),
@@ -239,7 +279,10 @@ class BacktestCandidate:
         prices: The ticker's actual sessions, sorted ascending by ``trade_date``; never
             zero-filled or forward-filled.
         fundamentals: The company's reporting periods, sorted ascending by ``period_end_date``.
-        currency: Trading currency; fundamentals in another currency are left out of P/E.
+        currency: ISO 4217 trading currency. Only a KES candidate can join a cohort: any other is
+            excluded, listed in ``excluded_constituents`` and flagged ``currency_mismatch``, and
+            its amounts are never converted. A fundamentals row not in KES is likewise left out
+            of P/E with the same flag.
     """
 
     ticker: str
@@ -368,24 +411,34 @@ class _Member:
 
 def _select_cohort(
     candidates: Sequence[BacktestCandidate], anchor: date, earliest_base: date
-) -> tuple[list[_Member], list[str]]:
+) -> tuple[list[_Member], list[str], bool]:
     """Split ``candidates`` into the cohort and the excluded tickers, both ordered by ticker.
 
-    A candidate's base close is its latest actual close on or before ``anchor`` and no earlier
-    than ``earliest_base``. Requiring an observed close at or before the anchor keeps a counter
-    that first trades inside the window from entering mid-cycle and creating an artificial
-    return; a candidate without a base close is excluded.
+    A candidate listed in a currency other than KES is excluded first: its capitalization,
+    turnover, flows and earnings are not KES amounts and are never converted, so it cannot share
+    a cohort's sums. A KES candidate's base close is its latest actual close on or before
+    ``anchor`` and no earlier than ``earliest_base``. Requiring an observed close at or before the
+    anchor keeps a counter that first trades inside the window from entering mid-cycle and
+    creating an artificial return; a candidate without a base close is excluded.
+
+    Returns:
+        ``(members, excluded tickers, whether any candidate was excluded for its currency)``.
     """
     members: list[_Member] = []
     excluded: list[str] = []
+    currency_excluded = False
     for candidate in sorted(candidates, key=lambda item: item.ticker):
+        if candidate.currency != ANALYTICS_CURRENCY:
+            excluded.append(candidate.ticker)
+            currency_excluded = True
+            continue
         position = bisect_right(candidate.prices, anchor, key=lambda row: row.trade_date)
         if position and candidate.prices[position - 1].trade_date >= earliest_base:
             base_close = candidate.prices[position - 1].close_price
             members.append(_Member(candidate, Decimal(candidate.shares_outstanding), base_close))
         else:
             excluded.append(candidate.ticker)
-    return members, excluded
+    return members, excluded, currency_excluded
 
 
 def _closes_by_day(member: _Member, days: Sequence[date]) -> list[Decimal]:
@@ -443,25 +496,35 @@ def _ma20(
 
 def _pe_at(
     members: Sequence[_Member], closes: Sequence[Decimal], day: date, lag_days: int
-) -> Decimal | None:
+) -> tuple[Decimal | None, bool]:
     """Cohort P/E on ``day`` over the matched set of members with available earnings.
 
     The matched set holds the members whose latest fiscal year available on ``day`` (under the
-    ``lag_days`` publication lag) has net income in the member's own currency. Capitalization
-    and earnings are summed over that same set, so a member without earnings never inflates the
-    numerator. ``None`` when the set is empty or its summed earnings are zero or negative.
+    ``lag_days`` publication lag) is in KES and has net income. Capitalization and earnings are
+    summed over that same set, so a member without earnings never inflates the numerator. A
+    member whose available row is in another currency is left out of both sums, never converted.
+
+    Returns:
+        ``(P/E, whether an available row was left out for its currency)``. The P/E is ``None``
+        when the set is empty or its summed earnings are zero or negative.
     """
     capitalization = ZERO
     earnings = ZERO
+    currency_omitted = False
     for member, close in zip(members, closes, strict=True):
         row = fundamentals_as_of(member.candidate.fundamentals, day, lag_days)
-        if row is None or row.net_income_kes is None or row.currency != member.candidate.currency:
+        if row is None:
+            continue
+        if row.currency != ANALYTICS_CURRENCY:
+            currency_omitted = True
+            continue
+        if row.net_income_kes is None:
             continue
         capitalization += member.shares * close
         earnings += row.net_income_kes
     if earnings <= ZERO:
-        return None
-    return capitalization / earnings
+        return None, currency_omitted
+    return capitalization / earnings, currency_omitted
 
 
 def _rebase(value: Decimal | None, base: Decimal | None) -> Decimal | None:
@@ -591,10 +654,11 @@ def run_cycle_backtest(
 ) -> CycleBacktestResult:
     """Backtest one event over ``window``.
 
-    The anchor is the first market session in the window. The cohort C is every candidate with
-    an actual close on the anchor or one of the :data:`BASE_CLOSE_MAX_SESSIONS` market sessions
-    before it, and is fixed for the cycle. For each session t from the anchor to the last
-    observed session in the window:
+    The anchor is the first market session in the window. The cohort C is every KES candidate
+    with an actual close on the anchor or one of the :data:`BASE_CLOSE_MAX_SESSIONS` market
+    sessions before it, and is fixed for the cycle; the other candidates, those listed in another
+    currency included, are listed in ``excluded_constituents``. For each session t from the
+    anchor to the last observed session in the window:
 
     * ``price_index_t = 100 * cap_t / cap_anchor``, ``cap_t = sum_C(shares * close_t)``, each
       member's close forward-filled from its own last actual close after the anchor;
@@ -602,16 +666,24 @@ def run_cycle_backtest(
       summed turnover over the sessions with rows among the last 20 market sessions (at least
       5), read back before the window;
     * ``pe_ratio_t = sum_E(shares * close_t) / sum_E(net income)`` over the matched set E_t of
-      members with earnings available on t, ``None`` when E_t is empty or its earnings are not
-      positive; ``pe_index_t = 100 * pe_t / pe_anchor``;
+      members with KES earnings available on t, ``None`` when E_t is empty or its earnings are
+      not positive; ``pe_index_t = 100 * pe_t / pe_anchor``;
     * ``cumulative_foreign_net_kes_t``: the running sum from the anchor of the cohort's non-null
       foreign net flows (``None`` until the first one);
     * inflation and 91/364-day T-bill overlays as of t, at most
       :data:`OVERLAY_MAX_STALENESS_DAYS` old. Overlays feed neither markers nor the summary.
 
-    Undefined normalizations are ``None`` throughout and flagged: ``zero_anchor_capitalization``,
-    ``insufficient_turnover_history``, ``zero_anchor_turnover``, ``pe_anchor_unavailable``, and
-    ``no_pre_event_data`` when the window's data begins after the event.
+    Cycle flags, each at most once and in this order:
+
+    * ``currency_mismatch`` when a candidate was excluded for a non-KES listing or a member's
+      available fundamentals row was left out of P/E for a non-KES currency; nothing is
+      converted;
+    * ``empty_cohort``, only with status ``no_constituents``;
+    * the undefined normalizations, each ``None`` throughout: ``zero_anchor_capitalization``,
+      ``insufficient_turnover_history`` or ``zero_anchor_turnover``, ``pe_anchor_unavailable``,
+      and ``no_pre_event_data`` when the window's data begins after the event.
+
+    :func:`with_projection` may append ``insufficient_projection_basis``.
 
     Args:
         event: The event and its label.
@@ -628,7 +700,8 @@ def run_cycle_backtest(
         The cycle with status ``complete`` (data reaches ``window_end``), ``partial`` (data ends
         inside the window), ``awaiting_data`` (no session inside the window yet; ``points`` empty,
         ``markers`` and ``summary`` ``None``) or ``no_constituents`` (flag ``empty_cohort``, same
-        empty shape). ``projection`` is left ``None``; see :func:`with_projection`.
+        empty shape; ``currency_mismatch`` comes first when any candidate was excluded for its
+        currency). ``projection`` is left ``None``; see :func:`with_projection`.
 
     Raises:
         ValueError: If ``window`` was resolved for a different event date.
@@ -647,7 +720,7 @@ def run_cycle_backtest(
 
     anchor = sessions[start]
     earliest_base = sessions[max(0, start - BASE_CLOSE_MAX_SESSIONS)]
-    members, excluded = _select_cohort(candidates, anchor, earliest_base)
+    members, excluded, currency_excluded = _select_cohort(candidates, anchor, earliest_base)
     if not members:
         return CycleBacktestResult(
             label=event.label,
@@ -657,7 +730,7 @@ def run_cycle_backtest(
             status="no_constituents",
             anchor_date=anchor,
             excluded_constituents=excluded,
-            flags=["empty_cohort"],
+            flags=["currency_mismatch", "empty_cohort"] if currency_excluded else ["empty_cohort"],
         )
 
     days = sessions[start:end]
@@ -666,8 +739,14 @@ def run_cycle_backtest(
     turnover_by_day, flow_by_day = _daily_totals(
         members, sessions[max(0, start - MA_SESSIONS + 1)], days[-1]
     )
+    pe_results = [
+        _pe_at(members, closes, day, lag_days) for closes, day in zip(day_closes, days, strict=True)
+    ]
+    pe_values = [pe for pe, _ in pe_results]
 
     flags: list[str] = []
+    if currency_excluded or any(omitted for _, omitted in pe_results):
+        flags.append("currency_mismatch")
     caps = [
         sum((member.shares * close for member, close in zip(members, closes, strict=True)), ZERO)
         for closes in day_closes
@@ -680,9 +759,6 @@ def run_cycle_backtest(
         flags.append("insufficient_turnover_history")
     elif ma_anchor.is_zero():
         flags.append("zero_anchor_turnover")
-    pe_values = [
-        _pe_at(members, closes, day, lag_days) for closes, day in zip(day_closes, days, strict=True)
-    ]
     pe_anchor = pe_values[0]
     pe_base = pe_anchor if pe_anchor is not None and pe_anchor > ZERO else None
     if pe_base is None:

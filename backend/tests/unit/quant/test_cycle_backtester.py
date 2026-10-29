@@ -138,12 +138,15 @@ def candidate(
     shares: int,
     rows: Sequence[PriceRow],
     fundamentals: Sequence[FundamentalsRow] = (),
+    *,
+    currency: str = "KES",
 ) -> BacktestCandidate:
     return BacktestCandidate(
         ticker=ticker,
         shares_outstanding=shares,
         prices=list(rows),
         fundamentals=list(fundamentals),
+        currency=currency,
     )
 
 
@@ -354,6 +357,135 @@ def test_out_of_range_window_fields_are_a_caller_error(fields: dict[str, int]) -
         resolve_window(date(2022, 8, 9), **fields)
 
 
+@pytest.mark.parametrize(
+    ("event_date", "fields", "requested"),
+    [
+        pytest.param(
+            date(1, 1, 1), {}, "180 days before and 180 days after", id="days-default-at-date-min"
+        ),
+        pytest.param(
+            date(1, 6, 29),
+            {},
+            "180 days before and 180 days after",
+            id="days-default-179-days-after-date-min",
+        ),
+        pytest.param(
+            date(9999, 12, 31),
+            {},
+            "180 days before and 180 days after",
+            id="days-default-at-date-max",
+        ),
+        pytest.param(
+            date(9999, 12, 1),
+            {"post_days": 31},
+            "180 days before and 31 days after",
+            id="days-post-31-from-30-days-before-date-max",
+        ),
+        pytest.param(
+            date(1, 6, 15),
+            {"pre_months": 12},
+            "12 months before and 12 months after",
+            id="months-pre-12-into-year-0",
+        ),
+        pytest.param(
+            date(1, 12, 31),
+            {"pre_months": 12},
+            "12 months before and 12 months after",
+            id="months-pre-12-one-month-short",
+        ),
+        pytest.param(
+            date(9999, 6, 15),
+            {"post_months": 12},
+            "12 months before and 12 months after",
+            id="months-post-12-into-year-10000",
+        ),
+        pytest.param(
+            date(9999, 1, 1),
+            {"pre_months": 1, "post_months": 12},
+            "1 month before and 12 months after",
+            id="months-post-12-one-month-past",
+        ),
+    ],
+)
+def test_window_beyond_the_supported_dates_is_an_out_of_range_violation(
+    event_date: date, fields: dict[str, int], requested: str
+) -> None:
+    """Valid field values whose window would start before 0001-01-01 or end after 9999-12-31: a
+    coded violation against ``event_dates``, never a raw date-arithmetic exception.
+
+    0001-06-29 is 179 days after 0001-01-01 (31 + 28 + 31 + 30 + 31 + 28), one short of 180;
+    9999-12-01 is 30 days before 9999-12-31; 12 months before 0001-12-31 is 0000-12."""
+    result = resolve_window(event_date, **fields)
+    assert isinstance(result, Violation)
+    assert result.code == "window_out_of_range"
+    assert result.field == "event_dates"
+    assert f"{requested} the event date {event_date.isoformat()}" in result.message
+    assert "0001-01-01 to 9999-12-31" in result.message
+
+
+@pytest.mark.parametrize(
+    ("event_date", "fields", "expected"),
+    [
+        pytest.param(
+            date(1, 6, 30),
+            {},
+            CycleWindow(
+                date(1, 6, 30), date(1, 1, 1), date(1, 12, 27), pre_days=180, post_days=180
+            ),
+            id="days-default-starts-on-date-min",
+        ),
+        pytest.param(
+            date(9999, 7, 4),
+            {},
+            CycleWindow(
+                date(9999, 7, 4), date(9999, 1, 5), date(9999, 12, 31), pre_days=180, post_days=180
+            ),
+            id="days-default-ends-on-date-max",
+        ),
+        pytest.param(
+            date(1, 6, 29),
+            {"pre_days": 179, "post_days": 1},
+            CycleWindow(date(1, 6, 29), date(1, 1, 1), date(1, 6, 30), pre_days=179, post_days=1),
+            id="days-pre-179-starts-on-date-min",
+        ),
+        pytest.param(
+            date(9999, 12, 1),
+            {"pre_days": 1, "post_days": 30},
+            CycleWindow(
+                date(9999, 12, 1), date(9999, 11, 30), date(9999, 12, 31), pre_days=1, post_days=30
+            ),
+            id="days-post-30-ends-on-date-max",
+        ),
+        pytest.param(
+            date(2, 1, 1),
+            {"pre_months": 12},
+            CycleWindow(date(2, 1, 1), date(1, 1, 1), date(3, 1, 1), pre_months=12, post_months=12),
+            id="months-pre-12-starts-on-date-min",
+        ),
+        pytest.param(
+            date(9998, 12, 31),
+            {"post_months": 12},
+            CycleWindow(
+                date(9998, 12, 31),
+                date(9997, 12, 31),
+                date(9999, 12, 31),
+                pre_months=12,
+                post_months=12,
+            ),
+            id="months-post-12-ends-on-date-max",
+        ),
+    ],
+)
+def test_window_reaching_exactly_date_min_or_date_max_is_resolved(
+    event_date: date, fields: dict[str, int], expected: CycleWindow
+) -> None:
+    """A window whose first or last day is exactly 0001-01-01 or 9999-12-31 is still resolved.
+
+    0001-06-30 is day 181 of year 1, so 180 days earlier is 0001-01-01, and 180 days later is
+    0001-12-27; 9999-07-04 plus 180 days is 9999-12-31 and minus 180 days is 9999-01-05."""
+    assert resolve_window(event_date, **fields) == expected
+
+
 def test_standard_window_runs_from_2022_07_30_to_2022_08_19() -> None:
     """±10 days around Tue 2022-08-09: Sat 2022-07-30 .. Fri 2022-08-19."""
     assert WINDOW == CycleWindow(
@@ -504,34 +636,96 @@ def test_base_close_is_the_latest_actual_close_before_an_untraded_anchor() -> No
 
 
 @pytest.mark.parametrize(
-    ("x_fundamentals", "y_fundamentals", "expected_pe"),
+    "u_fundamentals_currency",
     [
-        pytest.param([fy(FY2021, "100")], [], "10.00", id="y-without-fundamentals"),
-        pytest.param([fy(FY2021, "100")], [fy(FY2021, None)], "10.00", id="y-without-ni"),
-        pytest.param([fy(FY2021, "300")], [fy(FY2021, "-100")], "10.00", id="loss-in-matched-set"),
+        pytest.param("USD", id="usd-listing-usd-fundamentals"),
+        pytest.param("KES", id="usd-listing-kes-fundamentals"),
+    ],
+)
+def test_candidate_listed_outside_kes_is_excluded_from_the_cohort(
+    u_fundamentals_currency: str,
+) -> None:
+    """X: KES, 100 shares at 10.00 (cap 1,000), FY2021 NI 100. U: listed in USD, 50 shares at
+    20.00 (cap 1,000 USD) and 40.00 after the anchor, turnover 5,000 after the anchor and a
+    foreign flow of 500 every session, FY2021 NI 10. Z (KES) first trades after the anchor.
+
+    Summing U with X would give P/E 2,000 / 110 = 18.18 at the anchor and a price index of
+    100 * 3,000 / 2,000 = 150.00 afterwards. U is excluded instead, whatever currency its
+    fundamentals carry, and listed with Z in the sorted excluded tickers: P/E is X's
+    1,000 / 100 = 10.00, the price and turnover indices stay 100.00, none of U's flow enters, and
+    the cycle is flagged currency_mismatch.
+    """
+    x = candidate("X", 100, prices("X", SESSIONS, "10.00"), [fy(FY2021, "100")])
+    u = candidate(
+        "U",
+        50,
+        prices(
+            "U",
+            SESSIONS,
+            after(ANCHOR, "20.00", "40.00"),
+            turnover=after(ANCHOR, "1000", "5000"),
+            flow="500",
+        ),
+        [fy(FY2021, "10", currency=u_fundamentals_currency)],
+        currency="USD",
+    )
+    late = candidate("Z", 1_000_000, prices("Z", SESSIONS[26:], "50.00"))
+
+    result = run_standard([late, u, x])
+
+    assert result.status == "complete"
+    assert result.constituents == ["X"]
+    assert result.excluded_constituents == ["U", "Z"]
+    assert result.flags == ["currency_mismatch"]
+    assert column(result.points, "pe_ratio", "ratio") == ["10.00"] * 15
+    assert column(result.points, "price_index", "index") == ["100.00"] * 15
+    assert column(result.points, "turnover_index", "index") == ["100.00"] * 15
+    assert all(point.cumulative_foreign_net_kes is None for point in result.points)
+
+
+@pytest.mark.parametrize(
+    ("x_fundamentals", "y_fundamentals", "expected_pe", "expected_flags"),
+    [
+        pytest.param([fy(FY2021, "100")], [], "10.00", [], id="y-without-fundamentals"),
+        pytest.param([fy(FY2021, "100")], [fy(FY2021, None)], "10.00", [], id="y-without-ni"),
         pytest.param(
-            [fy(FY2021, "100", currency="USD")], [fy(FY2021, "50")], "20.00", id="x-in-usd"
+            [fy(FY2021, "300")], [fy(FY2021, "-100")], "10.00", [], id="loss-in-matched-set"
         ),
         pytest.param(
-            [fy(FY2021, "100", period_type="H1")], [fy(FY2021, "40")], "25.00", id="x-half-year"
+            [fy(FY2021, "100", currency="USD")],
+            [fy(FY2021, "50")],
+            "20.00",
+            ["currency_mismatch"],
+            id="x-in-usd",
+        ),
+        pytest.param(
+            [fy(FY2021, "100", period_type="H1")],
+            [fy(FY2021, "40")],
+            "25.00",
+            [],
+            id="x-half-year",
         ),
     ],
 )
 def test_pe_uses_a_matched_set_of_members_with_available_earnings(
-    x_fundamentals: list[FundamentalsRow], y_fundamentals: list[FundamentalsRow], expected_pe: str
+    x_fundamentals: list[FundamentalsRow],
+    y_fundamentals: list[FundamentalsRow],
+    expected_pe: str,
+    expected_flags: list[str],
 ) -> None:
     """X and Y are flat with 1,000 KES of capitalization each; P/E sums cap and NI over E_t only.
 
     * Y without fundamentals or without NI: X alone, 1,000 / 100 = 10.00 (not 2,000 / 100).
     * X earns 300 and Y loses 100: both in E_t, 2,000 / 200 = 10.00.
-    * X reports in USD against a KES listing: Y alone, 1,000 / 50 = 20.00.
+    * X reports in USD against a KES listing: its row is refused, not converted, so Y alone gives
+      1,000 / 50 = 20.00 and the cycle is flagged currency_mismatch.
     * X has only a half-year row: Y alone, 1,000 / 40 = 25.00.
     """
     result = run_standard(pair(x_fundamentals=x_fundamentals, y_fundamentals=y_fundamentals))
 
     assert column(result.points, "pe_ratio", "ratio") == [expected_pe] * 15
     assert column(result.points, "pe_index", "index") == ["100.00"] * 15
-    assert "pe_anchor_unavailable" not in result.flags
+    assert result.flags == expected_flags
 
 
 @pytest.mark.parametrize(
@@ -850,14 +1044,30 @@ def test_no_pre_event_data_nulls_the_event_returns() -> None:
     assert q(result.summary.max_drawdown_pct, "pct") == "0.00"
 
 
-def test_empty_cohort_with_data_in_the_window_is_no_constituents() -> None:
-    """X and Y both first trade on 2022-08-02, after the anchor: neither has a base close, so the
-    cohort is empty. The cycle keeps its anchor and excluded tickers but has no points, markers
-    or summary."""
-    result = run_standard(pair(sessions=SESSIONS[26:]))
+@pytest.mark.parametrize(
+    ("candidates", "expected_flags"),
+    [
+        pytest.param(pair(sessions=SESSIONS[26:]), ["empty_cohort"], id="no-base-close"),
+        pytest.param(
+            [
+                candidate("X", 100, prices("X", SESSIONS, "10.00"), currency="USD"),
+                candidate("Y", 50, prices("Y", SESSIONS, "20.00"), currency="USD"),
+            ],
+            ["currency_mismatch", "empty_cohort"],
+            id="every-candidate-listed-in-usd",
+        ),
+    ],
+)
+def test_empty_cohort_with_data_in_the_window_is_no_constituents(
+    candidates: list[BacktestCandidate], expected_flags: list[str]
+) -> None:
+    """Either X and Y both first trade on 2022-08-02, after the anchor, so neither has a base
+    close; or both are listed in USD, so neither may join a KES cohort. The cohort is empty: the
+    cycle keeps its anchor and excluded tickers but has no points, markers or summary."""
+    result = run_standard(candidates)
 
     assert result.status == "no_constituents"
-    assert result.flags == ["empty_cohort"]
+    assert result.flags == expected_flags
     assert result.anchor_date == ANCHOR
     assert result.constituents == []
     assert result.excluded_constituents == ["X", "Y"]

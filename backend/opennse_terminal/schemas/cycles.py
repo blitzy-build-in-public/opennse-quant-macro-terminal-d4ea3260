@@ -9,8 +9,8 @@ Index levels, P/E multiples, percentages, KES flows and macro overlays are ``Dec
 serialized as JSON strings already quantized to 2 dp by the cycle service. Offsets, counts and
 day numbers are ``int``.
 
-The request rules that span several parameters (``no_event_dates`` and
-``conflicting_window_units``, both 422) are coded errors raised by the service or the route, never
+The request rules that span several parameters (``no_event_dates``, ``conflicting_window_units``
+and ``window_out_of_range``, all 422) are coded errors raised by the service or the route, never
 validators here. The limits below bound the route's query parameters.
 """
 
@@ -292,7 +292,8 @@ class CycleResult(TerminalResponseModel):
     excluded_constituents: list[str] = Field(
         description=(
             "Sorted candidate tickers left out because they have no actual close within 10 "
-            "market sessions on or before the anchor."
+            "market sessions on or before the anchor, or are listed in a currency other than KES "
+            "(flag currency_mismatch)."
         ),
     )
     points: list[CyclePoint] = Field(
@@ -324,9 +325,10 @@ class CycleResult(TerminalResponseModel):
     flags: list[str] = Field(
         default_factory=list,
         description=(
-            "Reason codes for null or qualified values, for example empty_cohort, "
-            "zero_anchor_capitalization, insufficient_turnover_history, zero_anchor_turnover, "
-            "pe_anchor_unavailable, no_pre_event_data or insufficient_projection_basis."
+            "Reason codes for null or qualified values, for example currency_mismatch, "
+            "empty_cohort, zero_anchor_capitalization, insufficient_turnover_history, "
+            "zero_anchor_turnover, pe_anchor_unavailable, no_pre_event_data or "
+            "insufficient_projection_basis."
         ),
     )
 

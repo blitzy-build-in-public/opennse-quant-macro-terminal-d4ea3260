@@ -89,6 +89,7 @@ ErrorCode = Literal[
     "start_after_end",
     "no_event_dates",
     "conflicting_window_units",
+    "window_out_of_range",
     "wacc_not_above_terminal_growth",
     "shares_offered_exceeds_outstanding",
     "primary_exceeds_offer_size",

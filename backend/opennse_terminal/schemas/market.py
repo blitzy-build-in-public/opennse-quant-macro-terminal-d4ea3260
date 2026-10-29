@@ -202,7 +202,10 @@ class ScreenerRow(TerminalResponseModel):
         description="Change from the previous close, in percent; null without a previous close.",
     )
     market_cap_kes: Decimal | None = Field(
-        description="Market capitalization (close x shares outstanding), in KES.",
+        description=(
+            "Market capitalization (close x shares outstanding), in KES; null with "
+            "currency_mismatch for an equity not listed in KES, which is never converted."
+        ),
     )
     eps_kes: Decimal | None = Field(description="Earnings per share, in KES per share.")
     pe: Decimal | None = Field(description="Price-to-earnings ratio (x).")
@@ -257,7 +260,10 @@ class SectorAggregate(TerminalResponseModel):
     sector: str = Field(description="Sector name as stored, for example Banking.")
     constituent_count: int = Field(description="Equities in the sector.")
     market_cap_kes: Decimal | None = Field(
-        description="Market capitalization summed over every constituent, in KES; null if empty.",
+        description=(
+            "Market capitalization summed over the constituents listed in KES, in KES; null when "
+            "there is none. Non-KES constituents are left out and flag currency_mismatch."
+        ),
     )
     pe: Decimal | None = Field(
         description="Sector P/E (x): sum of market cap over sum of net income, NI-eligible set.",

@@ -515,7 +515,9 @@ FLOW_FRACTION_CLIP: Final = Decimal("0.5")
 # --- SYNTHETIC --- election-cycle shapes planted in the mock history
 # Offsets o are calendar days from each CYCLES event date; seed/synthetic.py holds the shape
 # functions, multiplies the price and volume overlays of successive cycles and sums their flow
-# fractions. Every shape is OVERLAY_NEUTRAL (or a zero flow fraction) outside its window.
+# fractions. The volume overlay is OVERLAY_NEUTRAL and the flow fraction zero outside their
+# windows. The price overlay is neutral only before its window: it holds PRICE_OVERLAY_POST from
+# +150 on, so each completed cycle's level carries forward and compounds across cycles.
 OVERLAY_NEUTRAL: Final = Decimal("1.00")
 # Price: neutral up to o = -150; linear to PRE_FLOOR at -5; FLOOR from -5 to +5 (the valuation
 # floor); linear to POST at +150; POST held afterwards.

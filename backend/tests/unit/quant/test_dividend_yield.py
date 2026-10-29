@@ -21,8 +21,10 @@ from typing import get_args
 
 import pytest
 
+from opennse_terminal.config import DEFAULT_CURRENCY
 from opennse_terminal.quant.asof import FundamentalsRow, fundamentals_as_of
 from opennse_terminal.quant.numeric import (
+    ANALYTICS_CURRENCY,
     HUNDRED,
     ONE,
     PLACES,
@@ -148,6 +150,11 @@ def test_kes_is_the_default_currency_of_valuation_inputs() -> None:
 
     assert row.currency == "KES"
     assert inputs.currency == "KES"
+
+
+def test_analytics_currency_is_the_package_default_currency() -> None:
+    """Quant restates config.DEFAULT_CURRENCY instead of importing config; the two must agree."""
+    assert ANALYTICS_CURRENCY == DEFAULT_CURRENCY == "KES"
 
 
 # ---------------------------------------------------------------------------------------------

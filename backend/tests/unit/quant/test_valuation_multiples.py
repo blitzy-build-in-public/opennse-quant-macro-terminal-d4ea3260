@@ -344,6 +344,61 @@ def test_currency_mismatch_nulls_every_fundamental_metric() -> None:
     assert rounded(result.market_cap_kes, "money") == "25000000.00"
 
 
+@pytest.mark.parametrize(
+    ("sector", "fundamentals_row", "price_age_days", "expected_flags"),
+    [
+        pytest.param(
+            "Telecommunications",
+            fundamentals(currency="USD", net_income_kes=Decimal("100")),
+            0,
+            ["currency_mismatch"],
+            id="usd-equity-usd-fundamentals",
+        ),
+        pytest.param(
+            "Telecommunications",
+            fundamentals(net_income_kes=Decimal("100")),
+            0,
+            ["currency_mismatch"],
+            id="usd-equity-kes-fundamentals",
+        ),
+        pytest.param("Telecommunications", None, 0, ["currency_mismatch"], id="usd-equity-alone"),
+        pytest.param(
+            "Banking",
+            fundamentals(currency="USD", net_income_kes=Decimal("100")),
+            11,
+            ["stale_price", "currency_mismatch", "ev_not_meaningful_for_banks"],
+            id="stale-usd-bank",
+        ),
+    ],
+)
+def test_non_kes_equity_is_refused_with_no_market_cap(
+    sector: str,
+    fundamentals_row: FundamentalsRow | None,
+    price_age_days: int,
+    expected_flags: list[str],
+) -> None:
+    """A USD equity, 100 shares closing at 10: close × shares is 1,000 USD, and with USD NI 100
+    it would read as P/E 10.00. Analytics accept only KES and never convert, so market cap and
+    every fundamental metric are undefined (currency_mismatch) whatever fundamentals it carries;
+    a stale close and the bank EV policy are still reported.
+    """
+    result = compute_valuation(
+        inputs(
+            sector=sector,
+            currency="USD",
+            shares_outstanding=100,
+            close_price=Decimal("10"),
+            price_date=AS_OF - timedelta(days=price_age_days),
+            fundamentals=fundamentals_row,
+        )
+    )
+
+    assert result.market_cap_kes is None
+    assert_fundamental_metrics_null(result)
+    assert result.flags == expected_flags
+    assert (result.shares_outstanding, result.close_price) == (100, Decimal("10"))
+
+
 def test_no_fundamentals_nulls_every_fundamental_metric() -> None:
     """No fundamentals within the lag: every fundamental metric undefined (no_fundamentals);
     market cap 25,000,000.00 is still computed.
@@ -497,6 +552,94 @@ def test_sector_aggregates_use_matched_eligible_sets() -> None:
     assert rounded(aggregate.dividend_yield_pct, "pct") == "5.00"
     assert aggregate.dy_eligible_count == 1
     assert aggregate.flags == []
+
+
+def refused_member(equity_currency: str) -> ValuationResult:
+    """R: 1,000,000 shares at 10.00 whose fundamentals are in USD (NI 100,000, equity 1,000,000,
+    EBITDA 500,000, debt 0, cash 0, dps 0.10), figures that would move every aggregate if they
+    were summed with KES ones.
+    """
+    return member(
+        ticker="USDR",
+        currency=equity_currency,
+        shares_outstanding=1_000_000,
+        close_price=Decimal("10.00"),
+        fundamentals=fundamentals(
+            currency="USD",
+            net_income_kes=Decimal("100000"),
+            total_equity_kes=Decimal("1000000"),
+            ebitda_kes=Decimal("500000"),
+            total_debt_kes=Decimal("0"),
+            cash_and_equivalents_kes=Decimal("0"),
+            dps_kes=Decimal("0.10"),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("equity_currency", "market_cap_total"),
+    [
+        pytest.param("USD", "25000000.00", id="usd-equity-left-out-of-the-total"),
+        pytest.param("KES", "35000000.00", id="kes-equity-with-usd-fundamentals-keeps-its-cap"),
+    ],
+)
+def test_sector_aggregates_leave_out_refused_currency_inputs(
+    equity_currency: str, market_cap_total: str
+) -> None:
+    """A (the base equity, dps 1.25) plus R. Over A alone: P/E 25,000,000 ÷ 2,500,000 = 10.00,
+    P/B 25,000,000 ÷ 12,500,000 = 2.00, EV/EBITDA 28,000,000 ÷ 4,000,000 = 7.00 and dividend
+    yield 1.25 × 1,000,000 ÷ 25,000,000 × 100 = 5.00%; summing R's USD figures in would give
+    P/E 35,000,000 ÷ 2,600,000 = 13.46 instead. A USD-listed R has no KES market cap, so the total
+    is A's 25,000,000.00; a KES-listed R keeps its 10,000,000 cap: 35,000,000.00. Either way R
+    counts as a constituent, joins no eligible set and flags the sector currency_mismatch.
+    """
+    kes_member = member(fundamentals=fundamentals(dps_kes=Decimal("1.25")))
+
+    aggregate = sector_aggregates(
+        "Telecommunications", [kes_member, refused_member(equity_currency)]
+    )
+
+    assert aggregate.constituent_count == 2
+    assert rounded(aggregate.market_cap_kes, "money") == market_cap_total
+    assert aggregate.pe == Decimal("10")
+    assert rounded(aggregate.pe, "ratio") == "10.00"
+    assert aggregate.pb == Decimal("2")
+    assert aggregate.ev_ebitda == Decimal("7")
+    assert aggregate.dividend_yield_pct == Decimal("5")
+    assert rounded(aggregate.dividend_yield_pct, "pct") == "5.00"
+    assert (
+        aggregate.pe_eligible_count,
+        aggregate.pb_eligible_count,
+        aggregate.ev_ebitda_eligible_count,
+        aggregate.dy_eligible_count,
+    ) == (1, 1, 1, 1)
+    assert aggregate.flags == ["currency_mismatch"]
+
+
+def test_sector_of_only_refused_constituents_has_no_market_cap() -> None:
+    """Only R, listed in USD: there is no KES market cap to sum, so the total is None rather than
+    0.00, every aggregate is undefined over empty eligible sets, and R still counts as the one
+    constituent.
+    """
+    aggregate = sector_aggregates("Telecommunications", [refused_member("USD")])
+
+    assert aggregate.constituent_count == 1
+    assert aggregate.market_cap_kes is None
+    assert (aggregate.pe, aggregate.pb, aggregate.ev_ebitda) == (None, None, None)
+    assert aggregate.dividend_yield_pct is None
+    assert (
+        aggregate.pe_eligible_count,
+        aggregate.pb_eligible_count,
+        aggregate.ev_ebitda_eligible_count,
+        aggregate.dy_eligible_count,
+    ) == (0, 0, 0, 0)
+    assert aggregate.flags == [
+        "currency_mismatch",
+        "sector_pe_unavailable",
+        "sector_pb_unavailable",
+        "sector_ev_ebitda_unavailable",
+        "sector_dy_unavailable",
+    ]
 
 
 def test_sector_pe_is_null_when_summed_earnings_are_not_positive() -> None:

@@ -71,8 +71,8 @@ class TerminalFundamental(TerminalBase):
     Units: every ``*_kes`` column is whole KES, never thousands (the PDF parser and the importer
     normalize statement scale before writing); ``dps_kes`` is KES per share; ``shares_outstanding``
     is whole shares, bounded to 0..10^12 (``MAX_SHARE_COUNT``) by a CHECK. ``currency`` defaults
-    to KES; analytics refuse a row whose currency differs from the equity's (``currency_mismatch``),
-    and writers never merge values across currencies.
+    to KES; analytics refuse a row that is not in KES, or whose equity is not listed in KES
+    (``currency_mismatch``), and writers never merge values across currencies.
 
     Every line item is nullable, because a filing or an import can supply a subset. Banks carry
     NULL ``ebitda_kes``, ``total_debt_kes``, ``cash_and_equivalents_kes`` and

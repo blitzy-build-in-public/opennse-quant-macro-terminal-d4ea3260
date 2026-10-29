@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Final
 
 from opennse_terminal.quant.numeric import HUNDRED, ONE, ZERO
@@ -227,8 +227,10 @@ def assumption_violations(a: DcfAssumptions) -> list[Violation]:
     2. ``shares_offered`` must not exceed ``shares_outstanding``
        (``shares_offered_exceeds_outstanding`` on ``shares_offered``).
     3. ``primary_proceeds_kes`` must not exceed the offer size ``offer_price_kes * shares_offered``,
-       compared exactly, since the excess would be negative secondary proceeds
-       (``primary_exceeds_offer_size`` on ``primary_proceeds_kes``).
+       since the excess would be negative secondary proceeds
+       (``primary_exceeds_offer_size`` on ``primary_proceeds_kes``). The offer size is the exact
+       product, not one rounded to the default 28-digit context, so an excess smaller than that
+       context's rounding unit is still reported, and the message states the exact offer size.
 
     Single-field bounds are not rechecked here; the request schema enforces them.
     """
@@ -251,7 +253,7 @@ def assumption_violations(a: DcfAssumptions) -> list[Violation]:
                 f"({a.shares_outstanding:,}).",
             )
         )
-    offer_size = a.offer_price_kes * a.shares_offered
+    offer_size = _exact_offer_size(a)
     if a.primary_proceeds_kes > offer_size:
         violations.append(
             Violation(
@@ -263,6 +265,19 @@ def assumption_violations(a: DcfAssumptions) -> list[Violation]:
             )
         )
     return violations
+
+
+def _exact_offer_size(a: DcfAssumptions) -> Decimal:
+    """``offer_price_kes * shares_offered``, KES, computed exactly for the cross-field check.
+
+    The default 28-digit context can round this product up, hiding a smaller excess of primary
+    proceeds. A product of a ``p``-digit coefficient and a ``c``-digit integer has at most
+    ``p + c`` digits, so a context of that precision holds it exactly. The valuation formulas,
+    ``offer_size_kes`` included, still run under the default context.
+    """
+    precision = len(a.offer_price_kes.as_tuple().digits) + len(str(abs(a.shares_offered)))
+    with localcontext(prec=precision):
+        return a.offer_price_kes * a.shares_offered
 
 
 def _merge_flags(*groups: Sequence[str]) -> list[str]:

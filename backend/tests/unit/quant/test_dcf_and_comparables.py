@@ -747,32 +747,52 @@ def test_shares_offered_exceeds_outstanding(shares_offered: int, reported: bool)
 
 
 @pytest.mark.parametrize(
-    ("primary", "reported"),
+    ("offer_price", "primary", "message"),
     [
-        pytest.param("3750000000.00", False, id="exactly_offer_size"),
-        pytest.param("3750000000.01", True, id="one_cent_over"),
+        pytest.param("7.50", "3750000000.00", None, id="exactly_offer_size"),
+        pytest.param(
+            "7.50",
+            "3750000000.01",
+            "Primary proceeds (KES 3,750,000,000.01) cannot exceed the offer size "
+            "(KES 3,750,000,000.00, offer price times shares offered): the difference would "
+            "be negative secondary proceeds.",
+            id="one_cent_over",
+        ),
+        pytest.param(
+            "7.123456789012345678901234567",
+            "3561728394.5061728394506172835",
+            None,
+            id="exactly_unrounded_offer_size",
+        ),
+        pytest.param(
+            "7.123456789012345678901234567",
+            "3561728394.506172839450617284",
+            "Primary proceeds (KES 3,561,728,394.506172839450617284) cannot exceed the offer size "
+            "(KES 3,561,728,394.506172839450617283500000000, offer price times shares offered): "
+            "the difference would be negative secondary proceeds.",
+            id="5e-19_over_unrounded_offer_size",
+        ),
     ],
 )
-def test_primary_exceeds_offer_size(primary: str, reported: bool) -> None:
-    """Offer 7.50 x 500,000,000 shares = 3,750,000,000.00: one cent more is reported.
+def test_primary_exceeds_offer_size(offer_price: str, primary: str, message: str | None) -> None:
+    """Primary proceeds above offer x 500,000,000 shares are reported; exactly equal is clear.
 
-    Exactly the offer size is clear. The comparison is exact, so a one-cent excess (negative
-    secondary proceeds) is caught.
+    Offer 7.50 gives 3,750,000,000.00, so one cent more is reported. Offer
+    7.123456789012345678901234567 (28 digits) gives exactly 3,561,728,394.5061728394506172835,
+    which the default 28-digit context rounds up to ...617284. Primary ...617284 therefore
+    exceeds the exact offer size by 5E-19 (negative secondary proceeds) and is still reported,
+    with the exact offer size in the message; primary equal to the exact product is clear.
     """
-    violations = assumption_violations(quickmart(primary_proceeds_kes=Decimal(primary)))
+    violations = assumption_violations(
+        quickmart(offer_price_kes=Decimal(offer_price), primary_proceeds_kes=Decimal(primary))
+    )
 
-    if reported:
-        assert violations == [
-            Violation(
-                "primary_exceeds_offer_size",
-                "primary_proceeds_kes",
-                "Primary proceeds (KES 3,750,000,000.01) cannot exceed the offer size "
-                "(KES 3,750,000,000.00, offer price times shares offered): the difference would "
-                "be negative secondary proceeds.",
-            )
-        ]
-    else:
+    if message is None:
         assert violations == []
+    else:
+        assert violations == [
+            Violation("primary_exceeds_offer_size", "primary_proceeds_kes", message)
+        ]
 
 
 def test_violations_are_reported_in_rule_order() -> None:

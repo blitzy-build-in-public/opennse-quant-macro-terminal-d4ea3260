@@ -46,7 +46,9 @@ class TerminalSettings(BaseSettings):
     database_url=...)`` configures the mounted router from the host's own configuration.
 
     ``database_url`` carries the database password. Never log the settings object or the raw
-    URL; log ``sqlalchemy.engine.make_url(url).render_as_string(hide_password=True)`` instead.
+    URL; log ``opennse_terminal.db.session.database_log_label(url)`` instead, which keeps only the
+    driver, host, port and database. ``render_as_string(hide_password=True)`` is not a safe
+    substitute: it prints query values, and asyncpg accepts the password as ``?password=...``.
     """
 
     # hide_input_in_errors keeps a rejected database_url, password included, out of the
@@ -100,15 +102,19 @@ class TerminalSettings(BaseSettings):
             "OpenNSE-Terminal/<version> (+mailto:<contact>)."
         ),
     )
-    # The two *_seconds fields are durations, not money, so float is appropriate for them.
+    # The two *_seconds fields are durations, not money, so float is appropriate for them. They
+    # must be finite: allow_inf_nan=False rejects "inf" and overflowing strings such as "1e309",
+    # which would otherwise reach asyncio.sleep and httpx.Timeout and stall ingestion.
     scraper_min_interval_seconds: float = Field(
         default=2.0,
         ge=0,
+        allow_inf_nan=False,
         description="Minimum spacing between requests to the same host, in seconds.",
     )
     scraper_timeout_seconds: float = Field(
         default=30.0,
         gt=0,
+        allow_inf_nan=False,
         description=(
             "Read timeout per scraper request, in seconds. The connect timeout is fixed at 10 s."
         ),

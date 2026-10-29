@@ -18,6 +18,7 @@ from types import MappingProxyType
 from typing import Final, Literal, overload
 
 __all__ = [
+    "ANALYTICS_CURRENCY",
     "HUNDRED",
     "ONE",
     "PLACES",
@@ -51,6 +52,15 @@ PLACES: Final[Mapping[QuantizeKind, int]] = MappingProxyType(
 ZERO: Final[Decimal] = Decimal(0)
 ONE: Final[Decimal] = Decimal(1)
 HUNDRED: Final[Decimal] = Decimal(100)
+
+ANALYTICS_CURRENCY: Final[str] = "KES"
+"""ISO 4217 code of the only currency the quant engine accepts: the Kenyan shilling.
+
+Every ``*_kes`` field, KES total, multiple and aggregate assumes this unit, and FX conversion is
+not supported, so an equity or a fundamentals row in any other currency is refused with the
+``currency_mismatch`` flag, never converted. It equals ``config.DEFAULT_CURRENCY``, restated here
+because quant modules import only the standard library and other quant modules.
+"""
 
 # Used only for the output quantize step. Its wider precision lets a large magnitude, such as a
 # 10^16 KES terminal value at 6 dp, keep every requested place instead of raising

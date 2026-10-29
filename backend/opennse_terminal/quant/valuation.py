@@ -12,6 +12,11 @@ dimensionless ratios (×) and yields are percentage points. Every value is an un
 services round once with :func:`opennse_terminal.quant.numeric.quantize_out` (``money`` for KES
 totals, ``per_share`` for EPS, ``ratio`` for multiples, ``pct`` for yields).
 
+Only KES inputs are valued (:data:`~opennse_terminal.quant.numeric.ANALYTICS_CURRENCY`). An
+equity in another currency, or fundamentals in another currency, is refused with
+``currency_mismatch`` and never converted; a refused equity has no market cap and enters no
+sector total or eligible set.
+
 An undefined metric is ``None`` together with a reason code in ``flags``, never zero and never an
 exception. Each primitive returns a :class:`Metric` carrying both.
 """
@@ -25,7 +30,7 @@ from decimal import Decimal
 from typing import Final, NamedTuple
 
 from opennse_terminal.quant.asof import FundamentalsRow
-from opennse_terminal.quant.numeric import HUNDRED, ZERO, safe_div
+from opennse_terminal.quant.numeric import ANALYTICS_CURRENCY, HUNDRED, ZERO, safe_div
 
 __all__ = [
     "EV_EXCLUDED_SECTORS",
@@ -72,10 +77,13 @@ class ValuationInputs:
         ticker: Exchange ticker, for example ``"SCOM"``.
         sector: Sector exactly as stored in ``terminal_equities``, for example ``"Banking"``.
         shares_outstanding: Shares in issue (``terminal_equities.shares_outstanding``), >= 0.
-        close_price: Latest close on or before ``as_of``, in KES per share.
+        close_price: Latest close on or before ``as_of``, per share in ``currency`` (KES for
+            every equity that is valued).
         price_date: ``trade_date`` of that close.
         as_of: Day on which the valuation stands.
-        currency: The equity's ISO 4217 currency; fundamentals in another currency are refused.
+        currency: The equity's ISO 4217 trading currency. Only KES is valued: an equity in any
+            other currency is refused outright, and a KES equity's fundamentals in any other
+            currency are refused, both with ``currency_mismatch`` and without conversion.
         fundamentals: The fiscal-year row available on ``as_of``, or ``None`` when there is none.
     """
 
@@ -93,17 +101,19 @@ class ValuationInputs:
 class ValuationResult:
     """Unrounded valuation of one counter, with the effective inputs sector aggregates reuse.
 
+    ``market_cap_kes`` is ``None`` only for an equity refused because its currency is not KES
+    (flag ``currency_mismatch``), which keeps it out of every sector total and eligible set.
     ``net_income_kes``, ``total_equity_kes``, ``ebitda_kes`` and ``dps_kes`` are the fundamentals
-    values actually used: all ``None`` when fundamentals are absent or in another currency, so a
-    member is eligible for a sector aggregate under exactly the rules of its own metrics.
-    ``flags`` holds unique reason codes in evaluation order.
+    values actually used, in KES: all ``None`` when fundamentals are absent, the equity is refused
+    or the fundamentals are not in KES, so a member is eligible for a sector aggregate under
+    exactly the rules of its own metrics. ``flags`` holds unique reason codes in evaluation order.
     """
 
     ticker: str
     sector: str
     shares_outstanding: int
     close_price: Decimal
-    market_cap_kes: Decimal
+    market_cap_kes: Decimal | None
     eps_kes: Decimal | None
     pe: Decimal | None
     pb: Decimal | None
@@ -122,9 +132,11 @@ class ValuationResult:
 class SectorAggregateResult:
     """Unrounded sector aggregates, each over its own matched eligible set of constituents.
 
-    ``market_cap_kes`` is the sum over every constituent (``None`` for an empty sector). Each
-    ``*_eligible_count`` is the size of the set its aggregate was computed over, so partial
-    coverage is visible next to ``constituent_count``.
+    ``market_cap_kes`` is the sum, in KES, over the constituents that have a market cap, so a
+    constituent refused for a non-KES currency is left out; it is ``None`` when no constituent has
+    one, an empty sector included. ``constituent_count`` counts every constituent, refused ones
+    included, and each ``*_eligible_count`` is the size of the set its aggregate was computed over,
+    so partial coverage is visible.
     """
 
     sector: str
@@ -282,13 +294,18 @@ def compute_valuation(inputs: ValuationInputs) -> ValuationResult:
 
     Evaluation order, which is also the order of ``flags``:
 
-    1. Market cap = close × shares (KES), always computed.
+    1. Market cap = close × shares (KES), computed for every KES equity. An equity whose
+       ``currency`` is not KES is refused: its market cap is ``None``, because close × shares is
+       then not a KES amount and is never converted.
     2. ``stale_price`` when the close is more than :data:`STALE_PRICE_DAYS` calendar days before
        ``as_of``; the metrics are still computed.
-    3. Without fundamentals every fundamentals-based metric (EPS, P/E, P/B, EV, EV/EBITDA and
-       dividend yield) is ``None`` with ``no_fundamentals``; fundamentals in a currency other than
-       the equity's give ``currency_mismatch`` instead. A sector in :data:`EV_EXCLUDED_SECTORS`
-       also gets ``ev_not_meaningful_for_banks``, because that policy does not depend on data.
+    3. A refused (non-KES) equity has every fundamentals-based metric (EPS, P/E, P/B, EV,
+       EV/EBITDA and dividend yield), every effective input and ``fundamentals_period_end``
+       ``None`` with ``currency_mismatch``, whatever fundamentals it carries. For a KES equity the
+       same metrics are ``None`` with ``no_fundamentals`` when there are no fundamentals, and with
+       ``currency_mismatch`` when the fundamentals are not in KES (its market cap stands). A
+       sector in :data:`EV_EXCLUDED_SECTORS` also gets ``ev_not_meaningful_for_banks``, because
+       that policy does not depend on data.
     4. With zero shares, EPS, P/E, P/B and EV/EBITDA are ``None`` with ``zero_shares``; enterprise
        value (debt − cash) and dividend yield, which do not divide by shares, are still computed.
     5. Otherwise EPS, P/E, P/B, enterprise value, EV/EBITDA (skipped for excluded sectors, whose
@@ -304,16 +321,17 @@ def compute_valuation(inputs: ValuationInputs) -> ValuationResult:
         flags.append("stale_price")
     ev_excluded = inputs.sector in EV_EXCLUDED_SECTORS
 
+    kes_equity = inputs.currency == ANALYTICS_CURRENCY
     fundamentals = inputs.fundamentals
-    if fundamentals is None or fundamentals.currency != inputs.currency:
-        reason = "no_fundamentals" if fundamentals is None else "currency_mismatch"
+    if not kes_equity or fundamentals is None or fundamentals.currency != ANALYTICS_CURRENCY:
+        reason = "no_fundamentals" if kes_equity and fundamentals is None else "currency_mismatch"
         _add_flags(flags, (reason, "ev_not_meaningful_for_banks" if ev_excluded else None))
         return ValuationResult(
             ticker=inputs.ticker,
             sector=inputs.sector,
             shares_outstanding=shares,
             close_price=inputs.close_price,
-            market_cap_kes=mc,
+            market_cap_kes=mc if kes_equity else None,
             eps_kes=None,
             pe=None,
             pb=None,
@@ -388,8 +406,16 @@ def _ratio_of_sums(pairs: Sequence[tuple[Decimal, Decimal]]) -> Decimal | None:
 def sector_aggregates(sector: str, members: Sequence[ValuationResult]) -> SectorAggregateResult:
     """Aggregate one sector's constituents, each metric over a matched eligible set.
 
-    Numerator and denominator of every aggregate are summed over the same constituents:
+    Numerator and denominator of every aggregate are summed over the same constituents. Only
+    constituents with a market cap take part: one refused for a non-KES currency is left out of
+    the market-cap total and of every eligible set (numerator and denominator alike), still counts
+    in ``constituent_count``, and gives the sector the flag ``currency_mismatch``, listed first. A
+    KES constituent whose fundamentals were refused (not in KES) keeps its market cap in the
+    total, has no fundamentals to make it eligible, and also gives the sector
+    ``currency_mismatch``. No amount is converted.
 
+    * Market cap (KES) = Σ market cap over the constituents that have one; ``None`` when none
+      does.
     * P/E (×) = Σ market cap ÷ Σ net income over members with net income; ``None`` with
       ``sector_pe_unavailable`` when that set is empty or Σ net income <= 0.
     * P/B (×) = Σ market cap ÷ Σ equity over members with equity; ``None`` with
@@ -411,18 +437,17 @@ def sector_aggregates(sector: str, members: Sequence[ValuationResult]) -> Sector
         members: :func:`compute_valuation` results of the sector's constituents.
     """
     flags: list[str] = []
-    market_cap_total = sum((m.market_cap_kes for m in members), ZERO) if members else None
+    if any(m.market_cap_kes is None or "currency_mismatch" in m.flags for m in members):
+        flags.append("currency_mismatch")
+    priced = [(m, m.market_cap_kes) for m in members if m.market_cap_kes is not None]
+    market_cap_total = sum((cap for _, cap in priced), ZERO) if priced else None
 
-    pe_pairs = [
-        (m.market_cap_kes, m.net_income_kes) for m in members if m.net_income_kes is not None
-    ]
+    pe_pairs = [(cap, m.net_income_kes) for m, cap in priced if m.net_income_kes is not None]
     pe = _ratio_of_sums(pe_pairs)
     if pe is None:
         flags.append("sector_pe_unavailable")
 
-    pb_pairs = [
-        (m.market_cap_kes, m.total_equity_kes) for m in members if m.total_equity_kes is not None
-    ]
+    pb_pairs = [(cap, m.total_equity_kes) for m, cap in priced if m.total_equity_kes is not None]
     pb = _ratio_of_sums(pb_pairs)
     if pb is None:
         flags.append("sector_pb_unavailable")
@@ -434,16 +459,16 @@ def sector_aggregates(sector: str, members: Sequence[ValuationResult]) -> Sector
     else:
         ev_pairs = [
             (m.enterprise_value_kes, m.ebitda_kes)
-            for m in members
+            for m, _ in priced
             if m.enterprise_value_kes is not None and m.ebitda_kes is not None
         ]
         ev_multiple = _ratio_of_sums(ev_pairs)
         if ev_multiple is None:
             flags.append("sector_ev_ebitda_unavailable")
 
-    dy_members = [(m, m.dps_kes) for m in members if m.dps_kes is not None]
-    dividends = sum((dps * Decimal(m.shares_outstanding) for m, dps in dy_members), ZERO)
-    dy_market_cap = sum((m.market_cap_kes for m, _ in dy_members), ZERO)
+    dy_members = [(m, cap, m.dps_kes) for m, cap in priced if m.dps_kes is not None]
+    dividends = sum((dps * Decimal(m.shares_outstanding) for m, _, dps in dy_members), ZERO)
+    dy_market_cap = sum((cap for _, cap, _ in dy_members), ZERO)
     dy_ratio = safe_div(dividends, dy_market_cap) if dy_members else None
     dividend_yield = None if dy_ratio is None else dy_ratio * HUNDRED
     if dividend_yield is None:

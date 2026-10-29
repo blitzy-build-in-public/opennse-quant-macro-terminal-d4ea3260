@@ -285,7 +285,7 @@ export interface ScreenerRow {
   close_price: DecimalString;
   /** Change from the previous close, %. */
   change_pct: DecimalString | null;
-  /** Close × shares outstanding, KES. */
+  /** Close × shares outstanding, KES; null (`currency_mismatch`) for a non-KES equity. */
   market_cap_kes: DecimalString | null;
   /** Earnings per share, KES per share. */
   eps_kes: DecimalString | null;
@@ -323,7 +323,7 @@ export interface SectorAggregate {
   sector: string;
   /** Equities in the sector. */
   constituent_count: number;
-  /** Market capitalization summed over every constituent, KES. */
+  /** Market capitalization summed over the KES-listed constituents, KES; null when none. */
   market_cap_kes: DecimalString | null;
   /** Sector P/E (×): Σ market cap ÷ Σ net income over the NI-eligible set. */
   pe: DecimalString | null;
@@ -677,7 +677,10 @@ export interface CycleResult {
   days_until_window_start: number | null;
   /** Sorted tickers of the cohort, fixed at the anchor. */
   constituents: string[];
-  /** Sorted candidates without an actual close within 10 sessions on or before the anchor. */
+  /**
+   * Sorted candidates without an actual close within 10 sessions on or before the anchor, or
+   * listed in a currency other than KES (flag `currency_mismatch`).
+   */
   excluded_constituents: string[];
   /** Market sessions from the anchor to the last observed session in the window. */
   points: CyclePoint[];

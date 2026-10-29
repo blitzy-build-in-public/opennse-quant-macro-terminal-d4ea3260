@@ -25,9 +25,22 @@ seed removable once real data exists, for example::
     UPDATE terminal_macro_indicators SET tbill_91d_pct = NULL
         WHERE source_by_field ->> 'tbill_91d_pct' = 'seed';
 
-The same ``DELETE`` applies to the other row-level-source tables (``terminal_equities``,
-``terminal_bond_yields``, ``terminal_cycles``, ``terminal_ipo_scenarios``), and the same per-column
-``UPDATE`` to ``terminal_fundamentals``.
+The same ``DELETE`` applies to ``terminal_bond_yields``, ``terminal_cycles`` and
+``terminal_ipo_scenarios``, and the same per-column ``UPDATE`` to ``terminal_fundamentals``.
+``terminal_equities`` is the exception. An equity is a shared reference row: it keeps
+``source = 'seed'`` after real prices, fundamentals or watchlist items attach to it, and deleting
+it cascades to those rows and clears the ``ticker`` of its corporate filings. Keep every
+referenced equity and remove only unreferenced seed equities::
+
+    DELETE FROM terminal_equities e WHERE e.source = 'seed'
+        AND NOT EXISTS (SELECT 1 FROM terminal_daily_prices p WHERE p.ticker = e.ticker)
+        AND NOT EXISTS (SELECT 1 FROM terminal_fundamentals f WHERE f.ticker = e.ticker)
+        AND NOT EXISTS (SELECT 1 FROM terminal_watchlist_items w WHERE w.ticker = e.ticker)
+        AND NOT EXISTS (SELECT 1 FROM terminal_corporate_filings c WHERE c.ticker = e.ticker);
+
+The seeded fundamentals rows (the per-column ``UPDATE`` clears their values but keeps the rows)
+and the "NSE Core 8" watchlist reference all eight seeded tickers, so this statement keeps those
+equities until those rows are removed as well.
 """
 
 import argparse
@@ -43,11 +56,11 @@ from typing import Final, TypeAlias
 
 import sqlalchemy as sa
 from pydantic import ValidationError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from opennse_terminal import migrations
 from opennse_terminal.config import TerminalSettings
-from opennse_terminal.db.session import build_engine
+from opennse_terminal.db.session import build_engine, database_log_label
 from opennse_terminal.db.upsert import Executor, upsert_rows
 from opennse_terminal.models import (
     TerminalBondYield,
@@ -97,7 +110,6 @@ SCHEMA_HINT: Final = "run `opennse-terminal migrate upgrade head` first"
 _EXIT_OK: Final = 0
 _EXIT_FAILED: Final = 1
 _EXIT_SCHEMA_NOT_AT_HEAD: Final = 2
-_MAX_ERROR_MESSAGE_CHARS: Final = 2000
 _SEED_CALENDAR: Final = "synthetic"
 
 # to_regclass returns NULL instead of raising for a missing relation, so an unmigrated database
@@ -217,8 +229,9 @@ class _TableWriter:
 def _row_with_id(record: SeedRecord, **extra: object) -> dict[str, object]:
     """Return ``record``'s column mapping with a new UUID ``id`` and ``extra`` columns.
 
-    The id is set here rather than left to the model's Python-side default, which multi-row Core
-    inserts do not apply; on a conflict the stored row keeps its own id.
+    The seeder allocates each row's ``uuid4`` id explicitly here, when it builds the record and
+    before the rows are batched, so every row offered to ``upsert_rows`` is complete. On a conflict
+    the stored row keeps its own id.
     """
     row = synthetic.to_row(record)
     row["id"] = uuid.uuid4()
@@ -306,7 +319,10 @@ async def _record_failure(
 ) -> None:
     """Roll back the seed transaction and record the run as ``failed`` in a fresh transaction.
 
-    Best effort: an error here is logged and suppressed, so the caller re-raises the original.
+    ``error_message`` is the exception's type name only. SQLAlchemy errors embed the failed
+    statement's parameters, such as the watchlist's ``default_owner_key``, so their text is never
+    stored or logged. Best effort: an error here is logged with the run id and its type name, then
+    suppressed, so the caller re-raises the original.
     """
     try:
         await session.rollback()
@@ -322,13 +338,15 @@ async def _record_failure(
                 rows_fetched=0,
                 rows_written=0,
                 rows_rejected=0,
-                error_message=f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_MESSAGE_CHARS],
+                error_message=type(exc).__name__,
                 details={},
             )
         )
         await session.commit()
-    except Exception:
-        logger.exception("could not record seed run %s as failed", run_id)
+    except Exception as record_exc:
+        logger.error(
+            "could not record seed run %s as failed: %s", run_id, type(record_exc).__name__
+        )
 
 
 async def seed(
@@ -345,23 +363,28 @@ async def seed(
     anything is written.
 
     Steps: :func:`ensure_schema_at_head` (raises :class:`SchemaNotAtHeadError`, nothing written);
-    a ``terminal_ingestion_runs`` row with status ``running``; every table inserted with
+    the run's id and start time; the dataset generated, when none is given; a
+    ``terminal_ingestion_runs`` row with status ``running``; every table inserted with
     ``ON CONFLICT DO NOTHING`` on its natural key, so existing rows, seeded or real, are never
     changed; the run row finished as ``succeeded`` with the counts in ``details``; then
     ``session.commit()``. The seeder owns this transaction, so the session should hold no other
     pending work.
 
-    On any later failure the transaction is rolled back, the run is recorded as ``failed`` in a
-    fresh transaction (best effort) and the exception is re-raised.
+    On any failure after the schema check, generation and its invariant checks included, the
+    transaction is rolled back, the run is recorded as ``failed`` in a fresh transaction (best
+    effort, with the exception's type name as ``error_message``) and the exception is re-raised.
     """
     settings = settings if settings is not None else TerminalSettings()
-    # The cheap precondition comes before the generation, so an unmigrated database fails fast.
+    # The cheap precondition comes first, so an unmigrated database, which has no
+    # terminal_ingestion_runs table to record a failure in, fails fast.
     await ensure_schema_at_head(session)
-    dataset = dataset if dataset is not None else synthetic.generate_all()
 
     run_id = uuid.uuid4()
     started_at = datetime.now(UTC)
     try:
+        # Generation, with its invariant checks, runs inside the recorded operation, so its
+        # failure leaves a failed run row; it still precedes the run row and every data write.
+        dataset = dataset if dataset is not None else synthetic.generate_all()
         run = TerminalIngestionRun(
             id=run_id,
             pipeline=SEED_PIPELINE,
@@ -394,7 +417,9 @@ async def seed(
         await session.commit()
     except Exception as exc:
         await _record_failure(session, run_id=run_id, started_at=started_at, exc=exc)
-        # The traceback travels with the re-raised exception; run_seed logs it once.
+        # Only the type name is logged, here and by run_seed: the exception's text, and so its
+        # traceback, can carry SQL parameters such as default_owner_key. The caller receives the
+        # exception itself.
         logger.error("seed run %s failed and was rolled back: %s", run_id, type(exc).__name__)
         raise
 
@@ -417,29 +442,47 @@ async def run_seed(settings: TerminalSettings) -> int:
 
     ``0`` seeded (a re-run that inserts nothing included); ``2`` the schema is not at head, with
     the :class:`SchemaNotAtHeadError` message, which contains :data:`SCHEMA_HINT`, printed to
-    stderr; ``1`` any other failure, logged with its traceback. The engine is always disposed.
-    A coroutine, so code that already runs an event loop (such as test fixtures) awaits it.
+    stderr; ``1`` any other failure, the engine's creation included. A ``ValueError`` from
+    :func:`build_engine` prints its own message, which quotes the URL only through
+    :func:`database_log_label`; any other error creating the engine (such as SQLAlchemy's
+    ``ArgumentError`` for a multi-host URL without every port) prints a fixed line naming only
+    its exception type. A failure once the engine exists is logged at ERROR with its type name
+    only, never its text or traceback, which can carry SQL parameters such as
+    ``default_owner_key``. The engine is disposed whenever it was created. A coroutine, so code
+    that already runs an event loop (such as test fixtures) awaits it.
     """
+    engine: AsyncEngine | None = None
     try:
         engine = build_engine(settings)
-    except ValueError as exc:
-        # build_engine masks the password in this message.
-        print(str(exc), file=sys.stderr)
-        logger.error("cannot seed: %s", exc)
-        return _EXIT_FAILED
-    logger.info("seeding %s", engine.url.render_as_string(hide_password=True))
-    try:
+        logger.info("seeding %s", database_log_label(engine.url))
         async with async_sessionmaker(engine, expire_on_commit=False)() as session:
             await seed(session, settings=settings)
     except SchemaNotAtHeadError as exc:
         print(str(exc), file=sys.stderr)
         logger.error("%s", exc)
         return _EXIT_SCHEMA_NOT_AT_HEAD
-    except Exception:
-        logger.exception("seeding failed")
+    except Exception as exc:
+        if engine is None and isinstance(exc, ValueError):
+            # build_engine's own messages quote the URL only through database_log_label.
+            print(str(exc), file=sys.stderr)
+            logger.error("cannot seed: %s", exc)
+        elif engine is None:
+            # Other construction errors are reported by type only: their text can quote parts of
+            # the URL, such as the ports of a multi-host query.
+            message = (
+                "cannot seed: could not create a database engine from TERMINAL_DATABASE_URL "
+                f"({type(exc).__name__})"
+            )
+            print(message, file=sys.stderr)
+            logger.error("%s", message)
+        else:
+            # Type name only, with no traceback: SQLAlchemy errors embed the statement's
+            # parameters, such as default_owner_key.
+            logger.error("seeding failed: %s", type(exc).__name__)
         return _EXIT_FAILED
     finally:
-        await engine.dispose()
+        if engine is not None:
+            await engine.dispose()
     return _EXIT_OK
 
 
