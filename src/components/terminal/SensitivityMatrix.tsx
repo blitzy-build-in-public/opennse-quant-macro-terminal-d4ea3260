@@ -1,6 +1,7 @@
 "use client";
 
-import type { ReactElement } from "react";
+import { useId, useRef, useState } from "react";
+import type { ReactElement, ReactNode } from "react";
 
 import { EMPTY_VALUE, compareDecimal, formatDecimal } from "./lib/format";
 import type { DecimalString, SensitivityCell, SensitivityMatrixData } from "./types";
@@ -34,7 +35,8 @@ export interface SensitivityMatrixProps {
   className?: string;
 }
 
-const ROOT_CLASS = "bg-slate-900 text-slate-100 overflow-x-auto";
+// The root sets its own surface and font family, so a host's body font never reaches the table.
+const ROOT_CLASS = "bg-slate-900 text-slate-100 font-sans overflow-x-auto";
 
 // Every class below is a complete static string, never assembled from fragments, so Tailwind's
 // source scan and a host's `@source` directive find each one.
@@ -44,6 +46,29 @@ const TONE_AT_OR_ABOVE_OFFER = "bg-emerald-900/60 text-emerald-100";
 const TONE_BELOW_OFFER = "bg-rose-900/60 text-rose-100";
 const TONE_NOT_COMPARABLE = "bg-slate-800 text-slate-400";
 const SELECTED_CLASS = "ring-2 ring-inset ring-sky-400";
+// A cell with an explanation positions its keyboard tooltip.
+const EXPLAINED_CELL_CLASS = "relative";
+// The explanation trigger looks like the plain cell content, even in a host without a CSS reset,
+// and shows a slate-100 focus ring distinct from the selected cell's sky ring. The transparent
+// outline (written out, since `outline-none` differs between Tailwind 3 and 4) keeps a focus
+// indicator in forced-colors mode, where box-shadow rings are not drawn.
+const EXPLANATION_TRIGGER_CLASS =
+  "peer m-0 block w-full cursor-help appearance-none rounded border-0 bg-transparent p-0 text-end text-inherit [font:inherit] [letter-spacing:inherit] focus-visible:ring-2 focus-visible:ring-slate-100 focus-visible:[outline:2px_solid_transparent]";
+const EXPLANATION_TIP_CLASS =
+  "pointer-events-none absolute z-10 w-max max-w-[14rem] whitespace-normal break-words rounded-md border border-slate-600 bg-slate-950 px-2 py-1 text-start text-xs font-normal text-slate-100 shadow-lg";
+// A tooltip sits above its cell, except on the first body row. The root's horizontal scrolling
+// makes it a scroll container, and content overflowing a scroll container's top can never be
+// scrolled to, so a multi-line tooltip above a first-row cell, with only the caption and header
+// row over it, would lose its top. Below the cell, any overflow past the root's bottom stays
+// reachable, and focusing scrolls it into view.
+const EXPLANATION_TIP_ABOVE = "bottom-full mb-1";
+const EXPLANATION_TIP_BELOW = "top-full mt-1";
+// Left-half columns extend the tooltip rightward and right-half columns leftward, so it spreads
+// across the table rather than past the root's left edge, which the scroll container clips.
+const EXPLANATION_TIP_ANCHOR_LEFT = "left-0";
+const EXPLANATION_TIP_ANCHOR_RIGHT = "right-0";
+const EXPLANATION_TIP_ON_FOCUS = "hidden peer-focus-visible:block";
+const EXPLANATION_TIP_DISMISSED = "hidden";
 
 /** An axis value with a React key that is unique within its axis. */
 interface AxisEntry {
@@ -87,7 +112,10 @@ function toneClass(cell: SensitivityCell, offerPriceKes: DecimalString): string 
   return comparison >= 0 ? TONE_AT_OR_ABOVE_OFFER : TONE_BELOW_OFFER;
 }
 
-/** Hover text of a cell: the reason codes of a null cell, otherwise the upside and any flags. */
+/**
+ * Explanation of a cell, its pointer tooltip (`title`) and, for a null or flagged cell, its
+ * keyboard tooltip: the reason codes of a null cell, otherwise the upside and any flags.
+ */
 function cellTitle(cell: SensitivityCell, offerText: string): string {
   const flags = cell.flags.join(", ");
   if (cell.fair_value_per_share_kes === null) return flags === "" ? "Not computable" : flags;
@@ -96,20 +124,127 @@ function cellTitle(cell: SensitivityCell, offerText: string): string {
   return flags === "" ? upside : `${upside}; ${flags}`;
 }
 
+/** Props of {@link CellExplanation}. */
+interface CellExplanationProps {
+  /** The explanation text, the same as the cell's `title`. */
+  explanation: string;
+  /**
+   * Anchors the tooltip to the cell's right edge so that it extends leftward, for a cell in the
+   * right half of the columns; otherwise it is anchored to the left edge and extends rightward.
+   */
+  anchorRight: boolean;
+  /**
+   * Places the tooltip below the cell, for a cell in the first body row, where the matrix's
+   * scrolling root would cut off the top of a tooltip above it; otherwise it is placed above.
+   */
+  placeBelow: boolean;
+  /** The cell's visible and screen-reader content, rendered unchanged inside the trigger. */
+  children: ReactNode;
+}
+
+/**
+ * Keyboard access to a cell's explanation, which a pointer user gets from the cell's `title`. The
+ * cell's content becomes a focusable button, described by a tooltip that shows while the button
+ * has keyboard focus: above the cell, or below it on the first body row, since the scrolling root
+ * cannot scroll to a tooltip overflowing its top. Focusing scrolls the tooltip into view, which a
+ * narrow, horizontally scrolled host, or a below-cell tooltip running past the root's bottom,
+ * would otherwise cut off. Escape hides the tooltip without moving focus, so it no longer covers
+ * neighbouring cells, and leaving the button restores it for the next visit.
+ */
+function CellExplanation({
+  explanation,
+  anchorRight,
+  placeBelow,
+  children,
+}: CellExplanationProps): ReactElement {
+  const tipId = useId();
+  const tipRef = useRef<HTMLSpanElement>(null);
+  const [dismissed, setDismissed] = useState(false);
+  const placementClass = placeBelow ? EXPLANATION_TIP_BELOW : EXPLANATION_TIP_ABOVE;
+  const anchorClass = anchorRight ? EXPLANATION_TIP_ANCHOR_RIGHT : EXPLANATION_TIP_ANCHOR_LEFT;
+  const visibilityClass = dismissed ? EXPLANATION_TIP_DISMISSED : EXPLANATION_TIP_ON_FOCUS;
+
+  return (
+    <>
+      <button
+        type="button"
+        aria-describedby={tipId}
+        className={EXPLANATION_TRIGGER_CLASS}
+        onFocus={() => {
+          // The browser scrolls only the button into view. The tooltip has no box unless keyboard
+          // focus shows it, so a pointer focus scrolls nothing.
+          tipRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") setDismissed(true);
+        }}
+        onBlur={() => setDismissed(false)}
+      >
+        {children}
+      </button>
+      <span
+        ref={tipRef}
+        role="tooltip"
+        id={tipId}
+        className={`${EXPLANATION_TIP_CLASS} ${placementClass} ${anchorClass} ${visibilityClass}`}
+      >
+        {explanation}
+      </span>
+    </>
+  );
+}
+
 interface MatrixCellProps {
   cell: SensitivityCell;
   offerPriceKes: DecimalString;
   offerText: string;
   selected: SensitivityMatrixProps["selected"];
+  /** Whether the cell's column lies in the right half of the columns. */
+  inRightHalf: boolean;
+  /** Whether the cell lies in the first body row. */
+  inFirstRow: boolean;
 }
 
-/** One blended fair value with its upside beneath it, coloured against the offer. */
-function MatrixCell({ cell, offerPriceKes, offerText, selected }: MatrixCellProps): ReactElement {
+/**
+ * One blended fair value with its upside beneath it, coloured against the offer. A null or
+ * flagged cell also offers its explanation to keyboard users through {@link CellExplanation}.
+ */
+function MatrixCell({
+  cell,
+  offerPriceKes,
+  offerText,
+  selected,
+  inRightHalf,
+  inFirstRow,
+}: MatrixCellProps): ReactElement {
   const isSelected = isSelectedCell(cell, selected);
+  const isExplained = cell.fair_value_per_share_kes === null || cell.flags.length > 0;
+  const baseClass = isExplained ? `${CELL_CLASS} ${EXPLAINED_CELL_CLASS}` : CELL_CLASS;
   const className = isSelected
-    ? `${CELL_CLASS} ${toneClass(cell, offerPriceKes)} ${SELECTED_CLASS}`
-    : `${CELL_CLASS} ${toneClass(cell, offerPriceKes)}`;
+    ? `${baseClass} ${toneClass(cell, offerPriceKes)} ${SELECTED_CLASS}`
+    : `${baseClass} ${toneClass(cell, offerPriceKes)}`;
   const flags = cell.flags.join(", ");
+  const title = cellTitle(cell, offerText);
+
+  const content =
+    cell.fair_value_per_share_kes === null ? (
+      <>
+        <span aria-hidden="true">{EMPTY_VALUE}</span>
+        <span className="sr-only">
+          {flags === "" ? "Not computable" : `Not computable: ${flags}`}
+        </span>
+      </>
+    ) : (
+      <>
+        <span className="block font-medium">
+          {formatDecimal(cell.fair_value_per_share_kes, "per_share", { unit: false })}
+        </span>
+        <span className="block text-xs">
+          {formatDecimal(cell.upside_pct, "pct", { signed: true })}
+        </span>
+        {flags === "" ? null : <span className="sr-only">{flags}</span>}
+      </>
+    );
 
   return (
     <td
@@ -118,26 +253,15 @@ function MatrixCell({ cell, offerPriceKes, offerText, selected }: MatrixCellProp
       data-margin={cell.ebitda_margin_pct}
       data-selected={isSelected ? "true" : "false"}
       aria-current={isSelected ? "true" : undefined}
-      title={cellTitle(cell, offerText)}
+      title={title}
       className={className}
     >
-      {cell.fair_value_per_share_kes === null ? (
-        <>
-          <span aria-hidden="true">{EMPTY_VALUE}</span>
-          <span className="sr-only">
-            {flags === "" ? "Not computable" : `Not computable: ${flags}`}
-          </span>
-        </>
+      {isExplained ? (
+        <CellExplanation explanation={title} anchorRight={inRightHalf} placeBelow={inFirstRow}>
+          {content}
+        </CellExplanation>
       ) : (
-        <>
-          <span className="block font-medium">
-            {formatDecimal(cell.fair_value_per_share_kes, "per_share", { unit: false })}
-          </span>
-          <span className="block text-xs">
-            {formatDecimal(cell.upside_pct, "pct", { signed: true })}
-          </span>
-          {flags === "" ? null : <span className="sr-only">{flags}</span>}
-        </>
+        content
       )}
     </td>
   );
@@ -148,9 +272,11 @@ function MatrixCell({ cell, offerPriceKes, offerText, selected }: MatrixCellProp
  * the offer price: emerald at or above it, rose below it, slate when not computable.
  *
  * A pure render of the server's decimal strings: values are displayed with `formatDecimal` and
- * compared with the exact `compareDecimal`, never converted to numbers. It holds no state or
- * effects, so server and client output match on hydration. `IpoValuationSandbox` renders it, and
- * a host that calls `POST /ipo/valuation` itself can render it from the response's `sensitivity`.
+ * compared with the exact `compareDecimal`, never converted to numbers. Rendering is a pure
+ * function of the props apart from each cell explanation's Escape-dismissed flag, which starts
+ * false, so server and client output still match on hydration; it runs no effects.
+ * `IpoValuationSandbox` renders it, and a host that calls `POST /ipo/valuation` itself can render
+ * it from the response's `sensitivity`.
  */
 export function SensitivityMatrix({
   data,
@@ -176,7 +302,7 @@ export function SensitivityMatrix({
   return (
     <div data-testid="terminal-sensitivity-matrix" className={rootClass}>
       <table className="min-w-full border-collapse text-sm tabular-nums">
-        <caption className="pbe-2 text-start text-sm font-medium text-slate-300">
+        <caption className="pb-2 text-start text-sm font-medium text-slate-300">
           Fair value per share (KES) by WACC × base EBITDA margin
         </caption>
         <thead>
@@ -213,6 +339,8 @@ export function SensitivityMatrix({
                       offerPriceKes={offerPriceKes}
                       offerText={offerText}
                       selected={selected}
+                      inRightHalf={j >= cols.length / 2}
+                      inFirstRow={i === 0}
                     />
                   );
                 })}
@@ -221,7 +349,7 @@ export function SensitivityMatrix({
           })}
         </tbody>
       </table>
-      <p className="mbs-2 text-xs text-slate-400">
+      <p className="mt-2 text-xs text-slate-400">
         Green: at or above offer KES {offerText}; rose: below
       </p>
     </div>
