@@ -15,9 +15,14 @@ Run lifecycle (one call of :func:`execute_pipeline`):
    commit, on rollback after an exception, and on cancellation or process death when the
    connection closes. The lock is never taken at session level nor twice on one connection.
 3. Fetching, parsing, validation, reconciliation and the upsert all happen inside that
-   transaction; any exception rolls everything back.
+   transaction, one stage after another; any exception rolls everything back. ``parse`` and
+   ``validate`` run in a worker thread, so decoding a large file never blocks the event loop.
 4. The run row is updated with its final status, counts, ``error_message`` and ``details`` on a
-   separate connection, so run-record writes never release or extend the lock.
+   separate connection, so run-record writes never release or extend the lock. The status is the
+   data transaction's confirmed outcome: once the commit has returned, a later cleanup error or
+   cancellation does not turn the run ``failed``. The commit and both run-row writes run to
+   completion even when the run is cancelled meanwhile, so a started run never stays
+   ``running``.
 
 Final statuses:
 
@@ -78,12 +83,8 @@ from opennse_terminal.models import TerminalIngestionRun
 from opennse_terminal.models.ingestion_runs import RUN_STATUSES, RUN_TRIGGERS
 
 if TYPE_CHECKING:
-    # The ignore covers a tree in which ingestion/http.py is not present. With the module
-    # present the ignore is unused (unused-ignore keeps strict mode quiet) and mypy checks the
-    # import in full.
-    from opennse_terminal.ingestion.http import (  # type: ignore[import-not-found, unused-ignore]
-        PoliteClient,
-    )
+    # Type-only: ingestion.http imports this module at load time (see the module docstring).
+    from opennse_terminal.ingestion.http import PoliteClient
 
 __all__ = [
     "MAX_INVALID_FRACTION",
@@ -440,6 +441,13 @@ class Pipeline(ABC, Generic[RawT, RecordT]):
     def parse(self, raw: RawT) -> list[RecordT]:
         """Turn raw content into typed records, without I/O.
 
+        Runs in a worker thread (``asyncio.to_thread``) once :meth:`fetch` has returned, so heavy
+        decoding never blocks the event loop; no other stage of the run executes meanwhile. It
+        must not use the event loop, ``ctx.conn`` or ``ctx.http``; it may keep per-run evidence
+        on the instance, including in the ``ctx.details`` mapping it kept from :meth:`fetch`. A
+        cancellation that arrives while it runs takes effect once it returns, and its result is
+        then discarded.
+
         Raises :class:`SourceLayoutChanged` when expected headers or tables are missing or
         different. Rows whose cells do not convert are returned for :meth:`validate` to reject.
         """
@@ -448,8 +456,9 @@ class Pipeline(ABC, Generic[RawT, RecordT]):
     def validate(self, records: Sequence[RecordT]) -> ValidationOutcome[RecordT]:
         """Check each record against the source's range and format rules, without I/O.
 
-        The framework applies the shared thresholds: up to 10% rejected gives ``partial``,
-        more gives ``layout_changed``.
+        Runs in a worker thread once :meth:`parse` has returned, under the same rules as
+        :meth:`parse`. The framework applies the shared thresholds: up to 10% rejected gives
+        ``partial``, more gives ``layout_changed``.
         """
 
     async def reconcile(
@@ -528,6 +537,10 @@ def parse_decimal_text(text: str | None, *, parentheses_negative: bool = True) -
     Whitespace (NBSP included) and ``,`` thousands separators are removed; the Unicode minus
     sign counts as ``-``; a leading ``+`` or ``-`` is accepted; ``(1,234.5)`` reads as
     ``Decimal("-1234.5")`` when ``parentheses_negative`` is true.
+
+    The result is exact at any length and exponent, whatever the active ``decimal`` context: a
+    parenthesized non-zero number equals its leading-minus form digit for digit, and ``(0)``
+    stays a positive zero. Range checks are the caller's.
 
     Returns ``None`` for ``None``, an empty cell, ``-``, ``—``, ``–``, ``n/a`` (any case) and
     anything that is not a finite decimal number (``NaN``, ``Infinity``, stray letters). The
@@ -746,11 +759,65 @@ _DURATION_QUANTUM: Final = Decimal("0.001")
 
 @dataclass(slots=True)
 class _RunProgress:
-    """Counts kept while a run proceeds, so a failure still reports what was fetched."""
+    """Counts kept while a run proceeds, so a failure still reports what was fetched, and the
+    confirmed outcome of its data transaction.
+
+    ``written`` and ``committed`` (the ``succeeded`` or ``partial`` status committed) are set
+    only once the commit has returned; from then on the data is in the database, whatever a later
+    cleanup step or cancellation does.
+    """
 
     fetched: int = 0
     written: int = 0
     rejected: list[RejectedRow] = field(default_factory=list)
+    committed: RunStatus | None = None
+
+
+_ArgT = TypeVar("_ArgT")
+_ResultT = TypeVar("_ResultT")
+
+
+async def _wait_through_cancellation(task: asyncio.Future[Any]) -> bool:
+    """Wait until ``task`` is done, however often the calling task is cancelled meanwhile, and
+    return whether it was asked to cancel while waiting.
+
+    ``asyncio.wait`` neither cancels ``task`` nor raises its exception, so ``task`` always runs
+    to completion and its outcome stays on it for the caller to read; the caller's reference
+    keeps it alive. A cancellation received while waiting is absorbed and reported through the
+    return value: the caller deals with the finished task, then raises
+    ``asyncio.CancelledError`` itself, so the calling task still ends cancelled.
+    """
+    cancel_requested = False
+    while not task.done():
+        try:
+            await asyncio.wait((task,))
+        except asyncio.CancelledError:
+            cancel_requested = True
+    return cancel_requested
+
+
+def _task_error(task: asyncio.Future[Any]) -> BaseException | None:
+    """The exception a finished task ended with (``CancelledError`` when it was itself
+    cancelled), or ``None``; reading it marks it retrieved, so asyncio never reports it."""
+    if task.cancelled():
+        return asyncio.CancelledError()
+    return task.exception()
+
+
+async def _run_stage(stage: Callable[[_ArgT], _ResultT], argument: _ArgT) -> _ResultT:
+    """Run a synchronous pipeline stage (``parse`` or ``validate``) in a worker thread and
+    return its result or raise its exception, leaving the event loop free meanwhile.
+
+    A thread cannot be interrupted, so a cancellation received while the stage runs waits for it
+    to return; the stage therefore never outlives the run, nor touches the run's ``details``
+    while they are being recorded. Its result or exception is then discarded and
+    ``asyncio.CancelledError`` raised, which rolls the data transaction back.
+    """
+    task = asyncio.create_task(asyncio.to_thread(stage, argument))
+    if await _wait_through_cancellation(task):
+        _task_error(task)
+        raise asyncio.CancelledError
+    return task.result()
 
 
 def _exception_evidence(exc: BaseException) -> dict[str, Any]:
@@ -809,11 +876,15 @@ async def _run_in_transaction(
     """Run fetch -> parse -> validate -> reconcile -> upsert in one data transaction holding the
     run's transaction-scoped advisory lock, and return ``succeeded`` or ``partial``.
 
-    The transaction commits when the block exits cleanly and rolls back on any exception;
-    either way PostgreSQL releases the lock with it.
+    ``parse`` and ``validate`` run in a worker thread (:func:`_run_stage`). Any exception before
+    the commit rolls the transaction back. The commit is explicit and runs to completion even if
+    the run is cancelled meanwhile, so its outcome is never in doubt: once it has returned,
+    ``progress`` records the committed status and the rows written, and a cancellation received
+    during it is re-raised only then. PostgreSQL releases the lock with the transaction.
     """
     run_name = pipeline.run_name
-    async with engine.connect() as conn, conn.begin():
+    cancel_requested = False
+    async with engine.connect() as conn, conn.begin() as transaction:
         await conn.execute(_SET_IDLE_TIMEOUT)
         acquired = (await conn.execute(_TRY_XACT_LOCK, {"pipeline": run_name})).scalar_one()
         if not acquired:
@@ -830,9 +901,9 @@ async def _run_in_transaction(
             details=details,
         )
         raw = await pipeline.fetch(ctx)
-        records = pipeline.parse(raw)
+        records = await _run_stage(pipeline.parse, raw)
         progress.fetched = len(records)
-        validated = pipeline.validate(records)
+        validated = await _run_stage(pipeline.validate, records)
         progress.rejected.extend(validated.rejected)
         reconciled = await pipeline.reconcile(ctx, validated.valid)
         progress.rejected.extend(reconciled.rejected)
@@ -855,41 +926,150 @@ async def _run_in_transaction(
                 message=message,
             )
         written = await pipeline.upsert(conn, reconciled.valid, run_id) if reconciled.valid else 0
-    # Counted only once the commit has succeeded.
-    progress.written = written
+        # Committed explicitly, in a task of its own that a cancellation cannot abandon midway, so
+        # the outcome is known before anything else happens; leaving the block then changes
+        # nothing.
+        commit = asyncio.create_task(transaction.commit())
+        cancel_requested = await _wait_through_cancellation(commit)
+        commit_error = _task_error(commit)
+        if commit_error is not None:
+            if cancel_requested:
+                raise asyncio.CancelledError
+            raise commit_error
+        # Counted only once the commit has succeeded.
+        progress.written = written
+        progress.committed = status
+    if cancel_requested:
+        raise asyncio.CancelledError
     return status
 
 
+# The FetchFailed reason codes the ingestion modules raise, besides "http_<status>" and
+# "robots_http_<status>". A reason reaches a log line only as one of these codes, so no URL,
+# file path or file name can.
+_FETCH_FAILED_CODES: Final = frozenset(
+    {
+        # ingestion/http.py
+        "invalid_url",
+        "unsupported_url",
+        "url_has_userinfo",
+        "unsupported_content_encoding",
+        "invalid_content_encoding",
+        "too_many_redirects",
+        "invalid_redirect",
+        "response_too_large",
+        # ingestion/files/tabular_import.py
+        "too_many_rows",
+        "file_too_large",
+        "file_not_found",
+        "not_a_file",
+        "unreadable_file",
+    }
+)
+_HTTP_STATUS_REASON: Final = re.compile(r"(?:robots_)?http_[0-9]{3}")
+# The documented values of RobotsDisallowed.reason.
+_ROBOTS_REASONS: Final = frozenset({"disallowed", "robots_unreachable"})
+
+
+def _fetch_failed_code(exc: FetchFailed) -> str:
+    """``fetch_failed``, then ``:<code>`` when the reason's text before its first ``:`` is a
+    known code, then ``:<type>`` of the exception it was raised from, if any."""
+    parts = ["fetch_failed"]
+    code = exc.reason.partition(":")[0] if isinstance(exc.reason, str) else ""
+    if code in _FETCH_FAILED_CODES or _HTTP_STATUS_REASON.fullmatch(code):
+        parts.append(code)
+    if exc.__cause__ is not None:
+        parts.append(type(exc.__cause__).__name__)
+    return ":".join(parts)
+
+
+def _log_code(exc: BaseException) -> str:
+    """Name an exception in the run's log lines without its text.
+
+    Exception messages, reasons and tracebacks can carry input file paths, file names, URLs and
+    SQL statements with their bound parameters, so a log line gets only fixed codes and type
+    names:
+
+    ==============================  ===================================================
+    Exception                       Logged as
+    ==============================  ===================================================
+    ``asyncio.CancelledError``      ``cancelled``
+    :class:`LockHeld`               ``lock held``
+    :class:`FetchFailed`            ``fetch_failed``, then ``:<code>`` when its
+                                    ``reason``, up to any ``:``, is a code the
+                                    ingestion modules raise (``http_<status>``,
+                                    ``robots_http_<status>``, ``invalid_url``,
+                                    ``unsupported_url``, ``url_has_userinfo``,
+                                    ``unsupported_content_encoding``,
+                                    ``invalid_content_encoding``,
+                                    ``too_many_redirects``, ``invalid_redirect``,
+                                    ``response_too_large``, ``too_many_rows``,
+                                    ``file_too_large``, ``file_not_found``,
+                                    ``not_a_file``, ``unreadable_file``), then
+                                    ``:<type>`` of the exception it was raised from,
+                                    for example ``fetch_failed:http_404``,
+                                    ``fetch_failed:unreadable_file:PermissionError``
+                                    or ``fetch_failed:ConnectTimeout``
+    ``CalendarNotVerified``         ``calendar_not_verified:<year>``
+    :class:`RobotsDisallowed`       its ``reason`` when it is ``disallowed`` or
+                                    ``robots_unreachable``, else its type name
+    :class:`AmbiguousSession`       its type name; the dating evidence is recorded in
+                                    the run's ``details``, never logged
+    :class:`SourceLayoutChanged`    ``layout_changed``
+    :class:`NoNewData`              ``no_new_data``
+    any other exception             its type name, for example ``IntegrityError``
+    ==============================  ===================================================
+
+    Any other text in a reason is never logged: an exception type it names is taken from the
+    exception's ``__cause__``, not from the reason.
+    """
+    if isinstance(exc, asyncio.CancelledError):
+        return "cancelled"
+    if isinstance(exc, LockHeld):
+        return "lock held"
+    if isinstance(exc, FetchFailed):
+        return _fetch_failed_code(exc)
+    if isinstance(exc, CalendarNotVerified):
+        return f"calendar_not_verified:{int(exc.year)}"
+    if isinstance(exc, RobotsDisallowed):
+        return exc.reason if exc.reason in _ROBOTS_REASONS else type(exc).__name__
+    if isinstance(exc, AmbiguousSession):
+        return type(exc).__name__
+    if isinstance(exc, SourceLayoutChanged):
+        return "layout_changed"
+    if isinstance(exc, NoNewData):
+        return "no_new_data"
+    return type(exc).__name__
+
+
 def _log_run_end(result: RunResult, exc: BaseException | None) -> None:
-    """Log a finished run at the level its status calls for, then its summary at INFO."""
+    """Log a finished run at the level its status calls for, then its summary at INFO.
+
+    Every line carries the run id and run name. A failure, robots block or ambiguous session is
+    named by :func:`_log_code`, never by the exception's text or traceback. A layout change is
+    logged with ``details.expected`` and ``details.found`` (the expected and found headers, row
+    counts, sheet names or links) and without its message, which can name the input file; the
+    message is the run row's ``error_message``.
+    """
     status = result.status
+    reason = "unknown" if exc is None else _log_code(exc)
     if status is RunStatus.LAYOUT_CHANGED:
         logger.error(
-            "ingestion run %s (%s) layout_changed: %s; expected=%r found=%r",
+            "ingestion run %s (%s) layout_changed: expected=%r found=%r",
             result.run_id,
             result.pipeline,
-            result.error_message,
             result.details.get("expected"),
             result.details.get("found"),
         )
     elif status is RunStatus.FAILED:
-        unexpected = exc is not None and not isinstance(
-            exc, (IngestionError, CalendarNotVerified, asyncio.CancelledError)
-        )
-        logger.error(
-            "ingestion run %s (%s) failed: %s",
-            result.run_id,
-            result.pipeline,
-            result.error_message,
-            exc_info=exc if unexpected else None,
-        )
+        logger.error("ingestion run %s (%s) failed: %s", result.run_id, result.pipeline, reason)
     elif status in (RunStatus.BLOCKED_BY_ROBOTS, RunStatus.AMBIGUOUS_SESSION):
         logger.warning(
             "ingestion run %s (%s) %s: %s",
             result.run_id,
             result.pipeline,
             status.value,
-            result.error_message,
+            reason,
         )
     logger.info(
         "ingestion run %s finished: pipeline=%s status=%s fetched=%d written=%d rejected=%d "
@@ -920,23 +1100,72 @@ async def execute_pipeline(
        ``idle_in_transaction_session_timeout`` and takes
        ``pg_try_advisory_xact_lock(hashtext('terminal:' || run_name))``; a held lock raises
        :class:`LockHeld`. Fetch, parse, validate, reconcile, the thresholds of
-       :func:`evaluate_thresholds` and the upsert run inside it. It commits on success and rolls
-       back on any exception, and PostgreSQL releases the lock either way.
+       :func:`evaluate_thresholds` and the upsert run inside it, in that order; ``parse`` and
+       ``validate`` run in a worker thread. It commits on success and rolls back on any
+       exception, and PostgreSQL releases the lock either way.
     4. The run row is updated with the final status (see :func:`classify_exception`), counts,
        ``error_message`` and ``details``: ``ctx.details``, the exception's evidence,
        ``duration_seconds`` (seconds to 3 decimal places, measured with
        :func:`time.monotonic_ns`) and the first 50 rejected rows.
 
     Only ``succeeded`` and ``partial`` runs write data (``partial`` writes the valid rows only).
-    Pipeline exceptions become statuses and are not raised. ``asyncio.CancelledError`` rolls the
-    data back, records ``failed`` with ``"cancelled"`` and is re-raised; ``KeyboardInterrupt``
-    and ``SystemExit`` propagate untouched. Errors writing the run row itself propagate.
+    Pipeline exceptions become statuses and are not raised.
+
+    The recorded status is the data transaction's confirmed outcome. Once the commit has
+    returned, an exception or cancellation while the run's HTTP client is closed or its
+    connection released keeps the committed status and ``rows_written``, adds
+    ``details.after_commit_error`` (the exception's type name) and is logged at WARNING; the
+    exception itself is not raised, a pending cancellation is (below).
+
+    ``asyncio.CancelledError`` before the commit rolls the data back and records ``failed`` with
+    ``"cancelled"``; a ``parse`` or ``validate`` stage already running in its worker thread is
+    first allowed to return. The ``running`` insert, the commit and the final update each run in
+    a task of their own to completion, however often the run is cancelled meanwhile, so a
+    started run is never left ``running`` and nothing outlives the call. A cancellation received
+    at any point is re-raised once the run row is final.
+
+    A cancellation is pending while the calling task's :meth:`asyncio.Task.cancelling` count
+    stays above its value when the call began; nothing here calls ``uncancel()``. It is therefore
+    re-raised even when another exception replaced its ``CancelledError`` while the run unwound,
+    for example from closing the run's HTTP client: before the commit, the run is still recorded
+    ``failed`` with ``"cancelled"``, ``details.error_during_cancellation`` names the replacing
+    exception's type, and a WARNING names it by its type or reason code, never by its text. The
+    ``CancelledError`` raised leaves the count as it is, so an ``asyncio.timeout()`` around the
+    call raises ``TimeoutError``.
+
+    An error writing the run row propagates, unless a cancellation is pending: the error is then
+    logged at ERROR (its type only) and the cancellation re-raised. ``KeyboardInterrupt`` and
+    ``SystemExit`` propagate untouched, leaving the row ``running``.
     """
     recorder = RunRecorder(engine)
     run_name = pipeline.run_name
-    run_id = await recorder.start(
-        pipeline=run_name, trigger=trigger, source_url=pipeline.source_url
+    # A cancellation request stays counted on the task until uncancel(), which nothing here
+    # calls: a rise in the count is a cancellation of this run, whether it was absorbed while a
+    # step ran to completion or its CancelledError was replaced by a cleanup error.
+    task = asyncio.current_task()
+    cancels_at_entry = 0 if task is None else task.cancelling()
+
+    def cancel_pending() -> bool:
+        return task is not None and task.cancelling() > cancels_at_entry
+
+    # The running row is inserted in a task of its own that a cancellation cannot abandon
+    # midway: once the insert has committed, the row is finished below whatever happens.
+    start = asyncio.create_task(
+        recorder.start(pipeline=run_name, trigger=trigger, source_url=pipeline.source_url)
     )
+    cancelled_while_starting = await _wait_through_cancellation(start) or cancel_pending()
+    start_error = _task_error(start)
+    if start_error is not None:
+        if cancelled_while_starting:
+            if not isinstance(start_error, asyncio.CancelledError):
+                logger.error(
+                    "could not record the start of an ingestion run of %s: %s",
+                    run_name,
+                    _log_code(start_error),
+                )
+            raise asyncio.CancelledError
+        raise start_error
+    run_id = start.result()
     started_ns = time.monotonic_ns()
     logger.info("ingestion run %s started: pipeline=%s trigger=%s", run_id, run_name, trigger)
 
@@ -945,7 +1174,10 @@ async def execute_pipeline(
     evidence: dict[str, Any] = {}
     error_message: str | None = None
     failure: BaseException | None = None
+    cancellation: asyncio.CancelledError | None = None
     try:
+        if cancelled_while_starting:
+            raise asyncio.CancelledError
         async with AsyncExitStack() as stack:
             client = http
             if client is None:
@@ -963,28 +1195,39 @@ async def execute_pipeline(
                 progress=progress,
             )
     except asyncio.CancelledError as exc:
-        # The data transaction has rolled back on the way out; record the run even if this task
-        # is cancelled again while waiting, then let the cancellation continue.
-        cancelled = RunResult(
-            run_id=run_id,
-            pipeline=run_name,
-            status=RunStatus.FAILED,
-            rows_fetched=progress.fetched,
-            rows_written=0,
-            rows_rejected=len(progress.rejected),
-            error_message="cancelled",
-            details=_run_details(context_details, {}, progress, started_ns),
-        )
-        try:
-            await asyncio.shield(_finish(recorder, cancelled, pipeline.source_url))
-        except Exception:
-            logger.exception("could not record cancelled ingestion run %s", run_id)
-        _log_run_end(cancelled, exc)
-        raise
+        # Recorded below, then re-raised once the run row is finished.
+        failure = cancellation = exc
+        status, error_message = RunStatus.FAILED, "cancelled"
     except Exception as exc:
         failure = exc
         status, error_message = classify_exception(exc)
         evidence = _exception_evidence(exc)
+    if cancellation is None and cancel_pending():
+        # The run was cancelled, but the CancelledError was absorbed while the commit finished
+        # or replaced by an error raised while the run unwound; it is re-raised below.
+        cancellation = asyncio.CancelledError()
+        if progress.committed is None and failure is not None:
+            # Nothing committed: the cancellation, not the replacing error, ended the run.
+            logger.warning(
+                "ingestion run %s (%s) was cancelled; unwinding it raised %s",
+                run_id,
+                run_name,
+                _log_code(failure),
+            )
+            status, error_message = RunStatus.FAILED, "cancelled"
+            evidence = {"error_during_cancellation": type(failure).__name__}
+            failure = cancellation
+    if progress.committed is not None and failure is not None:
+        # The data had committed when closing the run's HTTP client or connection raised, or
+        # the run was cancelled: the committed outcome stands, and the interruption is noted.
+        status, error_message = progress.committed, None
+        evidence = {"after_commit_error": type(failure).__name__}
+        logger.warning(
+            "ingestion run %s (%s) was interrupted after its data committed: %s",
+            run_id,
+            run_name,
+            _log_code(failure),
+        )
 
     result = RunResult(
         run_id=run_id,
@@ -996,8 +1239,25 @@ async def execute_pipeline(
         error_message=error_message,
         details=_run_details(context_details, evidence, progress, started_ns),
     )
-    await _finish(recorder, result, pipeline.source_url)
+    # Like the insert, the final update runs to completion however often the task is cancelled
+    # meanwhile, and its error is observed here rather than left to the event loop.
+    audit = asyncio.create_task(_finish(recorder, result, pipeline.source_url))
+    if await _wait_through_cancellation(audit) and cancellation is None:
+        cancellation = asyncio.CancelledError()
+    audit_error = _task_error(audit)
+    if audit_error is not None:
+        if cancellation is None:
+            raise audit_error
+        logger.error(
+            "could not record ingestion run %s (%s) as %s: %s",
+            run_id,
+            run_name,
+            status.value,
+            _log_code(audit_error),
+        )
     _log_run_end(result, failure)
+    if cancellation is not None:
+        raise cancellation
     return result
 
 

@@ -15,27 +15,32 @@ recomputed with the code under test. Numbers are ``Decimal`` throughout.
 from __future__ import annotations
 
 import asyncio
+import gc
 import importlib.util
 import json
 import logging
+import threading
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import FrozenInstanceError, dataclass
 from datetime import UTC, date, datetime, time, timedelta
-from decimal import Decimal
+from decimal import Context, Decimal, localcontext
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, cast, get_args
 from zoneinfo import ZoneInfo
 
+import httpx
 import pytest
 from sqlalchemy import Insert, Update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 import opennse_terminal.models.ingestion_runs as ingestion_runs_model
 from opennse_terminal.config import TerminalSettings
 from opennse_terminal.ingestion import base
+from opennse_terminal.ingestion import http as ingestion_http
 from opennse_terminal.ingestion.base import (
     MAX_INVALID_FRACTION,
     REJECTED_SAMPLE_LIMIT,
@@ -113,15 +118,38 @@ class _ResultDouble:
         return self.scalar
 
 
+class _TransactionDouble:
+    """Stands in for ``AsyncTransaction``: ``commit()`` settles the outcome explicitly.
+
+    ``engine.commit_started`` is set when a commit begins; ``engine.commit_release``, when given,
+    holds the commit until it is set, and ``engine.fail_commit`` makes it raise.
+    """
+
+    def __init__(self, conn: _ConnectionDouble) -> None:
+        self._conn = conn
+
+    async def commit(self) -> None:
+        engine = self._conn._engine
+        engine.commit_started.set()
+        if engine.commit_release is not None:
+            await engine.commit_release.wait()
+        if engine.fail_commit:
+            raise RuntimeError("commit failed")
+        self._conn.outcome = COMMITTED
+
+
 @asynccontextmanager
-async def _transaction(conn: _ConnectionDouble) -> AsyncIterator[_ConnectionDouble]:
-    """Commit on a clean exit and roll back on any exception, as SQLAlchemy's ``begin()`` does."""
+async def _transaction(conn: _ConnectionDouble) -> AsyncIterator[_TransactionDouble]:
+    """Commit on a clean exit and roll back on any exception, as SQLAlchemy's ``begin()`` does;
+    after an explicit ``commit()``, leaving the block changes nothing."""
     try:
-        yield conn
+        yield _TransactionDouble(conn)
     except BaseException:
-        conn.outcome = ROLLED_BACK
+        if conn.outcome is None:
+            conn.outcome = ROLLED_BACK
         raise
-    conn.outcome = COMMITTED
+    if conn.outcome is None:
+        conn.outcome = COMMITTED
 
 
 class _ConnectionDouble:
@@ -140,7 +168,19 @@ class _ConnectionDouble:
         params = dict(statement.compile().params)
         params.update(parameters or {})
         self.executed.append(_Executed(statement, params))
+        if isinstance(statement, Insert) and self._engine.insert_release is not None:
+            self._engine.insert_started.set()
+            await self._engine.insert_release.wait()
+        if (
+            isinstance(statement, Insert)
+            and self.kind == RUN_RECORD
+            and self._engine.insert_error is not None
+        ):
+            raise self._engine.insert_error
         if isinstance(statement, Update):
+            self._engine.update_started.set()
+            if self._engine.update_release is not None:
+                await self._engine.update_release.wait()
             if self._engine.fail_run_updates:
                 raise RuntimeError("run row update failed")
             return _ResultDouble(rowcount=self._engine.update_rowcount)
@@ -148,7 +188,7 @@ class _ConnectionDouble:
             return _ResultDouble(scalar=self._engine.lock_available)
         return _ResultDouble()
 
-    def begin(self) -> AbstractAsyncContextManager[_ConnectionDouble]:
+    def begin(self) -> AbstractAsyncContextManager[_TransactionDouble]:
         return _transaction(self)
 
 
@@ -157,6 +197,11 @@ class _EngineDouble:
 
     ``begin()`` checks out a run-record connection inside its own transaction; ``connect()``
     checks out the run's dedicated data connection, whose transaction the caller begins.
+
+    ``insert_release``, ``update_release`` and ``commit_release``, when given, hold the run row's
+    insert, its final update and the data commit until they are set; the matching ``*_started``
+    event is set when each begins. ``insert_error``, when given, is raised by the run row's
+    insert once any hold is released.
     """
 
     def __init__(
@@ -165,10 +210,23 @@ class _EngineDouble:
         lock_available: bool = True,
         update_rowcount: int = 1,
         fail_run_updates: bool = False,
+        fail_commit: bool = False,
+        insert_error: BaseException | None = None,
+        hold_insert: bool = False,
+        hold_update: bool = False,
+        hold_commit: bool = False,
     ) -> None:
         self.lock_available = lock_available
         self.update_rowcount = update_rowcount
         self.fail_run_updates = fail_run_updates
+        self.fail_commit = fail_commit
+        self.insert_error = insert_error
+        self.insert_started = asyncio.Event()
+        self.update_started = asyncio.Event()
+        self.commit_started = asyncio.Event()
+        self.insert_release = asyncio.Event() if hold_insert else None
+        self.update_release = asyncio.Event() if hold_update else None
+        self.commit_release = asyncio.Event() if hold_commit else None
         self.connections: list[_ConnectionDouble] = []
 
     @asynccontextmanager
@@ -356,6 +414,81 @@ class _BlockingPipeline(_QuotePipeline):
         never_released = asyncio.Event()
         await never_released.wait()
         return list(self.cells)
+
+
+class _GatedStagePipeline(_QuotePipeline):
+    """Records the thread each synchronous stage runs in; the ``gate`` stage (``parse`` or
+    ``validate``) then blocks its thread until the test sets ``release``."""
+
+    name = "test_gated"
+
+    def __init__(self, settings: TerminalSettings, *, gate: str, **options: Any) -> None:
+        super().__init__(settings, **options)
+        self.gate = gate
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.threads: dict[str, int] = {}
+        self.finished: list[str] = []
+
+    def _enter(self, stage: str) -> None:
+        self.threads[stage] = threading.get_ident()
+        if stage == self.gate:
+            self.entered.set()
+            # Bounded, so a stage run on the event-loop thread fails the test instead of hanging.
+            if not self.release.wait(timeout=10):
+                raise TimeoutError(f"{stage} was never released")
+
+    def parse(self, raw: list[str]) -> list[_Quote]:
+        self._enter("parse")
+        records = super().parse(raw)
+        self.finished.append("parse")
+        return records
+
+    def validate(self, records: Sequence[_Quote]) -> ValidationOutcome[_Quote]:
+        self._enter("validate")
+        outcome = super().validate(records)
+        self.finished.append("validate")
+        return outcome
+
+
+class _ClosingClient:
+    """Stands in for the ``PoliteClient`` a run opens for itself. Closing it raises
+    ``close_error``, or, without one, waits until the run's task is cancelled."""
+
+    def __init__(self, settings: TerminalSettings, close_error: BaseException | None) -> None:
+        self.settings = settings
+        self.close_error = close_error
+        self.closing = asyncio.Event()
+
+    async def __aenter__(self) -> _ClosingClient:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self.closing.set()
+        if self.close_error is not None:
+            raise self.close_error
+        await asyncio.Event().wait()
+
+
+def _open_closing_clients(
+    monkeypatch: pytest.MonkeyPatch, close_error: BaseException | None
+) -> list[_ClosingClient]:
+    """Make every run open a :class:`_ClosingClient` in place of a ``PoliteClient``, and return
+    the list each opened client is appended to."""
+    clients: list[_ClosingClient] = []
+
+    def open_client(client_settings: TerminalSettings) -> _ClosingClient:
+        client = _ClosingClient(client_settings, close_error)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(ingestion_http, "PoliteClient", open_client)
+    return clients
+
+
+def _other_tasks() -> set[asyncio.Task[Any]]:
+    """Tasks of the running loop other than the test's own: a finished run leaves none."""
+    return asyncio.all_tasks() - {cast(asyncio.Task[Any], asyncio.current_task())}
 
 
 async def _execute(
@@ -980,6 +1113,31 @@ def test_parse_decimal_text_keeps_a_parenthesized_zero_positive(text: str) -> No
     assert not result.is_signed()
 
 
+@pytest.mark.parametrize(
+    ("text", "context", "expected"),
+    [
+        pytest.param(
+            "(1,234,567,890.123456789012345678901234567890)",
+            Context(),
+            "-1234567890.123456789012345678901234567890",
+            id="forty-digits-grouped-with-fraction",
+        ),
+        pytest.param("(1234567.89)", Context(prec=5), "-1234567.89", id="five-digit-context"),
+    ],
+)
+def test_parse_decimal_text_negates_parentheses_exactly_under_any_context(
+    text: str, context: Context, expected: str
+) -> None:
+    # Context() is the default context (28 digits, Emax 999999, Overflow trapped).
+    with localcontext(context):
+        result = parse_decimal_text(text)
+    assert type(result) is Decimal
+    # as_tuple() compares the sign, every digit and the exponent with the leading-minus form,
+    # which the Decimal constructor reads exactly whatever the context.
+    assert result.as_tuple() == Decimal(expected).as_tuple()
+    assert str(result) == expected
+
+
 # --- dedupe_by_key --------------------------------------------------------------------------
 
 
@@ -1506,9 +1664,10 @@ async def test_threshold_breach_ends_layout_changed_and_writes_nothing(
     (record,) = _warnings_and_errors(caplog)
     assert record.levelno == logging.ERROR
     assert record.getMessage() == (
-        f"ingestion run {result.run_id} ({pipeline.name}) layout_changed: {message}; "
+        f"ingestion run {result.run_id} ({pipeline.name}) layout_changed: "
         f"expected={expected!r} found={found!r}"
     )
+    assert message not in caplog.text
 
 
 async def test_reconcile_rejections_count_toward_the_thresholds(
@@ -1560,7 +1719,7 @@ async def test_empty_parse_succeeds_without_calling_upsert(settings: TerminalSet
 
 
 @pytest.mark.parametrize(
-    ("error", "status", "message", "evidence", "level"),
+    ("error", "status", "message", "evidence", "logged"),
     [
         pytest.param(
             SourceLayoutChanged(
@@ -1569,7 +1728,10 @@ async def test_empty_parse_succeeds_without_calling_upsert(settings: TerminalSet
             RunStatus.LAYOUT_CHANGED,
             "header row changed",
             {"expected": ["year", "month"], "found": ["yr"]},
-            logging.ERROR,
+            (
+                logging.ERROR,
+                "layout_changed: expected=['year', 'month'] found=['yr']",
+            ),
             id="source-layout-changed",
         ),
         pytest.param(
@@ -1577,7 +1739,7 @@ async def test_empty_parse_succeeds_without_calling_upsert(settings: TerminalSet
             RunStatus.BLOCKED_BY_ROBOTS,
             f"robots.txt blocks {CSV_URL} (disallowed)",
             {"robots": {"url": CSV_URL, "reason": "disallowed"}},
-            logging.WARNING,
+            (logging.WARNING, "blocked_by_robots: disallowed"),
             id="robots-disallowed",
         ),
         pytest.param(
@@ -1585,7 +1747,7 @@ async def test_empty_parse_succeeds_without_calling_upsert(settings: TerminalSet
             RunStatus.FAILED,
             f"fetch failed for {CSV_URL}: http_503",
             {"fetch_failure": {"url": CSV_URL, "reason": "http_503"}},
-            logging.ERROR,
+            (logging.ERROR, "failed: fetch_failed:http_503"),
             id="fetch-failed",
         ),
         pytest.param(
@@ -1593,7 +1755,7 @@ async def test_empty_parse_succeeds_without_calling_upsert(settings: TerminalSet
             RunStatus.AMBIGUOUS_SESSION,
             "ambiguous session: label_mismatch",
             {"reason": "label_mismatch", "label_session": "2026-10-27"},
-            logging.WARNING,
+            (logging.WARNING, "ambiguous_session: AmbiguousSession"),
             id="ambiguous-session",
         ),
         pytest.param(
@@ -1609,7 +1771,7 @@ async def test_empty_parse_succeeds_without_calling_upsert(settings: TerminalSet
             RunStatus.FAILED,
             CALENDAR_MESSAGE,
             {"calendar": {"year": 2028, "verified_years": [2026, 2027]}},
-            logging.ERROR,
+            (logging.ERROR, "failed: calendar_not_verified:2028"),
             id="calendar-not-verified",
         ),
         pytest.param(
@@ -1617,7 +1779,7 @@ async def test_empty_parse_succeeds_without_calling_upsert(settings: TerminalSet
             RunStatus.FAILED,
             "RuntimeError: parser exploded",
             {"exception": "RuntimeError"},
-            logging.ERROR,
+            (logging.ERROR, "failed: RuntimeError"),
             id="unexpected",
         ),
     ],
@@ -1629,7 +1791,7 @@ async def test_fetch_exception_becomes_the_run_status_with_its_evidence(
     status: RunStatus,
     message: str,
     evidence: dict[str, object],
-    level: int | None,
+    logged: tuple[int, str] | None,
 ) -> None:
     caplog.set_level(logging.INFO, logger=LOGGER)
     engine = _EngineDouble()
@@ -1652,14 +1814,20 @@ async def test_fetch_exception_becomes_the_run_status_with_its_evidence(
     assert update.params["details"] == result.details
 
     records = _warnings_and_errors(caplog)
-    if level is None:
+    if logged is None:
         assert records == []
     else:
         (record,) = records
-        assert record.levelno == level
-        assert record.getMessage().startswith(f"ingestion run {result.run_id} (test_quotes) ")
-        # Only an unexpected exception carries its traceback into the log.
-        assert (record.exc_info is not None) is isinstance(error, RuntimeError)
+        level, line = logged
+        assert (record.levelno, record.getMessage()) == (
+            level,
+            f"ingestion run {result.run_id} (test_quotes) {line}",
+        )
+        # No traceback, and no recorded message: they are exception text (here carrying the
+        # source URL), recorded in the run row only.
+        assert record.exc_info is None
+        assert message not in caplog.text
+        assert CSV_URL not in caplog.text
 
 
 async def test_exception_after_parsing_keeps_the_fetched_count_and_writes_nothing(
@@ -1859,6 +2027,705 @@ async def test_cancelled_run_still_reraises_when_its_run_row_cannot_be_written(
 
     run_id = engine.inserts[0].params["id"]
     not_recorded, failed = _warnings_and_errors(caplog)
-    assert not_recorded.getMessage() == f"could not record cancelled ingestion run {run_id}"
-    assert not_recorded.exc_info is not None
+    # The audit error is named by its type only: no message text and no traceback.
+    assert (not_recorded.levelno, not_recorded.getMessage()) == (
+        logging.ERROR,
+        f"could not record ingestion run {run_id} (test_blocking) as failed: RuntimeError",
+    )
+    assert not_recorded.exc_info is None
+    assert "run row update failed" not in caplog.text
     assert failed.getMessage() == f"ingestion run {run_id} (test_blocking) failed: cancelled"
+    assert failed.exc_info is None
+
+
+# --- Worker-thread stages, cancel-safe recording and the committed outcome --------------------
+
+
+@pytest.mark.parametrize("gate", ["parse", "validate"])
+async def test_parse_and_validate_run_in_a_worker_thread_while_the_loop_stays_free(
+    settings: TerminalSettings, gate: str
+) -> None:
+    engine = _EngineDouble()
+    pipeline = _GatedStagePipeline(settings, gate=gate, cells=["1.00", "2.00"])
+    task = asyncio.create_task(_execute(pipeline, engine, _HttpDouble()))
+    assert await asyncio.to_thread(pipeline.entered.wait, 10)
+
+    # The gated stage holds its thread, yet timers and other coroutines keep running.
+    await asyncio.sleep(0.02)
+    assert not task.done()
+    pipeline.release.set()
+    result = await task
+
+    assert result.status is RunStatus.SUCCEEDED
+    assert (result.rows_fetched, result.rows_written) == (2, 2)
+    assert pipeline.finished == ["parse", "validate"]
+    assert set(pipeline.threads) == {"parse", "validate"}
+    assert threading.get_ident() not in pipeline.threads.values()
+    # Still one data transaction, committed after both stages.
+    (data,) = engine.data_connections
+    assert data.outcome == COMMITTED
+
+
+@pytest.mark.parametrize(
+    ("gate", "stages", "fetched"),
+    [
+        pytest.param("parse", ["parse"], 0, id="parse"),
+        pytest.param("validate", ["parse", "validate"], 2, id="validate"),
+    ],
+)
+async def test_cancellation_waits_for_the_running_stage_then_rolls_back(
+    settings: TerminalSettings,
+    caplog: pytest.LogCaptureFixture,
+    gate: str,
+    stages: list[str],
+    fetched: int,
+) -> None:
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    before = _other_tasks()
+    engine = _EngineDouble()
+    pipeline = _GatedStagePipeline(settings, gate=gate, cells=["1.00", "2.00"])
+    task = asyncio.create_task(_execute(pipeline, engine, _HttpDouble()))
+    assert await asyncio.to_thread(pipeline.entered.wait, 10)
+
+    task.cancel()
+    await asyncio.sleep(0.01)
+    task.cancel()
+    await asyncio.sleep(0.01)
+    # The stage's thread cannot be interrupted: the run waits for it, transaction still open.
+    assert not task.done()
+    (data,) = engine.data_connections
+    assert data.outcome is None
+    assert engine.updates == []
+
+    pipeline.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The stage completed and its result was discarded; no later stage ran.
+    assert pipeline.finished == stages
+    assert set(pipeline.threads) == set(stages)
+    assert pipeline.upserts == []
+    assert (data.outcome, data.closed) == (ROLLED_BACK, True)
+    (update,) = engine.updates
+    assert (update.params["status"], update.params["error_message"]) == ("failed", "cancelled")
+    assert (update.params["rows_fetched"], update.params["rows_written"]) == (fetched, 0)
+    (record,) = _warnings_and_errors(caplog)
+    assert record.getMessage().endswith("(test_gated) failed: cancelled")
+    assert _other_tasks() == before
+
+
+async def test_cancellation_during_the_commit_lets_it_finish_and_keeps_the_committed_run(
+    settings: TerminalSettings, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    engine = _EngineDouble(hold_commit=True)
+    pipeline = _QuotePipeline(settings, cells=["1.00", "2.00"])
+    task = asyncio.create_task(_execute(pipeline, engine, _HttpDouble()))
+    await engine.commit_started.wait()
+
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert engine.commit_release is not None
+    engine.commit_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    (data,) = engine.data_connections
+    assert data.outcome == COMMITTED
+    (update,) = engine.updates
+    assert (update.params["status"], update.params["error_message"]) == ("succeeded", None)
+    assert (update.params["rows_fetched"], update.params["rows_written"]) == (2, 2)
+    assert update.params["details"]["after_commit_error"] == "CancelledError"
+    (record,) = _warnings_and_errors(caplog)
+    run_id = engine.inserts[0].params["id"]
+    assert (record.levelno, record.getMessage()) == (
+        logging.WARNING,
+        f"ingestion run {run_id} (test_quotes) was interrupted after its data committed: cancelled",
+    )
+
+
+@pytest.mark.parametrize(
+    ("cancel", "message"),
+    [
+        pytest.param(False, "RuntimeError: commit failed", id="error"),
+        pytest.param(True, "cancelled", id="error-while-cancelled"),
+    ],
+)
+async def test_failed_commit_records_failed_with_nothing_written(
+    settings: TerminalSettings, cancel: bool, message: str
+) -> None:
+    engine = _EngineDouble(fail_commit=True, hold_commit=cancel)
+    pipeline = _QuotePipeline(settings, cells=["1.00", "2.00"])
+    task = asyncio.create_task(_execute(pipeline, engine, _HttpDouble()))
+    if cancel:
+        await engine.commit_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert engine.commit_release is not None
+        engine.commit_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        assert (await task).status is RunStatus.FAILED
+
+    (data,) = engine.data_connections
+    assert data.outcome == ROLLED_BACK
+    (update,) = engine.updates
+    assert (update.params["status"], update.params["error_message"]) == ("failed", message)
+    assert (update.params["rows_fetched"], update.params["rows_written"]) == (2, 0)
+
+
+async def test_cancellation_during_the_final_update_still_records_the_true_status(
+    settings: TerminalSettings, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    before = _other_tasks()
+    engine = _EngineDouble(hold_update=True)
+    pipeline = _QuotePipeline(settings, cells=["1.00", "abc", *(["2.00"] * 9)])
+    task = asyncio.create_task(_execute(pipeline, engine, _HttpDouble()))
+    await engine.update_started.wait()
+
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert engine.update_release is not None
+    engine.update_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    (update,) = engine.updates
+    assert (update.params["status"], update.params["error_message"]) == ("partial", None)
+    assert (update.params["rows_written"], update.params["rows_rejected"]) == (10, 1)
+    # The update's own transaction committed: the row is not left running.
+    assert engine.connections[-1].kind == RUN_RECORD
+    assert engine.connections[-1].outcome == COMMITTED
+    assert _warnings_and_errors(caplog) == []
+    duration = update.params["details"]["duration_seconds"]
+    assert caplog.messages[-1].endswith(
+        f" status=partial fetched=11 written=10 rejected=1 duration={duration}s"
+    )
+    assert _other_tasks() == before
+
+
+@pytest.mark.parametrize("fail_update", [False, True], ids=["recorded", "update-fails"])
+async def test_repeated_cancellation_while_recording_a_cancelled_run_waits_for_the_update(
+    settings: TerminalSettings, caplog: pytest.LogCaptureFixture, fail_update: bool
+) -> None:
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    loop = asyncio.get_running_loop()
+    unhandled: list[dict[str, Any]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+    try:
+        before = _other_tasks()
+        engine = _EngineDouble(hold_update=True, fail_run_updates=fail_update)
+        pipeline = _BlockingPipeline(settings)
+        task = asyncio.create_task(_execute(pipeline, engine, _HttpDouble()))
+        await pipeline.fetch_started.wait()
+        task.cancel()
+        await engine.update_started.wait()
+
+        for _ in range(3):
+            task.cancel()
+            await asyncio.sleep(0)
+        assert not task.done()
+        assert engine.update_release is not None
+        engine.update_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        del task
+        gc.collect()
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    # The update was waited for, not abandoned, and its error observed rather than reported
+    # by the event loop as never retrieved.
+    assert unhandled == []
+    assert _other_tasks() == before
+    (update,) = engine.updates
+    assert (update.params["status"], update.params["error_message"]) == ("failed", "cancelled")
+    assert engine.connections[-1].outcome == (ROLLED_BACK if fail_update else COMMITTED)
+    run_id = engine.inserts[0].params["id"]
+    messages = [record.getMessage() for record in _warnings_and_errors(caplog)]
+    expected_failed = f"ingestion run {run_id} (test_blocking) failed: cancelled"
+    if fail_update:
+        assert messages == [
+            f"could not record ingestion run {run_id} (test_blocking) as failed: RuntimeError",
+            expected_failed,
+        ]
+    else:
+        assert messages == [expected_failed]
+
+
+async def test_cancellation_while_the_running_row_is_inserted_still_finishes_the_row(
+    settings: TerminalSettings,
+) -> None:
+    engine = _EngineDouble(hold_insert=True)
+    pipeline = _QuotePipeline(settings, cells=["1.00"])
+    task = asyncio.create_task(_execute(pipeline, engine, _HttpDouble()))
+    await engine.insert_started.wait()
+
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert engine.insert_release is not None
+    engine.insert_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # No data transaction was started, and the committed running row was finished.
+    assert engine.data_connections == []
+    assert pipeline.contexts == []
+    (insert,) = engine.inserts
+    (update,) = engine.updates
+    assert update.params["id_1"] == insert.params["id"]
+    assert (update.params["status"], update.params["error_message"]) == ("failed", "cancelled")
+
+
+@pytest.mark.parametrize(
+    "close_error",
+    [
+        pytest.param(RuntimeError("close failed: SECRET-CLOSE-MARKER"), id="cleanup-raises"),
+        pytest.param(None, id="cleanup-cancelled"),
+    ],
+)
+async def test_cleanup_after_the_commit_keeps_the_committed_status_and_counts(
+    settings: TerminalSettings,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    close_error: BaseException | None,
+) -> None:
+    """The run's own HTTP client is closed after the data commit: whether closing raises or
+    is cancelled, the run keeps ``partial`` and its written rows."""
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    clients: list[_ClosingClient] = []
+
+    def open_client(client_settings: TerminalSettings) -> _ClosingClient:
+        client = _ClosingClient(client_settings, close_error)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(ingestion_http, "PoliteClient", open_client)
+    engine = _EngineDouble()
+    pipeline = _QuotePipeline(settings, cells=["abc", *(["1.00"] * 10)])
+    task = asyncio.create_task(execute_pipeline(pipeline, cast(AsyncEngine, engine), trigger="cli"))
+    if close_error is None:
+        async with asyncio.timeout(5):
+            while not (clients and clients[0].closing.is_set()):
+                await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        after_commit = "CancelledError"
+        logged = "cancelled"
+    else:
+        result = await task
+        assert (result.status, result.rows_written, result.error_message) == (
+            RunStatus.PARTIAL,
+            10,
+            None,
+        )
+        after_commit = logged = "RuntimeError"
+
+    (client,) = clients
+    assert client.settings is settings
+    assert client.closing.is_set()
+    (data,) = engine.data_connections
+    assert data.outcome == COMMITTED
+    (update,) = engine.updates
+    assert (update.params["status"], update.params["error_message"]) == ("partial", None)
+    assert (update.params["rows_fetched"], update.params["rows_written"]) == (11, 10)
+    assert update.params["rows_rejected"] == 1
+    assert update.params["details"]["after_commit_error"] == after_commit
+    run_id = engine.inserts[0].params["id"]
+    (record,) = _warnings_and_errors(caplog)
+    assert (record.levelno, record.getMessage()) == (
+        logging.WARNING,
+        f"ingestion run {run_id} (test_quotes) was interrupted after its data committed: {logged}",
+    )
+    assert record.exc_info is None
+    assert "SECRET-CLOSE-MARKER" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("interrupt", "raised"),
+    [
+        pytest.param("cancel", asyncio.CancelledError, id="cancelled-twice"),
+        pytest.param("timeout", TimeoutError, id="asyncio-timeout"),
+    ],
+)
+async def test_cancellation_during_the_commit_is_reraised_when_cleanup_then_raises(
+    settings: TerminalSettings,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt: str,
+    raised: type[BaseException],
+) -> None:
+    """The cancellation the commit absorbed survives closing the run's own HTTP client raising
+    afterwards: the committed run is recorded as such and the call still ends cancelled, which an
+    ``asyncio.timeout()`` around it turns into ``TimeoutError``."""
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    before = _other_tasks()
+    clients = _open_closing_clients(monkeypatch, RuntimeError("close failed: SECRET-CLOSE-MARKER"))
+    engine = _EngineDouble(hold_commit=True)
+    pipeline = _QuotePipeline(settings, cells=["1.00", "2.00"])
+    deadlines: list[asyncio.Timeout] = []
+
+    async def run() -> RunResult:
+        if interrupt == "cancel":
+            return await execute_pipeline(pipeline, cast(AsyncEngine, engine), trigger="cli")
+        async with asyncio.timeout(None) as deadline:
+            deadlines.append(deadline)
+            return await execute_pipeline(pipeline, cast(AsyncEngine, engine), trigger="cli")
+
+    task = asyncio.create_task(run())
+    await engine.commit_started.wait()
+    if interrupt == "cancel":
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+    else:
+        (deadline,) = deadlines
+        deadline.reschedule(asyncio.get_running_loop().time())
+        async with asyncio.timeout(5):
+            while not deadline.expired():
+                await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    # The commit is still held, so the run is waiting for it rather than abandoning it.
+    assert not task.done()
+    assert engine.commit_release is not None
+    engine.commit_release.set()
+    with pytest.raises(raised):
+        await task
+
+    assert task.cancelled() is (interrupt == "cancel")
+    (client,) = clients
+    assert client.closing.is_set()
+    (data,) = engine.data_connections
+    assert (data.outcome, data.closed) == (COMMITTED, True)
+    (update,) = engine.updates
+    assert (update.params["status"], update.params["error_message"]) == ("succeeded", None)
+    assert (update.params["rows_fetched"], update.params["rows_written"]) == (2, 2)
+    details = dict(update.params["details"])
+    _pop_duration(details)
+    assert details == {"after_commit_error": "RuntimeError"}
+    run_id = engine.inserts[0].params["id"]
+    (record,) = _warnings_and_errors(caplog)
+    assert (record.levelno, record.getMessage()) == (
+        logging.WARNING,
+        f"ingestion run {run_id} (test_quotes) was interrupted after its data committed: "
+        "RuntimeError",
+    )
+    assert all(entry.exc_info is None for entry in caplog.records)
+    assert "SECRET-CLOSE-MARKER" not in caplog.text
+    assert _other_tasks() == before
+
+
+@pytest.mark.parametrize(
+    ("stage", "fetched"),
+    [
+        pytest.param("fetch", 0, id="fetch"),
+        pytest.param("parse", 0, id="parse"),
+        pytest.param("validate", 2, id="validate"),
+    ],
+)
+async def test_cancellation_before_the_commit_is_reraised_when_cleanup_then_raises(
+    settings: TerminalSettings,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    fetched: int,
+) -> None:
+    """Closing the run's own HTTP client raises while a cancelled run unwinds, replacing its
+    ``CancelledError``: the run is still recorded as cancelled with nothing written, the
+    replacing error is named by its type only, and the call ends cancelled."""
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    before = _other_tasks()
+    clients = _open_closing_clients(monkeypatch, RuntimeError("close failed: SECRET-CLOSE-MARKER"))
+    engine = _EngineDouble()
+    pipeline: _QuotePipeline
+    if stage == "fetch":
+        blocking = _BlockingPipeline(settings, cells=["1.00", "2.00"])
+        pipeline = blocking
+        task = asyncio.create_task(
+            execute_pipeline(pipeline, cast(AsyncEngine, engine), trigger="cli")
+        )
+        await blocking.fetch_started.wait()
+        task.cancel()
+    else:
+        gated = _GatedStagePipeline(settings, gate=stage, cells=["1.00", "2.00"])
+        pipeline = gated
+        task = asyncio.create_task(
+            execute_pipeline(pipeline, cast(AsyncEngine, engine), trigger="cli")
+        )
+        assert await asyncio.to_thread(gated.entered.wait, 10)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        gated.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert task.cancelled()
+    (client,) = clients
+    assert client.closing.is_set()
+    assert pipeline.upserts == []
+    (data,) = engine.data_connections
+    assert (data.outcome, data.closed) == (ROLLED_BACK, True)
+    (update,) = engine.updates
+    assert (update.params["status"], update.params["error_message"]) == ("failed", "cancelled")
+    assert (update.params["rows_fetched"], update.params["rows_written"]) == (fetched, 0)
+    details = dict(update.params["details"])
+    _pop_duration(details)
+    assert details == {"error_during_cancellation": "RuntimeError"}
+    run_id = engine.inserts[0].params["id"]
+    name = pipeline.run_name
+    assert [(record.levelno, record.getMessage()) for record in _warnings_and_errors(caplog)] == [
+        (
+            logging.WARNING,
+            f"ingestion run {run_id} ({name}) was cancelled; unwinding it raised RuntimeError",
+        ),
+        (logging.ERROR, f"ingestion run {run_id} ({name}) failed: cancelled"),
+    ]
+    assert all(entry.exc_info is None for entry in caplog.records)
+    assert "SECRET-CLOSE-MARKER" not in caplog.text
+    assert _other_tasks() == before
+
+
+@pytest.mark.parametrize(
+    ("insert_error", "cancel", "logged"),
+    [
+        pytest.param(
+            RuntimeError("run row insert failed: SECRET-INSERT-MARKER"),
+            True,
+            ["could not record the start of an ingestion run of test_quotes: RuntimeError"],
+            id="insert-fails-while-cancelled",
+        ),
+        pytest.param(asyncio.CancelledError(), False, [], id="insert-task-ends-cancelled"),
+    ],
+)
+async def test_a_running_row_that_was_never_inserted_ends_the_call_cancelled(
+    settings: TerminalSettings,
+    caplog: pytest.LogCaptureFixture,
+    insert_error: BaseException,
+    cancel: bool,
+    logged: list[str],
+) -> None:
+    """The running insert fails while a cancellation is pending, or its own task ends cancelled:
+    there is no run row to finish, nothing runs, and the call ends cancelled."""
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    before = _other_tasks()
+    engine = _EngineDouble(hold_insert=cancel, insert_error=insert_error)
+    pipeline = _QuotePipeline(settings, cells=["1.00"])
+    task = asyncio.create_task(_execute(pipeline, engine, _HttpDouble()))
+    if cancel:
+        await engine.insert_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert engine.insert_release is not None
+        engine.insert_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The insert's own transaction rolled back; no data connection was opened.
+    (run_record,) = engine.connections
+    assert (run_record.kind, run_record.outcome) == (RUN_RECORD, ROLLED_BACK)
+    assert engine.updates == []
+    assert pipeline.contexts == []
+    assert [record.getMessage() for record in _warnings_and_errors(caplog)] == logged
+    assert all(entry.exc_info is None for entry in caplog.records)
+    assert "SECRET-INSERT-MARKER" not in caplog.text
+    assert _other_tasks() == before
+
+
+def _raised_from(error: FetchFailed, cause: BaseException) -> FetchFailed:
+    """``error`` as ``raise error from cause`` leaves it, with ``cause`` as its ``__cause__``."""
+    try:
+        raise error from cause
+    except FetchFailed as raised:
+        return raised
+
+
+@pytest.mark.parametrize(
+    ("error", "level", "logged", "marker"),
+    [
+        pytest.param(
+            SourceLayoutChanged(
+                expected=["year"],
+                found=["yr"],
+                message="input /srv/private/SECRET-LAYOUT-MARKER.csv token=SECRET-LAYOUT-MARKER",
+            ),
+            logging.ERROR,
+            "layout_changed: expected=['year'] found=['yr']",
+            "SECRET-LAYOUT-MARKER",
+            id="layout-changed-with-a-path-and-token-in-its-message",
+        ),
+        pytest.param(
+            FetchFailed("/srv/imports/SECRET-PATH-MARKER/prices.csv", "file_not_found"),
+            logging.ERROR,
+            "failed: fetch_failed:file_not_found",
+            "SECRET-PATH-MARKER",
+            id="fetch-failed-with-a-file-path",
+        ),
+        pytest.param(
+            FetchFailed(CSV_URL, "see /srv/SECRET-REASON-MARKER"),
+            logging.ERROR,
+            "failed: fetch_failed",
+            "SECRET-REASON-MARKER",
+            id="fetch-failed-with-a-path-in-its-reason",
+        ),
+        pytest.param(
+            FetchFailed("/srv/private/PRIVATE_FILE.csv", "PRIVATE_FILE.csv"),
+            logging.ERROR,
+            "failed: fetch_failed",
+            "PRIVATE_FILE",
+            id="fetch-failed-with-a-file-name-as-its-reason",
+        ),
+        pytest.param(
+            FetchFailed("https://example.org/SECRET-STATUS-MARKER", "http_503"),
+            logging.ERROR,
+            "failed: fetch_failed:http_503",
+            "SECRET-STATUS-MARKER",
+            id="fetch-failed-with-an-http-status",
+        ),
+        pytest.param(
+            FetchFailed("https://example.org/SECRET-ROBOTS-MARKER/robots.txt", "robots_http_503"),
+            logging.ERROR,
+            "failed: fetch_failed:robots_http_503",
+            "SECRET-ROBOTS-MARKER",
+            id="fetch-failed-with-a-robots-http-status",
+        ),
+        pytest.param(
+            FetchFailed("https://user:SECRET-USERINFO@example.org/x.csv", "url_has_userinfo"),
+            logging.ERROR,
+            "failed: fetch_failed:url_has_userinfo",
+            "SECRET-USERINFO",
+            id="fetch-failed-for-a-url-with-userinfo",
+        ),
+        pytest.param(
+            FetchFailed(CSV_URL, "http_404 SECRET-HTTP-MARKER"),
+            logging.ERROR,
+            "failed: fetch_failed",
+            "SECRET-HTTP-MARKER",
+            id="fetch-failed-with-text-after-an-http-status",
+        ),
+        pytest.param(
+            _raised_from(
+                FetchFailed("https://example.org/SECRET-INVALID-MARKER", "invalid_url"),
+                httpx.InvalidURL("Invalid URL https://example.org/SECRET-INVALID-MARKER"),
+            ),
+            logging.ERROR,
+            "failed: fetch_failed:invalid_url:InvalidURL",
+            "SECRET-INVALID-MARKER",
+            id="fetch-failed-with-a-known-code-raised-from-its-cause",
+        ),
+        pytest.param(
+            _raised_from(
+                FetchFailed(
+                    "/srv/imports/SECRET-UNREADABLE-MARKER/prices.xlsx",
+                    "unreadable_file:PermissionError",
+                ),
+                PermissionError(
+                    13, "Permission denied", "/srv/imports/SECRET-UNREADABLE-MARKER/prices.xlsx"
+                ),
+            ),
+            logging.ERROR,
+            "failed: fetch_failed:unreadable_file:PermissionError",
+            "SECRET-UNREADABLE-MARKER",
+            id="fetch-failed-unreadable-file-raised-from-its-cause",
+        ),
+        pytest.param(
+            FetchFailed(CSV_URL, "unreadable_file:SECRET-SUFFIX-MARKER"),
+            logging.ERROR,
+            "failed: fetch_failed:unreadable_file",
+            "SECRET-SUFFIX-MARKER",
+            id="fetch-failed-with-text-after-a-known-code",
+        ),
+        pytest.param(
+            _raised_from(
+                FetchFailed(
+                    "https://example.org/SECRET-RETRY-MARKER", "ConnectTimeout after 4 attempts"
+                ),
+                httpx.ConnectTimeout("timed out connecting to example.org/SECRET-RETRY-MARKER"),
+            ),
+            logging.ERROR,
+            "failed: fetch_failed:ConnectTimeout",
+            "SECRET-RETRY-MARKER",
+            id="fetch-failed-after-retries-raised-from-its-cause",
+        ),
+        pytest.param(
+            RuntimeError("token=SECRET-TOKEN-MARKER"),
+            logging.ERROR,
+            "failed: RuntimeError",
+            "SECRET-TOKEN-MARKER",
+            id="unexpected-with-a-secret",
+        ),
+        pytest.param(
+            IntegrityError(
+                "INSERT INTO terminal_daily_prices (ticker) VALUES ($1::VARCHAR)",
+                {"ticker": "SECRET-PARAM-MARKER"},
+                Exception("duplicate key"),
+            ),
+            logging.ERROR,
+            "failed: IntegrityError",
+            "SECRET-PARAM-MARKER",
+            id="sqlalchemy-error-with-bound-parameters",
+        ),
+        pytest.param(
+            RobotsDisallowed("https://example.org/SECRET-URL-MARKER", "robots_unreachable"),
+            logging.WARNING,
+            "blocked_by_robots: robots_unreachable",
+            "SECRET-URL-MARKER",
+            id="robots-with-a-url",
+        ),
+        pytest.param(
+            RobotsDisallowed(CSV_URL, "SECRET-ROBOTS-MARKER"),
+            logging.WARNING,
+            "blocked_by_robots: RobotsDisallowed",
+            "SECRET-ROBOTS-MARKER",
+            id="robots-with-an-undocumented-reason",
+        ),
+        pytest.param(
+            AmbiguousSession({"reason": "https://example.org/SECRET-EVIDENCE-MARKER"}),
+            logging.WARNING,
+            "ambiguous_session: AmbiguousSession",
+            "SECRET-EVIDENCE-MARKER",
+            id="ambiguous-session-with-a-url-reason",
+        ),
+        pytest.param(
+            AmbiguousSession({"reason": "label_mismatch SECRET-AMBIGUOUS-MARKER"}),
+            logging.WARNING,
+            "ambiguous_session: AmbiguousSession",
+            "SECRET-AMBIGUOUS-MARKER",
+            id="ambiguous-session-with-a-marker-in-its-reason",
+        ),
+    ],
+)
+async def test_run_logs_name_failures_by_code_without_their_text_or_traceback(
+    settings: TerminalSettings,
+    caplog: pytest.LogCaptureFixture,
+    error: BaseException,
+    level: int,
+    logged: str,
+    marker: str,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger=LOGGER)
+    pipeline = _QuotePipeline(settings, cells=["1.00"], fetch_error=error)
+
+    result = await _execute(pipeline, _EngineDouble(), _HttpDouble())
+
+    (record,) = _warnings_and_errors(caplog)
+    assert (record.levelno, record.getMessage()) == (
+        level,
+        f"ingestion run {result.run_id} (test_quotes) {logged}",
+    )
+    assert all(entry.exc_info is None for entry in caplog.records)
+    assert marker not in caplog.text
+    assert "Traceback" not in caplog.text
