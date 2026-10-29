@@ -16,7 +16,6 @@ from typing import NoReturn
 
 import pytest
 
-from helpers.sessions import weekdays
 from opennse_terminal.quant.bands import (
     DEFAULT_LOOKBACK_YEARS,
     MIN_BAND_OBSERVATIONS,
@@ -30,6 +29,21 @@ from opennse_terminal.quant.numeric import QuantizeKind, quantize_out
 
 FIRST_SESSION = date(2026, 1, 5)
 """Monday of ISO week 2026-W02; the reference series starts here."""
+
+
+def weekdays(start: date, count: int) -> list[date]:
+    """Return ``count`` consecutive Monday-Friday dates from ``start``, with no holiday logic.
+
+    ``start`` is the first date returned when it is a weekday; otherwise the list begins on the
+    following Monday. Each call builds a new list, so a caller may change its copy freely.
+    """
+    days: list[date] = []
+    day = start
+    while len(days) < count:
+        if day.weekday() < 5:
+            days.append(day)
+        day += timedelta(days=1)
+    return days
 
 
 def series(

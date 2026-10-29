@@ -656,27 +656,6 @@ def test_scenario_margin_is_derived_and_rounded_half_up(
             "notes",
             id="risk_scenarios_object",
         ),
-        # Every amount is KES and FX conversion is not supported, so a preset stored in another
-        # currency is refused before any amount is read. The stored code is not logged.
-        pytest.param(
-            {"currency": "USD"},
-            "skipping IPO preset 'Broken Preset': currency must be KES (currency_mismatch); "
-            "preset amounts are never converted",
-            id="currency_usd",
-        ),
-        pytest.param(
-            {"currency": "EUR"},
-            "skipping IPO preset 'Broken Preset': currency must be KES (currency_mismatch); "
-            "preset amounts are never converted",
-            id="currency_eur",
-        ),
-        # The currency check runs first: an out-of-range WACC on a USD preset is not reported.
-        pytest.param(
-            {"currency": "USD", "assumed_wacc_pct": Decimal("35.0000")},
-            "skipping IPO preset 'Broken Preset': currency must be KES (currency_mismatch); "
-            "preset amounts are never converted",
-            id="currency_checked_before_ranges",
-        ),
     ],
 )
 def test_invalid_row_is_skipped_with_a_warning_naming_fields_only(

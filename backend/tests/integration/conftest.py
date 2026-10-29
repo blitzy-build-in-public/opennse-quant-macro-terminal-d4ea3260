@@ -18,7 +18,10 @@ Database scopes:
 - ``seeded_database`` (root, function scope): ``test_ingestion_pipelines`` and ``test_seeder``
   use it directly. The runs they exercise open their own connections, the advisory-lock
   connection and the separate run-record connection, which an outer transaction cannot wrap, so
-  each of those tests gets a fresh clone instead.
+  each of those tests gets a fresh clone instead. The service sections of ``test_api_seeded``,
+  ``test_watchlists`` and ``test_ingest_pdf_endpoint`` also request it, so the rows those service
+  tests write, and the connections they open (the filings service's run-record connection, the
+  watchlist race tests' concurrent connections), stay in a clone of their own.
 - ``empty_database``: an empty ``opennse_iso_<uuid8>`` copied from ``template0`` per test, for
   ``test_migrations_isolation`` (the only module that creates simulated host objects) and the
   "not at head" cases of ``test_seeder``.
