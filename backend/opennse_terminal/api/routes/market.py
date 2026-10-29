@@ -155,11 +155,16 @@ _FLOWS_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
     },
 }
 
+# PostgreSQL text cannot hold a NUL character, so a ticker or sector carrying one is refused as a
+# single-field 422 here rather than failing as a 500 when the service queries it.
+_NO_NUL_PATTERN: Final = r"^[^\x00]*$"
+
 TickerQuery = Annotated[
     str | None,
     Query(
         min_length=1,
         max_length=TICKER_MAX_LENGTH,
+        pattern=_NO_NUL_PATTERN,
         description="NSE ticker symbol, for example SCOM; an unknown ticker is a 404.",
     ),
 ]
@@ -168,6 +173,7 @@ SectorQuery = Annotated[
     Query(
         min_length=1,
         max_length=SECTOR_MAX_LENGTH,
+        pattern=_NO_NUL_PATTERN,
         description="Sector name as stored, for example Banking; an unknown sector is a 404.",
     ),
 ]

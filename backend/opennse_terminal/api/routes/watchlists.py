@@ -45,9 +45,19 @@ __all__ = [
 TICKER_MAX_LENGTH: Final = 16
 """Longest ticker path segment, matching ``terminal_equities.ticker`` (``VARCHAR(16)``)."""
 
+# PostgreSQL text cannot hold a NUL character, so a ticker segment carrying one is refused as a
+# single-field 422 here rather than failing as a 500 when the service queries it.
+_NO_NUL_PATTERN: Final = r"^[^\x00]*$"
+
 WatchlistIdPath = Annotated[uuid.UUID, Path(description="Watchlist id")]
 TickerPath = Annotated[
-    str, Path(min_length=1, max_length=TICKER_MAX_LENGTH, description="NSE ticker")
+    str,
+    Path(
+        min_length=1,
+        max_length=TICKER_MAX_LENGTH,
+        pattern=_NO_NUL_PATTERN,
+        description="NSE ticker",
+    ),
 ]
 
 # TerminalJsonRoute rather than the default APIRoute: POST /watchlists binds a JSON body, and the
