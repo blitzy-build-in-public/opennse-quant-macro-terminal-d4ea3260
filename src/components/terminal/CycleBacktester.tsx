@@ -1,7 +1,7 @@
 "use client";
 
-import { useId, useMemo, useState } from "react";
-import type { ChangeEvent, FormEvent, ReactElement } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import type { ChangeEvent, FormEvent, MouseEvent, ReactElement } from "react";
 import {
   CartesianGrid,
   Line,
@@ -28,6 +28,7 @@ import type {
   CycleResult,
   DecimalString,
   TerminalWidgetProps,
+  WidgetState,
 } from "./types";
 
 /** Props of {@link CycleBacktester}. */
@@ -107,7 +108,10 @@ interface MarkerSpec {
 interface ChartModel {
   series: ChartSeries[];
   markers: MarkerSpec[];
-  /** Offset range of every drawn row, shared by both charts; null when nothing is drawn. */
+  /**
+   * Offset range of every drawn row, widened to reach the event (0) so its reference line is
+   * always on the axis; shared by both charts; null when nothing is drawn.
+   */
   xDomain: [number, number] | null;
   /** Ticks of that offset axis; empty when nothing is drawn. */
   xTicks: number[];
@@ -128,11 +132,25 @@ interface MarkerShapeProps {
   cy?: number;
 }
 
+/** Where keyboard focus goes once a removed chip's focused Remove button has unmounted. */
+type ChipFocusTarget = { kind: "remove"; date: string } | { kind: "date-input" };
+
 const WINDOW_DAYS = 180;
 const WINDOW_MONTHS = 12;
 /** The endpoint accepts at most 8 `event_dates`. */
 const MAX_EVENT_DATES = 8;
 const ISO_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
+/** A complete date input value. Past year 9999 the input reports a five- or six-digit year. */
+const DATE_VALUE_PATTERN = /^(\d{4,})-\d{2}-\d{2}$/;
+/**
+ * The event dates the API accepts under each window preset. Its calendar runs from 0001-01-01 to
+ * 9999-12-31, and it rejects an event whose window would cross either end
+ * (`window_out_of_range`): ±180 days needs 180 days on each side, ±12 months a whole year.
+ */
+const EVENT_DATE_BOUNDS: Readonly<Record<WindowPreset, { min: string; max: string }>> = {
+  "180d": { min: "0001-06-30", max: "9999-07-04" },
+  "12m": { min: "0002-01-01", max: "9998-12-31" },
+};
 const MARKER_RADIUS = 5;
 
 const WINDOW_OPTIONS: ReadonlyArray<{ value: WindowPreset; label: string; testId: string }> = [
@@ -228,21 +246,21 @@ const TOOLBAR_CLASS = "flex flex-wrap items-center gap-x-6 gap-y-2";
 const GROUP_CLASS = "flex flex-wrap items-center gap-1";
 const GROUP_LABEL_CLASS = "me-1 text-slate-400";
 const TOGGLE_CLASS =
-  "m-0 cursor-pointer rounded border border-slate-700 bg-slate-900 px-2.5 py-1 text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-slate-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "m-0 cursor-pointer rounded border border-slate-700 bg-slate-900 px-2.5 py-1 text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-slate-100 active:bg-slate-700 active:text-slate-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const TOGGLE_ACTIVE_CLASS =
-  "m-0 cursor-pointer rounded border border-sky-700 bg-sky-900 px-2.5 py-1 text-xs font-medium text-sky-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "m-0 cursor-pointer rounded border border-sky-700 bg-sky-900 px-2.5 py-1 text-xs font-medium text-sky-100 hover:bg-sky-800 active:bg-sky-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const CHIP_LIST_CLASS = "m-0 flex list-none flex-wrap items-center gap-2 p-0";
 const CHIP_CLASS =
   "inline-flex items-center gap-1 rounded-full border border-slate-700 bg-slate-800 py-0.5 ps-2.5 pe-0.5 text-xs text-slate-200";
 const CHIP_DATE_CLASS = "text-slate-400";
 const CHIP_REMOVE_CLASS =
-  "m-0 inline-flex h-6 w-6 cursor-pointer items-center justify-center rounded-full border-0 bg-transparent p-0 text-slate-400 hover:bg-slate-700 hover:text-slate-100 disabled:pointer-events-none disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "m-0 inline-flex h-6 w-6 cursor-pointer items-center justify-center rounded-full border-0 bg-transparent p-0 text-slate-400 hover:bg-slate-700 hover:text-slate-100 active:bg-slate-600 active:text-slate-100 disabled:pointer-events-none disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const ICON_CLASS = "h-3 w-3";
 const MUTED_TEXT_CLASS = "m-0 text-xs text-slate-400";
 const ADD_FORM_CLASS = "flex flex-col gap-1";
 const ADD_ROW_CLASS = "flex flex-wrap items-center gap-2";
 const INPUT_CLASS =
-  "m-0 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-100 [color-scheme:dark] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
+  "m-0 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-100 [color-scheme:dark] hover:border-slate-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const CHIP_ERROR_CLASS = "m-0 text-xs text-rose-400";
 // While a new window or event set is fetched, the previous result stays mounted and is dimmed.
 const BODY_CLASS = "flex flex-col gap-5";
@@ -251,14 +269,20 @@ const BODY_FETCHING_CLASS =
 const SECTION_CLASS = "m-0 flex min-w-0 flex-col gap-2";
 const SECTION_HEADER_CLASS = "flex flex-wrap items-baseline justify-between gap-2";
 const SECTION_TITLE_CLASS = "m-0 text-xs font-semibold uppercase tracking-wide text-slate-400";
-const MAIN_CHART_CLASS = "h-80 w-full";
-const OVERLAY_CHART_CLASS = "h-48 w-full";
+// Recharts 3 makes each chart's `<svg class="recharts-surface">` a tabindex 0 application, so it
+// gets the same keyboard focus ring as the other controls. Its `<g tabindex="-1">` layers are
+// never keyboard-reachable but a mouse click can focus them, so neither they nor a mouse-focused
+// surface draws an outline.
+const MAIN_CHART_CLASS =
+  "h-80 w-full [&_.recharts-surface:focus-visible]:outline-2 [&_.recharts-surface:focus-visible]:outline-offset-2 [&_.recharts-surface:focus-visible]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none";
+const OVERLAY_CHART_CLASS =
+  "h-48 w-full [&_.recharts-surface:focus-visible]:outline-2 [&_.recharts-surface:focus-visible]:outline-offset-2 [&_.recharts-surface:focus-visible]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none";
 const LEGEND_CLASS = "m-0 flex list-none flex-wrap gap-x-4 gap-y-1 p-0 text-xs text-slate-300";
 const LEGEND_ITEM_CLASS = "inline-flex items-center gap-1.5";
 const SWATCH_CLASS = "h-2 w-5 shrink-0";
 const MARKER_SWATCH_CLASS = "h-3 w-3 shrink-0";
 const SELECT_CLASS =
-  "m-0 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-100 [color-scheme:dark] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
+  "m-0 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-100 [color-scheme:dark] hover:border-slate-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const SELECT_LABEL_CLASS = "inline-flex items-center gap-2 text-xs text-slate-400";
 // The wrapper scrolls horizontally on narrow cards, so it is focusable for keyboard scrolling.
 const TABLE_WRAPPER_CLASS =
@@ -316,6 +340,29 @@ function isCalendarDate(iso: string): boolean {
   const isLeapYear = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
   const daysInMonth = [31, isLeapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
   return day <= (daysInMonth[month - 1] ?? 0);
+}
+
+/**
+ * Whether `value` is a complete date input value outside `bounds`. A year past 9999 has five or
+ * more digits; four-digit ISO dates order correctly as strings.
+ */
+function isOutsideEventDateRange(value: string, bounds: { min: string; max: string }): boolean {
+  const yearText = DATE_VALUE_PATTERN.exec(value)?.[1];
+  if (yearText === undefined) return false;
+  return yearText.length > 4 || value < bounds.min || value > bounds.max;
+}
+
+/**
+ * The event dates `preset` accepts, worded for a validation message, such as
+ * `between 30 Jun 0001 and 4 Jul 9999 for the ±180 days window`.
+ */
+function eventDateRangePhrase(preset: WindowPreset): string {
+  const bounds = EVENT_DATE_BOUNDS[preset];
+  const windowLabel = WINDOW_OPTIONS.find((option) => option.value === preset)?.label ?? preset;
+  return (
+    `between ${formatDate(bounds.min)} and ${formatDate(bounds.max)} ` +
+    `for the ${windowLabel} window`
+  );
 }
 
 /** An event-relative offset in days with an explicit sign: `+12`, `−5`, `0`. */
@@ -385,9 +432,44 @@ function offsetTicks(range: [number, number] | null): number[] {
   return ticks.length > 0 ? ticks : [min];
 }
 
-/** `YAxis` tick of the overlay chart, in percentage points. */
+/** Fraction digits of a generated percentage or index tick: the server's precision for both. */
+const PCT_INDEX_TICK_PLACES = 2;
+
+/**
+ * A generated `YAxis` coordinate as a plain decimal string for `formatDecimal`, or null when the
+ * tick is not a finite number. It is rounded to {@link PCT_INDEX_TICK_PLACES} places with trailing
+ * fraction zeros and a bare `.` removed, and never uses exponent notation: `15.5`, `16`, `0.3` for
+ * `0.30000000000000004`, `0` for `1e-7`, `-2.5`.
+ */
+function axisTickDecimal(value: unknown): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  // `toFixed` switches to exponent notation from 1e21; a float that large is integral, so BigInt
+  // prints all of its digits instead.
+  const fixed =
+    Math.abs(value) < 1e21 ? value.toFixed(PCT_INDEX_TICK_PLACES) : BigInt(value).toString();
+  return fixed.replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+}
+
+/**
+ * `YAxis` tick of the overlay chart, in percentage points (`15.5%`, `−2.5%`). A tick is a
+ * generated axis coordinate with no server string behind it, so it is rounded to the server's
+ * 2 dp here and then grouped and signed by `formatDecimal`; displayed rates themselves come from
+ * the API.
+ */
 function formatPctAxisTick(value: unknown): string {
-  return typeof value === "number" && Number.isFinite(value) ? String(value) + "%" : "";
+  const text = axisTickDecimal(value);
+  return text === null ? "" : formatDecimal(text, "pct");
+}
+
+/**
+ * `YAxis` tick of the main chart's base-100 index metrics (`97.5`, `1,050`). A tick is a
+ * generated axis coordinate with no server string behind it, so it is rounded to the server's
+ * 2 dp here and then grouped and signed by `formatDecimal`; displayed index levels themselves
+ * come from the API.
+ */
+function formatIndexAxisTick(value: unknown): string {
+  const text = axisTickDecimal(value);
+  return text === null ? "" : formatDecimal(text, "index");
 }
 
 /**
@@ -438,6 +520,25 @@ function describeWindow(resolved: BacktestWindow): string {
 }
 
 /**
+ * Text of the polite status region: "Recalculating…" while a new window or event set is fetched
+ * behind the dimmed previous result, then the number of cycles and the window now shown. It is
+ * empty while loading, empty or failed, where the frame shows its own state, so it never repeats
+ * a stale result.
+ */
+function describeUpdateStatus(
+  state: WidgetState,
+  data: BacktestResponse | undefined,
+  isFetching: boolean,
+): string {
+  if (state !== "ready" || data === undefined) return "";
+  if (isFetching) return "Recalculating\u2026";
+  const count = data.cycles.length;
+  const shown = `Showing ${formatInteger(count)} ${count === 1 ? "cycle" : "cycles"}`;
+  const windowText = describeWindow(data.window);
+  return windowText === "" ? `${shown}.` : `${shown}, ${windowText}.`;
+}
+
+/**
  * The lines and markers of the main chart for `metric`. Coordinates come from `toChartNumber`;
  * every row keeps its raw point, whose decimal strings the tooltip formats for display.
  */
@@ -483,9 +584,14 @@ function buildChartModel(cycles: readonly CycleResult[], metric: Metric): ChartM
       }
     }
   });
-  const xDomain = offsetRange(
+  const drawnRange = offsetRange(
     series.flatMap((item) => [...item.observed, ...(item.projection ?? [])]),
   );
+  // Recharts discards a reference line outside the axis domain, so the domain always reaches 0:
+  // a partial cycle observed only before the event, or a cycle observed only after it, still
+  // shows the event line and a 0 tick.
+  const xDomain: [number, number] | null =
+    drawnRange === null ? null : [Math.min(drawnRange[0], 0), Math.max(drawnRange[1], 0)];
   return { series, markers, xDomain, xTicks: offsetTicks(xDomain) };
 }
 
@@ -748,14 +854,20 @@ export function CycleBacktester({
   const [windowPreset, setWindowPreset] = useState<WindowPreset>(() =>
     defaultWindow === "12m" ? "12m" : "180d",
   );
-  // null means "the server's default events"; an empty prop list means the same.
+  // null means "the server's default events"; an empty prop list means the same. A repeated date
+  // is kept once, at its first position, so every chip is keyed by its date.
   const [eventDates, setEventDates] = useState<string[] | null>(() =>
-    defaultEventDates !== undefined && defaultEventDates.length > 0 ? [...defaultEventDates] : null,
+    defaultEventDates !== undefined && defaultEventDates.length > 0
+      ? Array.from(new Set(defaultEventDates))
+      : null,
   );
   const [metric, setMetric] = useState<Metric>("price_index");
   const [overlayEventDate, setOverlayEventDate] = useState<string | null>(null);
   const [customDate, setCustomDate] = useState("");
   const [chipError, setChipError] = useState<string | null>(null);
+  const removeButtonRefs = useRef(new Map<string, HTMLButtonElement>());
+  const dateInputRef = useRef<HTMLInputElement>(null);
+  const pendingChipFocus = useRef<ChipFocusTarget | null>(null);
 
   const chipsLabelId = useId();
   const dateInputId = useId();
@@ -811,14 +923,35 @@ export function CycleBacktester({
   const overlayCycle = overlay.selected;
   const overlayRows = overlay.rows;
 
+  // Runs once the removed chip and its focused Remove button have unmounted.
+  useEffect(() => {
+    const target = pendingChipFocus.current;
+    if (target === null) return;
+    pendingChipFocus.current = null;
+    if (target.kind === "remove") removeButtonRefs.current.get(target.date)?.focus();
+    else dateInputRef.current?.focus();
+  }, [eventDates]);
+
   function chipLabel(date: string): string | null {
     return cycles?.find((cycle) => cycle.event_date === date)?.label ?? null;
   }
 
-  function handleRemoveChip(index: number): void {
+  function handleRemoveChip(event: MouseEvent<HTMLButtonElement>, date: string): void {
+    const position = chips.indexOf(date);
     // The last chip stays, so an explicit empty list is never sent.
-    if (chips.length <= 1) return;
-    setEventDates(chips.filter((_, position) => position !== index));
+    if (chips.length <= 1 || position < 0) return;
+    const remaining = chips.filter((chip) => chip !== date);
+    const button = event.currentTarget;
+    if (button.ownerDocument.activeElement === button) {
+      // Focus would fall to the page with the removed button. It moves to the Remove button now
+      // in the same position, else the previous one; a lone chip's Remove is disabled, so focus
+      // then moves to the date input.
+      const neighbour =
+        remaining.length > 1 ? (remaining[position] ?? remaining[position - 1]) : undefined;
+      pendingChipFocus.current =
+        neighbour !== undefined ? { kind: "remove", date: neighbour } : { kind: "date-input" };
+    }
+    setEventDates(remaining);
     setChipError(null);
   }
 
@@ -827,11 +960,25 @@ export function CycleBacktester({
     setChipError(null);
   }
 
+  const eventDateBounds = EVENT_DATE_BOUNDS[windowPreset];
+
   function handleAddDate(event: FormEvent<HTMLFormElement>): void {
     event.preventDefault();
     const candidate = customDate.trim();
+    // The form is `noValidate`, so the input's min and max bounds are checked here.
+    if (isOutsideEventDateRange(candidate, eventDateBounds)) {
+      setChipError(`Enter a date ${eventDateRangePhrase(windowPreset)}.`);
+      return;
+    }
     if (!isCalendarDate(candidate)) {
-      setChipError("Enter a complete date.");
+      // An unfinished entry and a year the input rejects against `max` both leave the value empty
+      // with `badInput` set; Enter can submit before the input normalizes the year on blur, so
+      // the message names both requirements. An untouched input has no bad input.
+      setChipError(
+        candidate === "" && dateInputRef.current?.validity.badInput === true
+          ? `Enter a complete date ${eventDateRangePhrase(windowPreset)}.`
+          : "Enter a complete date.",
+      );
       return;
     }
     if (chips.includes(candidate)) {
@@ -895,10 +1042,10 @@ export function CycleBacktester({
           <span className={MUTED_TEXT_CLASS}>Stored election cycles</span>
         ) : (
           <ul aria-labelledby={chipsLabelId} className={CHIP_LIST_CLASS}>
-            {chips.map((date, index) => {
+            {chips.map((date) => {
               const label = chipLabel(date);
               return (
-                <li key={`${index}-${date}`}>
+                <li key={date}>
                   <span
                     data-testid="cycle-event-chip"
                     data-event-date={date}
@@ -912,7 +1059,11 @@ export function CycleBacktester({
                       type="button"
                       aria-label={`Remove ${date}`}
                       disabled={chips.length <= 1}
-                      onClick={() => handleRemoveChip(index)}
+                      onClick={(event) => handleRemoveChip(event, date)}
+                      ref={(element) => {
+                        if (element === null) removeButtonRefs.current.delete(date);
+                        else removeButtonRefs.current.set(date, element);
+                      }}
                       className={CHIP_REMOVE_CLASS}
                     >
                       <svg
@@ -943,7 +1094,10 @@ export function CycleBacktester({
           </label>
           <input
             id={dateInputId}
+            ref={dateInputRef}
             type="date"
+            min={eventDateBounds.min}
+            max={eventDateBounds.max}
             value={customDate}
             onChange={handleCustomDateChange}
             aria-invalid={chipError !== null}
@@ -967,6 +1121,18 @@ export function CycleBacktester({
           </p>
         ) : null}
       </form>
+      {/* Mounted in every frame state so screen readers register it before it first changes,
+          and outside the aria-busy result body, which defers announcing its descendants. A
+          metric change sends no request, so it leaves this text unchanged. */}
+      <p
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        data-testid="cycle-update-status"
+        className="sr-only"
+      >
+        {describeUpdateStatus(state, data, isFetching)}
+      </p>
     </div>
   );
 
@@ -999,7 +1165,7 @@ export function CycleBacktester({
                 <XAxis
                   type="number"
                   dataKey="x"
-                  domain={["dataMin", "dataMax"]}
+                  domain={chartModel.xDomain ?? ["dataMin", "dataMax"]}
                   allowDecimals={false}
                   ticks={chartModel.xTicks}
                   tick={AXIS_TICK}
@@ -1019,7 +1185,9 @@ export function CycleBacktester({
                   stroke={CHART_COLORS.axis}
                   width={76}
                   tickFormatter={
-                    metric === "cumulative_foreign_net_kes" ? formatKesAxisTick : undefined
+                    metric === "cumulative_foreign_net_kes"
+                      ? formatKesAxisTick
+                      : formatIndexAxisTick
                   }
                   label={{
                     value: metricOption?.axisLabel ?? "",
@@ -1041,10 +1209,16 @@ export function CycleBacktester({
                     />
                   )}
                 />
+                {/* The label sits left of the line, unless 0 is the domain's left edge (every
+                    drawn session after the event), where it goes right of it, off the Y axis. */}
                 <ReferenceLine
                   x={0}
                   stroke={CHART_COLORS.axis}
-                  label={{ value: "Event", position: "insideTopRight", ...AXIS_LABEL_STYLE }}
+                  label={{
+                    value: "Event",
+                    position: chartModel.xDomain?.[0] === 0 ? "insideTopLeft" : "insideTopRight",
+                    ...AXIS_LABEL_STYLE,
+                  }}
                 />
                 {/* activeDot is off: with per-line data Recharts can place it on another line's
                     index, while the tooltip resolves each line's own session. */}
