@@ -71,6 +71,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from helpers.pdf_builder import Page, StatementRow, build_pdf, statement_page, text_page
+from helpers.routing_session import RoutingSession
 from opennse_terminal.config import TerminalSettings
 from opennse_terminal.ingestion.base import RunRecorder, RunStatus
 from opennse_terminal.ingestion.files.pdf_line_items import LINE_ITEMS, ExtractionResult
@@ -502,13 +503,17 @@ def test_currency_conflict_names_the_key_and_the_stored_currency(
 async def test_run_rows_use_the_engine_behind_an_engine_or_binds_session(
     test_settings: TerminalSettings,
 ) -> None:
-    """A session bound to an engine yields that engine; one configured through ``binds`` yields
-    an ``AsyncEngine`` over the same sync engine. Neither resolution connects."""
+    """A session bound to an engine yields that engine; one configured through ``binds``, or
+    through a routing ``get_bind`` that reads ``mapper.class_``, yields an ``AsyncEngine`` over
+    the same sync engine. No resolution connects."""
     engine = create_async_engine(test_settings.database_url)
     try:
         assert fs._audit_engine(AsyncSession(bind=engine)) is engine
         resolved = fs._audit_engine(AsyncSession(binds={TerminalIngestionRun: engine}))
         assert resolved.sync_engine is engine.sync_engine
+        routing = AsyncSession(sync_session_class=RoutingSession, terminal_bind=engine.sync_engine)
+        assert routing.sync_session.bind is None
+        assert fs._audit_engine(routing).sync_engine is engine.sync_engine
     finally:
         await engine.dispose()
 

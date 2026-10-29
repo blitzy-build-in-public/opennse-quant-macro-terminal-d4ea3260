@@ -18,7 +18,10 @@ Politeness contract:
   default), so a source sending a byte just inside the read timeout cannot hold a fetch open; an
   abandoned attempt is retried as a read timeout is.
 * **Spacing.** At least ``TERMINAL_SCRAPER_MIN_INTERVAL_SECONDS`` (2.0 s) between the starts of two
-  requests to the same host, counting retries, redirect hops and ``robots.txt`` fetches.
+  requests to the same host, counting retries, redirect hops and ``robots.txt`` fetches. The
+  spacing also holds across runs whose clients share one :class:`HostSpacing`, as the runs of a
+  pipeline sequence do, while each run keeps its own ``httpx`` client, cookie jar and
+  ``robots.txt`` cache.
 * **Retries.** Up to ``TERMINAL_SCRAPER_MAX_RETRIES`` (3) on connect or read timeouts, other
   transient network failures and HTTP 429, 500, 502, 503 and 504. The wait before retry *n* is
   the server's ``Retry-After`` when it sends one, otherwise 2^n s plus up to 1 s of jitter, and
@@ -79,6 +82,7 @@ __all__ = [
     "RETRY_STATUSES",
     "ROBOTS_AGENT",
     "FetchedResponse",
+    "HostSpacing",
     "PoliteClient",
     "build_user_agent",
     "describe_url",
@@ -861,6 +865,59 @@ _LIBRARY_LOG_REDACTOR: Final = _LibraryLogRedactor()
 _redact_library_logs()
 
 
+class HostSpacing:
+    """When each host was last requested, so that requests to it start at least an interval
+    apart, whichever :class:`PoliteClient` sends them.
+
+    A client given no spacing builds its own, which spaces only its own requests. Consecutive
+    runs that pass one ``HostSpacing`` to their clients stay spaced across the run boundaries as
+    well, while each run keeps its own ``httpx`` client, cookie jar and ``robots.txt`` cache: the
+    spacing holds request start times and nothing a source sent.
+
+    Safe for concurrent coroutines on one event loop, and reusable on a later loop once the
+    earlier one has stopped (its start times are kept); not for use from several threads.
+
+    Args:
+        clock: Monotonic seconds, used to measure the time since a host's previous request.
+        sleep: Awaited with the seconds left to wait.
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self._clock = clock
+        self._sleep = sleep
+        self._last_request_at: dict[str, float] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    async def wait_turn(self, host: str, interval: float) -> None:
+        """Wait until ``interval`` seconds have passed since the start of the previous request to
+        ``host`` (none when it has not been requested yet, or enough time has passed already),
+        then claim the current clock time as the start of this request.
+
+        Waiting and claiming hold ``host``'s lock, so concurrent turns to one host follow each
+        other one interval apart, and a turn to another host is never delayed by them.
+        """
+        loop = asyncio.get_running_loop()
+        if loop is not self._loop:
+            # An asyncio.Lock binds to the loop it first waits on and then refuses every other
+            # loop, so a spacing reused by a later run's event loop takes fresh locks there.
+            self._locks.clear()
+            self._loop = loop
+        lock = self._locks.setdefault(host, asyncio.Lock())
+        async with lock:
+            previous = self._last_request_at.get(host)
+            if previous is not None:
+                remaining = interval - (self._clock() - previous)
+                if remaining > 0:
+                    await self._sleep(remaining)
+            self._last_request_at[host] = self._clock()
+
+
 class PoliteClient:
     """The run's HTTP client for public pages and files: identified, spaced, retried and
     ``robots.txt``-checked (see the module docstring for the full contract).
@@ -879,8 +936,14 @@ class PoliteClient:
             spacing and the retry count.
         transport: An httpx transport to send requests through instead of the network, for
             example ``httpx.MockTransport`` in tests.
-        sleep: Awaited for every spacing and backoff wait.
-        clock: Monotonic seconds, used to measure the spacing between requests.
+        sleep: Awaited for every backoff wait, and for every spacing wait of the client's own
+            spacing when no ``spacing`` is given.
+        clock: Monotonic seconds, used to measure the spacing between requests when no
+            ``spacing`` is given.
+        spacing: The per-host request times to space this client's requests by, shared with
+            the clients of the runs before and after this one so that their requests to a host
+            stay ``scraper_min_interval_seconds`` apart too; when omitted, the client builds its
+            own :class:`HostSpacing` on ``clock`` and ``sleep``.
     """
 
     def __init__(
@@ -890,16 +953,16 @@ class PoliteClient:
         transport: httpx.AsyncBaseTransport | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
+        spacing: HostSpacing | None = None,
     ) -> None:
         self._settings = settings
         self._transport = transport
         self._sleep = sleep
-        self._clock = clock
         self._user_agent = build_user_agent(settings)
         self._client: httpx.AsyncClient | None = None
-        self._host_locks: dict[str, asyncio.Lock] = {}
-        # Kept across openings of one instance, so a reopened client still spaces its requests.
-        self._last_request_at: dict[str, float] = {}
+        # Kept across openings of one instance, so a reopened client still spaces its requests,
+        # and across the clients given the same spacing, so consecutive runs do too.
+        self._spacing = spacing if spacing is not None else HostSpacing(clock=clock, sleep=sleep)
         self._robots: dict[str, _RobotsRules] = {}
         self._robots_locks: dict[str, asyncio.Lock] = {}
 
@@ -917,7 +980,6 @@ class PoliteClient:
         cache starts empty, so every run reads each origin's file afresh."""
         if self._client is not None:
             raise RuntimeError("PoliteClient is already open")
-        self._host_locks.clear()
         self._robots.clear()
         self._robots_locks.clear()
         self._client = httpx.AsyncClient(
@@ -1214,13 +1276,6 @@ class PoliteClient:
 
     async def _wait_turn(self, host: str) -> None:
         """Wait until ``scraper_min_interval_seconds`` have passed since the start of the previous
-        request to ``host``, then claim the current time as this request's start."""
-        interval = self._settings.scraper_min_interval_seconds
-        lock = self._host_locks.setdefault(host, asyncio.Lock())
-        async with lock:
-            previous = self._last_request_at.get(host)
-            if previous is not None:
-                remaining = interval - (self._clock() - previous)
-                if remaining > 0:
-                    await self._sleep(remaining)
-            self._last_request_at[host] = self._clock()
+        request to ``host``, by this client or any other sharing its :class:`HostSpacing`, then
+        claim the current time as this request's start."""
+        await self._spacing.wait_turn(host, self._settings.scraper_min_interval_seconds)

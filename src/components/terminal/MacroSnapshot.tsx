@@ -35,6 +35,12 @@ const DEFAULT_HISTORY_MONTHS = 24;
 /** Title of a change that cannot be computed, because the column has no earlier observation. */
 const NO_PREVIOUS_VALUE = "previous value unavailable";
 
+/**
+ * Title and screen-reader text of a value shown as "—", because the indicator column holds no
+ * non-null observation.
+ */
+const NO_STORED_VALUE = "No value stored for this indicator";
+
 // Every class below is a complete static string, so Tailwind's source scan and a host's `@source`
 // directive or `content` glob find each one. `m-0` on the list elements cancels the user-agent
 // `dl`/`dd` margins in a host that ships no CSS reset.
@@ -106,9 +112,9 @@ function formatChange(change: DecimalString, unit: IndicatorUnit): string {
 function ValueText({ item }: { item: IndicatorSnapshot }): ReactElement {
   if (item.value === null) {
     return (
-      <dd className={VALUE_CLASS}>
+      <dd className={VALUE_CLASS} title={NO_STORED_VALUE}>
         <span aria-hidden="true">{EMPTY_VALUE}</span>
-        <span className="sr-only">No value stored</span>
+        <span className="sr-only">{NO_STORED_VALUE}</span>
       </dd>
     );
   }

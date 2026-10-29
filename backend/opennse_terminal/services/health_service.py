@@ -24,6 +24,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from opennse_terminal import __version__
+from opennse_terminal.models import TerminalIngestionRun
 from opennse_terminal.schemas.common import ErrorDetail, HealthResponse
 
 __all__ = ["HEALTH_CHECK_TIMEOUT_SECONDS", "get_health"]
@@ -52,13 +53,28 @@ async def get_health(session: AsyncSession) -> HealthResponse:
     name only.
 
     The bound is applied to the given session rather than on the engine, so it also covers a
-    session supplied by a host's ``get_terminal_session`` override. The session is only read,
+    session supplied by a host's ``get_terminal_session`` override. The round trip runs on the bind
+    the session gives the terminal's models, so a host session with no default bind, configured
+    only through ``binds`` or a custom ``get_bind``, is checked like one with a default bind. The
+    session is only read,
     never committed or closed: its provider closes it after the request. An external cancellation
     (``asyncio.CancelledError``) propagates instead of becoming the 503.
     """
     try:
         async with asyncio.timeout(HEALTH_CHECK_TIMEOUT_SECONDS):
-            await session.execute(text("SELECT 1"))
+            # A text clause names no mapper or table, so a session with no default bind, configured
+            # only through ``binds``, finds no bind for it. The probe is therefore resolved as a
+            # query of TerminalIngestionRun, the model filings_service resolves the terminal's bind
+            # through: its mapper and table match ``binds`` keyed by TerminalBase, a mapped class or
+            # a table, and reach a custom ``get_bind`` as an ORM query's would. A session with only
+            # a default bind still uses that bind.
+            await session.execute(
+                text("SELECT 1"),
+                bind_arguments={
+                    "mapper": TerminalIngestionRun.__mapper__,
+                    "clause": TerminalIngestionRun.__table__,
+                },
+            )
     # Deliberately wider than SQLAlchemyError: any failure of this constant query means the
     # database is unavailable. SQLAlchemy does not wrap asyncpg's connect-time errors, so a refused
     # connection arrives as a raw OSError, and bad credentials, a missing database or too many

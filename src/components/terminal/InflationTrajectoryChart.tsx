@@ -49,6 +49,21 @@ const TARGET_BAND_FILL_OPACITY = 0.12;
 const INFLATION_LABEL = "12-month inflation";
 const CBR_LABEL = "Central Bank Rate";
 
+// A line with exactly one plottable point has no segment to stroke, so that point is drawn as a
+// dot in the line's colour; it would otherwise be invisible. Longer lines stay dot-free.
+const INFLATION_LONE_POINT_DOT = {
+  r: 3,
+  fill: CHART_COLORS.warning,
+  stroke: CHART_COLORS.warning,
+  strokeWidth: 1,
+};
+const CBR_LONE_POINT_DOT = {
+  r: 3,
+  fill: CHART_COLORS.accent,
+  stroke: CHART_COLORS.accent,
+  strokeWidth: 1,
+};
+
 // Every class below is a complete static string, never assembled from fragments, so Tailwind's
 // source scan and a host's `@source` directive or `content` glob find each one. The swatch
 // colours mirror the chart strokes: amber-400 (`CHART_COLORS.warning`), sky-400
@@ -98,9 +113,16 @@ interface ChartModel {
 
 const EMPTY_MODEL: ChartModel = { rows: [], inflationPoints: 0, cbrPoints: 0 };
 
-/** The widget has nothing to plot when neither series holds an observation. */
+/**
+ * The widget has nothing to plot when neither line has a point: no inflation value and no CBR
+ * value that {@link buildChartModel} turns into a chart coordinate. Null values, and rates rows
+ * that carry only interbank or T-bill rates, therefore leave the widget empty, while a single
+ * plottable value of either series keeps the chart. It reads the chart model's own point counts,
+ * so the empty state and the legend's `data-point-count` always agree.
+ */
 function isOverviewEmpty(data: MacroOverviewResponse): boolean {
-  return data.inflation_series.length === 0 && data.rates_series.length === 0;
+  const model = buildChartModel(data);
+  return model.inflationPoints === 0 && model.cbrPoints === 0;
 }
 
 /** Compares ISO dates as text: `YYYY-MM-DD` sorts lexically in calendar order. */
@@ -314,7 +336,7 @@ export function InflationTrajectoryChart(props: InflationTrajectoryChartProps): 
               type="monotone"
               stroke={CHART_COLORS.warning}
               strokeWidth={2}
-              dot={false}
+              dot={model.inflationPoints === 1 ? INFLATION_LONE_POINT_DOT : false}
               connectNulls
               isAnimationActive={false}
             />
@@ -324,7 +346,7 @@ export function InflationTrajectoryChart(props: InflationTrajectoryChartProps): 
               type="stepAfter"
               stroke={CHART_COLORS.accent}
               strokeWidth={2}
-              dot={false}
+              dot={model.cbrPoints === 1 ? CBR_LONE_POINT_DOT : false}
               connectNulls
               isAnimationActive={false}
             />

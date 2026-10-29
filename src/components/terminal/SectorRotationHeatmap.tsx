@@ -85,10 +85,12 @@ const LEGEND: ReadonlyArray<{ bucket: Bucket; label: string }> = [
 /* BLITZY [A11Y]: the mode toggle is about 26px tall (px-3 py-1 text-xs), above WCAG 2.2 AA's 24px
    target minimum and below the 44px guideline, matching WidgetFrame's Retry button. Flagged for
    designer review. */
+// Both variants dim and stop pointer input while the toggle is `aria-disabled`, which it is
+// whenever no table is on screen to switch.
 const TOGGLE_CLASS =
-  "rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-slate-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-slate-700 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const TOGGLE_PRESSED_CLASS =
-  "rounded border border-sky-700 bg-sky-900 px-3 py-1 text-xs font-medium text-sky-100 hover:bg-sky-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "rounded border border-sky-700 bg-sky-900 px-3 py-1 text-xs font-medium text-sky-100 hover:bg-sky-800 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 // The scroller is a keyboard-focusable region, so the periods can be scrolled without a pointer,
 // and a size container, so the caption text can wrap to its visible width.
 const SCROLL_CLASS =
@@ -320,7 +322,9 @@ function HeatmapTable({ data, mode }: HeatmapTableProps): ReactElement {
         </table>
       </div>
       <div className={LEGEND_CLASS}>
-        <p data-testid="heatmap-mode-description">
+        {/* Only this sentence is a live region: a mode switch announces what the sector values now
+            mean, without reading out the whole table. */}
+        <p data-testid="heatmap-mode-description" aria-live="polite" aria-atomic="true">
           {mode === "relative"
             ? "Showing: Relative to market (sector return minus market return). Market row: absolute return."
             : "Showing: Absolute return (sector return over each period). Market row: absolute return."}
@@ -366,15 +370,26 @@ export function SectorRotationHeatmap({
     isEmpty: isEmptyHeatmap,
   });
   const isAbsolute = mode === "absolute";
+  // The frame shows the header toggle in every state but the table only when `ready` with a
+  // payload, so loading, empty and error (even after an earlier success) leave nothing to switch.
+  // A background refetch stays `ready` with the previous payload, so the mode can still change.
+  const hasTable = query.state === "ready" && query.data !== undefined;
+  const toggleDisabled = hasTable ? undefined : true;
 
   // A toggle button keeps one label while `aria-pressed` carries its state, as the WAI-ARIA
-  // toggle-button pattern requires; the current mode is named in words beside the legend.
+  // toggle-button pattern requires; the current mode is named in words beside the legend. It is
+  // `aria-disabled` rather than `disabled`, because a focused button that becomes `disabled` drops
+  // keyboard focus to the page body, and the handler ignores clicks, Enter and Space meanwhile.
   const toggle = (
     <button
       type="button"
       data-testid="heatmap-mode-toggle"
       aria-pressed={isAbsolute}
-      onClick={() => setMode((current) => (current === "absolute" ? "relative" : "absolute"))}
+      aria-disabled={toggleDisabled}
+      onClick={() => {
+        if (!hasTable) return;
+        setMode((current) => (current === "absolute" ? "relative" : "absolute"));
+      }}
       className={isAbsolute ? TOGGLE_PRESSED_CLASS : TOGGLE_CLASS}
     >
       Absolute return

@@ -174,7 +174,8 @@ def _audit_engine(session: AsyncSession) -> AsyncEngine:
     A session bound to an ``AsyncEngine`` (the standalone provider) yields that engine; one bound
     to an ``AsyncConnection`` (a test or host session joining an outer transaction) yields the
     connection's engine. A session configured through ``binds`` or a custom ``get_bind`` is
-    resolved through its sync session, whose engine is wrapped in an ``AsyncEngine``.
+    resolved through its sync session for ``TerminalIngestionRun``'s ``Mapper`` and table, as an
+    ORM statement on it would be, and the engine found is wrapped in an ``AsyncEngine``.
     """
     bind = getattr(session, "bind", None)
     if isinstance(bind, AsyncEngine):
@@ -182,7 +183,11 @@ def _audit_engine(session: AsyncSession) -> AsyncEngine:
     if isinstance(bind, AsyncConnection):
         return bind.engine
     # Engine.engine is the engine itself and Connection.engine its engine.
-    return AsyncEngine(session.sync_session.get_bind(TerminalIngestionRun).engine)
+    return AsyncEngine(
+        session.sync_session.get_bind(
+            TerminalIngestionRun.__mapper__, clause=TerminalIngestionRun.__table__
+        ).engine
+    )
 
 
 async def _run_to_completion(

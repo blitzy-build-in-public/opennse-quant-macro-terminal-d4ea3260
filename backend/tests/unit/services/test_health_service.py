@@ -1,7 +1,9 @@
 """Tests for ``health_service.get_health``: the ``SELECT 1`` probe and its failure contract.
 
 A round trip that completes answers ``HealthResponse(status="ok", database="ok", version=...)``
-after executing exactly the constant ``SELECT 1``. Any failure the session raises answers the
+after executing exactly the constant ``SELECT 1``, resolved for the terminal's bind through
+``TerminalIngestionRun``'s mapper and table so a host session configured only through ``binds``
+or a custom ``get_bind`` is probed too. Any failure the session raises answers the
 coded 503 ``database_unavailable``, chained to the original exception, with one WARNING record on
 the service logger that names only the exception type: a refused or failed connect arrives as a
 raw ``OSError``, a driver error wrapped by SQLAlchemy as ``OperationalError``, asyncpg's own
@@ -25,6 +27,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import opennse_terminal
+from opennse_terminal.models import TerminalIngestionRun
 from opennse_terminal.schemas.common import HealthResponse
 from opennse_terminal.services import health_service
 
@@ -50,9 +53,11 @@ class RecordingSession:
 
     def __init__(self) -> None:
         self.statements: list[object] = []
+        self.bind_arguments: list[object] = []
 
-    async def execute(self, statement: object) -> None:
+    async def execute(self, statement: object, bind_arguments: object = None) -> None:
         self.statements.append(statement)
+        self.bind_arguments.append(bind_arguments)
 
 
 class FailingSession:
@@ -62,7 +67,7 @@ class FailingSession:
         self.error = error
         self.calls = 0
 
-    async def execute(self, statement: object) -> None:
+    async def execute(self, statement: object, bind_arguments: object = None) -> None:
         self.calls += 1
         raise self.error
 
@@ -90,6 +95,9 @@ async def test_completed_round_trip_reports_ok_after_executing_select_1(
     statement = session.statements[0]
     assert isinstance(statement, TextClause)
     assert statement.text == "SELECT 1"
+    assert session.bind_arguments == [
+        {"mapper": TerminalIngestionRun.__mapper__, "clause": TerminalIngestionRun.__table__}
+    ]
     assert _service_records(caplog) == []
 
 

@@ -8,7 +8,8 @@ stage by stage:
   ``parse`` and ``validate``;
 * ``reconcile`` on a read-only connection double that answers each ``select()`` with scripted
   rows and keeps the statement, so its tables and bound parameters can be checked;
-* ``upsert`` with the ``db.upsert`` writers replaced by recorders that keep their signatures;
+* ``upsert`` with the ``db.upsert`` writers replaced by recorders that keep their signatures,
+  and the same connection double answering the stored-currency read after a short write;
 * ``import_file`` with the engine factory and ``execute_pipeline`` replaced.
 
 The shared row thresholds are applied to the counts the stages produce.
@@ -51,7 +52,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from opennse_terminal.config import TerminalSettings
-from opennse_terminal.db.upsert import FlowUpdateResult, upsert_prices
+from opennse_terminal.db.upsert import FlowUpdateResult, upsert_fundamentals, upsert_prices
 from opennse_terminal.ingestion.base import (
     FetchFailed,
     RejectedRow,
@@ -1299,18 +1300,25 @@ async def test_parse_reads_an_operator_csv_export(
 
 
 async def test_parse_logs_neither_the_file_name_nor_a_forged_line(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     caplog.set_level(logging.DEBUG, logger=LOGGER)
     name = "prices\r\nFORGED ERROR line.csv"
-    try:
-        path = _write_csv(
-            tmp_path / name,
-            [(*PRICE_HEADER, "Notes"), ("SCOM", "2026-09-28", "28.45", "1,000", "checked")],
-        )
-    except OSError as exc:
-        pytest.skip(f"the filesystem rejects a CR/LF file name: {type(exc).__name__}")
-    staged = await _stage("daily_prices", path)
+    # The bytes live under a safe name and are served by the real descriptor read of a pipeline
+    # opened on it, so the run under test carries the hostile name in its path, file_name and
+    # source_url whether or not the filesystem can hold that name, and every assertion runs.
+    safe = _write_csv(
+        tmp_path / "prices.csv",
+        [(*PRICE_HEADER, "Notes"), ("SCOM", "2026-09-28", "28.45", "1,000", "checked")],
+    )
+    reader, _ = _open("daily_prices", safe)
+    pipeline, ctx = _open("daily_prices", tmp_path / name)
+    monkeypatch.setattr(pipeline, "_read_file", reader._read_file)
+    assert pipeline.source_url.endswith(name)
+    records = pipeline.parse(await pipeline.fetch(ctx))
+    staged = _Staged(
+        pipeline=pipeline, ctx=ctx, records=records, outcome=pipeline.validate(records)
+    )
     assert [record.row_number for record in staged.outcome.valid] == [2]
     # Details are run evidence stored on the run row, not log output: the name stays there.
     assert staged.ctx.details["file_name"] == name
@@ -3364,6 +3372,116 @@ async def test_foreign_flows_upsert_records_keys_that_lost_their_price_row(
     assert "foreign_flows import found 1 keys without a price row at write time" in caplog.messages
 
 
+FUNDAMENTALS_HEADER = ("Ticker", "Period End Date", "Period Type", "Currency", "Revenue KES")
+SCOM_LINE = ("SCOM", date(2026, 3, 31), "FY", "KES", "1")
+EQTY_H1_LINE = ("EQTY", date(2026, 6, 30), "H1", "USD", "2")
+"""Two fundamentals rows of one write batch; in key order the EQTY row (line 3) comes first."""
+
+
+async def _stage_one_skipped_fundamentals_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> _Staged:
+    """Stage :data:`SCOM_LINE` and :data:`EQTY_H1_LINE`, with ``upsert_fundamentals`` replaced
+    by a writer whose currency guard skips one row of each batch."""
+
+    async def skip_one(
+        executor: object,
+        rows: Sequence[Mapping[str, object]],
+        *,
+        source: str,
+        filing_id: uuid.UUID | None = None,
+    ) -> int:
+        return len(rows) - 1
+
+    monkeypatch.setattr(tabular_import, "upsert_fundamentals", skip_one)
+    path = _write_csv(tmp_path / "fundamentals.csv", [FUNDAMENTALS_HEADER, SCOM_LINE, EQTY_H1_LINE])
+    return await _stage("fundamentals", path)
+
+
+async def test_fundamentals_upsert_rejects_a_row_skipped_for_a_currency_stored_since_reconcile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    staged = await _stage_one_skipped_fundamentals_row(monkeypatch, tmp_path)
+    conn = _ScriptedConnection(
+        [("EQTY", date(2026, 6, 30), "H1", "KES"), ("SCOM", date(2026, 3, 31), "FY", "KES")]
+    )
+
+    written = await staged.pipeline.upsert(
+        cast(AsyncConnection, conn), staged.outcome.valid, RUN_ID
+    )
+
+    assert written == 1
+    assert [
+        (row.index, row.reason, dict(row.row)) for row in staged.pipeline.write_rejections()
+    ] == [
+        (
+            3,
+            "currency_conflict",
+            {
+                "ticker": "EQTY",
+                "period_end_date": "2026-06-30",
+                "period_type": "H1",
+                "currency": "USD",
+                "revenue_kes": "2",
+            },
+        )
+    ]
+    # One bound select() of exactly the batch's periods, in key order, after the write.
+    assert [_query(statement) for statement in conn.statements] == [
+        (
+            ["terminal_fundamentals", "requested"],
+            ["EQTY", date(2026, 6, 30), "H1", "SCOM", date(2026, 3, 31), "FY"],
+        )
+    ]
+    assert conn.unanswered == 0
+    # The run id and the count only: never the file's name or a value.
+    assert caplog.messages == [
+        f"fundamentals import run {RUN_ID} rejected 1 rows at write time: currency_conflict"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("stored", "explained"),
+    [
+        pytest.param([], 0, id="nothing-stored"),
+        pytest.param(
+            [("EQTY", date(2026, 6, 30), "H1", "USD"), ("SCOM", date(2026, 3, 31), "FY", "KES")],
+            0,
+            id="same-currencies-stored",
+        ),
+        pytest.param(
+            [("EQTY", date(2026, 6, 30), "H1", "KES"), ("SCOM", date(2026, 3, 31), "FY", "USD")],
+            2,
+            id="more-conflicts-than-skipped-rows",
+        ),
+    ],
+)
+async def test_fundamentals_upsert_fails_on_a_short_write_conflicts_do_not_explain(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    stored: list[tuple[object, ...]],
+    explained: int,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    staged = await _stage_one_skipped_fundamentals_row(monkeypatch, tmp_path)
+
+    with pytest.raises(RuntimeError) as raised:
+        await staged.pipeline.upsert(
+            cast(AsyncConnection, _ScriptedConnection(stored)), staged.outcome.valid, RUN_ID
+        )
+
+    assert str(raised.value) == (
+        "fundamentals upsert left 1 of 2 batch rows unwritten, "
+        f"of which currency conflicts explain {explained}"
+    )
+    # An unexpected exception: the run ends failed and its transaction rolls back.
+    assert classify_exception(raised.value)[0] is RunStatus.FAILED
+    assert staged.pipeline.write_rejections() == ()
+    assert caplog.messages == []
+
+
 # --- Imports into a seeded database ----------------------------------------------------------
 #
 # Each test below requests ``seeded_database``, a fresh clone of the migrated and seeded template,
@@ -3909,6 +4027,140 @@ async def test_fundamentals_merge_kes_rows_and_reject_a_currency_conflict(
         assert {name: new[name] for name in kept} == {name: old[name] for name in kept}
         assert new["currency"] == "KES"
     untouched = set(before) - {("KCB", period_end, "FY") for period_end in KCB_REVENUE}
+    assert {key: after[key] for key in untouched} == {key: before[key] for key in untouched}
+
+
+RACED_PERIODS: tuple[tuple[str, date, str], ...] = (
+    ("EQTY", date(2026, 6, 30), "H1"),
+    ("SCOM", date(2025, 9, 30), "H1"),
+)
+"""Half-year periods the seed does not hold. A USD import of them passes reconcile; a PDF commit
+then stores them in KES on its own connection before the import writes."""
+PDF_REVENUE = Decimal("45000000000.00")
+
+
+@pytest.mark.parametrize(
+    ("raced", "status", "written"),
+    [
+        pytest.param(1, RunStatus.PARTIAL, 9, id="one-of-ten-rows-is-partial"),
+        pytest.param(2, RunStatus.LAYOUT_CHANGED, 0, id="two-of-ten-rows-write-nothing"),
+    ],
+)
+async def test_fundamentals_reject_a_currency_conflict_committed_after_reconcile(
+    seeded_database: _Clone,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    raced: int,
+    status: RunStatus,
+    written: int,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    engine = seeded_database.engine
+    periods = RACED_PERIODS[:raced]
+    kcb = dict(list(KCB_REVENUE.items())[: 10 - raced])
+    # Lines 2 to raced + 1 are the USD rows of the raced periods; the KCB rows follow.
+    path = _write_csv(
+        tmp_path / "fundamentals.csv",
+        [
+            FUNDAMENTALS_HEADER,
+            *((*period, "USD", "1,000,000.00") for period in periods),
+            *(
+                ("KCB", period_end, "FY", "KES", _amount_text(revenue))
+                for period_end, revenue in kcb.items()
+            ),
+        ],
+    )
+
+    async def stored() -> StoredRows:
+        return await _rows_by_key(
+            engine,
+            TerminalFundamental,
+            FUNDAMENTAL_KEY,
+            FUNDAMENTAL_READ_COLUMNS,
+            TerminalFundamental.ticker.in_(("EQTY", "KCB", "SCOM")),
+        )
+
+    before = await stored()
+    assert not set(periods) & set(before)
+    committed_by_pdf: StoredRows = {}
+    reconcile = TabularImportPipeline.reconcile
+
+    async def reconcile_then_commit_a_pdf(
+        self: TabularImportPipeline, ctx: RunContext, records: list[TabularRecord]
+    ) -> ValidationOutcome[TabularRecord]:
+        outcome = await reconcile(self, ctx, records)
+        # Nothing was stored for the raced periods yet, so every row passed the currency check.
+        assert outcome.rejected == []
+        async with engine.begin() as conn:
+            await upsert_fundamentals(
+                conn,
+                [
+                    {
+                        "ticker": ticker,
+                        "period_end_date": period_end,
+                        "period_type": period_type,
+                        "currency": "KES",
+                        "revenue_kes": PDF_REVENUE,
+                    }
+                    for ticker, period_end, period_type in periods
+                ],
+                source="pdf_filing",
+            )
+        committed_by_pdf.update(await stored())
+        return outcome
+
+    monkeypatch.setattr(TabularImportPipeline, "reconcile", reconcile_then_commit_a_pdf)
+
+    result = await import_file("fundamentals", path, settings=seeded_database.settings)
+
+    assert (result.status, result.rows_fetched, result.rows_written, result.rows_rejected) == (
+        status,
+        10,
+        written,
+        raced,
+    )
+    assert _rejections(result, ("ticker", "period_end_date", "currency")) == {
+        (ticker, period_end.isoformat(), "USD"): (line, "currency_conflict")
+        for line, (ticker, period_end, _period_type) in enumerate(periods, start=2)
+    }
+    assert await _run_row(engine, result.run_id) == {
+        "pipeline": "csv_import:fundamentals",
+        "trigger": "cli",
+        "status": status.value,
+        "rows_fetched": 10,
+        "rows_written": written,
+        "rows_rejected": raced,
+    }
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == LOGGER and record.levelno == logging.WARNING
+    ] == [
+        f"fundamentals import run {result.run_id} rejected {raced} rows at write time: "
+        "currency_conflict"
+    ]
+    after = await stored()
+    assert set(after) == set(before) | set(periods)
+    for period in periods:
+        # The PDF's KES rows keep their values and provenance: nothing of the USD rows merged.
+        assert after[period] == committed_by_pdf[period]
+        pdf_row = after[period]
+        assert (pdf_row["currency"], pdf_row["revenue_kes"], pdf_row["source_by_field"]) == (
+            "KES",
+            PDF_REVENUE,
+            {"revenue_kes": "pdf_filing"},
+        )
+    kcb_keys = {("KCB", period_end, "FY") for period_end in kcb}
+    if status is RunStatus.PARTIAL:
+        for period_end, revenue in kcb.items():
+            old, new = before[("KCB", period_end, "FY")], after[("KCB", period_end, "FY")]
+            assert new["revenue_kes"] == revenue
+            assert new["source_by_field"] == {**old["source_by_field"], "revenue_kes": "csv_import"}
+    else:
+        # The breach rolled back the KCB rows the import had already written.
+        assert {key: after[key] for key in kcb_keys} == {key: before[key] for key in kcb_keys}
+    untouched = set(before) - kcb_keys
     assert {key: after[key] for key in untouched} == {key: before[key] for key in untouched}
 
 

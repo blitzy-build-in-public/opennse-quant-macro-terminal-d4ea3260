@@ -564,15 +564,18 @@ async def _ingest(
     Each name is a separate ``registry.run_pipeline`` call, so each run takes its own advisory
     lock and run row. A run that raises instead of returning a result, for example because its
     run row could not be written, is logged and counted as failed, and the sequence continues.
-    Cancellation (Ctrl-C) stops the sequence.
+    Cancellation (Ctrl-C) stops the sequence. Every run shares one ``HostSpacing``, so requests
+    to one host stay ``scraper_min_interval_seconds`` apart across the runs as within each.
     """
     from opennse_terminal.ingestion import registry
+    from opennse_terminal.ingestion.http import HostSpacing
 
+    spacing = HostSpacing()
     outcomes: list[tuple[str, int]] = []
     for name in names:
         try:
             result = await registry.run_pipeline(
-                name, settings, trigger="cli", trade_date=trade_date, limit=limit
+                name, settings, trigger="cli", trade_date=trade_date, limit=limit, spacing=spacing
             )
         except Exception as exc:
             logger.error("ingest %s: the run could not be recorded: %s", name, _failure_reason(exc))

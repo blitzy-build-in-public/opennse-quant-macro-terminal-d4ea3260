@@ -35,6 +35,7 @@ from opennse_terminal.ingestion.http import (
     RETRY_STATUSES,
     ROBOTS_AGENT,
     FetchedResponse,
+    HostSpacing,
     PoliteClient,
     build_user_agent,
     describe_url,
@@ -400,6 +401,93 @@ async def test_reopened_client_rereads_robots_but_keeps_spacing(
     assert robots.call_count == 2
     assert_spaced(network.starts())
     assert len(sleep.delays) == 1
+
+
+@pytest.mark.parametrize(
+    ("first_robots", "first_status", "first_error", "first_urls"),
+    [
+        pytest.param(ALLOW_ALL, 200, None, [CBK_ROBOTS, INFLATION_URL], id="after-a-fetch"),
+        pytest.param(
+            "User-agent: *\nDisallow: /\n", 200, RobotsDisallowed, [CBK_ROBOTS], id="robots-blocked"
+        ),
+        pytest.param(
+            ALLOW_ALL, 404, FetchFailed, [CBK_ROBOTS, INFLATION_URL], id="non-retryable-status"
+        ),
+    ],
+)
+async def test_runs_sharing_a_host_spacing_stay_spaced_across_the_run_boundary(
+    first_robots: str,
+    first_status: int,
+    first_error: type[Exception] | None,
+    first_urls: list[str],
+    network: FakeNetwork,
+    clock: FakeClock,
+    sleep: FakeSleep,
+    make_settings: SettingsFactory,
+) -> None:
+    robots = network.router.get(CBK_ROBOTS).mock(
+        side_effect=[httpx.Response(200, text=first_robots), httpx.Response(200, text=ALLOW_ALL)]
+    )
+    network.router.get(INFLATION_URL).respond(first_status, text="inflation")
+    network.router.get(BONDS_URL).respond(200, text="bonds")
+    settings = make_settings()
+    spacing = HostSpacing(clock=clock, sleep=sleep)
+
+    def run_client() -> PoliteClient:
+        """A new client, as each run opens: its own httpx client, cookies and robots cache."""
+        return PoliteClient(settings, transport=network.transport(), sleep=sleep, spacing=spacing)
+
+    async with run_client() as http:
+        if first_error is None:
+            await http.fetch(INFLATION_URL)
+        else:
+            with pytest.raises(first_error):
+                await http.fetch(INFLATION_URL)
+    # The first run ends, and its row is recorded, half a second before the next run starts.
+    clock.advance(0.5)
+    sleep.reset()
+    async with run_client() as http:
+        assert await http.get_text(BONDS_URL) == "bonds"
+
+    assert network.urls() == [*first_urls, CBK_ROBOTS, BONDS_URL]
+    assert robots.call_count == 2
+    starts = network.starts()
+    assert_spaced(starts)
+    boundary = len(first_urls)
+    assert starts[boundary] - starts[boundary - 1] >= 2.0
+    # Only the rest of the interval is waited at the boundary, then a full one before the page.
+    boundary_wait, page_wait = sleep.delays
+    assert 1.5 - 1e-9 <= boundary_wait <= 1.5 + 1e-9
+    assert 2.0 - 1e-9 <= page_wait <= 2.0 + 1e-9
+
+
+def test_host_spacing_reused_on_a_later_event_loop_keeps_its_times() -> None:
+    clock = FakeClock()
+    sleep = FakeSleep(clock)
+    spacing = HostSpacing(clock=clock, sleep=sleep)
+    starts: list[float] = []
+
+    async def turn() -> None:
+        await spacing.wait_turn("www.centralbank.go.ke", 2.0)
+        starts.append(clock())
+
+    async def three_concurrent_turns() -> None:
+        # The second turn sleeps holding the host's lock, so the third waits on it and binds the
+        # lock to the running loop.
+        await asyncio.gather(turn(), turn(), turn())
+
+    for _ in range(2):
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(three_concurrent_turns())
+        finally:
+            loop.close()
+
+    assert len(starts) == 6
+    assert_spaced(starts)
+    # Every turn after the very first waited a full interval, the first on the second loop too.
+    assert len(sleep.delays) == 5
+    assert all(2.0 - 1e-9 <= delay <= 2.0 + 1e-9 for delay in sleep.delays)
 
 
 # --- Retries and backoff ---------------------------------------------------------------------

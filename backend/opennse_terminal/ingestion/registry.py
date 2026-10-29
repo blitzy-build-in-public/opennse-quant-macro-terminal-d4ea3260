@@ -43,13 +43,18 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from types import MappingProxyType
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from opennse_terminal.config import TerminalSettings
 from opennse_terminal.db.session import build_engine
 from opennse_terminal.ingestion.base import Pipeline, RunResult, RunTrigger, execute_pipeline
+
+if TYPE_CHECKING:
+    # Type-only; run_pipelines imports it at run time, so importing the registry (as the CLI does
+    # for its argparse choices) neither loads httpx nor installs ingestion.http's log redactors.
+    from opennse_terminal.ingestion.http import HostSpacing
 
 __all__ = [
     "CBK_PIPELINES",
@@ -231,6 +236,7 @@ async def run_pipeline(
     trigger: RunTrigger,
     trade_date: date | None = None,
     limit: int | None = None,
+    spacing: "HostSpacing | None" = None,
 ) -> RunResult:
     """Run one pipeline end to end on an engine of its own, and return its recorded result.
 
@@ -238,6 +244,11 @@ async def run_pipeline(
     :func:`~opennse_terminal.ingestion.base.execute_pipeline`, so a pipeline failure is a status
     on the result rather than an exception. The engine comes from
     :func:`~opennse_terminal.db.session.build_engine` and is disposed when the run ends.
+
+    The run's HTTP client spaces its requests on ``spacing`` when given: pass the same
+    :class:`~opennse_terminal.ingestion.http.HostSpacing` to consecutive calls so that their
+    requests to one host stay ``scraper_min_interval_seconds`` apart across the runs. Without
+    it, the run spaces only its own requests.
 
     Raises:
         KeyError, ValueError, ImportError, AttributeError, TypeError: From
@@ -249,7 +260,7 @@ async def run_pipeline(
     pipeline = create_pipeline(name, settings, trade_date=trade_date, limit=limit)
     engine = build_engine(settings)
     try:
-        return await execute_pipeline(pipeline, engine, trigger=trigger)
+        return await execute_pipeline(pipeline, engine, trigger=trigger, spacing=spacing)
     finally:
         await _dispose(engine)
 
@@ -259,11 +270,14 @@ async def run_pipelines(
 ) -> list[RunResult]:
     """Run the named pipelines one after another on a shared engine, and return their results.
 
-    Each name gets a fresh pipeline instance and a run of its own through
-    :func:`~opennse_terminal.ingestion.base.execute_pipeline`: its own run row, transaction and
-    advisory lock, taken only after the previous run has released its own. A failing pipeline
-    ends with its status on its result, and the remaining pipelines still run. Used by
-    ``ingest cbk`` and the scheduler's ``cbk_macro`` job with :data:`CBK_PIPELINES`.
+    This is the API for running a group of pipelines in sequence; the scheduler's jobs use it,
+    ``cbk_macro`` with :data:`CBK_PIPELINES`. Each name gets a fresh pipeline instance and a run
+    of its own through :func:`~opennse_terminal.ingestion.base.execute_pipeline`: its own run
+    row, transaction and advisory lock, taken only after the previous run has released its own,
+    and its own HTTP client, cookie jar and ``robots.txt`` cache. Every run of the sequence
+    shares one :class:`~opennse_terminal.ingestion.http.HostSpacing`, so requests to one host
+    stay ``scraper_min_interval_seconds`` apart across the runs as within each. A failing
+    pipeline ends with its status on its result, and the remaining pipelines still run.
 
     Every name is checked before anything runs, so a misspelt name starts no run. A run that
     raises instead of returning a result (its pipeline could not be constructed, or its run row
@@ -279,12 +293,15 @@ async def run_pipelines(
         ExceptionGroup: One or more runs raised instead of returning a result.
         asyncio.CancelledError: The sequence was cancelled.
     """
+    from opennse_terminal.ingestion.http import HostSpacing
+
     if isinstance(names, str):
         raise TypeError("names must be a sequence of pipeline names, not a single string")
     for name in names:
         _spec(name)
     results: list[RunResult] = []
     errors: list[Exception] = []
+    spacing = HostSpacing()
     engine = build_engine(settings)
     try:
         for name in names:
@@ -292,7 +309,9 @@ async def run_pipelines(
             # dropped, so a caller deriving an exit code from the results never misses it.
             try:
                 pipeline = create_pipeline(name, settings)
-                results.append(await execute_pipeline(pipeline, engine, trigger=trigger))
+                results.append(
+                    await execute_pipeline(pipeline, engine, trigger=trigger, spacing=spacing)
+                )
             except Exception as exc:
                 logger.error(
                     "ingestion run of %s raised %s; continuing with the remaining pipelines",

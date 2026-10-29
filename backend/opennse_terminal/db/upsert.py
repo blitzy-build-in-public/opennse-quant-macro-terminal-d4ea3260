@@ -8,7 +8,11 @@ and the fallback seeder all write through this module, using SQLAlchemy 2.0 asyn
 Contract shared by every public function:
 
 1. **Executor.** The first argument is an ``AsyncSession`` or an ``AsyncConnection``. A session
-   contributes ``await session.connection()``, which joins the session's transaction.
+   contributes the connection it resolves for the target model (``session.connection()`` with
+   the model's ``Mapper`` and table as the ``mapper`` and ``clause`` bind arguments), which joins
+   the session's transaction. A host session with no default bind, configured through ``binds``
+   keyed by the model, a base class such as ``TerminalBase`` or the table, or through a custom
+   ``get_bind``, therefore writes on the bind its own queries of that model use.
 2. **The caller owns the transaction.** Nothing here calls ``begin()``, ``commit()`` or
    ``rollback()``. Ingestion writes inside the run's single data transaction, which holds the
    transaction-scoped advisory lock; the filings service commits the filing and fundamentals
@@ -191,10 +195,21 @@ _require_columns(
 )
 
 
-async def _connection(executor: Executor) -> AsyncConnection:
-    """Return the connection to write on; a session's connection joins its transaction."""
+async def _connection(executor: Executor, model: type[TerminalBase]) -> AsyncConnection:
+    """Return the connection to write ``model``'s table on.
+
+    A connection is returned as given. A session's connection is resolved for ``model`` and joins
+    the session's transaction. The ``mapper`` bind argument is ``model``'s ``Mapper``, not the
+    mapped class, as SQLAlchemy passes for an ORM statement, and the ``clause`` is its table. A
+    session without a default bind, configured through ``binds`` keyed by ``model``, a base class
+    of it such as ``TerminalBase``, or its table, or through a custom ``get_bind`` that routes on
+    ``mapper.class_`` or on the clause, therefore writes on the bind its own queries of ``model``
+    use. A session with only a default bind gets that bind's connection.
+    """
     if isinstance(executor, AsyncSession):
-        return await executor.connection()
+        return await executor.connection(
+            bind_arguments={"mapper": model.__mapper__, "clause": _table(model)}
+        )
     return executor
 
 
@@ -291,14 +306,14 @@ async def _count(conn: AsyncConnection, stmt: Executable) -> int:
 
 async def _insert_all(
     executor: Executor,
-    table: Table,
+    model: type[TerminalBase],
     rows: Iterable[_Row],
     key: Sequence[str],
     on_conflict: Callable[[Insert], Insert],
 ) -> int:
-    """Insert ``rows`` (normalized rows sharing one column tuple, in key order) chunk by chunk,
-    applying ``on_conflict`` to each statement, and return the number of rows ``RETURNING``
-    reports.
+    """Insert ``rows`` (normalized rows sharing one column tuple, in key order) into ``model``'s
+    table chunk by chunk, applying ``on_conflict`` to each statement, and return the number of
+    rows ``RETURNING`` reports.
 
     ``rows`` is consumed lazily, one chunk at a time, so a generator that normalizes the caller's
     rows holds only the current chunk's new rows. The first row's columns size the chunks.
@@ -309,9 +324,10 @@ async def _insert_all(
     first = next(iterator, None)
     if first is None:
         return 0
+    table = _table(model)
     columns = tuple(first)
     key_columns = [table.c[name] for name in key]
-    conn = await _connection(executor)
+    conn = await _connection(executor, model)
     written = 0
     for chunk in _chunks(chain((first,), iterator), _params_per_row(table, columns)):
         stmt = on_conflict(pg_insert(table).values(chunk))
@@ -490,7 +506,7 @@ async def upsert_rows(
             table, key_names, update_names if mode == "do_update" else ()
         )
         normalized = _normalized_rows(run, ordered, with_ids=with_ids)
-        written += await _insert_all(executor, table, normalized, key_names, on_conflict)
+        written += await _insert_all(executor, model, normalized, key_names, on_conflict)
 
     logger.debug(
         "upsert_rows %s (%s): %d rows in, %d duplicates dropped, %d written",
@@ -602,7 +618,7 @@ async def upsert_prices(
             where=guard,
         )
 
-    written = await _insert_all(executor, table, normalized(), _PRICE_KEY, on_conflict)
+    written = await _insert_all(executor, TerminalDailyPrice, normalized(), _PRICE_KEY, on_conflict)
     logger.debug(
         "upsert_prices %s (%s): %d rows in, %d duplicates dropped, %d written",
         table.name,
@@ -650,7 +666,7 @@ async def update_flows(
     rows_updated = 0
     missing: list[tuple[str, date]] = []
     if unique:
-        conn = await _connection(executor)
+        conn = await _connection(executor, TerminalDailyPrice)
         for chunk in _chunks(unique, len(_FLOW_ROW_COLUMNS)):
             # Typed columns make the driver bind DATE and NUMERIC, matching the table's columns.
             source_rows = values(
@@ -739,7 +755,9 @@ async def upsert_macro(
             set_=_merge_set(table, stmt, written_names),
         )
 
-    written = await _insert_all(executor, table, normalized, _MACRO_KEY, on_conflict)
+    written = await _insert_all(
+        executor, TerminalMacroIndicator, normalized, _MACRO_KEY, on_conflict
+    )
     logger.debug(
         "upsert_macro %s (%s): %d rows in, %d duplicates dropped, %d written",
         table.name,
@@ -813,7 +831,9 @@ async def upsert_fundamentals(
             where=table.c["currency"] == stmt.excluded["currency"],
         )
 
-    written = await _insert_all(executor, table, normalized, _FUNDAMENTALS_KEY, on_conflict)
+    written = await _insert_all(
+        executor, TerminalFundamental, normalized, _FUNDAMENTALS_KEY, on_conflict
+    )
     logger.debug(
         "upsert_fundamentals %s (%s): %d rows in, %d duplicates dropped, %d written",
         table.name,

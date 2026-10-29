@@ -194,8 +194,10 @@ async def run_job(
 
     The runs go through :func:`~opennse_terminal.ingestion.registry.run_pipelines`: each pipeline
     gets its own run row, data transaction and advisory lock, a pipeline that fails ends with its
-    status on its result, and the remaining pipelines still run. Each result is logged at INFO
-    with the job id, pipeline, status and row counts.
+    status on its result, and the remaining pipelines still run. The job's runs share one
+    per-host spacing, so their requests to one host stay ``scraper_min_interval_seconds`` apart
+    across the runs. Each result is logged at INFO with the job id, pipeline, status and row
+    counts.
 
     Only ``asyncio.CancelledError`` is raised, so no run can stop the scheduler. Any other
     exception from ``run_pipelines`` is logged at ERROR and an empty list returned: a run that

@@ -26,6 +26,11 @@ The contract held here:
 - **Prices and flows.** ``csv_import`` replaces any row and owns the flow columns it supplies;
   ``nse_market_statistics`` replaces seeded and scraped rows only and never writes flows;
   ``update_flows`` sets flows on existing rows only and reports the missing keys sorted.
+- **Session executors.** Every writer resolves a session's connection for its model's mapper and
+  table, so a host session with no default bind, configured only through ``binds`` (by
+  ``TerminalBase`` or per model) or through a routing ``get_bind`` that reads ``mapper.class_``,
+  writes inside the session's transaction: visible to it, undone by its rollback and kept by its
+  commit.
 
 Pure cases run on stand-in connections. PostgreSQL cases run on the root conftest's
 ``seeded_database`` clone, which marks them ``integration``, because ``Numeric``, ``JSONB`` and
@@ -58,6 +63,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
+from helpers.routing_session import RoutingSession
 from opennse_terminal.db import upsert as upsert_module
 from opennse_terminal.db.base import TerminalBase
 from opennse_terminal.db.upsert import (
@@ -200,6 +206,20 @@ FUNDAMENTALS_ROW = {
     "period_end_date": SCOM_FY,
     "revenue_kes": Decimal("388688500000.00"),
 }
+
+SCOM_FY2027 = date(2027, 3, 31)
+"""A Safaricom period end the seeder does not write."""
+NEW_PRICE_ROW = _price("SCOM", AFTER_ANCHOR, "33.9000", 750_000)
+NEW_FLOW_ROW = {**FLOW_ROW, "trade_date": AFTER_ANCHOR}
+NEW_MACRO_ROW = {**MACRO_ROW, "observation_date": AFTER_ANCHOR}
+NEW_FUNDAMENTALS_ROW = {**FUNDAMENTALS_ROW, "period_end_date": SCOM_FY2027}
+BINDS_ONLY_MODELS: tuple[type[TerminalBase], ...] = (
+    TerminalBondYield,
+    TerminalDailyPrice,
+    TerminalMacroIndicator,
+    TerminalFundamental,
+)
+"""The models the binds-only session test writes, the only ones its per-model ``binds`` map."""
 
 
 @pytest.mark.parametrize(
@@ -922,3 +942,104 @@ async def test_update_flows_sets_existing_rows_and_reports_missing_keys(
     unchanged = {name: value for name, value in before.items() if "flow" not in name}
     assert {name: after[name] for name in unchanged} == unchanged
     assert stray == 0
+
+
+async def _new_row_values(executor: AsyncSession | AsyncConnection) -> tuple[object, ...]:
+    """The values the binds-only writes set, ``None`` where a row is absent.
+
+    Read with ORM column selects, so a session without a default bind resolves each statement's
+    bind from its model, as its own queries do.
+    """
+    statements = (
+        select(TerminalBondYield.yield_pct).where(
+            TerminalBondYield.observation_date == AFTER_ANCHOR,
+            TerminalBondYield.bond_code == BOND_ROW["bond_code"],
+        ),
+        select(TerminalDailyPrice.close_price).where(
+            TerminalDailyPrice.ticker == "SCOM", TerminalDailyPrice.trade_date == AFTER_ANCHOR
+        ),
+        select(TerminalDailyPrice.foreign_net_flow_kes).where(
+            TerminalDailyPrice.ticker == "SCOM", TerminalDailyPrice.trade_date == AFTER_ANCHOR
+        ),
+        select(TerminalMacroIndicator.tbill_91d_pct).where(
+            TerminalMacroIndicator.observation_date == AFTER_ANCHOR
+        ),
+        select(TerminalFundamental.revenue_kes).where(
+            TerminalFundamental.ticker == "SCOM",
+            TerminalFundamental.period_end_date == SCOM_FY2027,
+            TerminalFundamental.period_type == "FY",
+        ),
+    )
+    return tuple([(await executor.execute(stmt)).scalar_one_or_none() for stmt in statements])
+
+
+async def _write_with_every_writer(session: AsyncSession) -> tuple[object, ...]:
+    """Run each writer once through ``session`` and return what each reports.
+
+    ``update_flows`` targets the price row ``upsert_prices`` inserts just before it, which it finds
+    only inside the same transaction.
+    """
+    return (
+        await upsert_rows(session, TerminalBondYield, [BOND_ROW], BOND_KEY, "do_update"),
+        await upsert_prices(session, [NEW_PRICE_ROW], source="csv_import", ingestion_run_id=None),
+        await update_flows(session, [NEW_FLOW_ROW], flow_source="csv_import"),
+        await upsert_macro(session, [NEW_MACRO_ROW], source="cbk_rates_csv"),
+        await upsert_fundamentals(session, [NEW_FUNDAMENTALS_ROW], source="csv_import"),
+    )
+
+
+@pytest.mark.parametrize(
+    "session_options",
+    [
+        pytest.param(lambda engine: {"binds": {TerminalBase: engine}}, id="base-class-binds"),
+        pytest.param(
+            lambda engine: {"binds": {model: engine for model in BINDS_ONLY_MODELS}},
+            id="per-model-binds",
+        ),
+        pytest.param(
+            lambda engine: {
+                "sync_session_class": RoutingSession,
+                "terminal_bind": engine.sync_engine,
+            },
+            id="routing-get-bind",
+        ),
+    ],
+)
+async def test_every_writer_joins_a_binds_only_session(
+    seeded_database: SeededDatabase,
+    session_options: Callable[[AsyncEngine], dict[str, Any]],
+) -> None:
+    engine = seeded_database.engine
+    written = (1, 1, FlowUpdateResult(rows_updated=1, missing_keys=()), 1, 1)
+    values = (
+        BOND_ROW["yield_pct"],
+        NEW_PRICE_ROW["close_price"],
+        NEW_FLOW_ROW["foreign_net_flow_kes"],
+        NEW_MACRO_ROW["tbill_91d_pct"],
+        NEW_FUNDAMENTALS_ROW["revenue_kes"],
+    )
+    absent = (None,) * len(values)
+    # No default bind: only the binds mapping, or the routing get_bind, locates the database.
+    session = AsyncSession(**session_options(engine))
+    assert session.sync_session.bind is None
+    async with engine.connect() as observer:
+        assert await _new_row_values(observer) == absent
+
+        async with session:
+            rolled_back = await _write_with_every_writer(session)
+            in_session = await _new_row_values(session)
+            # The writes are uncommitted session state, not autocommitted on another connection.
+            outside_before_rollback = await _new_row_values(observer)
+            await session.rollback()
+            after_rollback = await _new_row_values(observer)
+
+            committed = await _write_with_every_writer(session)
+            await session.commit()
+        after_commit = await _new_row_values(observer)
+
+    assert rolled_back == written
+    assert in_session == values
+    assert outside_before_rollback == absent
+    assert after_rollback == absent
+    assert committed == written
+    assert after_commit == values

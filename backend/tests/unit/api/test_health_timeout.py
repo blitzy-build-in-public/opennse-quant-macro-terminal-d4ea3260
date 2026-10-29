@@ -5,25 +5,31 @@ A hung database must answer the coded 503 ``database_unavailable`` once
 cancellation from outside the route must still propagate instead of becoming that 503.
 
 Every case runs without PostgreSQL: one hangs a stub session supplied through a
-``get_terminal_session`` override, the other points the real session factory at a TCP listener
-that accepts connections and never replies. The bound is shortened for the tests through the
-``health_service`` module constant, which the service reads at call time. The credentials are
-synthetic markers, so a leak shows as a marker in the response body or a log record.
+``get_terminal_session`` override, another points the real session factory at a TCP listener
+that accepts connections and never replies, and a third overrides the session with one that has
+no default bind, configured only through ``binds`` on an engine aimed at that listener, so the
+check must reach the hung engine rather than fail at once for want of a bind. The bound is
+shortened for the tests through the ``health_service`` module constant, which the service reads
+at call time. The credentials are synthetic markers, so a leak shows as a marker in the response
+body or a log record.
 """
 
 import asyncio
 import logging
 import socket
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from sqlalchemy import Table
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
 from opennse_terminal.api.deps import get_terminal_session, get_terminal_settings
 from opennse_terminal.api.routes import health
 from opennse_terminal.config import TerminalSettings
+from opennse_terminal.db.base import TerminalBase
 from opennse_terminal.db.session import dispose_terminal_engine
 from opennse_terminal.services import health_service
 
@@ -44,6 +50,9 @@ TIMEOUT_WARNING = "terminal health check failed: TimeoutError"
 USER_MARKER = "healthuserMARK"
 PW_MARKER = "healthpwMARK"
 
+BindsFor = Callable[[AsyncEngine], dict[type[TerminalBase] | Table, AsyncEngine]]
+"""Builds a binds-only session's ``binds`` mapping onto one engine."""
+
 
 class HangingSession:
     """Stands in for an ``AsyncSession`` whose ``execute`` never returns until cancelled."""
@@ -53,7 +62,7 @@ class HangingSession:
         self.cancelled = False
         self._never_set = asyncio.Event()
 
-    async def execute(self, statement: object) -> None:
+    async def execute(self, statement: object, bind_arguments: object = None) -> None:
         self.started.set()
         try:
             await self._never_set.wait()
@@ -160,6 +169,52 @@ async def test_hung_database_answers_coded_503_once_the_bound_expires(
     for marker in (USER_MARKER, PW_MARKER):
         assert marker not in response.text
         assert marker not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "binds_for",
+    [
+        pytest.param(lambda engine: {TerminalBase: engine}, id="base_class_binds"),
+        pytest.param(
+            lambda engine: {mapper.class_: engine for mapper in TerminalBase.registry.mappers},
+            id="per_model_binds",
+        ),
+        pytest.param(
+            lambda engine: {table: engine for table in TerminalBase.metadata.tables.values()},
+            id="per_table_binds",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("short_bound")
+async def test_binds_only_session_probes_its_terminal_bind(
+    silent_listener_port: int, caplog: pytest.LogCaptureFixture, binds_for: BindsFor
+) -> None:
+    """A host session with no default bind, configured only through ``binds``, is probed on the
+    engine those binds give the terminal: against a hung database the check times out, rather
+    than failing at once because no bind was found."""
+    engine = create_async_engine(
+        f"postgresql+asyncpg://{USER_MARKER}:{PW_MARKER}@127.0.0.1:{silent_listener_port}/hung"
+    )
+    session = AsyncSession(binds=binds_for(engine))
+    assert session.sync_session.bind is None
+
+    async def binds_only_session_provider() -> AsyncIterator[AsyncSession]:
+        yield session
+
+    app = _health_app()
+    app.dependency_overrides[get_terminal_session] = binds_only_session_provider
+    caplog.set_level(logging.WARNING, logger=health_service.logger.name)
+
+    try:
+        response, elapsed = await _timed_health_request(app)
+    finally:
+        await session.close()
+        await engine.dispose()
+
+    assert response.status_code == 503
+    assert response.json() == UNAVAILABLE_BODY
+    assert TEST_BOUND_SECONDS <= elapsed < PROMPT_SECONDS
+    assert _health_records(caplog) == [(logging.WARNING, TIMEOUT_WARNING)]
 
 
 async def test_external_cancellation_propagates_instead_of_answering_503(

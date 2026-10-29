@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { Fragment, useMemo } from "react";
 import type { ReactElement, ReactNode } from "react";
 import {
   CartesianGrid,
@@ -50,14 +50,49 @@ export interface YieldCurveChartProps extends TerminalWidgetProps {
   data?: MacroOverviewResponse;
 }
 
-/** One plotted point: axis coordinates plus the untouched API point the tooltip displays. */
-interface ChartRow {
+/** One plotted point of a curve: axis coordinates plus the untouched API point. */
+interface PlottedPoint {
   /** Tenor in years, a chart coordinate only. */
   x: number;
   /** Yield in percentage points, a chart coordinate only. */
   y: number;
   /** The API point, whose decimal strings are what the tooltip shows. */
   point: YieldCurvePoint;
+}
+
+/** One tooltip block: a curve and every point it has at the hovered tenor. */
+interface TenorEntry {
+  /** The curve's {@link CurveSeries.id}. */
+  seriesId: string;
+  /** The curve's name. */
+  name: string;
+  /** The curve's colour. */
+  color: string;
+  /** The curve's API points at this tenor, in server order; never empty. */
+  points: readonly YieldCurvePoint[];
+}
+
+/**
+ * One row of the chart-level data that every curve is drawn from. The rows run through the union
+ * of the drawn curves' tenors in ascending order, tenors being matched by exact decimal equality.
+ * A tenor at which a curve has `k` points spans `k` rows at the same `x`, the `j`-th row holding
+ * each curve's `j`-th point there, so every point is drawn and repeated tenors join in server
+ * order.
+ */
+interface ChartRow {
+  /** Tenor in years, a chart coordinate only. */
+  x: number;
+  /**
+   * Yield coordinate of each curve at this row, keyed by {@link CurveSeries.id}; null where the
+   * curve has no point at this row, which the line bridges and marks with no dot.
+   */
+  y: Readonly<Record<string, number | null>>;
+  /**
+   * What the tooltip lists at this tenor: each curve with at least one point at it, in legend
+   * order. Every row of one tenor holds the same entries, so the tooltip is complete whichever
+   * of them Recharts resolves the hovered tenor to.
+   */
+  entries: readonly TenorEntry[];
 }
 
 /** One drawn curve with its legend identity. */
@@ -70,13 +105,34 @@ interface CurveSeries {
   color: string;
   /** Line width in px. */
   strokeWidth: number;
-  /** Points in ascending tenor. */
-  points: ChartRow[];
+  /** The points that have both chart coordinates, in server order. */
+  points: PlottedPoint[];
+  /**
+   * The `Line`'s data key: this curve's yield coordinate in a {@link ChartRow}, or null. It is
+   * created once per chart model, so its identity stays stable across renders.
+   */
+  yieldOf: (row: ChartRow) => number | null;
+}
+
+/** The drawn curves and the chart-level rows they are plotted from. */
+interface ChartModel {
+  series: CurveSeries[];
+  rows: ChartRow[];
+}
+
+/** A tenor of the union across the curves, and each curve's points at it in server order. */
+interface TenorGroup {
+  /** The tenor as the first point at it wrote it. */
+  tenor: string;
+  /** Its chart coordinate. */
+  x: number;
+  /** Points at this tenor by {@link CurveSeries.id}. */
+  pointsBySeries: Map<string, PlottedPoint[]>;
 }
 
 const DEFAULT_HISTORY_MONTHS = 24;
 
-// Module-level, so the default keeps one identity and never invalidates the series memo.
+// Module-level, so the default keeps one identity and never invalidates the chart model memo.
 const DEFAULT_COMPARE_MONTHS_AGO: readonly number[] = [6, 12];
 
 const CURRENT_STROKE_WIDTH = 2;
@@ -117,21 +173,113 @@ function isCurveEmpty(data: MacroOverviewResponse): boolean {
 }
 
 /**
- * Turns API points into plotted rows in ascending tenor, dropping a point whose tenor or yield
- * has no chart coordinate. The order is decided by exact decimal comparison, because chart
- * numbers are coordinates only and are never compared (lib/format.ts); a pair the exact
- * comparison cannot read keeps the server's ascending-tenor order.
+ * The API points that have both chart coordinates, in server order. A point whose tenor or yield
+ * has no chart coordinate is not drawn.
  */
-function toRows(points: readonly YieldCurvePoint[]): ChartRow[] {
-  const rows: ChartRow[] = [];
+function toPlottedPoints(points: readonly YieldCurvePoint[]): PlottedPoint[] {
+  const plotted: PlottedPoint[] = [];
   for (const point of points) {
     const x = toChartNumber(point.tenor_years);
     const y = toChartNumber(point.yield_pct);
     if (x !== null && y !== null) {
-      rows.push({ x, y, point });
+      plotted.push({ x, y, point });
     }
   }
-  return rows.sort((a, b) => compareDecimal(a.point.tenor_years, b.point.tenor_years) ?? 0);
+  return plotted;
+}
+
+/** Whether exact decimal comparison can read the tenor text. */
+function isComparableTenor(tenor: string): boolean {
+  return compareDecimal(tenor, tenor) !== null;
+}
+
+/**
+ * Whether two tenor texts are the same tenor: exactly equal decimals, or, for text the exact
+ * comparison cannot read, identical text. Chart numbers are coordinates only and are never
+ * compared (lib/format.ts).
+ */
+function isSameTenor(a: string, b: string): boolean {
+  const order = compareDecimal(a, b);
+  return order === null ? a === b : order === 0;
+}
+
+/**
+ * Where a new comparable tenor goes among the groups: before the first comparable tenor above
+ * it, so the comparable tenors stay in ascending exact order.
+ */
+function insertionIndex(groups: readonly TenorGroup[], tenor: string): number {
+  const index = groups.findIndex((group) => compareDecimal(group.tenor, tenor) === 1);
+  return index === -1 ? groups.length : index;
+}
+
+/**
+ * Groups the points of every curve by tenor, as the union of the curves' tenors in ascending
+ * exact order. A tenor the exact comparison cannot read is never matched to another tenor: it
+ * forms its own group, shared only with identical text, placed right after the tenor of the
+ * point its curve sends before it, so it keeps the server's ascending-tenor order.
+ */
+function groupByTenor(series: readonly CurveSeries[]): TenorGroup[] {
+  const groups: TenorGroup[] = [];
+  for (const curve of series) {
+    // The group holding this curve's previous point; null before its first point.
+    let previous: TenorGroup | null = null;
+    for (const plotted of curve.points) {
+      const tenor = plotted.point.tenor_years;
+      let group = groups.find((candidate) => isSameTenor(candidate.tenor, tenor));
+      if (group === undefined) {
+        group = { tenor, x: plotted.x, pointsBySeries: new Map() };
+        const afterPrevious = previous === null ? 0 : groups.indexOf(previous) + 1;
+        const index = isComparableTenor(tenor) ? insertionIndex(groups, tenor) : afterPrevious;
+        groups.splice(index, 0, group);
+      }
+      const atTenor = group.pointsBySeries.get(curve.id);
+      if (atTenor === undefined) {
+        group.pointsBySeries.set(curve.id, [plotted]);
+      } else {
+        atTenor.push(plotted);
+      }
+      previous = group;
+    }
+  }
+  return groups;
+}
+
+/**
+ * Builds the chart-level rows from the tenor groups: per tenor, as many rows as the most points
+ * any curve has there, each holding every curve's coordinate or null and the tenor's tooltip
+ * entries.
+ */
+function buildRows(series: readonly CurveSeries[]): ChartRow[] {
+  const rows: ChartRow[] = [];
+  for (const group of groupByTenor(series)) {
+    const entries: TenorEntry[] = [];
+    let depth = 0;
+    for (const curve of series) {
+      const atTenor = group.pointsBySeries.get(curve.id);
+      if (atTenor !== undefined && atTenor.length > 0) {
+        entries.push({
+          seriesId: curve.id,
+          name: curve.name,
+          color: curve.color,
+          points: atTenor.map((plotted) => plotted.point),
+        });
+        depth = Math.max(depth, atTenor.length);
+      }
+    }
+    for (let position = 0; position < depth; position += 1) {
+      const y: Record<string, number | null> = {};
+      for (const curve of series) {
+        y[curve.id] = group.pointsBySeries.get(curve.id)?.[position]?.y ?? null;
+      }
+      rows.push({ x: group.x, y, entries });
+    }
+  }
+  return rows;
+}
+
+/** The data key of the curve `id`: its yield coordinate in a row, or null where it has none. */
+function yieldOfSeries(id: string): (row: ChartRow) => number | null {
+  return (row) => row.y[id] ?? null;
 }
 
 /** Latest `observation_date` among the points (ISO dates order as text), or null when empty. */
@@ -196,7 +344,8 @@ function buildSeries(
       name: "Current",
       color: CHART_COLORS.accent,
       strokeWidth: CURRENT_STROKE_WIDTH,
-      points: toRows(current),
+      points: toPlottedPoints(current),
+      yieldOf: yieldOfSeries("current"),
     },
   ];
 
@@ -211,73 +360,84 @@ function buildSeries(
     if (snapshot === undefined) {
       return;
     }
-    const points = toRows(snapshot.points);
+    const points = toPlottedPoints(snapshot.points);
     if (points.length === 0) {
       return;
     }
+    const id = "m" + months;
     series.push({
-      id: "m" + months,
+      id,
       name: comparisonName(months, snapshot),
       color: comparisonColor(position),
       strokeWidth: COMPARISON_STROKE_WIDTH,
       points,
+      yieldOf: yieldOfSeries(id),
     });
   });
   return series;
 }
 
+/**
+ * Builds the drawn curves and the chart-level rows they share. Every `Line` reads the same rows,
+ * so Recharts resolves the hovered tenor to one row for all curves, and a curve without a point
+ * there contributes no tooltip entry and no active dot.
+ */
+function buildChartModel(
+  data: MacroOverviewResponse | undefined,
+  compareMonthsAgo: readonly number[],
+): ChartModel {
+  const series = buildSeries(data, compareMonthsAgo);
+  return { series, rows: buildRows(series) };
+}
+
 function isChartRow(value: unknown): value is ChartRow {
-  if (typeof value !== "object" || value === null || !("point" in value)) {
-    return false;
-  }
-  const point: unknown = value.point;
   return (
-    typeof point === "object" &&
-    point !== null &&
-    "tenor_label" in point &&
-    "yield_pct" in point &&
-    "observation_date" in point &&
-    "source" in point
+    typeof value === "object" &&
+    value !== null &&
+    "x" in value &&
+    typeof value.x === "number" &&
+    "y" in value &&
+    typeof value.y === "object" &&
+    value.y !== null &&
+    "entries" in value &&
+    Array.isArray(value.entries)
   );
 }
 
-/** One tooltip block: the hovered point of one curve. */
-interface TooltipEntry {
-  key: string;
-  name: string;
-  color: string;
-  point: YieldCurvePoint;
+/**
+ * The row of the hovered tenor. Every curve is drawn from the same chart-level rows, so each
+ * payload entry carries that row; the first one found is used.
+ */
+function hoveredRow(payload: TooltipContentProps["payload"]): ChartRow | undefined {
+  for (const entry of payload) {
+    const row: unknown = entry.payload;
+    if (isChartRow(row)) {
+      return row;
+    }
+  }
+  return undefined;
 }
 
 /**
- * Tooltip of the chart. The tooltip follows the tenor axis, so it lists every curve with a
- * point at the hovered tenor, each named, with the API's own strings: the yield through
- * `formatDecimal`, the observation date and the provenance of that point.
+ * Tooltip of the chart. It lists only the curves that have a point at the hovered tenor, taken
+ * from that tenor's chart row rather than from each curve's own data, so no entry comes from
+ * another tenor. Each curve is named once, followed by every point it has at the tenor, with the
+ * API's own strings: the yield through `formatDecimal`, the observation date and the provenance
+ * of that point.
  */
 function YieldCurveTooltip({ active, payload }: TooltipContentProps): ReactNode {
   if (!active) {
     return null;
   }
-  const entries: TooltipEntry[] = [];
-  payload.forEach((entry, index) => {
-    const row: unknown = entry.payload;
-    if (isChartRow(row)) {
-      entries.push({
-        key: `${entry.graphicalItemId}:${index}`,
-        name: typeof entry.name === "string" ? entry.name : String(entry.name ?? ""),
-        color: entry.color ?? entry.stroke ?? CHART_COLORS.text,
-        point: row.point,
-      });
-    }
-  });
-  if (entries.length === 0) {
+  const row = hoveredRow(payload);
+  if (row === undefined || row.entries.length === 0) {
     return null;
   }
   return (
     <div className={TOOLTIP_CLASS}>
       <ul className={TOOLTIP_LIST_CLASS}>
-        {entries.map(({ key, name, color, point }) => (
-          <li key={key}>
+        {row.entries.map(({ seriesId, name, color, points }) => (
+          <li key={seriesId}>
             <p className={TOOLTIP_SERIES_CLASS}>
               <svg
                 viewBox="0 0 8 8"
@@ -289,17 +449,22 @@ function YieldCurveTooltip({ active, payload }: TooltipContentProps): ReactNode 
               </svg>
               <span>{name}</span>
             </p>
-            <p className={TOOLTIP_LINE_CLASS}>
-              {point.tenor_label}: {formatDecimal(point.yield_pct, "pct")}
-            </p>
-            <p className={TOOLTIP_LINE_CLASS}>
-              {INSTRUMENT_LABELS[point.instrument] ?? point.instrument}
-              {point.bond_code ? ` ${point.bond_code}` : ""}
-            </p>
-            {/* One line for date and provenance keeps a three-curve tooltip within the chart height. */}
-            <p className={TOOLTIP_LINE_CLASS}>
-              Observed {formatDate(point.observation_date)} · Source: {point.source}
-            </p>
+            {/* The curve's points at this tenor are a fixed list, in server order. */}
+            {points.map((point, index) => (
+              <Fragment key={index}>
+                <p className={TOOLTIP_LINE_CLASS}>
+                  {point.tenor_label}: {formatDecimal(point.yield_pct, "pct")}
+                </p>
+                <p className={TOOLTIP_LINE_CLASS}>
+                  {INSTRUMENT_LABELS[point.instrument] ?? point.instrument}
+                  {point.bond_code ? ` ${point.bond_code}` : ""}
+                </p>
+                {/* One line for date and provenance keeps a three-curve tooltip within the chart height. */}
+                <p className={TOOLTIP_LINE_CLASS}>
+                  Observed {formatDate(point.observation_date)} · Source: {point.source}
+                </p>
+              </Fragment>
+            ))}
           </li>
         ))}
       </ul>
@@ -346,7 +511,7 @@ export function YieldCurveChart({
     isEmpty: isCurveEmpty,
   });
   const ages = compareMonthsAgo ?? DEFAULT_COMPARE_MONTHS_AGO;
-  const series = useMemo(() => buildSeries(query.data, ages), [query.data, ages]);
+  const { series, rows } = useMemo(() => buildChartModel(query.data, ages), [query.data, ages]);
 
   return (
     <WidgetFrame
@@ -362,6 +527,7 @@ export function YieldCurveChart({
         <div className={CHART_CLASS}>
           <ResponsiveContainer width="100%" height="100%">
             <LineChart
+              data={rows}
               margin={{ top: 8, right: 16, bottom: 4, left: 4 }}
               title="Yield curve"
               desc="Yield in percent against tenor in years, for the current curve and each comparison curve listed below the chart."
@@ -384,9 +550,9 @@ export function YieldCurveChart({
                   fontSize: 11,
                 }}
               />
+              {/* No axis data key: the domain is taken from every Line's yield values. */}
               <YAxis
                 type="number"
-                dataKey="y"
                 domain={["auto", "auto"]}
                 tick={AXIS_TICK}
                 stroke={CHART_COLORS.axis}
@@ -411,10 +577,12 @@ export function YieldCurveChart({
               {series.map((curve) => (
                 <Line
                   key={curve.id}
-                  data={curve.points}
-                  dataKey="y"
+                  dataKey={curve.yieldOf}
                   name={curve.name}
                   type="linear"
+                  // A row at a tenor this curve lacks is null: the line runs on through it, and
+                  // neither a dot nor an active dot is drawn there.
+                  connectNulls
                   stroke={curve.color}
                   strokeWidth={curve.strokeWidth}
                   dot={{ r: 3, fill: curve.color, stroke: curve.color, strokeWidth: 1 }}

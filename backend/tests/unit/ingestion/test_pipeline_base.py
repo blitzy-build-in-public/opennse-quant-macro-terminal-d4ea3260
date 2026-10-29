@@ -390,6 +390,34 @@ class _ReconcilingPipeline(_QuotePipeline):
         )
 
 
+class _WriteRejectingPipeline(_QuotePipeline):
+    """Its upsert leaves the rows at ``unwritable`` indexes unwritten and uncounted, and reports
+    them through :meth:`write_rejections`, as a write-time conflict would."""
+
+    name = "test_write_rejecting"
+
+    def __init__(
+        self, settings: TerminalSettings, *, unwritable: Sequence[int] = (), **options: Any
+    ) -> None:
+        super().__init__(settings, **options)
+        self.unwritable = tuple(unwritable)
+        self.unwritten: list[RejectedRow] = []
+
+    async def upsert(
+        self, conn: AsyncConnection, records: Sequence[_Quote], run_id: uuid.UUID
+    ) -> int:
+        self.upserts.append((conn, list(records), run_id))
+        self.unwritten = [
+            RejectedRow(index=record.index, reason="currency_conflict", row={"cell": record.cell})
+            for record in records
+            if record.index in self.unwritable
+        ]
+        return len(records) - len(self.unwritten)
+
+    def write_rejections(self) -> Sequence[RejectedRow]:
+        return self.unwritten
+
+
 class _CsvImportPipeline(_QuotePipeline):
     """Overrides ``run_name`` the way the tabular importer does (``csv_import:<kind>``)."""
 
@@ -480,7 +508,9 @@ def _open_closing_clients(
     the list each opened client is appended to."""
     clients: list[_ClosingClient] = []
 
-    def open_client(client_settings: TerminalSettings) -> _ClosingClient:
+    def open_client(
+        client_settings: TerminalSettings, *, spacing: ingestion_http.HostSpacing | None = None
+    ) -> _ClosingClient:
         client = _ClosingClient(client_settings, close_error)
         clients.append(client)
         return client
@@ -911,6 +941,7 @@ def test_minimal_pipeline_defaults(settings: TerminalSettings) -> None:
     assert pipeline.min_rows == 0
     assert pipeline.source_url is None
     assert pipeline.settings is settings
+    assert pipeline.write_rejections() == ()
 
 
 def test_run_name_can_differ_from_the_registry_name(settings: TerminalSettings) -> None:
@@ -1712,6 +1743,92 @@ async def test_reconcile_sees_only_validated_rows_and_both_rejection_kinds_add_u
     assert pipeline.upserts == []
 
 
+BREACH_EVIDENCE: Mapping[str, object] = {
+    "expected": {"min_rows": 0, "max_invalid_fraction": "0.10"},
+    "found": {"parsed": 10, "rejected": 2},
+}
+
+
+@pytest.mark.parametrize(
+    ("cells", "unwritable", "status", "message", "written", "outcome", "rejected", "evidence"),
+    [
+        pytest.param(
+            ["1.00"] * 10,
+            [4],
+            RunStatus.PARTIAL,
+            None,
+            9,
+            COMMITTED,
+            [(4, "currency_conflict")],
+            {},
+            id="one-of-ten-unwritten-is-partial",
+        ),
+        pytest.param(
+            ["1.00"] * 10,
+            [4, 7],
+            RunStatus.LAYOUT_CHANGED,
+            "2 of 10 rows rejected, more than 10% of the rows parsed",
+            0,
+            ROLLED_BACK,
+            [(4, "currency_conflict"), (7, "currency_conflict")],
+            BREACH_EVIDENCE,
+            id="two-of-ten-unwritten-roll-the-upsert-back",
+        ),
+        pytest.param(
+            ["abc", *(["1.00"] * 9)],
+            [4],
+            RunStatus.LAYOUT_CHANGED,
+            "2 of 10 rows rejected, more than 10% of the rows parsed",
+            0,
+            ROLLED_BACK,
+            [(0, "invalid_decimal"), (4, "currency_conflict")],
+            BREACH_EVIDENCE,
+            id="validation-and-write-rejections-add-up",
+        ),
+    ],
+)
+async def test_rows_the_upsert_could_not_write_count_toward_the_thresholds(
+    settings: TerminalSettings,
+    cells: list[str],
+    unwritable: list[int],
+    status: RunStatus,
+    message: str | None,
+    written: int,
+    outcome: str,
+    rejected: list[tuple[int, str]],
+    evidence: Mapping[str, object],
+) -> None:
+    """The thresholds are applied again once the upsert has run: its write rejections join the
+    earlier ones, and a breach rolls back the rows it had already written."""
+    engine = _EngineDouble()
+    pipeline = _WriteRejectingPipeline(settings, cells=cells, unwritable=unwritable)
+
+    result = await _execute(pipeline, engine, _HttpDouble())
+
+    assert result.status is status
+    assert result.error_message == message
+    assert (result.rows_fetched, result.rows_written, result.rows_rejected) == (
+        10,
+        written,
+        len(rejected),
+    )
+    # The upsert ran either way; the second threshold check decides whether its rows commit.
+    assert len(pipeline.upserts) == 1
+    (data,) = engine.data_connections
+    assert data.outcome == outcome
+    details = dict(result.details)
+    _pop_duration(details)
+    assert details == {
+        **evidence,
+        "rejected": [
+            {"index": index, "reason": reason, "row": {"cell": cells[index]}}
+            for index, reason in rejected
+        ],
+    }
+    (update,) = engine.updates
+    assert (update.params["status"], update.params["rows_written"]) == (status.value, written)
+
+
 async def test_empty_parse_succeeds_without_calling_upsert(settings: TerminalSettings) -> None:
     engine = _EngineDouble()
     pipeline = _QuotePipeline(settings, cells=[])
@@ -2314,7 +2431,9 @@ async def test_cleanup_after_the_commit_keeps_the_committed_status_and_counts(
     caplog.set_level(logging.INFO, logger=LOGGER)
     clients: list[_ClosingClient] = []
 
-    def open_client(client_settings: TerminalSettings) -> _ClosingClient:
+    def open_client(
+        client_settings: TerminalSettings, *, spacing: ingestion_http.HostSpacing | None = None
+    ) -> _ClosingClient:
         client = _ClosingClient(client_settings, close_error)
         clients.append(client)
         return client

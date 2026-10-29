@@ -1511,10 +1511,12 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
     the rows, checks the headers and converts the kind's columns; :meth:`validate` mirrors every
     CHECK and length limit of the target table; :meth:`reconcile` collapses repeated keys and
     checks stored data (unknown tickers, ISIN owners, currency conflicts, missing price rows);
-    :meth:`upsert` writes through ``opennse_terminal.db.upsert``. Rejections at either check count
-    toward the shared thresholds: up to 10% gives ``partial`` (valid rows written), more gives
-    ``layout_changed`` (nothing written); a missing required header or a file without data rows
-    is ``layout_changed`` too.
+    :meth:`upsert` writes through ``opennse_terminal.db.upsert`` and reports, through
+    :meth:`write_rejections`, each fundamentals row whose period a concurrent writer stored in
+    another currency after :meth:`reconcile` (``currency_conflict``). Rejections at any of these
+    stages count toward the shared thresholds: up to 10% gives ``partial`` (valid rows written),
+    more gives ``layout_changed`` (nothing written); a missing required header or a file without
+    data rows is ``layout_changed`` too.
 
     Instances are single-use. Evidence found during the run (``kind``, ``file_name``, ``sheet``,
     ``file_size_bytes``, ``ignored_columns``, ``blank_rows_skipped``, ``duplicates_collapsed``,
@@ -1551,6 +1553,8 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         self._run_id: uuid.UUID | None = None
         # The layouts of this run's compact rows, shared by every record with the same columns.
         self._layouts = _RowLayouts()
+        # The rows upsert() found it could not write, reported by write_rejections().
+        self._write_rejected: list[RejectedRow] = []
 
     @property
     def run_name(self) -> str:
@@ -1803,7 +1807,8 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
           finally defaulting to KES), so the upsert never nulls stored data.
         - ``daily_prices``: a ticker absent from ``terminal_equities`` (``unknown_ticker``).
         - ``fundamentals``: an unknown ticker (``unknown_ticker``), or a currency different from
-          the stored period's (``currency_conflict``), so values never merge across currencies.
+          the stored period's (``currency_conflict``), so values never merge across currencies;
+          a period another writer stores after this check is caught by :meth:`upsert`.
         - ``foreign_flows``: a ``(ticker, trade_date)`` without a price row (``no_price_row``).
 
         These rejections count toward the same thresholds as :meth:`validate`'s.
@@ -1836,39 +1841,16 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
                 select(TerminalEquity.ticker).where(TerminalEquity.ticker.in_(chunk))
             )
             known.update(result.scalars())
-        stored_currency: dict[tuple[str, date, str], str] = {}
+        stored_currency: dict[_Period, str] = {}
         if self.kind == "fundamentals":
             periods = sorted(
                 {
-                    (
-                        ticker,
-                        _required_date(record.values, "period_end_date"),
-                        _required_text(record.values, "period_type"),
-                    )
+                    _period_of(record)
                     for record in records
-                    if (ticker := _required_text(record.values, "ticker")) in known
+                    if _required_text(record.values, "ticker") in known
                 }
             )
-            for requested in _key_batches(
-                periods, ticker=String(), period_end_date=Date(), period_type=String()
-            ):
-                result_rows = await conn.execute(
-                    select(
-                        TerminalFundamental.ticker,
-                        TerminalFundamental.period_end_date,
-                        TerminalFundamental.period_type,
-                        TerminalFundamental.currency,
-                    ).join(
-                        requested,
-                        and_(
-                            TerminalFundamental.ticker == requested.c.ticker,
-                            TerminalFundamental.period_end_date == requested.c.period_end_date,
-                            TerminalFundamental.period_type == requested.c.period_type,
-                        ),
-                    )
-                )
-                for ticker, period_end, period_type, currency in result_rows.tuples():
-                    stored_currency[(ticker, period_end, period_type)] = currency
+            stored_currency = await _stored_currencies(conn, periods)
         valid: list[TabularRecord] = []
         rejected: list[RejectedRow] = []
         for record in records:
@@ -1877,15 +1859,8 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
             reason: str | None = None
             if ticker not in known:
                 reason = "unknown_ticker"
-            elif self.kind == "fundamentals":
-                key = (
-                    ticker,
-                    _required_date(values, "period_end_date"),
-                    _required_text(values, "period_type"),
-                )
-                stored = stored_currency.get(key)
-                if stored is not None and stored != _required_text(values, "currency"):
-                    reason = "currency_conflict"
+            elif self.kind == "fundamentals" and _conflicts_with(record, stored_currency):
+                reason = "currency_conflict"
             if reason is None:
                 valid.append(record)
             else:
@@ -1913,7 +1888,14 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
           ``foreign_net_flow_kes`` and ``flow_source = 'csv_import'``, an empty one keeps the
           stored flow.
         - ``fundamentals`` and ``macro_indicators``: COALESCE merges recording ``csv_import`` in
-          ``source_by_field`` for each non-empty cell.
+          ``source_by_field`` for each non-empty cell. ``upsert_fundamentals`` skips, uncounted,
+          a row whose period is stored in another currency; :meth:`reconcile` rejected every
+          such period it saw, so a skipped row's period was stored by a concurrent writer (a PDF
+          commit) since. When a batch writes fewer rows than it holds, the stored currencies of
+          its periods are read on ``conn`` (a bound ``select()`` joined to a typed ``VALUES``
+          list), and each row whose period is stored in another currency becomes a
+          ``currency_conflict`` rejection reported by :meth:`write_rejections`, so it counts
+          toward the shared thresholds; their count is logged once at WARNING with the run id.
         - ``foreign_flows``: ``update_flows(flow_source="csv_import")``, touching only the flow
           columns; keys that lost their price row since :meth:`reconcile` are counted across
           the batches, logged once and recorded in ``details.flow_missing_keys`` (their count
@@ -1921,17 +1903,21 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
 
         Returns the number of rows inserted or updated, summed over the batches. Re-importing a
         file rewrites identical values, so the stored state is unchanged.
+
+        Raises:
+            RuntimeError: A fundamentals batch wrote fewer rows than it holds and currency
+                conflicts do not account for every row it left out; the run ends ``failed`` and
+                rolls back rather than report a short write as success.
         """
         columns = _WRITE_COLUMNS[self.kind]
         ordered = sorted(records, key=self._key_of)
         written = 0
         missing_count = 0
         missing_sample: list[tuple[str, date]] = []
+        unwritten: list[RejectedRow] = []
         for start in range(0, len(ordered), _WRITE_BATCH_ROWS):
-            rows = [
-                {column: record.values.get(column) for column in columns}
-                for record in ordered[start : start + _WRITE_BATCH_ROWS]
-            ]
+            batch = ordered[start : start + _WRITE_BATCH_ROWS]
+            rows = [{column: record.values.get(column) for column in columns} for record in batch]
             if self.kind == "equities":
                 for row in rows:
                     row["source"] = _SOURCE
@@ -1941,7 +1927,10 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
             elif self.kind == "daily_prices":
                 written += await upsert_prices(conn, rows, source=_SOURCE, ingestion_run_id=run_id)
             elif self.kind == "fundamentals":
-                written += await upsert_fundamentals(conn, rows, source=_SOURCE)
+                count = await upsert_fundamentals(conn, rows, source=_SOURCE)
+                if count < len(rows):
+                    unwritten.extend(await _currency_conflicts(conn, batch, len(rows) - count))
+                written += count
             elif self.kind == "macro_indicators":
                 written += await upsert_macro(conn, rows, source=_SOURCE)
             else:
@@ -1961,7 +1950,100 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
                 "count": missing_count,
                 "sample": [list(key) for key in missing_sample],
             }
+        if unwritten:
+            logger.warning(
+                "fundamentals import run %s rejected %d rows at write time: currency_conflict",
+                self._run_id,
+                len(unwritten),
+            )
+            self._write_rejected.extend(unwritten)
         return written
+
+    def write_rejections(self) -> Sequence[RejectedRow]:
+        """The rows :meth:`upsert` could not write, in key order: fundamentals rows whose period
+        a concurrent writer stored in another currency after :meth:`reconcile`
+        (``currency_conflict``, with the row's line number and raw cells). Empty for the other
+        kinds."""
+        return tuple(self._write_rejected)
+
+
+_Period = tuple[str, date, str]
+"""A fundamentals period: ``(ticker, period_end_date, period_type)``, the conflict key."""
+
+
+def _period_of(record: TabularRecord) -> _Period:
+    """The period of a validated fundamentals record (``period_type`` already defaulted)."""
+    values = record.values
+    return (
+        _required_text(values, "ticker"),
+        _required_date(values, "period_end_date"),
+        _required_text(values, "period_type"),
+    )
+
+
+def _conflicts_with(record: TabularRecord, stored_currency: Mapping[_Period, str]) -> bool:
+    """True when the record's period is stored in a currency other than the record's own
+    (``currency`` already defaulted to KES)."""
+    stored = stored_currency.get(_period_of(record))
+    return stored is not None and stored != _required_text(record.values, "currency")
+
+
+async def _stored_currencies(
+    conn: AsyncConnection, periods: Sequence[_Period]
+) -> dict[_Period, str]:
+    """The stored ``currency`` of each of ``periods`` that ``terminal_fundamentals`` holds, read
+    on ``conn`` with bound ``select()`` statements joined to typed ``VALUES`` lists of the exact
+    periods (:func:`_key_batches`), so no other stored period is read."""
+    stored: dict[_Period, str] = {}
+    for requested in _key_batches(
+        periods, ticker=String(), period_end_date=Date(), period_type=String()
+    ):
+        result_rows = await conn.execute(
+            select(
+                TerminalFundamental.ticker,
+                TerminalFundamental.period_end_date,
+                TerminalFundamental.period_type,
+                TerminalFundamental.currency,
+            ).join(
+                requested,
+                and_(
+                    TerminalFundamental.ticker == requested.c.ticker,
+                    TerminalFundamental.period_end_date == requested.c.period_end_date,
+                    TerminalFundamental.period_type == requested.c.period_type,
+                ),
+            )
+        )
+        for ticker, period_end, period_type, currency in result_rows.tuples():
+            stored[(ticker, period_end, period_type)] = currency
+    return stored
+
+
+async def _currency_conflicts(
+    conn: AsyncConnection, batch: Sequence[TabularRecord], unwritten: int
+) -> list[RejectedRow]:
+    """The ``currency_conflict`` rejections of the ``unwritten`` rows ``upsert_fundamentals``
+    left out of a written ``batch`` (unique periods, in key order).
+
+    The batch's periods are read on the run's connection, inside its transaction, after the
+    write, so a period a concurrent writer committed meanwhile is read in the currency the
+    ``upsert_fundamentals`` guard compared against (a stored currency is written on insert
+    only).
+
+    Raises:
+        RuntimeError: Currency conflicts do not account for exactly ``unwritten`` rows.
+    """
+    stored_currency = await _stored_currencies(conn, [_period_of(record) for record in batch])
+    conflicts = [
+        RejectedRow(index=record.row_number, reason="currency_conflict", row=record.raw)
+        for record in batch
+        if _conflicts_with(record, stored_currency)
+    ]
+    if len(conflicts) != unwritten:
+        raise RuntimeError(
+            f"fundamentals upsert left {unwritten} of {len(batch)} batch rows unwritten, "
+            f"of which currency conflicts explain {len(conflicts)}"
+        )
+    return conflicts
 
 
 def _no_values(values: Mapping[str, CellValue], failed: set[str], columns: Sequence[str]) -> bool:

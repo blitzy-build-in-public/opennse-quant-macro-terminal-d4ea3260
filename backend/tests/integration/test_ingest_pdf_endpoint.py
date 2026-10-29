@@ -11,7 +11,9 @@ transaction, so they are read through ``db_session`` and rolled back after the t
 of ``terminal_ingestion_runs`` (``pipeline='pdf_filing'``, ``trigger='api'``) is written by the
 service on a separate connection and persists in the module clone, so it is read through
 ``committed_query`` and always filtered by the upload's SHA-256. Each test prints a distinct tag
-into its filing, which keeps every SHA-256, and with it every run-row filter, unique.
+into its filing, which keeps every SHA-256, and with it every run-row filter, unique. The
+binds-only test serves its requests from a host session with no default bind, configured only
+through ``binds`` or a routing ``get_bind`` on that same connection, instead of ``db_session``.
 
 Rejections come from two layers. The route (size guard, file size, ``%PDF-`` magic bytes, parse
 slots) records no run row; the service (commit preconditions, parse failures, currency rules)
@@ -32,12 +34,15 @@ from typing import Any, Final, NoReturn, Protocol
 
 import httpx
 import pytest
-from fastapi import HTTPException
-from sqlalchemy import Executable, select
+from fastapi import FastAPI, HTTPException
+from sqlalchemy import Executable, literal_column, select
 from sqlalchemy.engine import RowMapping
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
+from helpers.routing_session import RoutingSession
+from opennse_terminal.api import get_terminal_session
 from opennse_terminal.api.routes.ingest import MULTIPART_OVERHEAD_BYTES
+from opennse_terminal.db.base import TerminalBase
 from opennse_terminal.ingestion.files.pdf_line_items import ITEM_COLUMNS
 from opennse_terminal.models import (
     TerminalCorporateFiling,
@@ -415,6 +420,139 @@ async def test_commit_into_seeded_scom_row_updates_six_columns(
     assert final is not None
     for column in COMMITTED_COLUMNS:
         assert final[column] == statement_expected[column], column
+    runs = await run_rows(committed_query, pdf)
+    assert [(run["status"], run["filing_id"]) for run in runs] == [
+        ("succeeded", body["filing_id"]),
+        ("succeeded", body["filing_id"]),
+    ]
+
+
+HostSessionOptions = Callable[[AsyncConnection], dict[str, Any]]
+"""Builds a host session's bind configuration onto the per-test connection: a ``binds`` mapping,
+or a routing ``sync_session_class`` with its ``terminal_bind``."""
+
+_XMIN: Final = literal_column("xmin::text")
+"""The id of the (sub)transaction that last wrote a row, read from PostgreSQL's system column."""
+_SCOM_FUNDAMENTALS_KEY: Final = (
+    TerminalFundamental.ticker == "SCOM",
+    TerminalFundamental.period_end_date == SCOM_PERIOD,
+    TerminalFundamental.period_type == "FY",
+)
+"""``WHERE`` terms of the seeded SCOM FY fundamentals row the binds-only commit merges into."""
+
+
+@pytest.mark.parametrize(
+    ("tag", "session_options"),
+    [
+        pytest.param(
+            "binds by base class",
+            lambda conn: {"binds": {TerminalBase: conn}},
+            id="base_class_binds",
+        ),
+        pytest.param(
+            "binds per model",
+            lambda conn: {
+                "binds": {mapper.class_: conn for mapper in TerminalBase.registry.mappers}
+            },
+            id="per_model_binds",
+        ),
+        pytest.param(
+            "routing get_bind",
+            lambda conn: {
+                "sync_session_class": RoutingSession,
+                "terminal_bind": conn.sync_connection,
+            },
+            id="routing_get_bind",
+        ),
+    ],
+)
+async def test_binds_only_host_session_previews_and_commits(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_connection: AsyncConnection,
+    db_session: AsyncSession,
+    committed_query: CommittedQuery,
+    statement_pdf: StatementPdf,
+    statement_expected: StatementExpectation,
+    tag: str,
+    session_options: HostSessionOptions,
+) -> None:
+    """A host session with no default bind, configured only through ``binds`` or a routing
+    ``get_bind``, previews and commits a KES filing.
+
+    The override maps the terminal's base class or every mapped class to the per-test
+    connection, or routes the terminal's mappers to it as a host's custom ``get_bind`` reading
+    ``mapper.class_`` does, and joins its outer transaction through SAVEPOINTs, so the outer
+    rollback still undoes the writes. The preview upserts the filing row; the commit writes the
+    filing and the fundamentals in one transaction, which another connection never sees.
+    """
+    host_session = AsyncSession(
+        **session_options(db_connection),
+        join_transaction_mode="create_savepoint",
+        expire_on_commit=False,
+    )
+    assert host_session.sync_session.bind is None
+
+    async def _host_session_override() -> AsyncIterator[AsyncSession]:
+        yield host_session
+
+    app.dependency_overrides[get_terminal_session] = _host_session_override
+    before = await fundamentals_row(db_session, "SCOM", SCOM_PERIOD)
+    assert before is not None
+    pdf = statement_pdf("KES", tag=tag)
+
+    try:
+        preview = await upload(client, pdf, **SCOM_FORM, commit="false")
+        previewed = await filing_row(db_session, pdf)
+        commit = await upload(client, pdf, **SCOM_FORM, commit="true")
+    finally:
+        await host_session.close()
+
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["committed"] is False
+    assert previewed is not None
+    assert str(previewed["id"]) == preview.json()["filing_id"]
+    assert previewed["committed_to_fundamentals"] is False
+
+    assert commit.status_code == 200, commit.text
+    body = commit.json()
+    assert body["committed"] is True
+    assert body["filing_id"] == preview.json()["filing_id"]
+    assert body["fundamentals_id"] == str(before["id"])
+    after = await fundamentals_row(db_session, "SCOM", SCOM_PERIOD)
+    assert after is not None
+    for column in COMMITTED_COLUMNS:
+        assert after[column] == statement_expected[column], column
+        assert after["source_by_field"][column] == "pdf_filing", column
+    assert after["filing_id"] == uuid.UUID(body["filing_id"])
+    filing = await filing_row(db_session, pdf)
+    assert filing is not None
+    assert filing["committed_to_fundamentals"] is True
+
+    # Rows written in one (sub)transaction carry its transaction id as xmin.
+    filing_xmin = await db_session.scalar(
+        select(_XMIN)
+        .select_from(TerminalCorporateFiling)
+        .where(TerminalCorporateFiling.file_sha256 == sha(pdf))
+    )
+    fundamentals_xmin = await db_session.scalar(
+        select(_XMIN).select_from(TerminalFundamental).where(*_SCOM_FUNDAMENTALS_KEY)
+    )
+    assert filing_xmin is not None
+    assert filing_xmin == fundamentals_xmin
+    # Both writes stayed inside the outer transaction: another connection sees neither.
+    assert (
+        await committed_query(
+            select(TerminalCorporateFiling.id).where(
+                TerminalCorporateFiling.file_sha256 == sha(pdf)
+            )
+        )
+        == []
+    )
+    outside = await committed_query(
+        select(TerminalFundamental.source_by_field).where(*_SCOM_FUNDAMENTALS_KEY)
+    )
+    assert [row["source_by_field"] for row in outside] == [before["source_by_field"]]
     runs = await run_rows(committed_query, pdf)
     assert [(run["status"], run["filing_id"]) for run in runs] == [
         ("succeeded", body["filing_id"]),

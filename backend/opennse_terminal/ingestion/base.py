@@ -17,6 +17,8 @@ Run lifecycle (one call of :func:`execute_pipeline`):
 3. Fetching, parsing, validation, reconciliation and the upsert all happen inside that
    transaction, one stage after another; any exception rolls everything back. ``parse`` and
    ``validate`` run in a worker thread, so decoding a large file never blocks the event loop.
+   The shared thresholds are applied before the upsert, and again before the commit when the
+   upsert reports rows it could not write (:meth:`Pipeline.write_rejections`).
 4. The run row is updated with its final status, counts, ``error_message`` and ``details`` on a
    separate connection, so run-record writes never release or extend the lock. The status is the
    data transaction's confirmed outcome: once the commit has returned, a later cleanup error or
@@ -53,8 +55,8 @@ integers, ``fx_kes_usd`` KES per USD and ``fx_reserves_usd_m`` millions of USD. 
 :func:`to_jsonable` writes decimals into ``details`` as strings.
 
 ``opennse_terminal.ingestion.http`` imports this module's exceptions at module level, so this
-module imports ``PoliteClient`` only for type checking and, at run time, inside
-:func:`execute_pipeline`.
+module imports ``PoliteClient`` and ``HostSpacing`` only for type checking and, at run time,
+``PoliteClient`` inside :func:`execute_pipeline`.
 """
 
 import asyncio
@@ -84,7 +86,7 @@ from opennse_terminal.models.ingestion_runs import RUN_STATUSES, RUN_TRIGGERS
 
 if TYPE_CHECKING:
     # Type-only: ingestion.http imports this module at load time (see the module docstring).
-    from opennse_terminal.ingestion.http import PoliteClient
+    from opennse_terminal.ingestion.http import HostSpacing, PoliteClient
 
 __all__ = [
     "MAX_INVALID_FRACTION",
@@ -176,8 +178,11 @@ class SourceLayoutChanged(IngestionError):  # noqa: N818 - names the condition, 
     """The source no longer has the expected layout; the run ends ``layout_changed``.
 
     Raised before any write when headers, a required table or file link, or a row-count minimum
-    do not match. ``expected`` and ``found`` are recorded as ``details.expected`` and
-    ``details.found`` (through :func:`to_jsonable`).
+    do not match. The framework also raises it when more than 10% of the parsed rows are
+    rejected, including after the upsert and before the commit when rows the upsert could not
+    write tip the count; the transaction then rolls back and nothing is written.
+    ``expected`` and ``found`` are recorded as ``details.expected`` and ``details.found``
+    (through :func:`to_jsonable`).
 
     Attributes:
         expected: What the parser expected, for example the normalized header tuple.
@@ -316,7 +321,7 @@ def classify_exception(exc: BaseException) -> tuple[RunStatus, str]:
 
 @dataclass(frozen=True, slots=True)
 class RejectedRow:
-    """A parsed row that failed validation or reconciliation.
+    """A parsed row that failed validation or reconciliation, or that the upsert could not write.
 
     Attributes:
         index: The row's position in the source (0-based index, or the file's line number for
@@ -481,8 +486,22 @@ class Pipeline(ABC, Generic[RawT, RecordT]):
         """Write the accepted records through ``opennse_terminal.db.upsert`` on ``conn`` and
         return the number of rows written. Never commits; the framework does.
 
-        Not called when no record was accepted.
+        A record found unwritable only while writing (for example a conflict a concurrent writer
+        created after :meth:`reconcile`) is left out of that number and reported through
+        :meth:`write_rejections`, never dropped silently. Not called when no record was
+        accepted.
         """
+
+    def write_rejections(self) -> Sequence[RejectedRow]:
+        """The rows :meth:`upsert` found it could not write, for example a row whose key a
+        concurrent writer stored in another currency after :meth:`reconcile` checked it.
+
+        Read once the upsert stage is over, before the commit. These rows count toward the run's
+        thresholds like :meth:`validate`'s and :meth:`reconcile`'s rejections: up to 10% of the
+        parsed rows rejected in all gives ``partial``, more gives ``layout_changed`` and rolls
+        the upsert back. The default reports none.
+        """
+        return ()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -866,6 +885,23 @@ def _run_details(
     return details
 
 
+def _threshold_breach(parsed: int, rejected: int, min_rows: int) -> SourceLayoutChanged:
+    """The :class:`SourceLayoutChanged` of a run whose counts :func:`evaluate_thresholds` finds
+    ``layout_changed``: ``expected`` holds the thresholds and ``found`` the counts."""
+    if parsed < min_rows:
+        message = f"{parsed} rows parsed, below the minimum of {min_rows}"
+    else:
+        message = (
+            f"{rejected} of {parsed} rows rejected, more than "
+            f"{MAX_INVALID_FRACTION:.0%} of the rows parsed"
+        )
+    return SourceLayoutChanged(
+        expected={"min_rows": min_rows, "max_invalid_fraction": str(MAX_INVALID_FRACTION)},
+        found={"parsed": parsed, "rejected": rejected},
+        message=message,
+    )
+
+
 async def _run_in_transaction(
     pipeline: Pipeline[Any, Any],
     engine: AsyncEngine,
@@ -878,6 +914,11 @@ async def _run_in_transaction(
 ) -> RunStatus:
     """Run fetch -> parse -> validate -> reconcile -> upsert in one data transaction holding the
     run's transaction-scoped advisory lock, and return ``succeeded`` or ``partial``.
+
+    The thresholds of :func:`evaluate_thresholds` are applied to the validation and
+    reconciliation rejections before the upsert, then, when :meth:`Pipeline.write_rejections`
+    reports rows the upsert could not write, again with those added, before the commit; a breach
+    either time raises :class:`SourceLayoutChanged`, which rolls the transaction back.
 
     ``parse`` and ``validate`` run in a worker thread (:func:`_run_stage`). Any exception before
     the commit rolls the transaction back. The commit is explicit and runs to completion even if
@@ -920,22 +961,16 @@ async def _run_in_transaction(
 
         status = evaluate_thresholds(parsed, len(progress.rejected), pipeline.min_rows)
         if status is RunStatus.LAYOUT_CHANGED:
-            if parsed < pipeline.min_rows:
-                message = f"{parsed} rows parsed, below the minimum of {pipeline.min_rows}"
-            else:
-                message = (
-                    f"{len(progress.rejected)} of {parsed} rows rejected, more than "
-                    f"{MAX_INVALID_FRACTION:.0%} of the rows parsed"
-                )
-            raise SourceLayoutChanged(
-                expected={
-                    "min_rows": pipeline.min_rows,
-                    "max_invalid_fraction": str(MAX_INVALID_FRACTION),
-                },
-                found={"parsed": parsed, "rejected": len(progress.rejected)},
-                message=message,
-            )
+            raise _threshold_breach(parsed, len(progress.rejected), pipeline.min_rows)
         written = await pipeline.upsert(conn, reconciled.valid, run_id) if reconciled.valid else 0
+        # Rows the upsert could not write count like the earlier rejections; a breach they cause
+        # rolls back the rows already written.
+        write_rejected = pipeline.write_rejections()
+        if write_rejected:
+            progress.rejected.extend(write_rejected)
+            status = evaluate_thresholds(parsed, len(progress.rejected), pipeline.min_rows)
+            if status is RunStatus.LAYOUT_CHANGED:
+                raise _threshold_breach(parsed, len(progress.rejected), pipeline.min_rows)
         # Committed explicitly, in a task of its own that a cancellation cannot abandon midway, so
         # the outcome is known before anything else happens; leaving the block then changes
         # nothing.
@@ -1125,19 +1160,26 @@ async def execute_pipeline(
     *,
     trigger: RunTrigger,
     http: "PoliteClient | None" = None,
+    spacing: "HostSpacing | None" = None,
 ) -> RunResult:
     """Run one pipeline end to end and record it in ``terminal_ingestion_runs``.
 
     1. A ``running`` row is committed through :class:`RunRecorder`.
     2. A :class:`~opennse_terminal.ingestion.http.PoliteClient` is opened for the run, unless
-       ``http`` is injected (tests); an injected client is neither opened nor closed here.
+       ``http`` is injected (tests); an injected client is neither opened nor closed here, and
+       keeps its own spacing. The opened client spaces its requests on ``spacing`` when given
+       (a :class:`~opennse_terminal.ingestion.http.HostSpacing` the caller passes to every run
+       of a sequence, so requests to one host stay ``scraper_min_interval_seconds`` apart
+       across the runs), else on a spacing of its own; its cookies and ``robots.txt`` cache are
+       the run's own either way.
     3. One dedicated connection opens the data transaction before fetching, sets the 30-minute
        ``idle_in_transaction_session_timeout`` and takes
        ``pg_try_advisory_xact_lock(hashtext('terminal:' || run_name))``; a held lock raises
        :class:`LockHeld`. Fetch, parse, validate, reconcile, the thresholds of
-       :func:`evaluate_thresholds` and the upsert run inside it, in that order; ``parse`` and
-       ``validate`` run in a worker thread. It commits on success and rolls back on any
-       exception, and PostgreSQL releases the lock either way.
+       :func:`evaluate_thresholds` and the upsert run inside it, in that order, then the
+       thresholds again when :meth:`Pipeline.write_rejections` reports rows the upsert could not
+       write; ``parse`` and ``validate`` run in a worker thread. It commits on success and rolls
+       back on any exception, and PostgreSQL releases the lock either way.
     4. The run row is updated with the final status (see :func:`classify_exception`), counts,
        ``error_message`` and ``details``: ``ctx.details``, the exception's evidence,
        ``duration_seconds`` (seconds to 3 decimal places, measured with
@@ -1218,7 +1260,7 @@ async def execute_pipeline(
             if client is None:
                 from opennse_terminal.ingestion.http import PoliteClient
 
-                client = PoliteClient(pipeline.settings)
+                client = PoliteClient(pipeline.settings, spacing=spacing)
                 await stack.enter_async_context(client)
             status = await _run_in_transaction(
                 pipeline,

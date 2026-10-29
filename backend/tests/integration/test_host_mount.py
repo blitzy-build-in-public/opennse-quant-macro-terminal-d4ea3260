@@ -11,6 +11,7 @@ transaction through SAVEPOINTs, so every write rolls back after its test. The te
   ``TerminalUploadRoute`` class, and the host's routes, middleware, exception handlers and
   startup and shutdown hooks are left as the host declared them;
 - the host's session and principal overrides serve the screener and own the watchlist it creates;
+- a host session with no default bind, configured only through ``binds``, answers ``/health``;
 - a principal override raising 401 blocks every terminal operation while the host's own routes
   still answer 200;
 - the whole-request upload bound answers 413 inside the host with no host configuration at all.
@@ -26,12 +27,14 @@ from dataclasses import dataclass
 from typing import Any, Final, Protocol
 
 import httpx
+import pytest
 import pytest_asyncio
 from fastapi import FastAPI, HTTPException, status
 from fastapi.routing import APIRoute, iter_route_contexts
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, Table, func, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
+from opennse_terminal import __version__
 from opennse_terminal.api import (
     TerminalPrincipal,
     dispose_terminal_engine,
@@ -41,6 +44,7 @@ from opennse_terminal.api import (
     terminal_router,
 )
 from opennse_terminal.api.routes.ingest import TerminalUploadRoute
+from opennse_terminal.db.base import TerminalBase
 from opennse_terminal.models import (
     TerminalCorporateFiling,
     TerminalIngestionRun,
@@ -88,6 +92,9 @@ HOST_RESPONSES: Final[Mapping[tuple[str, str], object]] = {
 """The host's own routes and the bodies they answer."""
 
 _HTTP_METHODS: Final = frozenset({"get", "put", "post", "delete", "patch", "options", "head"})
+
+BindsFor = Callable[[AsyncConnection], dict[type[TerminalBase] | Table, AsyncConnection]]
+"""Builds a binds-only host session's ``binds`` mapping onto the per-test connection."""
 
 
 class _DatabaseHandle(Protocol):
@@ -321,6 +328,47 @@ async def test_host_session_and_principal_overrides(
     assert health.status_code == 200, health.text
     assert (health.json()["status"], health.json()["database"]) == ("ok", "ok")
     assert host_app.sessions_opened == 4
+
+
+@pytest.mark.parametrize(
+    "binds_for",
+    [
+        pytest.param(lambda conn: {TerminalBase: conn}, id="base_class_binds"),
+        pytest.param(
+            lambda conn: {mapper.class_: conn for mapper in TerminalBase.registry.mappers},
+            id="per_model_binds",
+        ),
+        pytest.param(
+            lambda conn: {table: conn for table in TerminalBase.metadata.tables.values()},
+            id="per_table_binds",
+        ),
+    ],
+)
+async def test_binds_only_host_session_answers_health(
+    host_app: HostApp,
+    host_client: httpx.AsyncClient,
+    db_connection: AsyncConnection,
+    binds_for: BindsFor,
+) -> None:
+    """A host session with no default bind, configured only through ``binds`` (keyed by the
+    terminal's base class, by every mapped class or by every table), answers ``GET /health``
+    200: the probe reaches the bind the terminal's own queries use instead of failing to find
+    one and answering a false 503."""
+    host_sessionmaker = async_sessionmaker(
+        binds=binds_for(db_connection), join_transaction_mode="create_savepoint"
+    )
+
+    async def host_binds_only_session() -> AsyncIterator[AsyncSession]:
+        async with host_sessionmaker() as session:
+            assert session.sync_session.bind is None
+            yield session
+
+    host_app.app.dependency_overrides[get_terminal_session] = host_binds_only_session
+
+    health = await host_client.get(f"{TERMINAL_PREFIX}/health")
+
+    assert health.status_code == 200, health.text
+    assert health.json() == {"status": "ok", "database": "ok", "version": __version__}
 
 
 # ---------------------------------------------------------------------------------------------
