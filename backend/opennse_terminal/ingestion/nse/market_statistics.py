@@ -173,7 +173,8 @@ _MONTHS: Final[Mapping[str, int]] = MappingProxyType(
 
 _SEED_SOURCE: Final = "seed"
 # NUMERIC(18,4) holds fewer than 10^14 whole shillings; NUMERIC(24,2) fewer than 10^22. A row
-# beyond either is rejected rather than failing the run's whole write on the column bound.
+# beyond either, its turnover as rounded to 0.01, is rejected rather than failing the run's whole
+# write on the column bound.
 _PRICE_INTEGER_DIGITS: Final = 14
 _TURNOVER_LIMIT: Final = Decimal(10) ** 22
 _DASHES: Final = frozenset({"-", "—", "–"})
@@ -977,6 +978,24 @@ def _quantized_close(value: Decimal) -> Decimal | None:
     return quantized
 
 
+def _estimated_turnover(volume: int, close: Decimal) -> Decimal | None:
+    """The estimated ``turnover_kes``: ``volume x close`` in whole KES, quantized to 0.01
+    (``ROUND_HALF_UP``), or ``None`` when that rounded value does not fit ``NUMERIC(24,2)``.
+
+    ``volume`` is a share count and ``close`` the stored 4-place close in KES per share. The
+    rounded value is what is checked because it is what the column stores: a product within 0.005
+    of 10^22 rounds up to 10^22, which the column cannot hold. Below the limit in magnitude the
+    product has at most 26 significant digits, so it is exact in the default 28-digit context, and
+    only there is it rounded; a larger product is never quantized, so ``quantize`` cannot raise
+    ``InvalidOperation``.
+    """
+    estimate = Decimal(volume) * close
+    if estimate.copy_abs() >= _TURNOVER_LIMIT:
+        return None
+    rounded = estimate.quantize(TURNOVER_QUANTUM, rounding=ROUND_HALF_UP)
+    return rounded if rounded.copy_abs() < _TURNOVER_LIMIT else None
+
+
 def build_price_rows(quotes: Sequence[NseQuote]) -> list[dict[str, object]]:
     """``terminal_daily_prices`` rows for ``upsert_prices``, one per mapped and dated quote.
 
@@ -985,8 +1004,9 @@ def build_price_rows(quotes: Sequence[NseQuote]) -> list[dict[str, object]]:
     Open, high and low are ``None``; no flow column is ever included.
 
     Raises:
-        ValueError: A quote lacks its ticker, trade date, volume or a storable close; the
-            pipeline only passes quotes that validation and reconciliation accepted.
+        ValueError: A quote lacks its ticker, trade date, volume or a storable close, or its
+            rounded turnover does not fit ``NUMERIC(24,2)``; the pipeline only passes quotes
+            that validation and reconciliation accepted.
     """
     rows: list[dict[str, object]] = []
     for quote in quotes:
@@ -995,6 +1015,9 @@ def build_price_rows(quotes: Sequence[NseQuote]) -> list[dict[str, object]]:
         close = _quantized_close(quote.close_price) if quote.close_price is not None else None
         if close is None:
             raise ValueError(f"quote for ISIN {quote.isin!r} has no storable close price")
+        turnover = _estimated_turnover(quote.volume, close)
+        if turnover is None:
+            raise ValueError(f"quote for ISIN {quote.isin!r} has no storable turnover")
         rows.append(
             {
                 "ticker": quote.ticker,
@@ -1004,9 +1027,7 @@ def build_price_rows(quotes: Sequence[NseQuote]) -> list[dict[str, object]]:
                 "low_price": None,
                 "close_price": close,
                 "volume": quote.volume,
-                "turnover_kes": (Decimal(quote.volume) * close).quantize(
-                    TURNOVER_QUANTUM, rounding=ROUND_HALF_UP
-                ),
+                "turnover_kes": turnover,
                 "turnover_estimated": True,
             }
         )
@@ -1023,8 +1044,9 @@ def _rejection_reasons(quote: NseQuote) -> list[str]:
     volume = quote.volume
     if volume is None or volume < 0 or volume > MAX_SHARE_COUNT:
         reasons.append("invalid_volume")
-    elif close is not None and Decimal(volume) * close >= _TURNOVER_LIMIT:
-        # Beyond NUMERIC(24,2): one such row would otherwise fail the whole write.
+    elif close is not None and _estimated_turnover(volume, close) is None:
+        # Beyond NUMERIC(24,2) once rounded to the stored 0.01: one such row would otherwise fail
+        # the whole write.
         reasons.append("invalid_turnover")
     change = quote.change_pct
     # copy_abs and the comparison are exact: abs() would round to the context's precision (a

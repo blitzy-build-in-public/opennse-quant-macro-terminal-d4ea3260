@@ -17,6 +17,7 @@ its layout only; it is skipped by default.
 Expected values are literals from the fixtures, compared as exact ``Decimal`` and ``int`` values.
 """
 
+import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime
 from decimal import Decimal
@@ -48,6 +49,7 @@ from opennse_terminal.ingestion.nse.market_statistics import (
     NseQuote,
     SectorTable,
     StoredRow,
+    build_price_rows,
     check_continuity,
     is_stale,
     parse_page,
@@ -858,6 +860,49 @@ def test_out_of_bound_changes_are_counted_and_make_the_run_partial(
     ]
     assert outcome.valid == parse_page(snapshot(page_shell, sector_html)).quotes
     assert evaluate_thresholds(len(records), len(outcome.rejected), MIN_ROWS) is RunStatus.PARTIAL
+
+
+def test_turnover_that_rounds_to_just_below_the_limit_is_kept_and_written_rounded(
+    pipeline: MarketStatisticsPipeline,
+) -> None:
+    # 859,282,386,827 x 11,637,617,799.8087 = 9,999,999,999,999,999,999,999.9949, which rounds
+    # half up to 9,999,999,999,999,999,999,999.99, the largest value NUMERIC(24,2) holds.
+    record = quote("KE0000000554", "11637617799.8087", 859_282_386_827, "0")
+
+    outcome = pipeline.validate([record])
+    [row] = build_price_rows([dataclasses.replace(record, ticker="EQTY", trade_date=SESSION)])
+
+    assert outcome.valid == [record]
+    assert outcome.rejected == []
+    assert str(row["turnover_kes"]) == "9999999999999999999999.99"
+    assert row["turnover_estimated"] is True
+
+
+@pytest.mark.parametrize(
+    ("close", "volume"),
+    [
+        # 151,982,882 x 65,796,883,625,354.5975 = 10^22 - 0.005 exactly: half up gives 10^22.
+        ("65796883625354.5975", 151_982_882),
+        # 265,371,653 x 37,683,000,000,003.7683 = 9,999,999,999,999,999,999,999.9999.
+        ("37683000000003.7683", 265_371_653),
+        ("10000000000", MAX_SHARE_COUNT),
+        # The largest volume and close each bound allows: the product, about 10^26, exceeds 10^22.
+        ("99999999999999.9999", MAX_SHARE_COUNT),
+    ],
+    ids=["half-cent-below-the-limit", "rounds-up-to-the-limit", "at-the-limit", "largest-inputs"],
+)
+def test_turnover_that_does_not_fit_its_column_once_rounded_is_rejected(
+    pipeline: MarketStatisticsPipeline, close: str, volume: int
+) -> None:
+    # Close and volume are each within their own bounds; only the stored turnover overflows.
+    record = quote("KE0000000554", close, volume, "0")
+
+    outcome = pipeline.validate([record])
+
+    assert outcome.valid == []
+    assert [(row.index, row.reason) for row in outcome.rejected] == [(0, "invalid_turnover")]
+    with pytest.raises(ValueError, match="no storable turnover"):
+        build_price_rows([dataclasses.replace(record, ticker="EQTY", trade_date=SESSION)])
 
 
 # --- Live source (skipped by default) ---------------------------------------------------------

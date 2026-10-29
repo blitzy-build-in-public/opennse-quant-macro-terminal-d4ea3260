@@ -19,7 +19,8 @@ Covered:
 
 - Statuses: ``succeeded``, ``layout_changed`` (a five-sector page), ``no_new_data`` (stale
   guard), ``ambiguous_session`` and the operator's ``--trade-date`` override,
-  ``blocked_by_robots`` and ``failed`` for a year the exchange calendar does not cover.
+  ``blocked_by_robots``, ``failed`` for a year the exchange calendar does not cover, and
+  ``partial`` for a row whose turnover, rounded to 0.01, overflows its column.
 - The transaction-scoped advisory lock: a second run fails with "lock held" while the first is
   blocked inside its fetch, and the lock is free again after a run whose parser raises and after
   a run cancelled mid-fetch.
@@ -354,6 +355,26 @@ def bump_seeded_volumes(html: str, delta: int = 1000) -> str:
     return str(soup)
 
 
+def overflow_equity_turnover(html: str) -> str:
+    """``html`` with Equity Group's row (``KE0000000554``) quoting 265,371,653 shares at
+    37,683,000,000,003.7683 with a change of 0.
+
+    Volume, close and change are each within their own bounds, but the turnover,
+    9,999,999,999,999,999,999,999.9999, rounds half up to 10^22, which ``NUMERIC(24,2)`` cannot
+    hold. Other fragments keep their values; the ``<html><body>`` wrapper lxml adds is harmless.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    table = soup.select_one("table.nsetable")
+    assert table is not None, "sector fragment has no table.nsetable"
+    for row in table.find_all("tr"):
+        cells = row.find_all("td", recursive=False)
+        if len(cells) == 5 and cells[1].get_text(strip=True) == "KE0000000554":
+            cells[2].string = "265371653"
+            cells[3].string = "37683000000003.7683"
+            cells[4].string = "0"
+    return str(soup)
+
+
 @pytest.fixture
 def robots() -> Iterator[respx.MockRouter]:
     """respx router serving the exchange site's ``robots.txt`` (route name ``"robots"``).
@@ -620,6 +641,45 @@ async def test_unverified_calendar_year_fails(
     assert result.rows_written == 0
     assert await prices_on(seeded_database, SESSION) == {}
     assert await prices_on(seeded_database, date(2028, 1, 4)) == {}
+
+
+async def test_row_whose_rounded_turnover_overflows_is_rejected_and_the_run_partial(
+    seeded_database: SeededClone,
+    fixture_text: Callable[[str], str],
+    robots: respx.MockRouter,
+) -> None:
+    # The one row is rejected before the write, so the other seven counters are still written
+    # instead of PostgreSQL's numeric overflow rolling back the whole data transaction.
+    fetcher = FixtureFetcher(fixture_text, transform=overflow_equity_turnover)
+
+    result = await run(scrape(seeded_database, fetcher), seeded_database)
+
+    assert result.status is RunStatus.PARTIAL, result.error_message
+    assert result.error_message is None
+    assert result.rows_written == 7
+    assert result.rows_rejected == 1
+    [rejected] = result.details["rejected"]
+    assert rejected["reason"] == "invalid_turnover"
+    assert rejected["row"] == {
+        "company": "Equity Group Holdings Plc",
+        "isin code": "KE0000000554",
+        "volume": "265371653",
+        "last traded price": "37683000000003.7683",
+        "change (%)": "0",
+        "sector": "Banking",
+    }
+
+    rows = await prices_on(seeded_database, SESSION)
+    assert set(rows) == SEEDED_TICKERS - {"EQTY"}
+    for ticker, volume, close in SEEDED.values():
+        if ticker != "EQTY":
+            assert_nse_row(rows[ticker], volume=volume, close=close)
+            assert rows[ticker]["ingestion_run_id"] == result.run_id
+
+    recorded = await run_row(seeded_database, result.run_id)
+    assert recorded["status"] == RunStatus.PARTIAL.value
+    assert (recorded["rows_written"], recorded["rows_rejected"]) == (7, 1)
+    assert recorded["details"]["rejected"] == result.details["rejected"]
 
 
 # --- Transaction-scoped advisory lock ---------------------------------------------------------
