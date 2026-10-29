@@ -30,9 +30,11 @@ from statistics import mean
 import pytest
 
 from opennse_terminal.config import DEFAULT_CURRENCY, MAX_SHARE_COUNT, TerminalSettings
+from opennse_terminal.models.fundamentals import FUNDAMENTAL_LINE_ITEM_COLUMNS
 from opennse_terminal.quant.numeric import quantize_out
 from opennse_terminal.quant.zscore import Observation, is_spike, rolling_zscores
 from opennse_terminal.seed import reference_data as ref
+from opennse_terminal.seed import synthetic
 from opennse_terminal.seed.synthetic import (
     EXPECTED_BOND_ROWS,
     EXPECTED_FUNDAMENTAL_ROWS,
@@ -297,6 +299,19 @@ _FINGERPRINT_SCRIPT = (
     "print(dataset_fingerprint(generate_all()))"
 )
 
+# The layers the pure generator must never load, directly or through a module it imports.
+GENERATOR_FORBIDDEN_PACKAGES = (
+    "sqlalchemy",
+    "opennse_terminal.models",
+    "opennse_terminal.db",
+    "opennse_terminal.api",
+    "opennse_terminal.services",
+)
+
+_IMPORT_PROBE_SCRIPT = (
+    "import sys; import opennse_terminal.seed.synthetic; print('\\n'.join(sorted(sys.modules)))"
+)
+
 
 @pytest.fixture(scope="module")
 def dataset() -> SeedDataset:
@@ -375,6 +390,34 @@ def test_output_is_independent_of_the_interpreter_hash_seed(
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == dataset_fingerprint(dataset)
+
+
+def test_generator_loads_no_database_model_api_or_service_layer() -> None:
+    """The generator is a pure module: a fresh interpreter that imports it has loaded neither
+    SQLAlchemy nor the terminal's model, database, API or service packages, so its record types,
+    not the ORM models, are where it takes its column names from."""
+    environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    # The command is this interpreter running a fixed literal script: no untrusted input.
+    completed = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", _IMPORT_PROBE_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+        timeout=120,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    loaded = completed.stdout.split()
+    assert "opennse_terminal.seed.synthetic" in loaded
+    assert [
+        name
+        for name in loaded
+        if any(
+            name == package or name.startswith(f"{package}.")
+            for package in GENERATOR_FORBIDDEN_PACKAGES
+        )
+    ] == []
 
 
 def test_canonical_form_writes_exact_decimals_iso_dates_and_sorted_compact_json(
@@ -930,6 +973,13 @@ def test_generate_bonds_rejects_invalid_macro_months(
 
 
 # Fundamentals -------------------------------------------------------------------------------------
+
+
+def test_provenance_columns_are_the_schema_value_columns_in_table_order() -> None:
+    """The columns ``source_by_field`` labels, derived from the record's fields less its key,
+    currency and provenance, are exactly ``terminal_fundamentals``' value columns in table order,
+    so a field added to the record or the table cannot leave a seeded column unlabelled."""
+    assert synthetic._FUNDAMENTAL_VALUE_COLUMNS == FUNDAMENTAL_LINE_ITEM_COLUMNS
 
 
 @pytest.mark.parametrize(

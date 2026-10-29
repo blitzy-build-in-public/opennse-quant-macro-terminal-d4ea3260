@@ -87,6 +87,8 @@ from sqlalchemy.types import TypeEngine
 from opennse_terminal.config import DEFAULT_CURRENCY, MAX_SHARE_COUNT, TerminalSettings
 from opennse_terminal.db.session import build_engine
 from opennse_terminal.db.upsert import (
+    FLOW_COLUMN,
+    PRICE_COLUMNS,
     update_flows,
     upsert_fundamentals,
     upsert_macro,
@@ -1419,18 +1421,7 @@ _WRITE_COLUMNS: Final[Mapping[ImportKind, tuple[str, ...]]] = MappingProxyType(
             "free_float_pct",
             "currency",
         ),
-        "daily_prices": (
-            "ticker",
-            "trade_date",
-            "open_price",
-            "high_price",
-            "low_price",
-            "close_price",
-            "volume",
-            "turnover_kes",
-            "turnover_estimated",
-            "foreign_net_flow_kes",
-        ),
+        "daily_prices": (*KIND_SPECS["daily_prices"].key, *PRICE_COLUMNS, FLOW_COLUMN),
         "fundamentals": (
             "ticker",
             "period_end_date",
@@ -1439,7 +1430,7 @@ _WRITE_COLUMNS: Final[Mapping[ImportKind, tuple[str, ...]]] = MappingProxyType(
             *FUNDAMENTAL_LINE_ITEM_COLUMNS,
         ),
         "macro_indicators": ("observation_date", *MACRO_INDICATOR_COLUMNS),
-        "foreign_flows": ("ticker", "trade_date", "foreign_net_flow_kes"),
+        "foreign_flows": (*KIND_SPECS["foreign_flows"].key, FLOW_COLUMN),
     }
 )
 """The columns each kind passes to its ``db.upsert`` writer: one uniform key set per kind, with
@@ -1513,10 +1504,11 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
     checks stored data (unknown tickers, ISIN owners, currency conflicts, missing price rows);
     :meth:`upsert` writes through ``opennse_terminal.db.upsert`` and reports, through
     :meth:`write_rejections`, each fundamentals row whose period a concurrent writer stored in
-    another currency after :meth:`reconcile` (``currency_conflict``). Rejections at any of these
-    stages count toward the shared thresholds: up to 10% gives ``partial`` (valid rows written),
-    more gives ``layout_changed`` (nothing written); a missing required header or a file without
-    data rows is ``layout_changed`` too.
+    another currency after :meth:`reconcile` (``currency_conflict``) and each foreign_flows row
+    whose price row was deleted after :meth:`reconcile` (``no_price_row``). Rejections at any of
+    these stages count toward the shared thresholds: up to 10% gives ``partial`` (valid rows
+    written), more gives ``layout_changed`` (nothing written); a missing required header or a file
+    without data rows is ``layout_changed`` too.
 
     Instances are single-use. Evidence found during the run (``kind``, ``file_name``, ``sheet``,
     ``file_size_bytes``, ``ignored_columns``, ``blank_rows_skipped``, ``duplicates_collapsed``,
@@ -1897,24 +1889,28 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
           ``currency_conflict`` rejection reported by :meth:`write_rejections`, so it counts
           toward the shared thresholds; their count is logged once at WARNING with the run id.
         - ``foreign_flows``: ``update_flows(flow_source="csv_import")``, touching only the flow
-          columns; keys that lost their price row since :meth:`reconcile` are counted across
-          the batches, logged once and recorded in ``details.flow_missing_keys`` (their count
-          and the first 50, in key order).
+          columns. A key whose price row was deleted since :meth:`reconcile` (for example by an
+          equity cascade) updates nothing; its row becomes a ``no_price_row`` rejection reported
+          by :meth:`write_rejections`, with its line number and raw cells, so it counts toward
+          the shared thresholds. Their count is logged once at WARNING with the run id and
+          recorded in ``details.flow_missing_keys`` (the count and the first 50 keys, in key
+          order).
 
         Returns the number of rows inserted or updated, summed over the batches. Re-importing a
         file rewrites identical values, so the stored state is unchanged.
 
         Raises:
             RuntimeError: A fundamentals batch wrote fewer rows than it holds and currency
-                conflicts do not account for every row it left out; the run ends ``failed`` and
-                rolls back rather than report a short write as success.
+                conflicts do not account for every row it left out, or ``update_flows`` reported
+                a key without a price row that its foreign_flows batch does not hold; the run
+                ends ``failed`` and rolls back rather than report a short write as success.
         """
         columns = _WRITE_COLUMNS[self.kind]
         ordered = sorted(records, key=self._key_of)
         written = 0
-        missing_count = 0
         missing_sample: list[tuple[str, date]] = []
         unwritten: list[RejectedRow] = []
+        no_price_rows: list[RejectedRow] = []
         for start in range(0, len(ordered), _WRITE_BATCH_ROWS):
             batch = ordered[start : start + _WRITE_BATCH_ROWS]
             rows = [{column: record.values.get(column) for column in columns} for record in batch]
@@ -1936,20 +1932,44 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
             else:
                 outcome = await update_flows(conn, rows, flow_source=_SOURCE)
                 written += outcome.rows_updated
-                missing_count += len(outcome.missing_keys)
-                # Batches ascend by key and each batch's keys are sorted, so this keeps the
-                # first keys overall.
+                if outcome.missing_keys:
+                    # reconcile() collapsed repeated keys, so each key names one batch record.
+                    by_key = {
+                        (
+                            _required_text(record.values, "ticker"),
+                            _required_date(record.values, "trade_date"),
+                        ): record
+                        for record in batch
+                    }
+                    unknown = sum(1 for key in outcome.missing_keys if key not in by_key)
+                    if unknown:
+                        raise RuntimeError(
+                            f"update_flows reported {unknown} keys without a price row that its "
+                            f"batch of {len(batch)} foreign_flows rows does not hold"
+                        )
+                    no_price_rows.extend(
+                        RejectedRow(
+                            index=by_key[key].row_number,
+                            reason="no_price_row",
+                            row=by_key[key].raw,
+                        )
+                        for key in outcome.missing_keys
+                    )
+                # Batches ascend by key and each batch's keys are sorted, so the rejections and
+                # this sample keep the key order overall.
                 room = _MISSING_KEYS_SAMPLE - len(missing_sample)
                 missing_sample.extend(outcome.missing_keys[:room])
-        if missing_count:
+        if no_price_rows:
             logger.warning(
-                "foreign_flows import found %d keys without a price row at write time",
-                missing_count,
+                "foreign_flows import run %s rejected %d rows at write time: no_price_row",
+                self._run_id,
+                len(no_price_rows),
             )
             self._details["flow_missing_keys"] = {
-                "count": missing_count,
+                "count": len(no_price_rows),
                 "sample": [list(key) for key in missing_sample],
             }
+            self._write_rejected.extend(no_price_rows)
         if unwritten:
             logger.warning(
                 "fundamentals import run %s rejected %d rows at write time: currency_conflict",
@@ -1960,10 +1980,11 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         return written
 
     def write_rejections(self) -> Sequence[RejectedRow]:
-        """The rows :meth:`upsert` could not write, in key order: fundamentals rows whose period
-        a concurrent writer stored in another currency after :meth:`reconcile`
-        (``currency_conflict``, with the row's line number and raw cells). Empty for the other
-        kinds."""
+        """The rows :meth:`upsert` could not write, in key order, each with its line number and
+        raw cells: fundamentals rows whose period a concurrent writer stored in another currency
+        after :meth:`reconcile` (``currency_conflict``), and foreign_flows rows whose price row
+        was deleted after :meth:`reconcile` (``no_price_row``). They count toward the shared
+        thresholds with the earlier stages' rejections. Empty for the other kinds."""
         return tuple(self._write_rejected)
 
 

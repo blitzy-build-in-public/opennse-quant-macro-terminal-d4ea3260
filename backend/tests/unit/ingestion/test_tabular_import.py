@@ -47,7 +47,7 @@ from typing import Any, Protocol, cast
 import pandas
 import pytest
 from openpyxl import Workbook
-from sqlalchemy import ColumnElement, Join, func, select
+from sqlalchemy import ColumnElement, Join, delete, func, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -3324,6 +3324,22 @@ async def test_upsert_writes_bounded_batches_in_key_order_on_the_run_connection(
     ] == KEYS_IN_ORDER[kind]
 
 
+FLOW_SAMPLE_NO_PRICE_ROWS: tuple[tuple[int, str, dict[str, str]], ...] = (
+    (
+        3,
+        "no_price_row",
+        {"ticker": "EQTY", "trade_date": "2026-09-28", "foreign_net_flow_kes": "3,400,500.565"},
+    ),
+    (
+        2,
+        "no_price_row",
+        {"ticker": "SCOM", "trade_date": "2026-09-28", "foreign_net_flow_kes": "(1,250,000.00)"},
+    ),
+)
+"""The ``foreign_flows`` sample's rows as write-time ``no_price_row`` rejections (line, reason,
+raw cells), in key order: EQTY's line 3 comes first."""
+
+
 @pytest.mark.parametrize(
     ("sample_limit", "sample"),
     [
@@ -3349,9 +3365,14 @@ async def test_foreign_flows_batches_report_their_missing_keys_together(
     )
     assert written == 0
     assert len(writers.calls) == 2
+    # Every key is rejected, in key order across the batches, whatever the sample keeps.
+    assert [
+        (row.index, row.reason, dict(row.row)) for row in staged.pipeline.write_rejections()
+    ] == list(FLOW_SAMPLE_NO_PRICE_ROWS)
     assert staged.ctx.details["flow_missing_keys"] == {"count": 2, "sample": sample}
+    # One line for the whole run: the run id and the count, never the file's name or a value.
     assert caplog.messages == [
-        "foreign_flows import found 2 keys without a price row at write time"
+        f"foreign_flows import run {RUN_ID} rejected 2 rows at write time: no_price_row"
     ]
 
 
@@ -3365,11 +3386,45 @@ async def test_foreign_flows_upsert_records_keys_that_lost_their_price_row(
         cast(AsyncConnection, _ScriptedConnection()), staged.outcome.valid, RUN_ID
     )
     assert written == 1
+    assert [
+        (row.index, row.reason, dict(row.row)) for row in staged.pipeline.write_rejections()
+    ] == [FLOW_SAMPLE_NO_PRICE_ROWS[0]]
     assert staged.ctx.details["flow_missing_keys"] == {
         "count": 1,
         "sample": [["EQTY", SESSION]],
     }
-    assert "foreign_flows import found 1 keys without a price row at write time" in caplog.messages
+    assert caplog.messages == [
+        f"foreign_flows import run {RUN_ID} rejected 1 rows at write time: no_price_row"
+    ]
+
+
+async def test_foreign_flows_upsert_fails_on_a_missing_key_its_batch_does_not_hold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    staged = await _stage("foreign_flows", _write_sample(tmp_path, "foreign_flows"))
+
+    async def report_a_key_never_requested(
+        executor: object, rows: Sequence[Mapping[str, object]], *, flow_source: str
+    ) -> FlowUpdateResult:
+        return FlowUpdateResult(rows_updated=len(rows), missing_keys=(("KCB", SESSION),))
+
+    monkeypatch.setattr(tabular_import, "update_flows", report_a_key_never_requested)
+
+    with pytest.raises(RuntimeError) as raised:
+        await staged.pipeline.upsert(
+            cast(AsyncConnection, _ScriptedConnection()), staged.outcome.valid, RUN_ID
+        )
+
+    assert str(raised.value) == (
+        "update_flows reported 1 keys without a price row that its batch of 2 foreign_flows rows "
+        "does not hold"
+    )
+    # An unexpected exception: the run ends failed and its transaction rolls back.
+    assert classify_exception(raised.value)[0] is RunStatus.FAILED
+    assert staged.pipeline.write_rejections() == ()
+    assert "flow_missing_keys" not in staged.ctx.details
+    assert caplog.messages == []
 
 
 FUNDAMENTALS_HEADER = ("Ticker", "Period End Date", "Period Type", "Currency", "Revenue KES")
@@ -3955,6 +4010,116 @@ async def test_foreign_flows_set_only_the_flow_of_existing_price_rows(
             "flow_source": "csv_import",
         }
     untouched = set(before) - set(FLOW_UPDATES)
+    assert {key: after[key] for key in untouched} == {key: before[key] for key in untouched}
+
+
+RACED_FLOW_KEYS: tuple[tuple[str, date], ...] = (
+    ("SCOM", NEXT_SESSION),
+    ("EQTY", NEXT_SESSION),
+)
+"""Seeded price rows a flows import finds at reconcile and a concurrent writer then deletes on its
+own connection before the import writes. They are lines 2 and 3 of a file listing
+:data:`FLOW_UPDATES` in order; in key order EQTY comes first."""
+
+
+@pytest.mark.parametrize(
+    ("raced", "status", "written"),
+    [
+        pytest.param(1, RunStatus.PARTIAL, 9, id="one-of-ten-rows-is-partial"),
+        pytest.param(2, RunStatus.LAYOUT_CHANGED, 0, id="two-of-ten-rows-write-nothing"),
+    ],
+)
+async def test_foreign_flows_reject_a_price_row_deleted_after_reconcile(
+    seeded_database: _Clone,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    raced: int,
+    status: RunStatus,
+    written: int,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    engine = seeded_database.engine
+    deleted = RACED_FLOW_KEYS[:raced]
+    lines = {key: line for line, key in enumerate(FLOW_UPDATES, start=2)}
+    path = _write_csv(
+        tmp_path / "flows.csv",
+        [
+            ("Ticker", "Trade Date", "Foreign Net Flow KES"),
+            *((ticker, day, _amount_text(flow)) for (ticker, day), flow in FLOW_UPDATES.items()),
+        ],
+    )
+    before = await _stored_prices(engine, since=SAMPLE_START)
+    assert all(before[key]["foreign_net_flow_kes"] != flow for key, flow in FLOW_UPDATES.items())
+    reconcile = TabularImportPipeline.reconcile
+
+    async def reconcile_then_delete_price_rows(
+        self: TabularImportPipeline, ctx: RunContext, records: list[TabularRecord]
+    ) -> ValidationOutcome[TabularRecord]:
+        outcome = await reconcile(self, ctx, records)
+        # Every price row still existed, so every flow passed the price-row check.
+        assert outcome.rejected == []
+        async with engine.begin() as conn:
+            for ticker, day in deleted:
+                await conn.execute(
+                    delete(TerminalDailyPrice).where(
+                        TerminalDailyPrice.ticker == ticker, TerminalDailyPrice.trade_date == day
+                    )
+                )
+        return outcome
+
+    monkeypatch.setattr(TabularImportPipeline, "reconcile", reconcile_then_delete_price_rows)
+
+    result = await import_file("foreign_flows", path, settings=seeded_database.settings)
+
+    assert (result.status, result.rows_fetched, result.rows_written, result.rows_rejected) == (
+        status,
+        10,
+        written,
+        raced,
+    )
+    assert _rejections(result, PRICE_KEY) == {
+        (ticker, day.isoformat()): (lines[(ticker, day)], "no_price_row") for ticker, day in deleted
+    }
+    # Reported in key order, with the bounded diagnostics alongside.
+    assert [entry["index"] for entry in result.details["rejected"]] == [
+        lines[key] for key in sorted(deleted)
+    ]
+    assert result.details["flow_missing_keys"] == {
+        "count": raced,
+        "sample": [[ticker, day.isoformat()] for ticker, day in sorted(deleted)],
+    }
+    assert await _run_row(engine, result.run_id) == {
+        "pipeline": "csv_import:foreign_flows",
+        "trigger": "cli",
+        "status": status.value,
+        "rows_fetched": 10,
+        "rows_written": written,
+        "rows_rejected": raced,
+    }
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == LOGGER and record.levelno == logging.WARNING
+    ] == [
+        f"foreign_flows import run {result.run_id} rejected {raced} rows at write time: "
+        "no_price_row"
+    ]
+    after = await _stored_prices(engine, since=SAMPLE_START)
+    # The concurrent deletions stand; the import never re-creates a price row.
+    assert set(after) == set(before) - set(deleted)
+    kept = [key for key in FLOW_UPDATES if key not in deleted]
+    if status is RunStatus.PARTIAL:
+        for key in kept:
+            assert after[key] == {
+                **before[key],
+                "foreign_net_flow_kes": FLOW_UPDATES[key],
+                "flow_source": "csv_import",
+            }
+    else:
+        # The breach rolled back the flows the import had already set.
+        assert {key: after[key] for key in kept} == {key: before[key] for key in kept}
+    untouched = set(after) - set(FLOW_UPDATES)
     assert {key: after[key] for key in untouched} == {key: before[key] for key in untouched}
 
 

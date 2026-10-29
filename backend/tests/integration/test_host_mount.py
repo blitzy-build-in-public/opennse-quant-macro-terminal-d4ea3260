@@ -1209,21 +1209,28 @@ async def test_settings_change_keeps_counting_the_parses_already_admitted(
     """With two parses held at limit 2, a request at limit 1 and then one back at limit 2 are
     both refused; only once a held parse ends is the next request admitted."""
     host = await make_host(2)
+    # Calls are released in arrival order, so the second upload starts only once the first has
+    # arrived: then release(0) ends ``first``.
     first = parses.hold(host)
+    await parses.wait_for_calls(1)
     parses.hold(host)
     await parses.wait_for_calls(2)
 
     host.limit = 1
-    assert_busy(await host.upload())
+    async with asyncio.timeout(10):
+        assert_busy(await host.upload())
     host.limit = 2
-    assert_busy(await host.upload())
+    async with asyncio.timeout(10):
+        assert_busy(await host.upload())
     assert parses.calls == 2
 
     parses.release(0)
-    assert_coded(await first, 409, "released")
+    async with asyncio.timeout(10):
+        assert_coded(await first, 409, "released")
     parses.hold(host)
     await parses.wait_for_calls(3)
-    assert_busy(await host.upload())
+    async with asyncio.timeout(10):
+        assert_busy(await host.upload())
     assert parses.calls == 3
 
 

@@ -44,7 +44,7 @@ import random
 from bisect import bisect_left
 from calendar import monthrange
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import date, timedelta
 from decimal import (
     ROUND_CEILING,
@@ -758,17 +758,20 @@ def generate_prices() -> tuple[SeedPriceRow, ...]:
 
 # Fundamentals -----------------------------------------------------------------------------------
 
-_FUNDAMENTAL_VALUE_COLUMNS: Final[tuple[str, ...]] = (
-    "revenue_kes",
-    "ebitda_kes",
-    "net_income_kes",
-    "total_assets_kes",
-    "total_equity_kes",
-    "total_debt_kes",
-    "cash_and_equivalents_kes",
-    "operating_cash_flow_kes",
-    "dps_kes",
-    "shares_outstanding",
+_FUNDAMENTAL_NON_VALUE_FIELDS: Final[tuple[str, ...]] = (
+    "ticker",
+    "period_end_date",
+    "period_type",
+    "currency",
+    "source_by_field",
+)
+"""Fields of :class:`SeedFundamentalRow` that are not value columns: the conflict key, the
+currency and the provenance mapping itself."""
+
+_FUNDAMENTAL_VALUE_COLUMNS: Final[tuple[str, ...]] = tuple(
+    field.name
+    for field in fields(SeedFundamentalRow)
+    if field.name not in _FUNDAMENTAL_NON_VALUE_FIELDS
 )
 """Value columns whose provenance ``source_by_field`` records, in table order."""
 
