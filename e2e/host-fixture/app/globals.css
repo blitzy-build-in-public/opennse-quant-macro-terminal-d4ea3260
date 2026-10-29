@@ -1,0 +1,3 @@
+/* Host step for a Tailwind 4 app consuming the widgets from outside its root: one @source line. */
+@import "tailwindcss";
+@source "../../../src/components/terminal";
