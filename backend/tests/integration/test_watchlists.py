@@ -9,8 +9,9 @@ consulted.
 Each test runs inside the ``db_session`` outer transaction, where a service's ``commit()`` only
 releases a SAVEPOINT, and that transaction is rolled back afterwards. The seeded "NSE Core 8" list
 of the default principal ``local`` is therefore present and unchanged in every test, and no test
-depends on another's writes or on their order. Database checks read through the same
-``db_session``, with SQL in ``text()`` and bound parameters only.
+depends on another's writes or on their order. Database checks read and write through the same
+``db_session``, with Core ``select()`` and ``update()`` over the ``opennse_terminal.models``
+columns and every value bound.
 """
 
 import uuid
@@ -20,8 +21,10 @@ from typing import Any, Final, Protocol
 
 import httpx
 import pytest
-from sqlalchemy import text
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from opennse_terminal.models import TerminalWatchlist, TerminalWatchlistItem
 
 BASE: Final = "/api/v1/terminal"
 """Prefix of every terminal endpoint."""
@@ -85,17 +88,16 @@ async def names(client: httpx.AsyncClient) -> list[str]:
 async def stored_items(db_session: AsyncSession, watchlist_id: str) -> list[str]:
     """Tickers of the ``terminal_watchlist_items`` rows referencing ``watchlist_id``, sorted."""
     result = await db_session.execute(
-        text(
-            "SELECT ticker FROM terminal_watchlist_items WHERE watchlist_id = :id ORDER BY ticker"
-        ),
-        {"id": uuid.UUID(watchlist_id)},
+        select(TerminalWatchlistItem.ticker)
+        .where(TerminalWatchlistItem.watchlist_id == uuid.UUID(watchlist_id))
+        .order_by(TerminalWatchlistItem.ticker)
     )
     return [str(ticker) for ticker in result.scalars().all()]
 
 
 async def watchlist_count(db_session: AsyncSession) -> int:
     """Number of ``terminal_watchlists`` rows, across every owner."""
-    result = await db_session.execute(text("SELECT count(*) FROM terminal_watchlists"))
+    result = await db_session.execute(select(func.count()).select_from(TerminalWatchlist))
     return int(result.scalar_one())
 
 
@@ -139,8 +141,7 @@ async def test_lists_are_scoped_to_principal(
     ]
 
     result = await db_session.execute(
-        text("SELECT owner_key FROM terminal_watchlists WHERE id = :id"),
-        {"id": uuid.UUID(watchlist_id)},
+        select(TerminalWatchlist.owner_key).where(TerminalWatchlist.id == uuid.UUID(watchlist_id))
     )
     assert result.scalar_one() == "alice"
     assert await stored_items(db_session, watchlist_id) == ["SCOM"]
@@ -207,8 +208,9 @@ async def test_create_rejects_unknown_ticker(
 
     assert "Bad" not in await names(client)
     result = await db_session.execute(
-        text("SELECT count(*) FROM terminal_watchlists WHERE owner_key = :owner AND name = :name"),
-        {"owner": "alice", "name": "Bad"},
+        select(func.count())
+        .select_from(TerminalWatchlist)
+        .where(TerminalWatchlist.owner_key == "alice", TerminalWatchlist.name == "Bad")
     )
     assert result.scalar_one() == 0
 
@@ -314,20 +316,20 @@ async def test_item_change_bumps_updated_at(
 
     for method in ("PUT", "DELETE"):
         await db_session.execute(
-            text(
-                "UPDATE terminal_watchlists "
-                "SET updated_at = updated_at - interval '1 hour', "
-                "created_at = created_at - interval '1 hour' "
-                "WHERE id = :id"
-            ),
-            {"id": watchlist_id},
+            update(TerminalWatchlist)
+            .where(TerminalWatchlist.id == watchlist_id)
+            .values(
+                updated_at=TerminalWatchlist.updated_at - timedelta(hours=1),
+                created_at=TerminalWatchlist.created_at - timedelta(hours=1),
+            )
         )
         # Releases the savepoint only; the outer transaction still rolls everything back.
         await db_session.commit()
         db_session.expire_all()
         result = await db_session.execute(
-            text("SELECT created_at, updated_at FROM terminal_watchlists WHERE id = :id"),
-            {"id": watchlist_id},
+            select(TerminalWatchlist.created_at, TerminalWatchlist.updated_at).where(
+                TerminalWatchlist.id == watchlist_id
+            )
         )
         backdated_created, backdated_updated = result.one()
 

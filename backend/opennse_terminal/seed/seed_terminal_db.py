@@ -58,11 +58,11 @@ from typing import Final, NoReturn, TypeAlias
 
 import sqlalchemy as sa
 from pydantic import ValidationError
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from opennse_terminal import migrations
 from opennse_terminal.config import TerminalSettings
-from opennse_terminal.db.session import build_engine, database_log_label
+from opennse_terminal.db.session import build_engine, build_session_factory, database_log_label
 from opennse_terminal.db.upsert import Executor, upsert_rows
 from opennse_terminal.models import (
     TerminalBondYield,
@@ -103,11 +103,13 @@ SEED_TRIGGER: Final = "seed"
 """``terminal_ingestion_runs.trigger`` of every seeder run."""
 
 SEED_BATCH_SIZE: Final = 1000
-"""Rows per ``upsert_rows`` call; keeps each price statement far below asyncpg's 32,767
+"""Rows per ``upsert_rows`` call, sliced from a table's rows only after they are sorted by natural
+key, so the batches follow one key order; keeps each price statement far below asyncpg's 32,767
 bind-parameter limit."""
 
 SCHEMA_HINT: Final = "run `opennse-terminal migrate upgrade head` first"
-"""Operator instruction carried by :class:`SchemaNotAtHeadError` and printed on exit code 2."""
+"""Operator instruction carried by :class:`SchemaNotAtHeadError` and logged at ERROR on exit code
+2."""
 
 _EXIT_OK: Final = 0
 _EXIT_FAILED: Final = 1
@@ -143,8 +145,10 @@ exit codes:
 """
 
 # to_regclass returns NULL instead of raising for a missing relation, so an unmigrated database
-# is detected without aborting the transaction. The table name is a bound parameter.
-_VERSION_TABLE_EXISTS: Final = sa.text("SELECT to_regclass(:name) IS NOT NULL")
+# is detected without aborting the transaction. The table name is the bound parameter ``name``.
+_VERSION_TABLE_EXISTS: Final = sa.select(
+    sa.func.to_regclass(sa.bindparam("name", type_=sa.String())).is_not(None)
+)
 _VERSION_TABLE: Final = sa.table(migrations.VERSION_TABLE, sa.column("version_num", sa.String))
 
 _SeedModel: TypeAlias = (
@@ -232,7 +236,8 @@ async def ensure_schema_at_head(executor: Executor) -> str:
 
 
 class _TableWriter:
-    """Writes the seed table by table with ``ON CONFLICT DO NOTHING`` and tallies the counts."""
+    """Writes the seed table by table, each in natural-key order with ``ON CONFLICT DO NOTHING``,
+    and tallies the counts."""
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -242,16 +247,39 @@ class _TableWriter:
     async def write(
         self, model: _SeedModel, key: tuple[str, ...], rows: Sequence[Mapping[str, object]]
     ) -> None:
-        """Insert ``rows`` into ``model``'s table in batches of :data:`SEED_BATCH_SIZE`.
+        """Insert ``rows`` into ``model``'s table in natural-key order, in batches of
+        :data:`SEED_BATCH_SIZE`.
+
+        The complete input is de-duplicated by the natural ``key``, the last occurrence winning,
+        and sorted by it before it is sliced, so each batch covers a key range above the previous
+        one's and the whole table is written in one key order, whatever order the generator
+        produced (prices come per counter, SCOM first). ``upsert_rows`` sorts each call the same
+        way, so concurrent writers such as a CSV import of the same table take their row locks in
+        that one order: when a seed and an import insert the same new keys, the later one waits
+        for the earlier instead of both deadlocking. Batches hold the caller's own mappings, never
+        copies.
 
         Existing rows with the same natural ``key`` are left untouched, so only new rows count
-        as inserted.
+        as inserted; ``candidates`` counts every row offered, duplicates included. Nothing is
+        committed or begun here: every batch joins the caller's seed transaction.
+
+        Raises:
+            ValueError: If a row lacks a ``key`` column or holds ``None`` in one, before any batch
+                is written. Such a key can be neither ordered nor matched to the conflict target.
         """
-        inserted = 0
-        for start in range(0, len(rows), SEED_BATCH_SIZE):
-            batch = rows[start : start + SEED_BATCH_SIZE]
-            inserted += await upsert_rows(self._session, model, batch, key, "do_nothing")
         table = model.__tablename__
+        by_key: dict[tuple[object, ...], Mapping[str, object]] = {}
+        for index, row in enumerate(rows):
+            for name in key:
+                if row.get(name) is None:
+                    reason = "is None" if name in row else "is missing"
+                    raise ValueError(f"{table} row {index}: natural-key column {name!r} {reason}")
+            by_key[tuple(row[name] for name in key)] = row
+        ordered = [by_key[row_key] for row_key in sorted(by_key)]
+        inserted = 0
+        for start in range(0, len(ordered), SEED_BATCH_SIZE):
+            batch = ordered[start : start + SEED_BATCH_SIZE]
+            inserted += await upsert_rows(self._session, model, batch, key, "do_nothing")
         self.inserted[table] = inserted
         self.candidates[table] = len(rows)
 
@@ -403,11 +431,30 @@ async def seed(
     On any failure after the schema check, generation and its invariant checks included, the
     transaction is rolled back, the run is recorded as ``failed`` in a fresh transaction (best
     effort, with the exception's type name as ``error_message``) and the exception is re-raised.
+
+    Every failure it raises is logged exactly once at ERROR on ``opennse_terminal.seed``, with no
+    traceback, and then re-raised unchanged, so callers receive the exception itself and need not
+    log it again. A :class:`SchemaNotAtHeadError` is logged as its message, which names only
+    revisions and ends with :data:`SCHEMA_HINT`; any other failure before the run starts (the
+    schema check's query, or reading the default settings) as ``seeding failed before the run
+    started: <type>``; a failure once the run has started as ``seed run <run_id> failed and was
+    rolled back: <type>``, naming the failed ``terminal_ingestion_runs`` row. Only type names are
+    logged because exception text can quote SQL parameters such as ``default_owner_key``.
     """
-    settings = settings if settings is not None else TerminalSettings()
     # The cheap precondition comes first, so an unmigrated database, which has no
-    # terminal_ingestion_runs table to record a failure in, fails fast.
-    await ensure_schema_at_head(session)
+    # terminal_ingestion_runs table to record a failure in, fails fast. With no run started there
+    # is no run id to name, but the failure is still reported here, once.
+    try:
+        settings = settings if settings is not None else TerminalSettings()
+        await ensure_schema_at_head(session)
+    except SchemaNotAtHeadError as exc:
+        logger.error("%s", exc)
+        raise
+    except Exception as exc:
+        # Type name only: a settings ValidationError quotes the invalid values, the database URL
+        # among them, and a database error its statement's parameters.
+        logger.error("seeding failed before the run started: %s", type(exc).__name__)
+        raise
 
     run_id = uuid.uuid4()
     started_at = datetime.now(UTC)
@@ -447,9 +494,9 @@ async def seed(
         await session.commit()
     except Exception as exc:
         await _record_failure(session, run_id=run_id, started_at=started_at, exc=exc)
-        # Only the type name is logged, here and by run_seed: the exception's text, and so its
-        # traceback, can carry SQL parameters such as default_owner_key. The caller receives the
-        # exception itself.
+        # The one record of this failure: callers, run_seed included, do not log it again. Only
+        # the type name is logged: the exception's text, and so its traceback, can carry SQL
+        # parameters such as default_owner_key. The caller receives the exception itself.
         logger.error("seed run %s failed and was rolled back: %s", run_id, type(exc).__name__)
         raise
 
@@ -481,7 +528,7 @@ async def _check_connection(engine: AsyncEngine) -> None:
 
 
 def _connect_failure_reason(exc: Exception) -> str:
-    """Return the reason printed for a failed connection attempt.
+    """Return the reason logged for a failed connection attempt.
 
     An ``OSError`` (a refused connection, an unresolvable host, a missing socket file, or asyncio's
     ``Multiple exceptions: ...`` for a host with several addresses) carries only the OS reason and
@@ -504,21 +551,29 @@ async def run_seed(settings: TerminalSettings, *, url_source: str = "settings.da
 
     ``url_source`` names where ``settings.database_url`` came from, for the messages about the URL
     itself; :func:`main` passes ``--database-url`` or ``TERMINAL_DATABASE_URL``. The INFO line
-    ``seeding <label>`` names the database through :func:`database_log_label` only. Each outcome
-    below is reported exactly once:
+    ``seeding <label>`` names the database through :func:`database_log_label` only. Nothing is
+    printed: every outcome below is reported exactly once, as a record on the
+    ``opennse_terminal.seed`` logger, so a host's logging configuration routes it. No record
+    carries a traceback.
 
     * ``0``: seeded, a re-run that inserts nothing included; :func:`seed` logs the summary.
-    * ``2``: the schema is not at head. The :class:`SchemaNotAtHeadError` message, which ends with
-      :data:`SCHEMA_HINT`, is printed to stderr.
-    * ``1``, printed to stderr: an invalid URL, as ``cannot seed: <build_engine's message> (from
-      <url_source>)``, a message that quotes the URL only through its label; any other error
-      creating the engine (such as SQLAlchemy's ``ArgumentError`` for a multi-host URL without
-      every port), as ``cannot seed: could not create a database engine from <url_source>
-      (<type>)``, by type only because its text can quote parts of the URL; a database that
-      cannot be reached, as ``cannot seed: could not connect to <label>: <reason>`` (see
-      :func:`_connect_failure_reason`).
-    * ``1``, logged at ERROR: a failure once connected, by its type name only, never its text or
-      traceback, which can carry SQL parameters such as ``default_owner_key``.
+    * ``2``: the schema is not at head. :func:`seed` logs the :class:`SchemaNotAtHeadError`
+      message, which ends with :data:`SCHEMA_HINT`, at ERROR.
+    * ``1``, logged at ERROR here, before :func:`seed` runs: an invalid URL, as ``cannot seed:
+      <build_engine's message> (from <url_source>)``, a message that quotes the URL only through
+      its label; any other error creating the engine (such as SQLAlchemy's ``ArgumentError`` for
+      a multi-host URL without every port), as ``cannot seed: could not create a database engine
+      from <url_source> (<type>)``, by type only because its text can quote parts of the URL; a
+      database that cannot be reached, as ``cannot seed: could not connect to <label>: <reason>``
+      (see :func:`_connect_failure_reason`).
+    * ``1``, logged at ERROR by :func:`seed`: a failure once connected, which :func:`seed`
+      reports itself, with the failed run's id once the run has started; no second record is
+      added here.
+    * ``1``, logged at ERROR here: a failure outside :func:`seed`, such as closing its session, as
+      ``seeding failed: <type>``.
+
+    Failures once connected are named by type only, never by their text or traceback, which can
+    carry SQL parameters such as ``default_owner_key``.
 
     The engine is disposed whenever it was created. ``asyncio.CancelledError`` and
     ``KeyboardInterrupt`` are not caught: they propagate after that disposal. A coroutine, so
@@ -528,15 +583,15 @@ async def run_seed(settings: TerminalSettings, *, url_source: str = "settings.da
         engine = build_engine(settings)
     except ValueError as exc:
         # build_engine's own messages quote the URL only through database_log_label.
-        print(f"cannot seed: {exc} (from {url_source})", file=sys.stderr)
+        logger.error("cannot seed: %s (from %s)", exc, url_source)
         return _EXIT_FAILED
     except Exception as exc:
         # Other construction errors are reported by type only: their text can quote parts of the
         # URL, such as the ports of a multi-host query.
-        print(
-            f"cannot seed: could not create a database engine from {url_source} "
-            f"({type(exc).__name__})",
-            file=sys.stderr,
+        logger.error(
+            "cannot seed: could not create a database engine from %s (%s)",
+            url_source,
+            type(exc).__name__,
         )
         return _EXIT_FAILED
     try:
@@ -545,17 +600,24 @@ async def run_seed(settings: TerminalSettings, *, url_source: str = "settings.da
         try:
             await _check_connection(engine)
         except Exception as exc:
-            reason = _connect_failure_reason(exc)
-            print(f"cannot seed: could not connect to {label}: {reason}", file=sys.stderr)
+            logger.error(
+                "cannot seed: could not connect to %s: %s", label, _connect_failure_reason(exc)
+            )
             return _EXIT_FAILED
-        async with async_sessionmaker(engine, expire_on_commit=False)() as session:
-            await seed(session, settings=settings)
-    except SchemaNotAtHeadError as exc:
-        print(str(exc), file=sys.stderr)
-        return _EXIT_SCHEMA_NOT_AT_HEAD
+        async with build_session_factory(engine)() as session:
+            try:
+                await seed(session, settings=settings)
+            except SchemaNotAtHeadError:
+                # seed() has logged the message, SCHEMA_HINT included.
+                return _EXIT_SCHEMA_NOT_AT_HEAD
+            except Exception:
+                # seed() has logged this failure once, with the failed run's id once the run had
+                # started; a second record here would count one failure twice.
+                return _EXIT_FAILED
     except Exception as exc:
-        # Type name only, with no traceback: SQLAlchemy errors embed the statement's parameters,
-        # such as default_owner_key.
+        # Only a failure outside seed(), such as closing its session, reaches this handler. Type
+        # name only, with no traceback: SQLAlchemy errors embed the statement's parameters, such
+        # as default_owner_key.
         logger.error("seeding failed: %s", type(exc).__name__)
         return _EXIT_FAILED
     finally:

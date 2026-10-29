@@ -299,6 +299,10 @@ def _blank_to_none(value: str | None) -> str | None:
             "model": ErrorResponse,
             "description": "ingest_busy: every parse slot is in use; retry after 5 seconds",
         },
+        500: {
+            "model": ErrorResponse,
+            "description": "internal_error: a server fault, whose text is never returned",
+        },
     },
 )
 async def ingest_pdf(
@@ -370,8 +374,8 @@ async def ingest_pdf(
     ``request_too_large`` or ``file_too_large``, 415 ``not_a_pdf``, 429 ``ingest_busy`` (with
     ``Retry-After: 5``), and from the service 422 ``pdf_encrypted``, ``pdf_unreadable``,
     ``too_many_pages``, ``commit_requires_ticker_and_period`` or ``commit_requires_kes``, 409
-    ``currency_conflict`` and 404 ``unknown_ticker``. Send ``commit=false`` to preview what a
-    PDF yields before committing it.
+    ``currency_conflict``, 404 ``unknown_ticker`` and 500 ``internal_error`` for a server fault.
+    Send ``commit=false`` to preview what a PDF yields before committing it.
     """
     data = await file.read(settings.pdf_max_bytes + 1)
     if len(data) > settings.pdf_max_bytes:

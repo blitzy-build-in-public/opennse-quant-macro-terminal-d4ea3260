@@ -17,7 +17,8 @@ Rejections come from two layers. The route (size guard, file size, ``%PDF-`` mag
 slots) records no run row; the service (commit preconditions, parse failures, currency rules)
 records one ``failed`` run row carrying the error code. Either way the error body is the coded
 ``{"detail": {"code", "message", "field"}}`` with no extraction, and no filing or fundamentals row
-is written. Only ``terminal_`` tables are read or written here.
+is written; a server fault is the coded 500 ``internal_error``, never the fault itself. Only
+``terminal_`` tables are read or written here.
 """
 
 import asyncio
@@ -32,19 +33,23 @@ from typing import Any, Final, NoReturn, Protocol
 import httpx
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import Executable, select
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from opennse_terminal.api.routes.ingest import MULTIPART_OVERHEAD_BYTES
 from opennse_terminal.ingestion.files.pdf_line_items import ITEM_COLUMNS
-from opennse_terminal.models import TerminalCorporateFiling, TerminalFundamental
+from opennse_terminal.models import (
+    TerminalCorporateFiling,
+    TerminalFundamental,
+    TerminalIngestionRun,
+)
 from opennse_terminal.services import filings_service
 
 URL: Final = "/api/v1/terminal/ingest/pdf"
 
-CommittedQuery = Callable[..., Awaitable[list[RowMapping]]]
-"""The ``committed_query`` fixture: ``(sql, /, **params) -> rows`` on a separate connection."""
+CommittedQuery = Callable[[Executable], Awaitable[list[RowMapping]]]
+"""The ``committed_query`` fixture: ``(statement, /) -> rows`` on a separate connection."""
 StatementPdf = Callable[..., bytes]
 """The ``statement_pdf`` fixture: ``(currency="KES", *, tag, pages=None) -> bytes``."""
 SettingsConfigurer = Callable[..., object]
@@ -104,14 +109,8 @@ _ENCRYPTED_TRAILER_ROOT: Final = (
     f"/ID [<{'0a' * 16}> <{'0b' * 16}>] >>"
 ).encode("ascii")
 
-_RUN_ROWS_SQL: Final = (
-    "SELECT status, trigger, error_message, finished_at IS NOT NULL AS finished, "
-    "details->>'file_sha256' AS file_sha256, details->>'ticker' AS ticker, "
-    "details->>'period_end_date' AS period_end_date, details->>'filing_id' AS filing_id "
-    "FROM terminal_ingestion_runs "
-    "WHERE pipeline = 'pdf_filing' AND details->>'file_sha256' = :sha "
-    "ORDER BY started_at"
-)
+_RUN_DETAIL_KEYS: Final[tuple[str, ...]] = ("file_sha256", "ticker", "period_end_date", "filing_id")
+"""``details`` keys :func:`run_rows` projects as text columns of the same names."""
 
 
 # ---------------------------------------------------------------------------------------------
@@ -131,7 +130,18 @@ def sha(data: bytes) -> str:
 
 async def run_rows(committed_query: CommittedQuery, data: bytes) -> list[RowMapping]:
     """The committed ``pdf_filing`` run rows of the upload ``data``, oldest first."""
-    return await committed_query(_RUN_ROWS_SQL, sha=sha(data))
+    run = TerminalIngestionRun
+    return await committed_query(
+        select(
+            run.status,
+            run.trigger,
+            run.error_message,
+            run.finished_at.is_not(None).label("finished"),
+            *(run.details[key].astext.label(key) for key in _RUN_DETAIL_KEYS),
+        )
+        .where(run.pipeline == "pdf_filing", run.details["file_sha256"].astext == sha(data))
+        .order_by(run.started_at)
+    )
 
 
 async def filing_row(db_session: AsyncSession, data: bytes) -> RowMapping | None:
@@ -631,3 +641,56 @@ async def test_concurrency_limit_returns_429(
     for outcome in outcomes:
         assert isinstance(outcome, httpx.Response), outcome
         coded_error(outcome, 409, "released", None)
+
+
+# ---------------------------------------------------------------------------------------------
+# Server faults
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_server_fault_is_answered_with_coded_internal_error_and_no_upload_text(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    committed_query: CommittedQuery,
+    monkeypatch: pytest.MonkeyPatch,
+    statement_pdf: StatementPdf,
+) -> None:
+    """A database fault mid-request reaches the client as the coded 500 ``internal_error`` JSON
+    body, never as the fault itself, and is audited by its type.
+
+    The fault is the filing insert naming a ticker no equity holds, once the pre-parse check is
+    bypassed (as when the equity is deleted after it); its text carries the uploaded file name
+    and company name, which the response must not.
+    """
+
+    async def no_preconditions(*_args: object) -> None:
+        return None
+
+    monkeypatch.setattr(filings_service, "_check_preconditions", no_preconditions)
+    sentinel = "leak-sentinel-3b8f04"
+    pdf = statement_pdf(tag="server fault")
+
+    response = await client.post(
+        URL,
+        files={"file": (f"{sentinel}.pdf", pdf, "application/pdf")},
+        data={
+            "ticker": "ZZZZ",
+            "company_name": f"{sentinel} Ltd",
+            "period_end_date": SCOM_PERIOD.isoformat(),
+        },
+    )
+
+    assert response.status_code == 500, response.text
+    assert response.json() == {
+        "detail": {
+            "code": "internal_error",
+            "message": "The PDF could not be ingested because of an internal error.",
+            "field": None,
+        }
+    }
+    assert sentinel not in response.text
+    assert await filing_row(db_session, pdf) is None
+    runs = await run_rows(committed_query, pdf)
+    assert [
+        (run["status"], run["trigger"], run["finished"], run["error_message"]) for run in runs
+    ] == [("failed", "api", True, "unexpected_error:IntegrityError")]

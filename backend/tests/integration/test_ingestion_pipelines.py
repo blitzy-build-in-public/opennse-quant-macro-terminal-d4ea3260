@@ -38,7 +38,7 @@ import httpx
 import pytest
 import respx
 from bs4 import BeautifulSoup
-from sqlalchemy import text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from opennse_terminal.ingestion.base import Pipeline, RunResult, RunStatus, execute_pipeline
@@ -50,6 +50,7 @@ from opennse_terminal.ingestion.nse.market_statistics import (
     NseQuote,
     SectorTable,
 )
+from opennse_terminal.models import TerminalDailyPrice, TerminalIngestionRun
 
 NAIROBI: Final = ZoneInfo("Africa/Nairobi")
 NOW: Final = datetime(2026, 10, 28, 7, 30, tzinfo=NAIROBI)
@@ -98,19 +99,41 @@ ROBOTS_DISALLOW_PAGE: Final = "User-agent: *\nDisallow: /market-statistics/\n"
 WAIT_SECONDS: Final = 10.0
 """Bound on every wait for a blocked run, so a lock test never hangs."""
 
-_PRICE_ROW_SQL: Final = text(
-    "SELECT ticker, open_price, high_price, low_price, close_price, volume, turnover_kes, "
-    "turnover_estimated, foreign_net_flow_kes, source, flow_source, ingestion_run_id "
-    "FROM terminal_daily_prices WHERE trade_date = :day ORDER BY ticker"
+_PRICE_COLUMNS: Final = (
+    TerminalDailyPrice.ticker,
+    TerminalDailyPrice.open_price,
+    TerminalDailyPrice.high_price,
+    TerminalDailyPrice.low_price,
+    TerminalDailyPrice.close_price,
+    TerminalDailyPrice.volume,
+    TerminalDailyPrice.turnover_kes,
+    TerminalDailyPrice.turnover_estimated,
+    TerminalDailyPrice.foreign_net_flow_kes,
+    TerminalDailyPrice.source,
+    TerminalDailyPrice.flow_source,
+    TerminalDailyPrice.ingestion_run_id,
 )
-_RUN_ROW_SQL: Final = text(
-    "SELECT id, pipeline, trigger, status, rows_fetched, rows_written, rows_rejected, "
-    "error_message, details, finished_at FROM terminal_ingestion_runs WHERE id = :run_id"
+"""The price, flow and provenance columns of a :func:`prices_on` snapshot."""
+_RUN_COLUMNS: Final = (
+    TerminalIngestionRun.id,
+    TerminalIngestionRun.pipeline,
+    TerminalIngestionRun.trigger,
+    TerminalIngestionRun.status,
+    TerminalIngestionRun.rows_fetched,
+    TerminalIngestionRun.rows_written,
+    TerminalIngestionRun.rows_rejected,
+    TerminalIngestionRun.error_message,
+    TerminalIngestionRun.details,
+    TerminalIngestionRun.finished_at,
 )
-_RUNS_OF_SQL: Final = text(
-    "SELECT id, status, error_message, finished_at FROM terminal_ingestion_runs "
-    "WHERE pipeline = :pipeline ORDER BY started_at"
+"""The ``terminal_ingestion_runs`` columns :func:`run_row` reads."""
+_RUNS_OF_COLUMNS: Final = (
+    TerminalIngestionRun.id,
+    TerminalIngestionRun.status,
+    TerminalIngestionRun.error_message,
+    TerminalIngestionRun.finished_at,
 )
+"""The ``terminal_ingestion_runs`` columns :func:`runs_of` reads."""
 
 
 class SeededClone(Protocol):
@@ -256,22 +279,33 @@ async def run(pipeline: Pipeline[Any, Any], handle: SeededClone) -> RunResult:
 async def prices_on(handle: SeededClone, day: date) -> dict[str, dict[str, Any]]:
     """Ticker -> the ``terminal_daily_prices`` row of ``day`` (price, flow and provenance
     columns), as plain dicts so snapshots compare by value."""
+    statement = (
+        select(*_PRICE_COLUMNS)
+        .where(TerminalDailyPrice.trade_date == day)
+        .order_by(TerminalDailyPrice.ticker)
+    )
     async with handle.engine.connect() as conn:
-        result = await conn.execute(_PRICE_ROW_SQL, {"day": day})
+        result = await conn.execute(statement)
         return {row["ticker"]: dict(row) for row in result.mappings()}
 
 
 async def run_row(handle: SeededClone, run_id: object) -> dict[str, Any]:
     """The recorded ``terminal_ingestion_runs`` row of a run."""
+    statement = select(*_RUN_COLUMNS).where(TerminalIngestionRun.id == run_id)
     async with handle.engine.connect() as conn:
-        result = await conn.execute(_RUN_ROW_SQL, {"run_id": run_id})
+        result = await conn.execute(statement)
         return dict(result.mappings().one())
 
 
 async def runs_of(handle: SeededClone, pipeline: str) -> list[dict[str, Any]]:
     """Every recorded run of ``pipeline``, oldest first."""
+    statement = (
+        select(*_RUNS_OF_COLUMNS)
+        .where(TerminalIngestionRun.pipeline == pipeline)
+        .order_by(TerminalIngestionRun.started_at)
+    )
     async with handle.engine.connect() as conn:
-        result = await conn.execute(_RUNS_OF_SQL, {"pipeline": pipeline})
+        result = await conn.execute(statement)
         return [dict(row) for row in result.mappings()]
 
 

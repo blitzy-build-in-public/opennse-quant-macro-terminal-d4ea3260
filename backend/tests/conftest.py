@@ -41,10 +41,10 @@ import os
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Protocol
+from typing import Any, Final, Protocol, TypeVar
 
 import pytest
 import pytest_asyncio
@@ -90,6 +90,8 @@ _SUFFIX_LENGTH: Final[int] = 8
 _DATABASE_NAME: Final = re.compile(r"[a-z0-9_]{1,63}")
 _NAME_PREFIX: Final = re.compile(r"[a-z][a-z0-9_]*")
 _UNSAFE_LABEL_CHARACTERS: Final = re.compile(r"[^a-z0-9_]")
+
+_T = TypeVar("_T")
 
 
 def test_database_url() -> str:
@@ -259,21 +261,38 @@ class DatabaseFactory:
     session, and cached; a failed build is cached too, so later requests fail at once instead of
     rebuilding. Empty databases are copied from ``template0``. Every database created here is
     tracked and dropped at the end of the session if a test left it behind.
+
+    A database is tracked before its ``CREATE DATABASE`` runs, because that statement commits on
+    its own and the call that issued it can still fail or be cancelled afterwards. Creating a
+    database, and building the template, run to completion even when their caller is cancelled
+    meanwhile, and :meth:`close` waits for them, so nothing is dropped while it is still being
+    created, migrated or seeded.
     """
 
     def __init__(self, admin_engine: AsyncEngine) -> None:
         self._admin = admin_engine
         self._preparer = admin_engine.dialect.identifier_preparer
-        # Database name -> its handle's engine; None between CREATE DATABASE and the engine.
+        # Database name -> its handle's engine; None from just before CREATE DATABASE until the
+        # engine exists, and for good when the creating call failed or was cancelled.
         self._live: dict[str, AsyncEngine | None] = {}
+        # Creation work that has not settled yet; see _run_to_completion.
+        self._in_flight: set[asyncio.Task[Any]] = set()
         self._template_lock = asyncio.Lock()
         self._template_created = False
         self._template_ready = False
         self._template_failure: str | None = None
 
     def url_for(self, name: str) -> str:
-        """The administrative URL pointed at database ``name``, password included."""
-        return self._admin.url.set(database=name).render_as_string(hide_password=False)
+        """The administrative URL pointed at database ``name``, password included.
+
+        The URL's ``database`` query option is removed and every other query option, such as a
+        Unix-socket ``host`` directory, is kept. asyncpg applies query options after the URL path,
+        so an administrative URL such as ``.../postgres?database=opennse_test`` would otherwise
+        connect every template, clone and empty database URL to the administrative database and
+        write their tables and rows there.
+        """
+        url = self._admin.url.set(database=name).difference_update_query(["database"])
+        return url.render_as_string(hide_password=False)
 
     def _quote(self, name: str) -> str:
         if not _DATABASE_NAME.fullmatch(name):
@@ -284,26 +303,69 @@ class DatabaseFactory:
         async with self._admin.connect() as connection:
             await connection.execute(text(statement), params)
 
+    async def _run_to_completion(self, work: Coroutine[Any, Any, _T], action: str) -> _T:
+        """Await ``work`` in a task of its own that the caller's cancellation does not stop.
+
+        Cancelling a caller half-way through ``CREATE DATABASE`` leaves it unknown whether the
+        database exists, and the template's migration runs in a thread that cancellation cannot
+        stop at all. A cancelled caller therefore keeps waiting until ``work`` has settled and
+        only then raises its ``CancelledError``; a failure of ``work`` is then logged by type,
+        since the cancellation takes precedence. Otherwise ``work``'s result is returned, or its
+        exception (its own ``CancelledError`` included) raised. ``action`` names the work in that
+        log record and must not hold a URL. The task stays in ``_in_flight`` until it settles,
+        which :meth:`close` waits for.
+        """
+        task = asyncio.create_task(work)
+        self._in_flight.add(task)
+        task.add_done_callback(self._in_flight.discard)
+        interrupted: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                # asyncio.wait neither cancels the task it waits for nor raises its exception, so
+                # a CancelledError here is always the caller's own.
+                await asyncio.wait((task,))
+            except asyncio.CancelledError as exc:
+                interrupted = exc
+        if interrupted is None:
+            return task.result()
+        # The outcome is retrieved either way, so asyncio never reports it as unretrieved.
+        if not task.cancelled() and (failure := task.exception()) is not None:
+            logger.error(
+                "%s failed after its caller was cancelled: %s", action, type(failure).__name__
+            )
+        raise interrupted
+
     async def seeded_template(self) -> str:
         """Return :data:`TEMPLATE_DATABASE`, building it on the first call of the session."""
         async with self._template_lock:
-            if self._template_ready:
-                return TEMPLATE_DATABASE
+            if not self._template_ready and self._template_failure is None:
+                # The build records its own outcome, so a caller cancelled during it neither
+                # discards a finished template nor skips caching a failed one.
+                await self._run_to_completion(
+                    self._record_template_build(), f"building {TEMPLATE_DATABASE}"
+                )
             if self._template_failure is not None:
                 pytest.fail(self._template_failure, pytrace=False)
-            try:
-                failure = await self._build_template()
-            except Exception as exc:
-                self._template_failure = (
-                    f"building {TEMPLATE_DATABASE} failed earlier in this session "
-                    f"({type(exc).__name__})"
-                )
-                raise
-            if failure is not None:
-                self._template_failure = failure
-                pytest.fail(failure, pytrace=False)
-            self._template_ready = True
             return TEMPLATE_DATABASE
+
+    async def _record_template_build(self) -> None:
+        """Build the template, then mark it ready or cache the failure that later calls repeat.
+
+        The first failure's exception propagates unchanged; a seeding failure, reported as a
+        message, is cached and raised by :meth:`seeded_template` with ``pytest.fail``.
+        """
+        try:
+            failure = await self._build_template()
+        except Exception as exc:
+            self._template_failure = (
+                f"building {TEMPLATE_DATABASE} failed earlier in this session "
+                f"({type(exc).__name__})"
+            )
+            raise
+        if failure is not None:
+            self._template_failure = failure
+        else:
+            self._template_ready = True
 
     async def _build_template(self) -> str | None:
         """Create, migrate and seed the template; return a failure message or ``None``."""
@@ -311,8 +373,11 @@ class DatabaseFactory:
         quoted = self._quote(TEMPLATE_DATABASE)
         logger.info("building seeded template database %s", TEMPLATE_DATABASE)
         await self._execute(f"DROP DATABASE IF EXISTS {quoted} WITH (FORCE)")
-        await self._execute(f"CREATE DATABASE {quoted}")
+        # Recorded first: CREATE DATABASE commits before its connection is released, and a
+        # failure in between must still leave the template to close(). Dropping a template that
+        # was never created is harmless there (DROP DATABASE IF EXISTS).
         self._template_created = True
+        await self._execute(f"CREATE DATABASE {quoted}")
         url = self.url_for(TEMPLATE_DATABASE)
         # env.py drives its own engine with asyncio.run, so the upgrade runs off this loop.
         await asyncio.to_thread(run_upgrade, url, "head")
@@ -357,8 +422,12 @@ class DatabaseFactory:
 
     async def _create(self, prefix: str, label: str, template: str) -> DatabaseHandle:
         name = database_name(prefix, label)
-        await self._execute(f"CREATE DATABASE {self._quote(name)} TEMPLATE {self._quote(template)}")
+        statement = f"CREATE DATABASE {self._quote(name)} TEMPLATE {self._quote(template)}"
+        # Tracked before the statement runs: it commits before its connection is released, and
+        # a failure or cancellation in between must still leave the database to close(), which
+        # drops a name that was never created harmlessly (DROP DATABASE IF EXISTS).
         self._live[name] = None
+        await self._run_to_completion(self._execute(statement), f"creating database {name}")
         url = self.url_for(name)
         settings = build_test_settings(database_url=url)
         engine = build_engine(settings)
@@ -386,7 +455,20 @@ class DatabaseFactory:
         logger.info("dropped database %s", name)
 
     async def close(self) -> None:
-        """Drop every database still tracked, then the template; re-raise the first failure."""
+        """Drop every database still tracked, then the template; re-raise the first failure.
+
+        It first waits for a template build and for any creation still in flight, whose caller
+        was cancelled but whose ``CREATE DATABASE`` or migration has not finished: dropping
+        before then would miss a database committed a moment later.
+        """
+        async with self._template_lock:
+            if self._in_flight:
+                # The creating callers retrieve the outcomes; this only waits for them.
+                await asyncio.wait(set(self._in_flight))
+            await self._drop_everything()
+
+    async def _drop_everything(self) -> None:
+        """The body of :meth:`close`, run once nothing is being created any more."""
         first_error: Exception | None = None
         # Engines cached by session_factory (the API's default session provider) may point at
         # these databases; they are released before the databases disappear under them.

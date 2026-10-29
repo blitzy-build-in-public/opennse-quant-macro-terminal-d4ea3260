@@ -47,7 +47,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
-from sqlalchemy import text
+from sqlalchemy import Executable
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
@@ -135,7 +135,7 @@ class DatabaseFactoryLike(Protocol):
 class CommittedQuery(Protocol):
     """Signature of the ``committed_query`` fixture's reader."""
 
-    async def __call__(self, sql: str, /, **params: object) -> list[RowMapping]: ...
+    async def __call__(self, statement: Executable, /) -> list[RowMapping]: ...
 
 
 class SettingsConfigurer(Protocol):
@@ -372,20 +372,21 @@ async def db_session(db_connection: AsyncConnection) -> AsyncIterator[AsyncSessi
 
 @pytest.fixture
 def committed_query(module_database: DatabaseHandleLike) -> CommittedQuery:
-    """Reader ``(sql, /, **params) -> list[RowMapping]`` on a separate connection to the clone.
+    """Reader ``(statement, /) -> list[RowMapping]`` on a separate connection to the clone.
 
     It sees only committed rows, such as the ``terminal_ingestion_runs`` audit rows the PDF
     endpoint and ``RunRecorder`` write on their own connection, outside the outer transaction.
     Those rows persist for the rest of the module, so filter them by a unique key (the upload's
     ``file_sha256`` or the run id). Rows written inside the request (filings, fundamentals,
-    watchlists) are visible only through ``db_session``/``db_connection``, never here. ``sql``
-    goes through ``text()`` with ``params`` as bound parameters.
+    watchlists) are visible only through ``db_session``/``db_connection``, never here.
+    ``statement`` is a Core ``select()`` over the ``opennse_terminal.models`` columns, with every
+    value bound inside it; each row comes back keyed by its selected column names or labels.
     """
     engine = module_database.engine
 
-    async def query(sql: str, /, **params: object) -> list[RowMapping]:
+    async def query(statement: Executable, /) -> list[RowMapping]:
         async with engine.connect() as connection:
-            result = await connection.execute(text(sql), params)
+            result = await connection.execute(statement)
             return list(result.mappings().all())
 
     return query

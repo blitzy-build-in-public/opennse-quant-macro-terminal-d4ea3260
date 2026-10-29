@@ -9,7 +9,8 @@ held here:
   ``rows_written`` 1 (the filing) or 2 (filing and fundamentals); anything else ends it
   ``failed`` with the error code as ``error_message`` (``unexpected_error:<Type>`` for a server
   fault, ``cancelled`` for a cancelled request). ``details`` hold ``file_sha256``, ``ticker``,
-  ``period_end_date``, ``document_type`` and ``commit``, plus the outcome on success.
+  ``period_end_date``, ``document_type`` and ``commit``, plus the outcome on success. A row that
+  cannot be started is logged once at ERROR by the fault's type, and no row is written.
 - **Preview and commit**: every success upserts ``terminal_corporate_filings`` on
   ``file_sha256``; a re-upload keeps the ``filing_id`` and never unsets
   ``committed_to_fundamentals``. Money is rounded once to 2 dp (ROUND_HALF_UP) and share counts
@@ -26,9 +27,11 @@ held here:
   both tables untouched: 422 ``commit_requires_ticker_and_period``, ``pdf_encrypted``,
   ``pdf_unreadable``, ``too_many_pages`` (``TERMINAL_PDF_MAX_PAGES``) and
   ``commit_requires_kes``; 404 ``unknown_ticker``, with or without commit; 409
-  ``currency_conflict``.
-- **Cancellation**: a request cancelled before its commit rolls back and records ``cancelled``;
-  one cancelled during its commit still commits and records ``succeeded``, then re-raises.
+  ``currency_conflict``; 500 ``internal_error`` for a server fault, raised ``from None`` so
+  neither the response, a log nor a traceback carries the fault's text.
+- **Cancellation**: a request cancelled while its run row is inserted, or before its commit,
+  rolls back and records ``cancelled``; one cancelled during its commit still commits and records
+  ``succeeded``, then re-raises; one whose row could not be started re-raises without a row.
 
 The request-size, magic-byte and concurrency checks (413, 415, 429) belong to the route, not to
 this service, so they are not exercised here.
@@ -48,6 +51,7 @@ import asyncio
 import hashlib
 import logging
 import threading
+import traceback
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from datetime import date
@@ -57,7 +61,8 @@ from typing import Any, Protocol
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
+from sqlalchemy.exc import IntegrityError, UnboundExecutionError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -94,6 +99,9 @@ WRITTEN_COLUMNS = (
     "shares_outstanding",
 )
 SEED_ONLY_COLUMNS = ("total_assets_kes", "total_equity_kes", "cash_and_equivalents_kes", "dps_kes")
+INTERNAL_ERROR_MESSAGE = "The PDF could not be ingested because of an internal error."
+# Upload text that a server fault's own text may carry and nothing the service returns or logs.
+LEAK_SENTINEL = "leak-sentinel-7d2e91"
 
 
 class SeededDatabase(Protocol):
@@ -652,6 +660,61 @@ async def test_commit_merges_every_item_and_a_later_preview_keeps_the_commit_fla
     )
 
 
+async def test_concurrent_first_preview_never_clears_the_flag_of_a_committing_upload(
+    session: AsyncSession, engine: AsyncEngine, settings: TerminalSettings
+) -> None:
+    """Two first uploads of the same bytes overlap. The commit has inserted the filing and merged
+    the fundamentals but not committed, so the preview finds no filing row and its insert waits
+    on the commit's unique-index entry. Once the commit lands, the preview's conflict update
+    replaces the extraction on the same row but keeps ``committed_to_fundamentals`` true, as the
+    fundamentals row's ``filing_id`` requires."""
+    sha = sha256(FULL_KES_PDF)
+    commit_form = PdfIngestForm(ticker="SCOM", period_end_date=SCOM_PERIOD, commit=True)
+    preview_form = PdfIngestForm(ticker="SCOM", period_end_date=SCOM_PERIOD)
+    result = await fs._extract(FULL_KES_PDF, commit_form, settings)
+    items = [fs._response_item(item) for item in result.items]
+
+    async def upload(db: AsyncSession, form: PdfIngestForm, file_name: str) -> uuid.UUID:
+        return await fs._upsert_filing(
+            db,
+            form=form,
+            file_name=file_name,
+            file_sha256=sha,
+            file_size_bytes=len(FULL_KES_PDF),
+            result=result,
+            items=items,
+            commits_fundamentals=form.commit,
+        )
+
+    filing_id = await upload(session, commit_form, "commit.pdf")
+    await fs._commit_fundamentals(session, commit_form, fs._fundamentals_values(items), filing_id)
+    committer_pid = await session.scalar(text("SELECT pg_backend_pid()"))
+    async with AsyncSession(engine, expire_on_commit=False) as preview_session:
+        preview_pid = await preview_session.scalar(text("SELECT pg_backend_pid()"))
+        preview = asyncio.create_task(upload(preview_session, preview_form, "preview.pdf"))
+        try:
+            async with engine.connect() as monitor, asyncio.timeout(30):
+                await monitor.execution_options(isolation_level="AUTOCOMMIT")
+                while not await monitor.scalar(
+                    text("SELECT :committer = ANY(pg_blocking_pids(:preview))"),
+                    {"committer": committer_pid, "preview": preview_pid},
+                ):
+                    assert not preview.done(), "the preview never waited on the commit"
+                    await asyncio.sleep(0.01)
+        finally:
+            # Committing on every path releases the preview, so it never outlives the test.
+            await session.commit()
+            preview_id = await asyncio.wait_for(preview, 30)
+        await preview_session.commit()
+
+    stored = await filing_by_sha(engine, sha)
+    assert stored is not None
+    assert (preview_id, stored.id) == (filing_id, filing_id)
+    assert (stored.file_name, stored.committed_to_fundamentals) == ("preview.pdf", True)
+    assert await filing_count(engine) == 1
+    assert (await scom_fundamentals(engine))["filing_id"] == filing_id
+
+
 async def test_partial_commit_writes_only_the_found_item_never_the_ambiguous_one(
     session: AsyncSession, engine: AsyncEngine, settings: TerminalSettings
 ) -> None:
@@ -1063,16 +1126,20 @@ async def test_commit_into_a_non_kes_fundamentals_row_is_a_currency_conflict(
     assert await scom_fundamentals(engine) == usd_row
 
 
-async def test_unexpected_error_is_recorded_by_type_and_re_raised(
+async def test_unexpected_error_is_recorded_by_type_and_answered_as_internal_error(
     session: AsyncSession, engine: AsyncEngine, settings: TerminalSettings
 ) -> None:
     """A fault outside the coded errors (here the extractor refusing an empty item list) is
-    re-raised unchanged and recorded as ``unexpected_error:<Type>``, never with its text."""
+    recorded as ``unexpected_error:<Type>``, never with its text, and answered with the coded
+    500 ``internal_error`` raised ``from None``, so no traceback of it chains the fault."""
     form = PdfIngestForm(ticker="SCOM", period_end_date=SCOM_PERIOD, items=())
 
-    with pytest.raises(ValueError, match="^at least one line item must be requested$"):
+    with pytest.raises(HTTPException) as excinfo:
         await ingest_pdf(session, settings, FULL_KES_PDF, "scom.pdf", form)
 
+    assert_coded(excinfo.value, 500, "internal_error", None, INTERNAL_ERROR_MESSAGE)
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__ is True
     assert await filing_count(engine) == 0
     [run] = await pdf_runs(engine)
     assert_run(
@@ -1083,6 +1150,123 @@ async def test_unexpected_error_is_recorded_by_type_and_re_raised(
         rows_written=0,
         details=run_details(sha256(FULL_KES_PDF)),
     )
+
+
+async def test_failed_statement_is_answered_without_its_bound_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+    session: AsyncSession,
+    engine: AsyncEngine,
+    settings: TerminalSettings,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A statement that fails mid-request carries its bound parameters in its text: here the
+    filing insert, whose ticker names no equity once the pre-parse check is bypassed (as when
+    the equity is deleted after it), with the upload's file name and company name. The request
+    is answered with the coded 500 alone, the run row records the fault by type, and neither a
+    log record nor a traceback of the raised error holds those values."""
+
+    async def no_preconditions(_session: AsyncSession, _form: PdfIngestForm) -> None:
+        return None
+
+    monkeypatch.setattr(fs, "_check_preconditions", no_preconditions)
+    form = PdfIngestForm(
+        ticker="ZZZZ", company_name=f"{LEAK_SENTINEL} Ltd", period_end_date=SCOM_PERIOD
+    )
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(HTTPException) as excinfo:
+        await ingest_pdf(session, settings, FULL_KES_PDF, f"{LEAK_SENTINEL}.pdf", form)
+
+    fault = excinfo.value.__context__
+    assert isinstance(fault, IntegrityError)
+    assert f"{LEAK_SENTINEL}.pdf" in str(fault)
+    assert f"{LEAK_SENTINEL} Ltd" in str(fault)
+    assert_coded(excinfo.value, 500, "internal_error", None, INTERNAL_ERROR_MESSAGE)
+    assert LEAK_SENTINEL not in "".join(traceback.format_exception(excinfo.value))
+    assert await filing_count(engine) == 0
+    [run] = await pdf_runs(engine)
+    assert_run(
+        run,
+        status="failed",
+        error_message="unexpected_error:IntegrityError",
+        rows_fetched=6,
+        rows_written=0,
+        details=run_details(sha256(FULL_KES_PDF), ticker="ZZZZ"),
+    )
+    assert LEAK_SENTINEL not in caplog.text
+    assert [
+        (record.name, record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.levelno >= logging.ERROR
+    ] == [
+        (
+            fs.logger.name,
+            logging.ERROR,
+            f"PDF ingestion run {run.id} failed: unexpected_error:IntegrityError",
+        )
+    ]
+
+
+def unresolvable_audit_engine(_session: AsyncSession) -> AsyncEngine:
+    """A host session whose binds name no engine for the run rows."""
+    raise UnboundExecutionError(f"no bind is configured for {LEAK_SENTINEL}")
+
+
+async def refused_run_start(_recorder: RunRecorder, **_kwargs: object) -> uuid.UUID:
+    """A run-row insert whose pooled connection is refused."""
+    raise ConnectionRefusedError(f"connection to {LEAK_SENTINEL} refused")
+
+
+@pytest.mark.parametrize(
+    ("owner", "attribute", "replacement", "fault"),
+    [
+        pytest.param(
+            fs, "_audit_engine", unresolvable_audit_engine, "UnboundExecutionError", id="engine"
+        ),
+        pytest.param(
+            RunRecorder, "start", refused_run_start, "ConnectionRefusedError", id="insert"
+        ),
+    ],
+)
+async def test_run_that_cannot_be_started_is_logged_once_and_answered_as_internal_error(
+    monkeypatch: pytest.MonkeyPatch,
+    session: AsyncSession,
+    engine: AsyncEngine,
+    settings: TerminalSettings,
+    caplog: pytest.LogCaptureFixture,
+    owner: object,
+    attribute: str,
+    replacement: object,
+    fault: str,
+) -> None:
+    """When the run row cannot be started, because the audit engine cannot be resolved or its
+    insert fails, there is no row to finish: the fault is logged once at ERROR by its type,
+    never by its text, the request is answered with the coded 500, and nothing is written."""
+    seeded = await scom_fundamentals(engine)
+    monkeypatch.setattr(owner, attribute, replacement)
+    form = PdfIngestForm(ticker="SCOM", period_end_date=SCOM_PERIOD, commit=True)
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(HTTPException) as excinfo:
+        await ingest_pdf(session, settings, FULL_KES_PDF, "scom.pdf", form)
+
+    assert_coded(excinfo.value, 500, "internal_error", None, INTERNAL_ERROR_MESSAGE)
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__ is True
+    assert LEAK_SENTINEL not in "".join(traceback.format_exception(excinfo.value))
+    assert LEAK_SENTINEL not in caplog.text
+    assert [
+        (record.name, record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ] == [
+        (
+            fs.logger.name,
+            logging.ERROR,
+            f"PDF ingestion run could not be started: unexpected_error:{fault}",
+        )
+    ]
+    assert await pdf_runs(engine) == []
+    assert await filing_count(engine) == 0
+    assert await scom_fundamentals(engine) == seeded
 
 
 async def test_run_row_that_cannot_be_finished_is_logged_not_raised(
@@ -1116,6 +1300,118 @@ async def test_run_row_that_cannot_be_finished_is_logged_not_raised(
 # ---------------------------------------------------------------------------------------------
 # Cancellation
 # ---------------------------------------------------------------------------------------------
+
+
+async def test_request_cancelled_while_its_run_row_is_inserted_finishes_the_row_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+    session: AsyncSession,
+    engine: AsyncEngine,
+    settings: TerminalSettings,
+) -> None:
+    """A cancellation that arrives while the run row is inserted (here after the insert has
+    committed, before its id is returned) never leaves the row ``running``: the insert
+    completes, the row is finished ``failed`` with ``cancelled`` and the request's details,
+    nothing else is written, and the cancellation is re-raised."""
+    seeded = await scom_fundamentals(engine)
+    inserted = asyncio.Event()
+    release_start = asyncio.Event()
+    real_start = RunRecorder.start
+
+    async def gated_start(recorder: RunRecorder, **kwargs: Any) -> uuid.UUID:
+        run_id = await real_start(recorder, **kwargs)
+        inserted.set()
+        await release_start.wait()
+        return run_id
+
+    monkeypatch.setattr(RunRecorder, "start", gated_start)
+    form = PdfIngestForm(ticker="SCOM", period_end_date=SCOM_PERIOD, commit=True)
+    request = asyncio.create_task(ingest_pdf(session, settings, FULL_KES_PDF, "scom.pdf", form))
+
+    await asyncio.wait_for(inserted.wait(), 30)
+    [running] = await pdf_runs(engine)
+    assert (running.status, running.finished_at) == ("running", None)
+    request.cancel()
+    release_start.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    assert await filing_count(engine) == 0
+    assert await scom_fundamentals(engine) == seeded
+    [run] = await pdf_runs(engine)
+    assert run.id == running.id
+    assert_run(
+        run,
+        status="failed",
+        error_message="cancelled",
+        rows_fetched=0,
+        rows_written=0,
+        details=run_details(sha256(FULL_KES_PDF), commit=True),
+    )
+
+
+@pytest.mark.parametrize(
+    ("raised", "cancel_request", "level", "message"),
+    [
+        pytest.param(
+            ConnectionRefusedError,
+            True,
+            logging.ERROR,
+            "PDF ingestion run could not be started: unexpected_error:ConnectionRefusedError",
+            id="insert_fails_after_the_request_is_cancelled",
+        ),
+        pytest.param(
+            asyncio.CancelledError,
+            False,
+            logging.WARNING,
+            "PDF ingestion run could not be started: cancelled",
+            id="insert_itself_cancelled",
+        ),
+    ],
+)
+async def test_cancellation_meeting_a_run_row_never_started_is_re_raised_without_a_row(
+    monkeypatch: pytest.MonkeyPatch,
+    session: AsyncSession,
+    engine: AsyncEngine,
+    settings: TerminalSettings,
+    caplog: pytest.LogCaptureFixture,
+    raised: type[BaseException],
+    cancel_request: bool,
+    level: int,
+    message: str,
+) -> None:
+    """A run-row insert that fails while the request is being cancelled, or that itself ends
+    cancelled, leaves no row to finish: the cancellation is re-raised rather than answered,
+    nothing is written, and one record is logged, never with the fault's text. A failed insert
+    is an ERROR naming its type; an insert that ended cancelled is a WARNING ``cancelled``, not
+    a fault."""
+    starting = asyncio.Event()
+    release_start = asyncio.Event()
+
+    async def failing_start(_recorder: RunRecorder, **_kwargs: object) -> uuid.UUID:
+        starting.set()
+        await release_start.wait()
+        raise raised(LEAK_SENTINEL)
+
+    monkeypatch.setattr(RunRecorder, "start", failing_start)
+    form = PdfIngestForm(ticker="SCOM", period_end_date=SCOM_PERIOD)
+
+    with caplog.at_level(logging.DEBUG):
+        request = asyncio.create_task(ingest_pdf(session, settings, FULL_KES_PDF, "scom.pdf", form))
+        await asyncio.wait_for(starting.wait(), 30)
+        if cancel_request:
+            request.cancel()
+        release_start.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+    assert LEAK_SENTINEL not in caplog.text
+    assert [
+        (record.name, record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ] == [(fs.logger.name, level, message)]
+    assert await pdf_runs(engine) == []
+    assert await filing_count(engine) == 0
 
 
 async def test_request_cancelled_while_parsing_rolls_back_and_records_cancelled(

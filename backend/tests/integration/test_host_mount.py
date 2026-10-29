@@ -29,7 +29,7 @@ import httpx
 import pytest_asyncio
 from fastapi import FastAPI, HTTPException, status
 from fastapi.routing import APIRoute, iter_route_contexts
-from sqlalchemy import text
+from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
 from opennse_terminal.api import (
@@ -41,6 +41,11 @@ from opennse_terminal.api import (
     terminal_router,
 )
 from opennse_terminal.api.routes.ingest import TerminalUploadRoute
+from opennse_terminal.models import (
+    TerminalCorporateFiling,
+    TerminalIngestionRun,
+    TerminalWatchlist,
+)
 
 TERMINAL_PREFIX: Final = "/api/v1/terminal"
 """The mount prefix a host relies on, stated here as the contract rather than read from the
@@ -128,9 +133,9 @@ def _api_operations(app: FastAPI) -> list[tuple[str, str, APIRoute]]:
     return operations
 
 
-async def _count(connection: AsyncConnection, sql: str, **params: object) -> int:
-    """Run a ``SELECT count(*)`` with bound parameters and return the count."""
-    return int((await connection.execute(text(sql), params)).scalar_one())
+async def _count(connection: AsyncConnection, statement: Select[tuple[int]]) -> int:
+    """Run a ``SELECT count(*)`` statement, its values bound inside it, and return the count."""
+    return int((await connection.execute(statement)).scalar_one())
 
 
 @pytest_asyncio.fixture
@@ -299,8 +304,9 @@ async def test_host_session_and_principal_overrides(
     watchlist = created.json()
     assert (watchlist["name"], watchlist["tickers"]) == ("Host list", ["SCOM"])
     owner = await db_connection.execute(
-        text("SELECT owner_key FROM terminal_watchlists WHERE id = :id"),
-        {"id": uuid.UUID(watchlist["id"])},
+        select(TerminalWatchlist.owner_key).where(
+            TerminalWatchlist.id == uuid.UUID(watchlist["id"])
+        )
     )
     assert owner.scalar_one() == HOST_SUBJECT
 
@@ -396,10 +402,14 @@ async def test_request_size_guard_travels_with_router(
     answered 413 ``request_too_large`` and writes neither a filing nor a run row."""
     oversized = b"%PDF-1.4\n" + b"0" * 1_200_000
     file_sha256 = hashlib.sha256(oversized).hexdigest()
-    filings_sql = "SELECT count(*) FROM terminal_corporate_filings"
-    runs_sql = "SELECT count(*) FROM terminal_ingestion_runs WHERE pipeline = 'pdf_filing'"
-    filings_before = await _count(db_connection, filings_sql)
-    runs_before = await _count(db_connection, runs_sql)
+    filings_count = select(func.count()).select_from(TerminalCorporateFiling)
+    runs_count = (
+        select(func.count())
+        .select_from(TerminalIngestionRun)
+        .where(TerminalIngestionRun.pipeline == "pdf_filing")
+    )
+    filings_before = await _count(db_connection, filings_count)
+    runs_before = await _count(db_connection, runs_count)
 
     response = await host_client.post(
         f"{TERMINAL_PREFIX}/ingest/pdf",
@@ -413,11 +423,10 @@ async def test_request_size_guard_travels_with_router(
     assert (
         await _count(
             db_connection,
-            "SELECT count(*) FROM terminal_corporate_filings WHERE file_sha256 = :sha",
-            sha=file_sha256,
+            filings_count.where(TerminalCorporateFiling.file_sha256 == file_sha256),
         )
         == 0
     )
-    assert await _count(db_connection, filings_sql) == filings_before
+    assert await _count(db_connection, filings_count) == filings_before
     # Run rows are committed on their own connection; READ COMMITTED shows them here as well.
-    assert await _count(db_connection, runs_sql) == runs_before
+    assert await _count(db_connection, runs_count) == runs_before

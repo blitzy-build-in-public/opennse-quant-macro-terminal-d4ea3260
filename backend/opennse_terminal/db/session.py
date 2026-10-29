@@ -5,6 +5,8 @@ Two entry points serve two ownership models:
 * :func:`build_engine` returns a new engine that the caller owns and disposes. Ingestion runs, the
   seeder, the CSV importer and the test fixtures use it, because they need dedicated connections
   (a transaction-scoped advisory lock on one, run-record writes on another) for a bounded job.
+  The seeder opens its session on such an engine through :func:`build_session_factory`, the one
+  place the terminal's ``async_sessionmaker`` configuration lives.
 * :func:`session_factory` returns the process-wide ``async_sessionmaker`` behind the API's default
   ``get_terminal_session`` provider. Its engine is created lazily on the first call, so importing
   this module, or mounting the router in a host that overrides the session provider, never
@@ -33,7 +35,13 @@ from sqlalchemy.ext.asyncio import (
 
 from opennse_terminal.config import TerminalSettings
 
-__all__ = ["build_engine", "database_log_label", "dispose_terminal_engine", "session_factory"]
+__all__ = [
+    "build_engine",
+    "build_session_factory",
+    "database_log_label",
+    "dispose_terminal_engine",
+    "session_factory",
+]
 
 logger = logging.getLogger("opennse_terminal.db.session")
 
@@ -143,13 +151,28 @@ def build_engine(settings: TerminalSettings, **engine_options: Any) -> AsyncEngi
     return engine
 
 
+def build_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+    """Return a new sessionmaker of the terminal's configuration, bound to ``engine``.
+
+    This is the single definition of how the terminal opens sessions:
+    ``async_sessionmaker(engine, expire_on_commit=False)``, so objects stay readable after
+    ``commit()`` without another round trip. :func:`session_factory` builds its cached
+    sessionmaker with it, and the seeder its one-shot session on an engine from
+    :func:`build_engine`.
+
+    Nothing is cached and no connection is opened. The caller keeps ownership of ``engine`` and
+    releases it with ``await engine.dispose()`` once its sessions are closed.
+    """
+    return async_sessionmaker(engine, expire_on_commit=False)
+
+
 def session_factory(settings: TerminalSettings | None = None) -> async_sessionmaker[AsyncSession]:
     """Return the process-wide sessionmaker for ``settings.database_url``.
 
     ``settings`` defaults to a fresh ``TerminalSettings()`` read from the environment. The first
-    call for a URL builds its engine with :func:`build_engine` and an
-    ``async_sessionmaker(engine, expire_on_commit=False)``; later calls return the same
-    sessionmaker. Creation involves no ``await``, so calls within one event loop cannot race.
+    call for a URL builds its engine with :func:`build_engine` and its sessionmaker with
+    :func:`build_session_factory`; later calls return the same sessionmaker. Creation involves no
+    ``await``, so calls within one event loop cannot race.
 
     Usage contract: ``api.deps.get_terminal_session`` runs
     ``async with session_factory(settings)() as session: yield session``, one ``AsyncSession`` per
@@ -162,7 +185,7 @@ def session_factory(settings: TerminalSettings | None = None) -> async_sessionma
     if cached is not None:
         return cached[1]
     engine = build_engine(settings)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
+    factory = build_session_factory(engine)
     _CACHE[settings.database_url] = (engine, factory)
     logger.info("terminal database engine initialised for %s", database_log_label(engine.url))
     return factory
@@ -177,19 +200,31 @@ async def dispose_terminal_engine() -> None:
     it does nothing.
 
     The cache is emptied before any ``await``, so a failing dispose leaves no half-disposed entry
-    behind. Every engine is still disposed when one fails; the first failure is then re-raised.
+    behind. Every engine is still disposed when one fails. Each failure is logged at ERROR with the
+    engine's :func:`database_log_label` and the exception's type name only; once every engine has
+    been tried, a ``RuntimeError`` naming the failed engines' labels and exception type names is
+    raised, for example ``failed to dispose 1 terminal database engine: database "opennse" on
+    localhost:5432 (OSError)``. The original exception is never logged, with or without its
+    traceback, and never chained: a driver, pool or network error's text and cause chain can quote
+    the connection URL, password included.
     """
     entries = list(_CACHE.values())
     _CACHE.clear()
-    first_error: Exception | None = None
+    failures: list[str] = []
     for engine, _factory in entries:
         try:
             await engine.dispose()
         except Exception as exc:
-            logger.exception(
-                "failed to dispose terminal database engine for %s", database_log_label(engine.url)
-            )
-            if first_error is None:
-                first_error = exc
-    if first_error is not None:
-        raise first_error
+            label = database_log_label(engine.url)
+            error_type = type(exc).__name__
+            # No exc_info and no exception text: either can carry connection details.
+            logger.error("failed to dispose terminal database engine for %s: %s", label, error_type)
+            failures.append(f"{label} ({error_type})")
+    if failures:
+        noun = "engine" if len(failures) == 1 else "engines"
+        detail = "; ".join(failures)
+        # Raised outside the except clause and from None, so no original exception is chained or
+        # kept as __cause__ or __context__.
+        raise RuntimeError(
+            f"failed to dispose {len(failures)} terminal database {noun}: {detail}"
+        ) from None

@@ -5,7 +5,10 @@ The route (``api.routes.ingest``) has already bounded the request and the file s
 :func:`ingest_pdf` owns everything after that:
 
 1. A ``terminal_ingestion_runs`` row (``pipeline='pdf_filing'``, ``trigger='api'``) is started on
-   its own connection, so it survives the rollback of a rejected request.
+   its own connection, so it survives the rollback of a rejected request. A request whose row
+   cannot be started is logged once and answered with 500 ``internal_error``, or the cancellation
+   re-raised when the request or the insert was cancelled; nothing else runs and no filing or
+   fundamentals row is written.
 2. Pre-parse checks, then the pdfplumber parse in a worker thread, then the commit checks.
 3. One transaction on the request session upserts ``terminal_corporate_filings`` on
    ``file_sha256`` and, with ``commit``, merges the ``found`` and ``derived`` items into
@@ -27,6 +30,8 @@ Status  Code                                    Condition
 422     ``commit_requires_kes``                 ``commit`` on a statement not in KES
 409     ``currency_conflict``                   ``commit`` into a fundamentals row whose
                                                 currency is not KES
+500     ``internal_error``                      a server fault, such as a database error; its
+                                                text is never returned or logged
 ======  ======================================  ==============================================
 
 Units: monetary items are whole KES after the statement scale, or whole USD when the statement is
@@ -139,6 +144,20 @@ def _coded_error(
     )
 
 
+def _internal_error() -> HTTPException:
+    """The coded 500 ``internal_error`` that answers a server fault.
+
+    Its message is fixed and names nothing of the fault: an exception's text can carry SQL with
+    its bound parameters (the file name, the form fields, the extraction).
+    """
+    return _coded_error(
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+        "internal_error",
+        "The PDF could not be ingested because of an internal error.",
+        None,
+    )
+
+
 def _error_code(exc: HTTPException) -> str:
     """The ``code`` of a coded ``HTTPException``, or ``http_<status>`` for any other one."""
     detail = exc.detail
@@ -186,6 +205,46 @@ async def _run_to_completion(
     return task, cancel_requested
 
 
+async def _start_run(session: AsyncSession) -> tuple[RunRecorder, uuid.UUID, bool]:
+    """Insert the request's ``running`` run row; return its recorder, its id and whether the
+    caller was cancelled while the row was written.
+
+    The insert runs to completion in a task of its own, so a cancellation never abandons a row
+    it has committed: the caller finishes that row before honouring the cancellation. When no
+    run id comes back, nothing can be finished (a row the insert may have committed before
+    failing stays ``running``), and exactly one record is logged. An insert that itself ended
+    cancelled is logged at WARNING as ``cancelled`` and the cancellation re-raised. A fault (the
+    audit engine cannot be resolved, or the insert fails) is logged at ERROR as
+    ``unexpected_error:<Type>``, never by its text; a cancellation received meanwhile is then
+    re-raised, and otherwise the coded 500 ``internal_error`` is raised.
+    """
+    try:
+        recorder = RunRecorder(_audit_engine(session))
+    except Exception as exc:
+        logger.error(
+            "PDF ingestion run could not be started: %s", f"unexpected_error:{type(exc).__name__}"
+        )
+        raise _internal_error() from None
+    task, cancel_requested = await _run_to_completion(
+        recorder.start(pipeline=PDF_FILING_PIPELINE, trigger="api", source_url=None)
+    )
+    error = task.exception() if not task.cancelled() else asyncio.CancelledError()
+    if error is not None:
+        # No id came back, so there is no row to finish.
+        if isinstance(error, asyncio.CancelledError):
+            # A cancellation, not a fault: logged by its code, and it stands.
+            logger.warning("PDF ingestion run could not be started: cancelled")
+            raise asyncio.CancelledError
+        logger.error(
+            "PDF ingestion run could not be started: %s",
+            f"unexpected_error:{type(error).__name__}",
+        )
+        if cancel_requested:
+            raise asyncio.CancelledError
+        raise _internal_error() from None
+    return recorder, task.result(), cancel_requested
+
+
 async def _finish_run(
     recorder: RunRecorder,
     run_id: uuid.UUID,
@@ -230,8 +289,8 @@ async def _record_failure(
 ) -> None:
     """Roll the request transaction back and finish the run ``failed``.
 
-    Neither step raises: the exception that ended the request is the one the caller re-raises,
-    so a failure here is only logged.
+    Neither step raises: the caller then raises the request's own outcome (the rejection, the
+    cancellation or the coded 500), so a failure here is only logged.
     """
     task, _ = await _run_to_completion(session.rollback())
     error = task.exception() if not task.cancelled() else asyncio.CancelledError()
@@ -451,15 +510,14 @@ async def _upsert_filing(
 ) -> uuid.UUID:
     """Upsert the filing on ``file_sha256`` and return its id.
 
-    ``committed_to_fundamentals`` is never unset by a later upload: a preview of a document that
-    was committed earlier keeps the flag. The existing row is locked until the transaction ends,
-    so concurrent uploads of the same document cannot lose the flag.
+    ``committed_to_fundamentals`` is written only as true, only by an upload that commits
+    fundamentals, and in the same ``INSERT ... ON CONFLICT`` statement as the rest of the row.
+    Other uploads omit the column: a new row takes its default (false) and a conflicting row keeps
+    its stored value, so the flag becomes stored OR new atomically, under the conflict update's
+    row lock. No upload can clear it, including a concurrent first upload of the same document,
+    for which no row existed to lock beforehand. The filing and fundamentals writes share the
+    request transaction, so a rolled-back commit sets nothing.
     """
-    previously_committed = await session.scalar(
-        select(TerminalCorporateFiling.committed_to_fundamentals)
-        .where(TerminalCorporateFiling.file_sha256 == file_sha256)
-        .with_for_update()
-    )
     row: dict[str, object] = {
         "ticker": form.ticker,
         "company_name": form.company_name,
@@ -474,8 +532,11 @@ async def _upsert_filing(
         "extraction": [item.model_dump(mode="json") for item in items],
         "status": result.status,
         "currency": result.currency,
-        "committed_to_fundamentals": commits_fundamentals or bool(previously_committed),
     }
+    if commits_fundamentals:
+        # Supplied only as true: the conflict update sets exactly the supplied columns, so a
+        # false here would overwrite a flag another upload has committed.
+        row["committed_to_fundamentals"] = True
     await upsert_rows(
         session, TerminalCorporateFiling, [row], key=("file_sha256",), mode="do_update"
     )
@@ -545,16 +606,27 @@ async def ingest_pdf(
       server fault, ``cancelled`` for a cancelled request) as ``error_message``. Its
       ``details`` hold ``file_sha256``, ``ticker``, ``period_end_date``, ``document_type`` and
       ``commit``, plus ``filing_id``, ``status``, ``committed`` and ``fundamentals_id`` on
-      success.
+      success. When the row cannot be started (the audit engine cannot be resolved, or its
+      insert fails), no run id is obtained and no row is finished: unless the request or the
+      insert was cancelled (below), the fault is logged once at ERROR as
+      ``unexpected_error:<Type>`` and the request answered with 500 ``internal_error``.
     * An HTTP 200 upserts ``terminal_corporate_filings`` on ``file_sha256``, with or without
       ``commit``. A commit writes only ``found`` and ``derived`` items, never ``ambiguous``
       ones, COALESCE-merged so existing values are never nulled, with ``filing_id`` set and
       ``source_by_field`` set to ``pdf_filing`` for exactly the written columns. When no item is
       committable nothing is merged and ``committed`` is false.
     * Any rejection rolls the request transaction back, so neither table is written or changed,
-      and is re-raised unchanged after the run row is finished.
-    * The transaction is committed here (services own write transactions). The commit and the
-      run-row writes run to completion even if the request is cancelled meanwhile.
+      and is re-raised unchanged after the run row is finished. A server fault is rolled back
+      and recorded alike, logged once at ERROR by its type, and then answered with the coded 500
+      ``internal_error`` raised ``from None``: its text, which can carry SQL with bound
+      parameters (the file name, the form fields, the extraction), never reaches the response,
+      a log or a traceback.
+    * The transaction is committed here (services own write transactions). The run-row insert,
+      the commit and the run-row writes run to completion even if the request is cancelled
+      meanwhile. A cancellation received while the row is inserted finishes it ``failed`` with
+      ``cancelled`` and then re-raises; a cancelled request whose row could not be started
+      re-raises the cancellation without one, logged once: at WARNING as ``cancelled`` when the
+      cancellation ended the insert itself, otherwise at ERROR as the insert's fault.
 
     Args:
         session: The request session; the filing and fundamentals writes share its transaction.
@@ -564,7 +636,6 @@ async def ingest_pdf(
         form: The form fields, with ``ticker`` already normalized.
     """
     file_sha256 = hashlib.sha256(upload_bytes).hexdigest()
-    recorder = RunRecorder(_audit_engine(session))
     base_details: dict[str, Any] = {
         "file_sha256": file_sha256,
         "ticker": form.ticker,
@@ -574,9 +645,12 @@ async def ingest_pdf(
         "document_type": form.document_type,
         "commit": form.commit,
     }
-    run_id = await recorder.start(pipeline=PDF_FILING_PIPELINE, trigger="api", source_url=None)
+    recorder, run_id, cancelled_while_starting = await _start_run(session)
     rows_fetched = 0
     try:
+        if cancelled_while_starting:
+            # The row is committed: the cancellation branch below finishes it, then re-raises.
+            raise asyncio.CancelledError
         await _check_preconditions(session, form)
         result = await _extract(upload_bytes, form, settings)
         rows_fetched = len(result.items)
@@ -649,7 +723,9 @@ async def ingest_pdf(
             rows_fetched=rows_fetched,
             details=base_details,
         )
-        raise
+        # Answered, not re-raised: a propagated fault would reach the server's traceback log
+        # with its text, and "from None" keeps it out of any traceback of the coded error.
+        raise _internal_error() from None
 
     cancel_requested |= await _finish_run(
         recorder,

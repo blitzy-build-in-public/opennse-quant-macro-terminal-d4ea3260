@@ -19,7 +19,11 @@ export interface WidgetFrameProps {
    * `"terminal-yield-curve-chart"`.
    */
   testId: string;
-  /** Heading text of the card, also used as the root's accessible name. */
+  /**
+   * Heading text of the card, also used as the root's accessible name, in the Retry button's
+   * accessible name (`"Retry Yield curve"`) and in the status region's announcements, such as
+   * `"Yield curve loaded"`.
+   */
   title: string;
   /** Selects the body shown, and is written verbatim to the root's `data-state` attribute. */
   state: WidgetState;
@@ -30,12 +34,15 @@ export interface WidgetFrameProps {
   error?: TerminalApiError | null;
   /**
    * Called by the error state's Retry button, which is rendered only when this is provided.
-   * Fetching widgets pass `useTerminalQuery(...).refetch`.
+   * Fetching widgets pass `useTerminalQuery(...).refetch`. Activating Retry first moves focus to
+   * the card's root, which is focusable by script but not in the tab order, so focus stays in the
+   * card when the retry replaces the error body.
    */
   onRetry?: () => void;
   /**
    * Replaces {@link EMPTY_MESSAGE} in the empty state, for example
-   * `"Select a counter or sector to see its valuation bands"`.
+   * `"Select a counter or sector to see its valuation bands"`. Either message is announced after
+   * the card's `title` through the status region.
    */
   emptyMessage?: string;
   /**
@@ -73,8 +80,10 @@ export interface FieldErrorTextProps {
 
 // Every class below is a complete static string, never assembled from fragments, so Tailwind's
 // source scan and a host's `@source` directive or `content` glob find each one. The root sets its
-// own surface and font family, so the widget never depends on a host's body styles or fonts.
-const ROOT_CLASS = "rounded-lg border border-slate-800 bg-slate-900 p-4 font-sans text-slate-100";
+// own surface and font family, so the widget never depends on a host's body styles or fonts. The
+// root is the focus target Retry hands focus to, so it carries the same outline ring as Retry.
+const ROOT_CLASS =
+  "rounded-lg border border-slate-800 bg-slate-900 p-4 font-sans text-slate-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 const HEADER_CLASS = "mb-3 flex items-center justify-between gap-2";
 const TITLE_CLASS = "text-sm font-semibold text-slate-200";
 const ACTIONS_CLASS = "flex items-center gap-2";
@@ -82,14 +91,18 @@ const CONTROLS_CLASS = "mb-3";
 // The pulse runs only when the user has not asked for reduced motion.
 const SKELETON_CLASS = "motion-safe:animate-pulse rounded bg-slate-800";
 const DEFAULT_SKELETON_HEIGHT = "h-48";
+// Hides the status region in every state but `empty`, and the title prefix of the empty copy. The
+// hidden region is taken out of the flow, so it adds no gap to a root a host lays out as flex.
+const SR_ONLY_CLASS = "sr-only";
 const EMPTY_CLASS = "text-sm text-slate-400";
 const ERROR_CLASS = "rounded border border-rose-900 bg-slate-950 p-3 text-sm text-rose-300";
 // The focus indicator is an outline rather than a box-shadow ring: forced-colors mode drops box
 // shadows but keeps outlines, and Tailwind 4's `outline-none` would remove the outline entirely.
+// Pressed goes one shade beyond hover, as the standalone navigation's links do.
 /* BLITZY [A11Y]: Retry keeps the compact size of the card's other text controls (about 26px tall,
    above WCAG 2.2 AA's 24px target minimum, below the 44px guideline). Flagged for designer review. */
 const RETRY_CLASS =
-  "mt-3 rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-slate-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "mt-3 rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-slate-700 active:bg-slate-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 // `min-w-0` lets charts and tables shrink inside a host's grid or flex layout.
 const READY_CLASS = "min-w-0";
 const FIELD_ERROR_CLASS = "mt-1 text-xs text-rose-400";
@@ -100,27 +113,53 @@ function joinClasses(...parts: Array<string | false | null | undefined>): string
   return parts.filter(Boolean).join(" ");
 }
 
+// Content of the card's one status region, which stays mounted in every state so a screen reader
+// announces each change politely. Loading and completion are short hidden phrases. The empty copy
+// is the visible message itself, prefixed by the hidden title, so it is read once. An error leaves
+// the region empty, because the error body's alert announces it.
+function renderStatus({ state, title, emptyMessage }: WidgetFrameProps): ReactNode {
+  switch (state) {
+    case "loading":
+      return "Loading…";
+    case "empty":
+      return (
+        <>
+          <span className={SR_ONLY_CLASS}>{title + ": "}</span>
+          <p className={EMPTY_CLASS}>{emptyMessage ?? EMPTY_MESSAGE}</p>
+        </>
+      );
+    case "error":
+      return null;
+    case "ready":
+      return title + " loaded";
+    default: {
+      const unreachable: never = state;
+      return unreachable;
+    }
+  }
+}
+
 function renderBody({
   state,
+  title,
   error,
   onRetry,
-  emptyMessage,
   skeletonClassName,
   children,
 }: WidgetFrameProps): ReactNode {
   switch (state) {
     case "loading":
       return (
-        <div role="status">
+        <div aria-busy="true">
           <div
             aria-hidden="true"
             className={joinClasses(SKELETON_CLASS, skeletonClassName || DEFAULT_SKELETON_HEIGHT)}
           />
-          <span className="sr-only">Loading…</span>
         </div>
       );
     case "empty":
-      return <p className={EMPTY_CLASS}>{emptyMessage ?? EMPTY_MESSAGE}</p>;
+      // The status region shows the empty copy, so the body adds nothing.
+      return null;
     case "error":
       // Only the message is shown: field errors are placed beside their inputs by the widget, and
       // the code is for programs, not readers.
@@ -131,7 +170,16 @@ function renderBody({
             <button
               type="button"
               data-testid="widget-retry"
-              onClick={onRetry}
+              // Names the card, so several failed widgets expose distinct Retry buttons; the
+              // visible "Retry" starts the name, as WCAG's label-in-name criterion asks.
+              aria-label={"Retry " + title}
+              onClick={(event) => {
+                // The retry replaces this error body, focused button included. Focus moves to the
+                // card root first, so keyboard users keep their place in the card through the
+                // loading, ready or repeated error state that follows.
+                event.currentTarget.closest("section")?.focus({ preventScroll: true });
+                onRetry();
+              }}
               className={RETRY_CLASS}
             >
               Retry
@@ -150,12 +198,21 @@ function renderBody({
 
 /**
  * Card shell of a terminal widget: a titled `<section>` that carries the widget's
- * `data-testid` and `data-state`, optional header actions and always-visible controls, and a body
- * chosen by `state`:
- * - `loading`: a skeleton sized by `skeletonClassName`, announced as "Loading…";
- * - `empty`: `emptyMessage`, or {@link EMPTY_MESSAGE};
- * - `error`: the error's `message` and, when `onRetry` is given, a Retry button;
- * - `ready`: `children`.
+ * `data-testid` and `data-state`, optional header actions and always-visible controls, one
+ * polite status region (`role="status"`) that stays mounted in every state, and a body chosen by
+ * `state`:
+ * - `loading`: a skeleton sized by `skeletonClassName`, marked `aria-busy`, while the status
+ *   region announces "Loading…";
+ * - `empty`: `emptyMessage`, or {@link EMPTY_MESSAGE}, shown inside the status region after the
+ *   title, which only screen readers get, so the empty result is announced;
+ * - `error`: an alert with the error's `message` and, when `onRetry` is given, a Retry button
+ *   named "Retry" followed by the title;
+ * - `ready`: `children`, while the status region announces the title followed by "loaded".
+ *   Charts and tables stay outside the region, so only that phrase is announced.
+ *
+ * The root is focusable by script (`tabIndex={-1}`) but not in the tab order. Activating Retry
+ * moves focus to it before retrying, so keyboard focus stays in the card when the error body is
+ * replaced; the root then shows the same outline ring as Retry under `:focus-visible`.
  *
  * The output depends only on the props, with no hooks or effects, so server rendering and
  * hydration agree in any React 18.2+ host.
@@ -166,8 +223,8 @@ export function WidgetFrame(props: WidgetFrameProps): ReactElement {
     <section
       data-testid={testId}
       data-state={state}
-      aria-busy={state === "loading"}
       aria-label={title}
+      tabIndex={-1}
       className={joinClasses(ROOT_CLASS, className)}
     >
       <header className={HEADER_CLASS}>
@@ -175,6 +232,10 @@ export function WidgetFrame(props: WidgetFrameProps): ReactElement {
         {actions ? <div className={ACTIONS_CLASS}>{actions}</div> : null}
       </header>
       {controls ? <div className={CONTROLS_CLASS}>{controls}</div> : null}
+      {/* Unkeyed and always at this position, so React keeps the same live node across states. */}
+      <div role="status" className={state === "empty" ? undefined : SR_ONLY_CLASS}>
+        {renderStatus(props)}
+      </div>
       {renderBody(props)}
     </section>
   );

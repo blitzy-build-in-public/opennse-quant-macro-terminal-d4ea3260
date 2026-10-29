@@ -7,7 +7,9 @@ What they prove, against PostgreSQL:
   data row and adds only its own ``terminal_ingestion_runs`` record;
 * the migrate-first precondition: on an unmigrated database, or one whose
   ``terminal_alembic_version`` is not at the packaged head, both entry points exit 2 with the
-  "run `opennse-terminal migrate upgrade head` first" instruction and write nothing;
+  "run `opennse-terminal migrate upgrade head` first" instruction and write nothing; probed
+  directly on an ``AsyncConnection``, the schema check finds no revision on an empty database
+  without aborting the transaction, and the head on a migrated one;
 * content and provenance: the seeded template holds every attachment value and the stated row
   counts, and every seeded row or column is marked ``seed`` so real data can supersede it;
 * precedence: rows written by the CSV/Excel importer survive a re-seed untouched.
@@ -16,9 +18,10 @@ Seeded tests request the root conftest's ``seeded_database``, a fresh function-s
 migrated and seeded template: the seeder and the importer open their own connections, which an
 outer rollback transaction cannot wrap. The precondition tests use ``empty_database``, an empty
 copy of ``template0`` in which only ``terminal_alembic_version`` is ever created. Every assertion
-reads committed state through ``text()`` statements with bound parameters on a separate
-connection, and every stored amount is compared as ``Decimal`` (``Decimal("6.8000") ==
-Decimal("6.80")``), never as a float.
+reads committed state on a separate connection, through Core ``select()`` statements over the
+``opennse_terminal.models`` columns with every value bound, and every stored amount is compared as
+``Decimal`` (``Decimal("6.8000") == Decimal("6.80")``), never as a float. Only the catalogue query
+and the Alembic-owned ``terminal_alembic_version`` table, which have no model, use ``text()``.
 
 Expected values are the seeder's reference constants (``seed/reference_data.py``), which hold the
 attachment values verbatim, plus the row counts AAP 0.8.3 states.
@@ -35,12 +38,24 @@ from types import MappingProxyType
 from typing import Any, Final, Protocol
 
 import pytest
-from sqlalchemy import TextClause, text
+from sqlalchemy import Executable, Select, func, or_, select, text
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from opennse_terminal import cli, migrations
 from opennse_terminal.ingestion.files.tabular_import import import_file
+from opennse_terminal.models import (
+    TerminalBondYield,
+    TerminalCycle,
+    TerminalDailyPrice,
+    TerminalEquity,
+    TerminalFundamental,
+    TerminalIngestionRun,
+    TerminalIpoScenario,
+    TerminalMacroIndicator,
+    TerminalWatchlist,
+    TerminalWatchlistItem,
+)
 from opennse_terminal.seed import seed_terminal_db
 from opennse_terminal.seed.reference_data import (
     ANCHOR_DATE,
@@ -165,42 +180,53 @@ BANK_TICKERS: Final[frozenset[str]] = frozenset(
 )
 
 # ---------------------------------------------------------------------------------------------
-# SQL. Every statement is a fixed literal: table names cannot be bound parameters, so each count
-# has its own pre-written statement instead of an interpolated one.
+# Statements. Mapped tables are read with Core ``select()`` over the model columns, every value
+# bound. The catalogue query and ``terminal_alembic_version``, which Alembic owns and no model
+# maps, are fixed ``text()`` literals with bound values only.
 # ---------------------------------------------------------------------------------------------
 
-_COUNT_SQL: Final[Mapping[str, TextClause]] = MappingProxyType(
+_COUNT_STATEMENTS: Final[Mapping[str, Select[tuple[int]]]] = MappingProxyType(
     {
-        "terminal_equities": text("SELECT count(*) FROM terminal_equities"),
-        "terminal_daily_prices": text("SELECT count(*) FROM terminal_daily_prices"),
-        "terminal_fundamentals": text("SELECT count(*) FROM terminal_fundamentals"),
-        "terminal_macro_indicators": text("SELECT count(*) FROM terminal_macro_indicators"),
-        "terminal_bond_yields": text("SELECT count(*) FROM terminal_bond_yields"),
-        "terminal_cycles": text("SELECT count(*) FROM terminal_cycles"),
-        "terminal_ipo_scenarios": text("SELECT count(*) FROM terminal_ipo_scenarios"),
-        "terminal_watchlists": text("SELECT count(*) FROM terminal_watchlists"),
-        "terminal_watchlist_items": text("SELECT count(*) FROM terminal_watchlist_items"),
+        model.__tablename__: select(func.count()).select_from(model)
+        for model in (
+            TerminalEquity,
+            TerminalDailyPrice,
+            TerminalFundamental,
+            TerminalMacroIndicator,
+            TerminalBondYield,
+            TerminalCycle,
+            TerminalIpoScenario,
+            TerminalWatchlist,
+            TerminalWatchlistItem,
+        )
     }
 )
+"""``SELECT count(*)`` of each :data:`DATA_TABLES` table, keyed by its table name."""
 
-_SEED_RUNS_SQL: Final = text(
-    "SELECT id, pipeline, trigger, status, started_at, finished_at, rows_fetched, rows_written, "
-    "rows_rejected, error_message, details FROM terminal_ingestion_runs "
-    "WHERE pipeline = :pipeline ORDER BY started_at, id"
+_SEED_RUNS: Final = (
+    select(
+        TerminalIngestionRun.id,
+        TerminalIngestionRun.pipeline,
+        TerminalIngestionRun.trigger,
+        TerminalIngestionRun.status,
+        TerminalIngestionRun.started_at,
+        TerminalIngestionRun.finished_at,
+        TerminalIngestionRun.rows_fetched,
+        TerminalIngestionRun.rows_written,
+        TerminalIngestionRun.rows_rejected,
+        TerminalIngestionRun.error_message,
+        TerminalIngestionRun.details,
+    )
+    .where(TerminalIngestionRun.pipeline == seed_terminal_db.SEED_PIPELINE)
+    .order_by(TerminalIngestionRun.started_at, TerminalIngestionRun.id)
 )
 
 _TERMINAL_TABLES_SQL: Final = text(
     "SELECT table_name::text AS table_name FROM information_schema.tables "
     "WHERE starts_with(table_name::text, :prefix) ORDER BY table_name"
-)
+).bindparams(prefix="terminal_")
 
-_PRICE_ROW_SQL: Final = text(
-    "SELECT * FROM terminal_daily_prices WHERE ticker = :ticker AND trade_date = :trade_date"
-)
-
-_MACRO_ROW_SQL: Final = text(
-    "SELECT * FROM terminal_macro_indicators WHERE observation_date = :observation_date"
-)
+_VERSION_SQL: Final = text("SELECT version_num FROM terminal_alembic_version")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -212,30 +238,28 @@ async def _counts(engine: AsyncEngine) -> dict[str, int]:
     """Row count of every table in :data:`DATA_TABLES`."""
     async with engine.connect() as connection:
         return {
-            table: int((await connection.execute(_COUNT_SQL[table])).scalar_one())
+            table: int((await connection.execute(_COUNT_STATEMENTS[table])).scalar_one())
             for table in DATA_TABLES
         }
 
 
-async def _fetch(engine: AsyncEngine, statement: TextClause, **params: object) -> list[RowMapping]:
-    """Every row of ``statement`` with bound ``params``, read on a fresh connection."""
+async def _fetch(engine: AsyncEngine, statement: Executable) -> list[RowMapping]:
+    """Every row of ``statement``, whose values are bound inside it, read on a fresh connection.
+
+    Rows are keyed by the selected column names or labels.
+    """
     async with engine.connect() as connection:
-        return list((await connection.execute(statement, params)).mappings().all())
-
-
-async def _fetch_sql(engine: AsyncEngine, sql: str, **params: object) -> list[RowMapping]:
-    """:func:`_fetch` for a literal SQL string."""
-    return await _fetch(engine, text(sql), **params)
+        return list((await connection.execute(statement)).mappings().all())
 
 
 async def _seed_runs(engine: AsyncEngine) -> list[RowMapping]:
     """The seeder's ``terminal_ingestion_runs`` rows, oldest first."""
-    return await _fetch(engine, _SEED_RUNS_SQL, pipeline=seed_terminal_db.SEED_PIPELINE)
+    return await _fetch(engine, _SEED_RUNS)
 
 
 async def _terminal_tables(engine: AsyncEngine) -> list[str]:
     """Names of every table or view whose name starts with ``terminal_``, sorted."""
-    rows = await _fetch(engine, _TERMINAL_TABLES_SQL, prefix="terminal_")
+    rows = await _fetch(engine, _TERMINAL_TABLES_SQL)
     return [str(row["table_name"]) for row in rows]
 
 
@@ -402,10 +426,35 @@ async def test_seed_refuses_database_not_at_head(
     assert MIGRATE_HINT in output
     assert STALE_REVISION in output
     assert await _terminal_tables(empty_database.engine) == [migrations.VERSION_TABLE]
-    versions = await _fetch_sql(
-        empty_database.engine, "SELECT version_num FROM terminal_alembic_version"
-    )
+    versions = await _fetch(empty_database.engine, _VERSION_SQL)
     assert [row["version_num"] for row in versions] == [STALE_REVISION]
+
+
+async def test_schema_probe_reports_no_revision_on_unmigrated_database(
+    empty_database: _Database,
+) -> None:
+    # Probed on an AsyncConnection; the seeder itself passes an AsyncSession. to_regclass yields
+    # NULL for the missing version table instead of an error, so the transaction stays usable.
+    async with empty_database.engine.connect() as connection:
+        assert await seed_terminal_db.current_schema_revision(connection) is None
+        with pytest.raises(seed_terminal_db.SchemaNotAtHeadError) as raised:
+            await seed_terminal_db.ensure_schema_at_head(connection)
+        assert connection.in_transaction()
+        assert await connection.scalar(text("SELECT 1")) == 1
+
+    assert raised.value.found is None
+    assert raised.value.expected == migrations.head_revision()
+    assert MIGRATE_HINT in str(raised.value)
+    assert await _terminal_tables(empty_database.engine) == []
+
+
+async def test_schema_probe_reads_head_on_migrated_database(
+    seeded_database: _SeededDatabase,
+) -> None:
+    head = migrations.head_revision()
+    async with seeded_database.engine.connect() as connection:
+        assert await seed_terminal_db.current_schema_revision(connection) == head
+        assert await seed_terminal_db.ensure_schema_at_head(connection) == head
 
 
 # ---------------------------------------------------------------------------------------------
@@ -427,18 +476,28 @@ async def _assert_seed_run_history(engine: AsyncEngine) -> None:
 
 
 async def _assert_prices(engine: AsyncEngine) -> None:
-    unmarked = await _fetch_sql(
+    price = TerminalDailyPrice
+    unmarked = await _fetch(
         engine,
-        "SELECT count(*) AS n FROM terminal_daily_prices WHERE source <> :seed "
-        "OR flow_source IS DISTINCT FROM :seed OR foreign_net_flow_kes IS NULL",
-        seed=SEED_SOURCE,
+        select(func.count().label("n"))
+        .select_from(price)
+        .where(
+            or_(
+                price.source != SEED_SOURCE,
+                price.flow_source.is_distinct_from(SEED_SOURCE),
+                price.foreign_net_flow_kes.is_(None),
+            )
+        ),
     )
     assert unmarked[0]["n"] == 0, "every seeded price row is marked seed, with a seeded flow"
 
-    (span,) = await _fetch_sql(
+    (span,) = await _fetch(
         engine,
-        "SELECT min(trade_date) AS first, max(trade_date) AS last, "
-        "count(DISTINCT trade_date) AS sessions FROM terminal_daily_prices",
+        select(
+            func.min(price.trade_date).label("first"),
+            func.max(price.trade_date).label("last"),
+            func.count(price.trade_date.distinct()).label("sessions"),
+        ),
     )
     # Nothing is dated after the anchor: future rows would read as observed history.
     assert (span["first"], span["last"], span["sessions"]) == (
@@ -446,15 +505,14 @@ async def _assert_prices(engine: AsyncEngine) -> None:
         ANCHOR_DATE,
         SEED_SESSIONS,
     )
-    per_ticker = await _fetch_sql(
-        engine, "SELECT ticker, count(*) AS n FROM terminal_daily_prices GROUP BY ticker"
+    per_ticker = await _fetch(
+        engine, select(price.ticker, func.count().label("n")).group_by(price.ticker)
     )
     assert {row["ticker"]: row["n"] for row in per_ticker} == dict.fromkeys(TICKERS, SEED_SESSIONS)
 
-    closes = await _fetch_sql(
+    closes = await _fetch(
         engine,
-        "SELECT ticker, close_price FROM terminal_daily_prices WHERE trade_date = :day",
-        day=ANCHOR_DATE,
+        select(price.ticker, price.close_price).where(price.trade_date == ANCHOR_DATE),
     )
     anchor_closes = {row["ticker"]: row["close_price"] for row in closes}
     assert anchor_closes == dict(PRICE_ANCHORS)
@@ -462,7 +520,7 @@ async def _assert_prices(engine: AsyncEngine) -> None:
 
 
 async def _assert_equities(engine: AsyncEngine) -> None:
-    rows = await _fetch_sql(engine, "SELECT * FROM terminal_equities")
+    rows = await _fetch(engine, select(TerminalEquity.__table__))
     by_ticker = {row["ticker"]: row for row in rows}
     assert set(by_ticker) == set(TICKERS)
     for equity in EQUITIES:
@@ -476,8 +534,9 @@ async def _assert_equities(engine: AsyncEngine) -> None:
 
 
 async def _assert_macro(engine: AsyncEngine) -> None:
-    rows = await _fetch_sql(
-        engine, "SELECT * FROM terminal_macro_indicators ORDER BY observation_date"
+    rows = await _fetch(
+        engine,
+        select(TerminalMacroIndicator.__table__).order_by(TerminalMacroIndicator.observation_date),
     )
     assert len(rows) == EXPECTED_COUNTS["terminal_macro_indicators"]
     assert (rows[0]["observation_date"], rows[-1]["observation_date"]) == (
@@ -504,7 +563,7 @@ async def _assert_macro(engine: AsyncEngine) -> None:
 
 
 async def _assert_fundamentals(engine: AsyncEngine) -> None:
-    rows = await _fetch_sql(engine, "SELECT * FROM terminal_fundamentals")
+    rows = await _fetch(engine, select(TerminalFundamental.__table__))
     assert len(rows) == EXPECTED_COUNTS["terminal_fundamentals"]
     period_ends: dict[str, set[date]] = {}
     for row in rows:
@@ -530,20 +589,27 @@ async def _assert_fundamentals(engine: AsyncEngine) -> None:
 
 
 async def _assert_bonds(engine: AsyncEngine) -> None:
-    unmarked = await _fetch_sql(
+    bond = TerminalBondYield
+    unmarked = await _fetch(
         engine,
-        "SELECT count(*) AS n FROM terminal_bond_yields "
-        "WHERE NOT starts_with(bond_code, :prefix) OR source <> :seed",
-        prefix=BOND_CODE_PREFIX,
-        seed=SEED_SOURCE,
+        select(func.count().label("n"))
+        .select_from(bond)
+        .where(
+            or_(
+                ~bond.bond_code.startswith(BOND_CODE_PREFIX, autoescape=True),
+                bond.source != SEED_SOURCE,
+            )
+        ),
     )
     assert unmarked[0]["n"] == 0, "every seeded bond carries an FXD-SEED- code and source seed"
 
-    anchor_rows = await _fetch_sql(
+    anchor_rows = await _fetch(
         engine,
-        "SELECT bond_code, original_tenor_years, remaining_tenor_years, yield_pct "
-        "FROM terminal_bond_yields WHERE observation_date = :day ORDER BY original_tenor_years",
-        day=ANCHOR_DATE,
+        select(
+            bond.bond_code, bond.original_tenor_years, bond.remaining_tenor_years, bond.yield_pct
+        )
+        .where(bond.observation_date == ANCHOR_DATE)
+        .order_by(bond.original_tenor_years),
     )
     # The anchor month carries no noise: each yield is the 364-day bill plus the tenor's spread.
     assert [dict(row) for row in anchor_rows] == [
@@ -559,11 +625,16 @@ async def _assert_bonds(engine: AsyncEngine) -> None:
 
 
 async def _assert_cycles(engine: AsyncEngine) -> None:
-    rows = await _fetch_sql(
+    cycle = TerminalCycle
+    rows = await _fetch(
         engine,
-        "SELECT label, event_date, event_type, source FROM terminal_cycles ORDER BY event_date",
+        select(cycle.label, cycle.event_date, cycle.event_type, cycle.source).order_by(
+            cycle.event_date
+        ),
     )
-    assert [tuple(row.values()) for row in rows] == [
+    assert [
+        (row["label"], row["event_date"], row["event_type"], row["source"]) for row in rows
+    ] == [
         ("2013 Cycle", date(2013, 3, 4), "general_election", SEED_SOURCE),
         ("2017 Cycle", date(2017, 8, 8), "general_election", SEED_SOURCE),
         ("2022 Cycle", date(2022, 8, 9), "general_election", SEED_SOURCE),
@@ -575,7 +646,7 @@ async def _assert_cycles(engine: AsyncEngine) -> None:
 
 
 async def _assert_ipo_preset(engine: AsyncEngine) -> None:
-    (row,) = await _fetch_sql(engine, "SELECT * FROM terminal_ipo_scenarios")
+    (row,) = await _fetch(engine, select(TerminalIpoScenario.__table__))
     for preset_field in fields(QUICKMART_PRESET):
         name = preset_field.name
         assert row[name] == getattr(QUICKMART_PRESET, name), name
@@ -602,10 +673,11 @@ async def _assert_ipo_preset(engine: AsyncEngine) -> None:
 
 
 async def _assert_watchlist(engine: AsyncEngine) -> None:
-    rows = await _fetch_sql(
+    rows = await _fetch(
         engine,
-        "SELECT w.owner_key, w.name, i.ticker FROM terminal_watchlists w "
-        "JOIN terminal_watchlist_items i ON i.watchlist_id = w.id",
+        select(TerminalWatchlist.owner_key, TerminalWatchlist.name, TerminalWatchlistItem.ticker)
+        .select_from(TerminalWatchlist)
+        .join(TerminalWatchlistItem, TerminalWatchlistItem.watchlist_id == TerminalWatchlist.id),
     )
     assert {(row["owner_key"], row["name"]) for row in rows} == {(SEED_OWNER, SEED_WATCHLIST_NAME)}
     assert sorted(row["ticker"] for row in rows) == sorted(TICKERS)
@@ -638,14 +710,24 @@ async def _price_rows(
     """Every column of ``ticker``'s price row on each of ``days``; a missing row fails."""
     rows: dict[date, dict[str, Any]] = {}
     for day in days:
-        (row,) = await _fetch(engine, _PRICE_ROW_SQL, ticker=ticker, trade_date=day)
+        (row,) = await _fetch(
+            engine,
+            select(TerminalDailyPrice.__table__).where(
+                TerminalDailyPrice.ticker == ticker, TerminalDailyPrice.trade_date == day
+            ),
+        )
         rows[day] = dict(row)
     return rows
 
 
 async def _macro_row(engine: AsyncEngine, day: date) -> dict[str, Any]:
     """Every column of the macro row dated ``day``; a missing row fails."""
-    (row,) = await _fetch(engine, _MACRO_ROW_SQL, observation_date=day)
+    (row,) = await _fetch(
+        engine,
+        select(TerminalMacroIndicator.__table__).where(
+            TerminalMacroIndicator.observation_date == day
+        ),
+    )
     return dict(row)
 
 

@@ -5,11 +5,16 @@ It is a prose label, never a URL or a libpq ``key=value`` connection string, and
 driver, the username, the password before ``@`` and every query value, because asyncpg also reads
 the password from ``?password=...``, which ``render_as_string(hide_password=True)`` prints.
 
+A failing engine dispose is reported by that label and the exception's type name alone: the
+driver's error text and its cause chain can quote the URL, so neither is logged or chained.
+
 Every case runs without PostgreSQL: engines are created but never connect. The secrets are
-synthetic markers, so a leak shows as the marker in a label, an error message or a log record.
+synthetic markers, so a leak shows as the marker in a label, an error message, a traceback or a
+log record.
 """
 
 import logging
+import traceback
 from collections.abc import AsyncIterator
 
 import pytest
@@ -36,6 +41,13 @@ MARKED_URL = (
     f"?password={QUERY_PW_MARKER}&application_name={QUERY_VALUE_MARKER}"
 )
 MARKED_URL_LABEL = 'database "opennse" on db.example:5432'
+SECOND_MARKED_URL = (
+    f"postgresql+asyncpg://{USER_MARKER}:{USERINFO_PW_MARKER}@db2.example:5433/opennse_two"
+    f"?password={QUERY_PW_MARKER}&application_name={QUERY_VALUE_MARKER}"
+)
+SECOND_MARKED_URL_LABEL = 'database "opennse_two" on db2.example:5433'
+# The password of the DSN that a failing dispose's error and its cause quote.
+DISPOSE_SENTINEL = "disposeSENTINELmark"
 PLACEHOLDER = "<unparseable database URL>"
 INVALID_URL_MESSAGE = (
     "database URL is not valid; expected postgresql+asyncpg://user:password@host:port/database"
@@ -207,26 +219,82 @@ async def test_session_factory_info_log(caplog: pytest.LogCaptureFixture) -> Non
     _assert_no_secret(caplog.text)
 
 
+@pytest.mark.parametrize(
+    ("database_urls", "failing_urls", "expected_message"),
+    [
+        pytest.param(
+            [MARKED_URL],
+            [MARKED_URL],
+            f"failed to dispose 1 terminal database engine: {MARKED_URL_LABEL} (OSError)",
+            id="one-engine",
+        ),
+        pytest.param(
+            [MARKED_URL, SECOND_MARKED_URL],
+            [MARKED_URL],
+            f"failed to dispose 1 terminal database engine: {MARKED_URL_LABEL} (OSError)",
+            id="first-of-two-fails",
+        ),
+        pytest.param(
+            [MARKED_URL, SECOND_MARKED_URL],
+            [MARKED_URL, SECOND_MARKED_URL],
+            "failed to dispose 2 terminal database engines: "
+            f"{MARKED_URL_LABEL} (OSError); {SECOND_MARKED_URL_LABEL} (OSError)",
+            id="both-of-two-fail",
+        ),
+    ],
+)
 @pytest.mark.usefixtures("no_cached_engines")
 async def test_failing_dispose_log(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    database_urls: list[str],
+    failing_urls: list[str],
+    expected_message: str,
 ) -> None:
-    session_factory(TerminalSettings(database_url=MARKED_URL, _env_file=None))
-    engine = db_session._CACHE[MARKED_URL][0]
+    caplog.set_level(logging.DEBUG, logger="opennse_terminal.db.session")
+    for url in database_urls:
+        session_factory(TerminalSettings(database_url=url, _env_file=None))
+    failing_engines = [db_session._CACHE[url][0] for url in failing_urls]
+    real_dispose = AsyncEngine.dispose
+    attempted: list[str] = []
 
     async def failing_dispose(self: AsyncEngine, close: bool = True) -> None:
-        raise RuntimeError("dispose failed")
+        attempted.append(database_log_label(self.url))
+        if not any(self is engine for engine in failing_engines):
+            await real_dispose(self, close)
+            return
+        # A driver error quoting the DSN, chained to a cause that quotes it too.
+        dsn = f"postgresql+asyncpg://u:{DISPOSE_SENTINEL}@db.example/opennse"
+        try:
+            raise ConnectionResetError(f"reset while closing {dsn}?password={DISPOSE_SENTINEL}")
+        except ConnectionResetError as cause:
+            raise OSError(f"connection to {dsn}?password={DISPOSE_SENTINEL} lost") from cause
 
     # AsyncEngine has __slots__, so the failure is patched on the class for this test only.
     monkeypatch.setattr(AsyncEngine, "dispose", failing_dispose)
-    caplog.set_level(logging.ERROR, logger="opennse_terminal.db.session")
 
-    with pytest.raises(RuntimeError, match="dispose failed"):
+    with pytest.raises(RuntimeError) as raised:
         await dispose_terminal_engine()
 
-    messages = [record.getMessage() for record in caplog.records]
-    assert f"failed to dispose terminal database engine for {MARKED_URL_LABEL}" in messages
-    _assert_no_secret(caplog.text)
+    error = raised.value
+    assert str(error) == expected_message
+    # The original exception is neither the cause nor the context, so no traceback shows it.
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert error.__suppress_context__
+    # Every cached engine was tried, in cache order, and the cache is empty.
+    assert attempted == [database_log_label(url) for url in database_urls]
+    assert db_session._CACHE == {}
+    errors = [record.getMessage() for record in caplog.records if record.levelno >= logging.ERROR]
+    assert errors == [
+        f"failed to dispose terminal database engine for {database_log_label(url)}: OSError"
+        for url in failing_urls
+    ]
+    assert all(record.exc_info is None for record in caplog.records)
+    for text in (str(error), "".join(traceback.format_exception(error)), caplog.text):
+        assert DISPOSE_SENTINEL not in text
+        _assert_no_secret(text)
 
     monkeypatch.undo()
-    await engine.dispose()
+    for engine in failing_engines:
+        await engine.dispose()

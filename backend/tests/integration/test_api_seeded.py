@@ -19,11 +19,16 @@ from typing import Any, Final
 
 import httpx
 import pytest
-from sqlalchemy import text
+from sqlalchemy import Executable, select
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from opennse_terminal import __version__
+from opennse_terminal.models import (
+    TerminalCorporateFiling,
+    TerminalFundamental,
+    TerminalIngestionRun,
+)
 
 BASE: Final[str] = "/api/v1/terminal"
 
@@ -90,26 +95,12 @@ ITEM_COLUMNS: Final[Mapping[str, str]] = {
     "shares_outstanding": "shares_outstanding",
 }
 
-FUNDAMENTALS_SQL: Final[str] = (
-    "SELECT id, filing_id, revenue_kes, ebitda_kes, net_income_kes, total_debt_kes, "
-    "operating_cash_flow_kes, shares_outstanding, source_by_field "
-    "FROM terminal_fundamentals "
-    "WHERE ticker = :ticker AND period_end_date = :period_end AND period_type = :period_type"
-)
-FILING_SQL: Final[str] = (
-    "SELECT ticker, file_sha256, committed_to_fundamentals, page_count, detected_scale "
-    "FROM terminal_corporate_filings WHERE id = :filing_id"
-)
-PDF_RUNS_SQL: Final[str] = (
-    "SELECT status, error_message FROM terminal_ingestion_runs "
-    "WHERE pipeline = 'pdf_filing' AND trigger = 'api' AND details ->> 'file_sha256' = :sha256"
-)
-
 CORE_WATCHLIST: Final[str] = "NSE Core 8"
 CORE_WATCHLIST_TICKERS: Final[list[str]] = sorted(SEEDED_TICKERS)
 
 JsonObject = dict[str, Any]
-CommittedQuery = Callable[..., Awaitable[list[RowMapping]]]
+CommittedQuery = Callable[[Executable], Awaitable[list[RowMapping]]]
+"""The ``committed_query`` fixture: ``(statement, /) -> rows`` on a separate connection."""
 
 
 # ---------------------------------------------------------------------------------------------
@@ -172,9 +163,9 @@ def by_key(items: list[JsonObject], key: str) -> dict[Any, JsonObject]:
     return indexed
 
 
-async def fetch_one(session: AsyncSession, sql: str, **params: object) -> RowMapping:
-    """Run ``sql`` (bound ``params``) on ``session`` and return its single row."""
-    result = await session.execute(text(sql), params)
+async def fetch_one(session: AsyncSession, statement: Executable) -> RowMapping:
+    """Run ``statement`` (values bound inside it) on ``session`` and return its single row."""
+    result = await session.execute(statement)
     return result.mappings().one()
 
 
@@ -666,10 +657,21 @@ async def test_ingest_pdf_commit_merges_all_six_items_into_seeded_scom_fundament
     # are read through the same session the request used.
     fundamentals = await fetch_one(
         db_session,
-        FUNDAMENTALS_SQL,
-        ticker="SCOM",
-        period_end=dt.date(2026, 3, 31),
-        period_type="FY",
+        select(
+            TerminalFundamental.id,
+            TerminalFundamental.filing_id,
+            TerminalFundamental.revenue_kes,
+            TerminalFundamental.ebitda_kes,
+            TerminalFundamental.net_income_kes,
+            TerminalFundamental.total_debt_kes,
+            TerminalFundamental.operating_cash_flow_kes,
+            TerminalFundamental.shares_outstanding,
+            TerminalFundamental.source_by_field,
+        ).where(
+            TerminalFundamental.ticker == "SCOM",
+            TerminalFundamental.period_end_date == dt.date(2026, 3, 31),
+            TerminalFundamental.period_type == "FY",
+        ),
     )
     assert str(fundamentals["id"]) == body["fundamentals_id"]
     assert str(fundamentals["filing_id"]) == body["filing_id"]
@@ -682,7 +684,16 @@ async def test_ingest_pdf_commit_merges_all_six_items_into_seeded_scom_fundament
         assert source == expected_source, column
     assert set(ITEM_COLUMNS.values()) <= set(provenance)
 
-    filing = await fetch_one(db_session, FILING_SQL, filing_id=uuid.UUID(body["filing_id"]))
+    filing = await fetch_one(
+        db_session,
+        select(
+            TerminalCorporateFiling.ticker,
+            TerminalCorporateFiling.file_sha256,
+            TerminalCorporateFiling.committed_to_fundamentals,
+            TerminalCorporateFiling.page_count,
+            TerminalCorporateFiling.detected_scale,
+        ).where(TerminalCorporateFiling.id == uuid.UUID(body["filing_id"])),
+    )
     assert filing["ticker"] == "SCOM"
     assert filing["file_sha256"] == sha256
     assert filing["committed_to_fundamentals"] is True
@@ -690,7 +701,13 @@ async def test_ingest_pdf_commit_merges_all_six_items_into_seeded_scom_fundament
     assert filing["detected_scale"] == 1000
 
     # The audit run row is written on its own connection and is therefore committed.
-    runs = await committed_query(PDF_RUNS_SQL, sha256=sha256)
+    runs = await committed_query(
+        select(TerminalIngestionRun.status, TerminalIngestionRun.error_message).where(
+            TerminalIngestionRun.pipeline == "pdf_filing",
+            TerminalIngestionRun.trigger == "api",
+            TerminalIngestionRun.details["file_sha256"].astext == sha256,
+        )
+    )
     assert [(run["status"], run["error_message"]) for run in runs] == [("succeeded", None)]
 
 
