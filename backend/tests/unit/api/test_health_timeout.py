@@ -7,8 +7,8 @@ cancellation from outside the route must still propagate instead of becoming tha
 Every case runs without PostgreSQL: one hangs a stub session supplied through a
 ``get_terminal_session`` override, the other points the real session factory at a TCP listener
 that accepts connections and never replies. The bound is shortened for the tests through the
-module constant, which the route reads at call time. The credentials are synthetic markers, so a
-leak shows as a marker in the response body or a log record.
+``health_service`` module constant, which the service reads at call time. The credentials are
+synthetic markers, so a leak shows as a marker in the response body or a log record.
 """
 
 import asyncio
@@ -25,6 +25,7 @@ from opennse_terminal.api.deps import get_terminal_session, get_terminal_setting
 from opennse_terminal.api.routes import health
 from opennse_terminal.config import TerminalSettings
 from opennse_terminal.db.session import dispose_terminal_engine
+from opennse_terminal.services import health_service
 
 HEALTH_URL = "http://testserver/api/v1/terminal/health"
 TEST_BOUND_SECONDS = 0.2
@@ -64,7 +65,7 @@ class HangingSession:
 @pytest.fixture
 def short_bound(monkeypatch: pytest.MonkeyPatch) -> None:
     """Shorten the health check's bound for one test."""
-    monkeypatch.setattr(health, "HEALTH_CHECK_TIMEOUT_SECONDS", TEST_BOUND_SECONDS)
+    monkeypatch.setattr(health_service, "HEALTH_CHECK_TIMEOUT_SECONDS", TEST_BOUND_SECONDS)
 
 
 @pytest.fixture
@@ -108,7 +109,7 @@ def _health_records(caplog: pytest.LogCaptureFixture) -> list[tuple[int, str]]:
     return [
         (record.levelno, record.getMessage())
         for record in caplog.records
-        if record.name == health.logger.name
+        if record.name == health_service.logger.name
     ]
 
 
@@ -123,7 +124,7 @@ async def test_hung_session_answers_coded_503_once_the_bound_expires(
 
     app = _health_app()
     app.dependency_overrides[get_terminal_session] = hanging_session_provider
-    caplog.set_level(logging.WARNING, logger=health.logger.name)
+    caplog.set_level(logging.WARNING, logger=health_service.logger.name)
 
     response, elapsed = await _timed_health_request(app)
 
@@ -166,7 +167,7 @@ async def test_external_cancellation_propagates_instead_of_answering_503(
 ) -> None:
     # The production bound stays in force, so the cancellation arrives well before it expires.
     hanging = HangingSession()
-    caplog.set_level(logging.WARNING, logger=health.logger.name)
+    caplog.set_level(logging.WARNING, logger=health_service.logger.name)
     task = asyncio.create_task(health.get_health(hanging))  # type: ignore[arg-type]
     async with asyncio.timeout(PROMPT_SECONDS):
         await hanging.started.wait()

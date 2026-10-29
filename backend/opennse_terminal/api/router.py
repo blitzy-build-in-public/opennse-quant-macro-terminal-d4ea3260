@@ -46,8 +46,13 @@ Collision invariants a host relies on:
   dependencies or route class added. ``include_router`` keeps each route's class, so the ingest
   router's ``TerminalUploadRoute`` (the whole-request 413 guard) and the ``TerminalJsonRoute``
   body decoding of the IPO and watchlist routers travel with ``terminal_router`` into a host.
-* The router registers no middleware, exception handlers, startup, shutdown or lifespan hooks,
-  CORS settings or other global state, none of which a router can carry into a host. Routes and
+* The router deliberately registers no startup, shutdown or lifespan hooks and no other global
+  state. This is the terminal's policy, not a framework limit: a host's ``include_router`` would
+  carry such hooks into the host's own lifecycle, so the terminal keeps none and the host owns
+  its application's lifecycle. The standalone app's own lifespan in ``main.py`` calls
+  ``dispose_terminal_engine()`` on shutdown; a host that keeps the default session provider calls
+  it from its own. Nor does the router register middleware, exception handlers or CORS settings,
+  which are application-level and which an ``APIRouter`` has no way to register. Routes and
   services raise ``HTTPException(status, detail={"code", "message", "field"})`` instead.
 
 ``opennse_terminal.api`` re-exports this module's router while that package is initialising, so
