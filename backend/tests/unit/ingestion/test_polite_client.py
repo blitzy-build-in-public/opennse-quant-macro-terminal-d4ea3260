@@ -24,8 +24,10 @@ import pytest
 import respx
 
 from opennse_terminal.config import TerminalSettings
+from opennse_terminal.ingestion import http as polite_http
 from opennse_terminal.ingestion.base import FetchFailed, RobotsDisallowed
 from opennse_terminal.ingestion.http import (
+    ATTEMPT_DEADLINE_READ_TIMEOUTS,
     BACKOFF_CAP_SECONDS,
     MAX_REDIRECTS,
     MAX_RESPONSE_BYTES,
@@ -213,6 +215,7 @@ async def test_contract_constants() -> None:
     assert MAX_REDIRECTS == 5
     assert frozenset({429, 500, 502, 503, 504}) == RETRY_STATUSES
     assert 60.0 <= BACKOFF_CAP_SECONDS <= 60.0
+    assert ATTEMPT_DEADLINE_READ_TIMEOUTS == 4
     assert ROBOTS_AGENT == "OpenNSE-Terminal"
 
 
@@ -606,6 +609,106 @@ async def test_retry_is_spaced_even_when_retry_after_is_shorter(
     assert_spaced(network.starts())
 
 
+# The attempt deadline runs on the event loop's real clock, so these tests shrink it to 50 ms and
+# stall the mock source on real sleeps far longer than that.
+TEST_DEADLINE_SECONDS = 0.05
+STALL_SECONDS = 5.0
+
+
+@pytest.fixture
+def deadlines_computed(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Each attempt deadline the client computes, while every attempt really gets 50 ms."""
+    computed: list[float] = []
+    compute = polite_http._attempt_deadline_seconds
+
+    def shrunk(read_timeout: float) -> float:
+        computed.append(compute(read_timeout))
+        return TEST_DEADLINE_SECONDS
+
+    monkeypatch.setattr(polite_http, "_attempt_deadline_seconds", shrunk)
+    return computed
+
+
+@pytest.mark.parametrize("stall", ["before-headers", "mid-body"])
+@pytest.mark.parametrize(
+    ("stalled_url", "sent"),
+    [
+        pytest.param(
+            INFLATION_URL, [CBK_ROBOTS] + [INFLATION_URL] * ATTEMPTS_WITH_THREE_RETRIES, id="page"
+        ),
+        pytest.param(CBK_ROBOTS, [CBK_ROBOTS] * ATTEMPTS_WITH_THREE_RETRIES, id="robots-txt"),
+    ],
+)
+async def test_attempt_running_past_its_deadline_is_retried_then_fails(
+    stall: str,
+    stalled_url: str,
+    sent: list[str],
+    deadlines_computed: list[float],
+    network: FakeNetwork,
+    make_client: ClientFactory,
+    sleep: FakeSleep,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def trickle() -> AsyncIterator[bytes]:
+        yield b"a byte inside the read timeout"
+        await asyncio.sleep(STALL_SECONDS)
+        yield b"never reached"
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        if stall == "before-headers":
+            await asyncio.sleep(STALL_SECONDS)
+        return httpx.Response(200, content=trickle())
+
+    network.router.get(stalled_url).mock(side_effect=respond)
+    if stalled_url != CBK_ROBOTS:
+        network.robots(CBK)
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        async with make_client(scraper_min_interval_seconds=0.0) as http:
+            with pytest.raises(FetchFailed) as caught:
+                await http.fetch(INFLATION_URL)
+
+    assert caught.value.reason == "DeadlineExceeded after 4 attempts"
+    assert caught.value.url == stalled_url
+    assert network.urls() == sent
+    # 10 s to connect plus four 30 s read timeouts, at the default settings.
+    assert deadlines_computed
+    assert all(129.99 < deadline < 130.01 for deadline in deadlines_computed)
+    assert len(sleep.delays) == 3
+    assert_backoff(sleep.delays)
+    retries = warnings_logged(caplog)
+    assert len(retries) == 3
+    for n, message in enumerate(retries, start=1):
+        assert f"attempt {n} of 4 failed (DeadlineExceeded)" in message
+
+
+async def test_cancelling_a_fetch_mid_attempt_propagates_without_retry(
+    network: FakeNetwork,
+    make_client: ClientFactory,
+    sleep: FakeSleep,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    network.robots(CBK)
+    started = asyncio.Event()
+
+    async def stall(request: httpx.Request) -> httpx.Response:
+        started.set()
+        await asyncio.sleep(STALL_SECONDS)
+        return httpx.Response(200, text="never served")
+
+    network.router.get(INFLATION_URL).mock(side_effect=stall)
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        async with make_client(scraper_min_interval_seconds=0.0) as http:
+            fetching = asyncio.create_task(http.fetch(INFLATION_URL))
+            await asyncio.wait_for(started.wait(), timeout=STALL_SECONDS)
+            fetching.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await fetching
+
+    assert network.urls() == [CBK_ROBOTS, INFLATION_URL]
+    assert sleep.delays == []
+    assert warnings_logged(caplog) == []
+
+
 # --- robots.txt -------------------------------------------------------------------------------
 
 
@@ -640,53 +743,551 @@ async def test_ensure_allowed_requests_only_robots_txt(
 
 
 @pytest.mark.parametrize(
-    "robots_body",
+    ("robots_body", "url"),
     [
-        pytest.param("User-agent: *\nDisallow: /statistics/\n", id="every-agent"),
-        pytest.param("User-agent: OpenNSE-Terminal\nDisallow: /\n", id="product-token"),
+        pytest.param("User-agent: *\nDisallow: /statistics/\n", RATES_PAGE_URL, id="every-agent"),
+        pytest.param(
+            "User-agent: OpenNSE-Terminal\nDisallow: /\n", RATES_PAGE_URL, id="product-token"
+        ),
         pytest.param(
             "User-agent: OpenNSE-Terminal\nDisallow: /statistics/\n\nUser-agent: *\nAllow: /\n",
+            RATES_PAGE_URL,
             id="product-group-over-wildcard",
+        ),
+        # RFC 9309 matching: the longest rule wins wherever it stands, "*" and "$" are patterns.
+        pytest.param(
+            "User-agent: *\nAllow: /\nDisallow: /blocked\n",
+            f"{CBK}/blocked",
+            id="longer-disallow-after-allow-all",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /*.pdf$\n", f"{CBK}/ok.pdf", id="wildcard-and-end-anchor"
+        ),
+        pytest.param("User-agent: *\nDisallow: /bl*ed\n", f"{CBK}/blocked", id="inner-wildcard"),
+        pytest.param(
+            "User-agent: *\nDisallow: /*a*b*c$\n", f"{CBK}/xaybzc", id="several-wildcards"
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /search?q=\n", f"{CBK}/search?q=kes", id="query-string-rule"
+        ),
+        # A rule's path is matched as its line writes it, not as robotparser's RuleLine rewrites
+        # it ("/*?" into "/*", "/search?" into "/search"); an escaped "*" or "$" is literal.
+        pytest.param(
+            "User-agent: *\nDisallow: /*?\n", f"{CBK}/page?x=1", id="wildcard-then-question-mark"
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /search?\n", f"{CBK}/search?q=1", id="trailing-question-mark"
+        ),
+        pytest.param("User-agent: *\nDisallow: /a;b\n", f"{CBK}/a;b", id="semicolon-in-path"),
+        pytest.param(
+            "User-agent: *\nDisallow: /a%2Ab\n", f"{CBK}/a*b", id="escaped-asterisk-literal"
+        ),
+        pytest.param("User-agent: *\nDisallow: /a%24\n", f"{CBK}/a$", id="escaped-dollar-literal"),
+        # Group selection: the product token is a value's leading letters, "_" and "-", in any
+        # case, and every group naming it (or, failing that, every "*" group) applies.
+        pytest.param(
+            "User-agent: OpenNSE-Terminal/1.0\nDisallow: /\n", RATES_PAGE_URL, id="token-version"
+        ),
+        pytest.param(
+            "User-agent: opennse-terminal\nDisallow: /\n", RATES_PAGE_URL, id="token-lowercase"
+        ),
+        pytest.param(
+            "User-agent: OpenNSE-Terminal\nDisallow: /a/\n\n"
+            "User-agent: opennse-terminal\nDisallow: /statistics/\n",
+            RATES_PAGE_URL,
+            id="product-groups-combined",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /a/\n\nUser-agent: *\nDisallow: /statistics/\n",
+            RATES_PAGE_URL,
+            id="wildcard-groups-combined",
+        ),
+        pytest.param(
+            "User-agent: *\nAllow: /\n\n"
+            "User-agent: OpenNSE-Terminal\nUser-agent: *\nDisallow: /statistics/\n",
+            RATES_PAGE_URL,
+            id="later-group-naming-product-and-wildcard",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /\n\nUser-agent: SomeOtherBot\n",
+            RATES_PAGE_URL,
+            id="rule-less-other-agent-group-at-end",
+        ),
+        pytest.param(
+            "User-agent: *\n\nDisallow: /private\n", f"{CBK}/private", id="empty-line-in-group"
+        ),
+        pytest.param(
+            "\ufeffUser-agent: *\nDisallow: /statistics/\n", RATES_PAGE_URL, id="byte-order-mark"
+        ),
+        # Lines end at CR, LF or CRLF alone (RFC 9309 §2.2's EOL), so no other character that
+        # str.splitlines breaks at can cut a longer Allow down to one that wins the tie.
+        pytest.param(
+            "User-agent: *\r\nDisallow: /private\r\n", f"{CBK}/private", id="crlf-line-endings"
+        ),
+        pytest.param(
+            "User-agent: *\rDisallow: /private\r", f"{CBK}/private", id="lone-cr-line-endings"
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /private\nAllow: /private\x85/public\n",
+            f"{CBK}/private",
+            id="next-line-character-inside-a-line",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /private\nAllow: /private\u2028/public\n",
+            f"{CBK}/private",
+            id="line-separator-inside-a-line",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /private\nAllow: /private\x0c/public\n",
+            f"{CBK}/private",
+            id="form-feed-inside-a-line",
+        ),
+        # A value is trimmed of space and tab alone (RFC 9309 §2.2's WS): other whitespace ending
+        # it stays in the path, so it cannot cut a longer Allow down to one that wins the tie.
+        pytest.param(
+            "User-agent: *\nDisallow: /private\nAllow: /private\x85\n",
+            f"{CBK}/private",
+            id="next-line-character-ending-a-value",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /private\nAllow: /private\u2028\n",
+            f"{CBK}/private",
+            id="line-separator-ending-a-value",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /private\nAllow: /private\x0c\n",
+            f"{CBK}/private",
+            id="form-feed-ending-a-value",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow:\t/private \t\n", f"{CBK}/private", id="space-and-tab-trimmed"
+        ),
+        # Rules and URLs compare in one canonical form (RFC 9309 §2.2.2), whichever side is
+        # escaped: non-ASCII characters as their UTF-8 escapes, hex digits uppercase, and the
+        # escapes of unreserved characters decoded.
+        pytest.param(
+            "User-agent: *\nDisallow: /caf%C3%A9\n", f"{CBK}/café", id="escaped-rule-raw-url"
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /café\n", f"{CBK}/caf%C3%A9", id="raw-rule-escaped-url"
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /caf%c3%a9\n", f"{CBK}/caf%C3%A9", id="lowercase-hex-rule"
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /caf%C3%A9\n", f"{CBK}/caf%c3%a9", id="lowercase-hex-url"
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /baz\n", f"{CBK}/%62%61%7a", id="escaped-unreserved-url"
+        ),
+        # Every other escape stays encoded, matching itself and nothing else: an escaped "%" stays
+        # literal, an escaped "#" is part of the path rather than the start of a fragment, and an
+        # escaped delimiter is not the delimiter. Characters outside the unreserved and reserved
+        # sets, a "%" that starts no escape and a "$" that is not final compare escaped.
+        pytest.param(
+            "User-agent: *\nDisallow: /a%2541\n", f"{CBK}/a%2541", id="escaped-percent-literal"
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /a%23b\n", f"{CBK}/a%23b", id="escaped-hash-in-path"
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /a%3Fb\n", f"{CBK}/a%3Fb", id="escaped-question-mark"
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /a%zz\n", f"{CBK}/a%25zz", id="percent-starting-no-escape"
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /a|b\n", f"{CBK}/a%7Cb", id="unsafe-character-escaped"
+        ),
+        pytest.param("User-agent: *\nDisallow: /a$b\n", f"{CBK}/a$b", id="inner-dollar-literal"),
+        # A longer Allow written with an escaped delimiter, or with an escaped octet that is not
+        # UTF-8, does not reach a URL with the delimiter or with another octet.
+        pytest.param(
+            "User-agent: *\nDisallow: /private/\nAllow: /private%2F\n",
+            f"{CBK}/private/secret",
+            id="escaped-slash-allow-not-the-slash",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /blocked\nAllow: /blocked%2Fok\n",
+            f"{CBK}/blocked/ok",
+            id="longer-escaped-slash-allow-not-the-slash",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /private\nAllow: /private%3Fpublic\n",
+            f"{CBK}/private?public=1",
+            id="escaped-question-mark-allow-not-the-query",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /private\nAllow: /private%FF\n",
+            f"{CBK}/private%FE",
+            id="non-utf8-escapes-distinct",
+        ),
+        # RFC 9309 §2.2.2, Figure 4: each row's path, as a rule, blocks its "path to match".
+        pytest.param(
+            "User-agent: *\nDisallow: /foo/bar?baz=quz\n",
+            f"{CBK}/foo/bar?baz=quz",
+            id="rfc9309-figure-4-row-1",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /foo/bar?baz=https%3A%2F%2Ffoo.bar\n",
+            f"{CBK}/foo/bar?baz=https%3A%2F%2Ffoo.bar",
+            id="rfc9309-figure-4-row-2",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /foo/bar/ツ\n",
+            f"{CBK}/foo/bar/%E3%83%84",
+            id="rfc9309-figure-4-row-3",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /foo/bar/%E3%83%84\n",
+            f"{CBK}/foo/bar/%E3%83%84",
+            id="rfc9309-figure-4-row-4",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /foo/bar/%62%61%7A\n",
+            f"{CBK}/foo/bar/baz",
+            id="rfc9309-figure-4-row-5",
+        ),
+        # Delimiters a rule writes literally match the same delimiters in the URL.
+        pytest.param(
+            "User-agent: *\nDisallow: /foo/bar?baz=https://foo.bar\n",
+            f"{CBK}/foo/bar?baz=https://foo.bar",
+            id="literal-delimiters-in-query",
         ),
     ],
 )
-async def test_disallowed_url_raises_and_is_never_requested(
+async def test_url_robots_txt_disallows_raises_and_is_never_requested(
     robots_body: str,
+    url: str,
     network: FakeNetwork,
     make_client: ClientFactory,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     network.robots(CBK, robots_body)
-    page = network.router.get(RATES_PAGE_URL).respond(200, text="never served")
+    page = network.router.get(url).respond(200, text="never served")
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         async with make_client() as http:
             with pytest.raises(RobotsDisallowed) as caught:
-                await http.fetch(RATES_PAGE_URL)
+                await http.fetch(url)
 
     assert caught.value.reason == "disallowed"
-    assert caught.value.url == RATES_PAGE_URL
+    assert caught.value.url == describe_url(url)
     assert page.call_count == 0
     assert network.urls() == [CBK_ROBOTS]
     assert any("disallows" in message for message in warnings_logged(caplog))
 
 
 @pytest.mark.parametrize(
-    "robots_body",
+    ("robots_body", "url"),
     [
-        pytest.param("User-agent: SomeOtherBot\nDisallow: /\n", id="other-agent-only"),
-        pytest.param("User-agent: *\nDisallow: /private/\n", id="other-path-only"),
-        pytest.param("", id="empty-file"),
+        pytest.param(
+            "User-agent: SomeOtherBot\nDisallow: /\n", RATES_PAGE_URL, id="other-agent-only"
+        ),
+        pytest.param("User-agent: *\nDisallow: /private/\n", RATES_PAGE_URL, id="other-path-only"),
+        pytest.param("", RATES_PAGE_URL, id="empty-file"),
+        pytest.param(
+            "User-agent: *\nDisallow: /\nAllow: /ok\n", f"{CBK}/ok", id="longer-allow-after-all"
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /page\nAllow: /page\n", f"{CBK}/page", id="tie-goes-to-allow"
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /*.pdf$\n", f"{CBK}/a.pdf?x=1", id="anchor-unmet-by-query"
+        ),
+        pytest.param("User-agent: *\nDisallow: /*.pdf$\n", f"{CBK}/a.pdfx", id="anchor-unmet"),
+        pytest.param(
+            "User-agent: *\nDisallow: /search?q=\n", f"{CBK}/search?page=2", id="other-query"
+        ),
+        # Rule paths as written: neither a trailing "?" nor a lone "?", ";" or "//" widens a rule
+        # (robotparser's RuleLine would make each match every URL), and an escaped "*" or "$" is
+        # neither a wildcard nor an anchor.
+        pytest.param(
+            "User-agent: *\nDisallow: /*?\n", f"{CBK}/page", id="wildcard-then-question-mark-unmet"
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /search?\n",
+            f"{CBK}/searchengine",
+            id="trailing-question-mark-unmet",
+        ),
+        pytest.param("User-agent: *\nDisallow: ?\n", f"{CBK}/x", id="question-mark-only"),
+        pytest.param("User-agent: *\nDisallow: ;\n", f"{CBK}/x", id="semicolon-only"),
+        pytest.param("User-agent: *\nDisallow: //\n", f"{CBK}/x", id="double-slash-only"),
+        pytest.param(
+            "User-agent: *\nDisallow: /a%2Ab\n", f"{CBK}/axb", id="escaped-asterisk-not-wildcard"
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /a%24\n", f"{CBK}/a", id="escaped-dollar-not-anchor"
+        ),
+        # Only the escapes of unreserved characters are decoded (RFC 9309 §2.2.2): a rule with an
+        # escaped delimiter does not reach the URL with the delimiter, nor the reverse, and the
+        # escape of an octet that is not UTF-8 reaches that octet alone. A path weighs the same
+        # however it is escaped, so the Allow wins the tie.
+        pytest.param(
+            "User-agent: *\nDisallow: /a%3Fb\n",
+            f"{CBK}/a?b",
+            id="escaped-question-mark-not-the-delimiter",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /a%2Fb\n", f"{CBK}/a/b", id="escaped-slash-not-the-slash"
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /private\nAllow: /private%FF\n",
+            f"{CBK}/private%FF",
+            id="non-utf8-escape-allow-applies",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /foo/bar?baz=https%3A%2F%2Ffoo.bar\n",
+            f"{CBK}/foo/bar?baz=https://foo.bar",
+            id="escaped-query-not-literal-query",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /foo/bar?baz=https://foo.bar\n",
+            f"{CBK}/foo/bar?baz=https%3A%2F%2Ffoo.bar",
+            id="literal-query-not-escaped-query",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /caf%c3%a9\nAllow: /café\n",
+            f"{CBK}/caf%C3%A9",
+            id="tie-across-spellings-goes-to-allow",
+        ),
+        # A character str.splitlines breaks at, but RFC 9309 §2.2's EOL does not, starts no line:
+        # it neither begins another rule nor leaves the path it stands in.
+        pytest.param(
+            "User-agent: *\nDisallow: /private\u2029Disallow: /\n",
+            RATES_PAGE_URL,
+            id="paragraph-separator-starts-no-rule",
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /private\nAllow: /private\x85/public\n",
+            f"{CBK}/private%C2%85/public",
+            id="next-line-character-stays-in-the-path",
+        ),
+        # A value of whitespace other than space and tab is a path, not an empty value: it
+        # matches only URLs starting with it.
+        pytest.param(
+            "User-agent: *\nDisallow: \u2028\n", f"{CBK}/x", id="line-separator-only-value"
+        ),
+        pytest.param(
+            "User-agent: *\nDisallow: /private\nAllow:\t/private\u2028 \t\n",
+            f"{CBK}/private%E2%80%A8",
+            id="line-separator-ending-an-allow-applies",
+        ),
+        pytest.param("User-agent: OpenNSE\nDisallow: /\n", RATES_PAGE_URL, id="token-prefix-only"),
+        pytest.param(
+            "User-agent: OpenNSE-Terminal-Beta\nDisallow: /\n", RATES_PAGE_URL, id="longer-token"
+        ),
+        pytest.param(
+            "User-agent: OpenNSE-Terminal\nAllow: /\n\nUser-agent: *\nDisallow: /\n",
+            RATES_PAGE_URL,
+            id="product-group-overrides-wildcard",
+        ),
+        # A group that ends the file without a rule still applies, and allows every URL.
+        pytest.param(
+            "User-agent: *\nDisallow: /\n\nUser-agent: OpenNSE-Terminal\n",
+            RATES_PAGE_URL,
+            id="rule-less-product-group-at-end",
+        ),
+        pytest.param(
+            "User-agent: SomeOtherBot\nDisallow: /\n\nUser-agent: *\n",
+            RATES_PAGE_URL,
+            id="rule-less-wildcard-group-at-end",
+        ),
     ],
 )
 async def test_url_robots_txt_permits_is_fetched(
-    robots_body: str, network: FakeNetwork, make_client: ClientFactory
+    robots_body: str, url: str, network: FakeNetwork, make_client: ClientFactory
 ) -> None:
     network.robots(CBK, robots_body)
-    network.router.get(RATES_PAGE_URL).respond(200, text="rates")
+    network.router.get(url).respond(200, text="page")
     async with make_client() as http:
-        assert await http.get_text(RATES_PAGE_URL) == "rates"
+        assert await http.get_text(url) == "page"
 
-    assert network.urls() == [CBK_ROBOTS, RATES_PAGE_URL]
+    assert network.urls() == [CBK_ROBOTS, url]
+
+
+async def test_robots_txt_judges_the_url_as_it_would_be_requested(
+    network: FakeNetwork, make_client: ClientFactory
+) -> None:
+    network.robots(NSE, "User-agent: *\nDisallow: /private/\n")
+    async with make_client() as http:
+        with pytest.raises(RobotsDisallowed) as caught:
+            await http.ensure_allowed(f"{NSE}/public/../private/report/")
+
+    assert caught.value.url == f"{NSE}/private/report/"
+    assert network.urls() == [f"{NSE}/robots.txt"]
+
+
+@pytest.mark.parametrize(
+    ("content_type", "body", "blocked"),
+    [
+        # Decoded by its declared codec, the escape would be a lone surrogate, which robotparser
+        # cannot quote; as UTF-8 it is six ASCII characters.
+        pytest.param(
+            "text/plain; charset=unicode_escape",
+            b"User-agent: *\nDisallow: /a\\ud800b\nDisallow: /private\n",
+            f"{CBK}/private",
+            id="unicode-escape-declared",
+        ),
+        pytest.param(
+            "text/plain; charset=windows-1252",
+            "User-agent: *\nDisallow: /café\n".encode(),
+            f"{CBK}/café",
+            id="windows-1252-declared-utf8-sent",
+        ),
+        pytest.param(
+            "text/plain; charset=windows-1252",
+            b"\xef\xbb\xbfUser-agent: *\nDisallow: /private\n",
+            f"{CBK}/private",
+            id="utf8-byte-order-mark-under-another-charset",
+        ),
+        # Undecodable bytes become U+FFFD in a User-agent value and a rule's path alike.
+        pytest.param(
+            "text/plain; charset=utf-8",
+            b"User-agent: \xffBot\nDisallow: /\n\n"
+            b"User-agent: *\nDisallow: /a\xffb\nDisallow: /private\n",
+            f"{CBK}/private",
+            id="undecodable-bytes-in-agent-and-rule",
+        ),
+        # Values robotparser converts with an error on them: rule paths urlparse rejects as
+        # malformed authorities, and a crawl rate str.isdigit accepts but int does not. The line
+        # stays a rule line and the file's other rules stay in force.
+        pytest.param(
+            "text/plain; charset=utf-8",
+            b"User-agent: *\nDisallow: //x]\nDisallow: /private\n",
+            f"{CBK}/private",
+            id="unopened-bracket-rule",
+        ),
+        pytest.param(
+            "text/plain; charset=utf-8",
+            b"User-agent: *\nAllow: //[x\nDisallow: /private\n",
+            f"{CBK}/private",
+            id="unclosed-bracket-rule",
+        ),
+        pytest.param(
+            "text/plain; charset=utf-8",
+            "User-agent: *\nDisallow: //a\uff03b\nDisallow: /private\n".encode(),
+            f"{CBK}/private",
+            id="fullwidth-delimiter-in-authority-rule",
+        ),
+        pytest.param(
+            "text/plain; charset=utf-8",
+            "User-agent: *\nCrawl-delay: \u00b2\nDisallow: /private\n".encode(),
+            f"{CBK}/private",
+            id="superscript-crawl-delay",
+        ),
+        pytest.param(
+            "text/plain; charset=utf-8",
+            "User-agent: *\nRequest-rate: \u00b2/1\nDisallow: /private\n".encode(),
+            f"{CBK}/private",
+            id="superscript-request-rate",
+        ),
+    ],
+)
+async def test_robots_txt_is_read_as_utf8_and_no_line_makes_robotparser_raise(
+    content_type: str,
+    body: bytes,
+    blocked: str,
+    network: FakeNetwork,
+    make_client: ClientFactory,
+) -> None:
+    network.router.get(CBK_ROBOTS).respond(
+        200, headers={"Content-Type": content_type}, content=body
+    )
+    page = network.router.get(blocked).respond(200, text="never served")
+    public = f"{CBK}/public"
+    network.router.get(public).respond(200, text="public")
+    async with make_client() as http:
+        with pytest.raises(RobotsDisallowed) as caught:
+            await http.fetch(blocked)
+        assert await http.get_text(public) == "public"
+
+    assert caught.value.reason == "disallowed"
+    assert page.call_count == 0
+    assert network.urls() == [CBK_ROBOTS, public]
+
+
+class BytesPathRuleLine:
+    """A ``urllib.robotparser.RuleLine`` stand-in whose ``path`` is not the str CPython's is."""
+
+    def __init__(self, path: str, allowance: bool) -> None:
+        self.path = path.encode()
+        self.allowance = allowance
+
+
+class KindFlippedRuleLine:
+    """A ``urllib.robotparser.RuleLine`` stand-in whose ``allowance`` is the opposite of the one
+    its line sets, as a parser classifying rule lines differently would record."""
+
+    def __init__(self, path: str, allowance: bool) -> None:
+        self.path = path
+        self.allowance = not (allowance or path == "")
+
+
+_RECORD_ENTRY = polite_http._GroupRecordingParser._add_entry
+
+
+def record_entry_without_its_last_rule(parser: Any, entry: Any) -> None:
+    """The client's ``_add_entry`` hook, losing the entry's last rule line first, as a parser
+    that made no rule of one of the body's rule lines would."""
+    del entry.rulelines[-1:]
+    _RECORD_ENTRY(parser, entry)
+
+
+def record_entry_with_its_last_rule_repeated(parser: Any, entry: Any) -> None:
+    """The client's ``_add_entry`` hook, repeating the entry's last rule line first, as a parser
+    that made a rule of a line the body has no rule line for would."""
+    entry.rulelines.extend(entry.rulelines[-1:])
+    _RECORD_ENTRY(parser, entry)
+
+
+@pytest.mark.parametrize(
+    ("target", "replacement"),
+    [
+        # parse() files its groups through a hook other than the one the client overrides.
+        pytest.param(
+            "opennse_terminal.ingestion.http._GroupRecordingParser._add_entry",
+            None,
+            id="hook-bypassed",
+        ),
+        pytest.param("urllib.robotparser.RobotFileParser._add_entry", None, id="hook-removed"),
+        pytest.param("urllib.robotparser.RuleLine", BytesPathRuleLine, id="rule-shape-changed"),
+        # parse()'s rules no longer pair, in order and in kind, with the body's rule lines, whose
+        # paths the rules are built from.
+        pytest.param(
+            "opennse_terminal.ingestion.http._GroupRecordingParser._add_entry",
+            record_entry_without_its_last_rule,
+            id="rule-line-dropped",
+        ),
+        pytest.param(
+            "opennse_terminal.ingestion.http._GroupRecordingParser._add_entry",
+            record_entry_with_its_last_rule_repeated,
+            id="rule-line-added",
+        ),
+        pytest.param("urllib.robotparser.RuleLine", KindFlippedRuleLine, id="rule-kind-changed"),
+    ],
+)
+async def test_robots_txt_is_not_judged_when_robotparser_internals_change(
+    target: str,
+    replacement: Callable[..., object] | None,
+    network: FakeNetwork,
+    make_client: ClientFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if replacement is None:
+        monkeypatch.delattr(target)
+    else:
+        monkeypatch.setattr(target, replacement)
+    robots = network.robots(CBK, "User-agent: *\nDisallow: /private/\n")
+    page = network.router.get(RATES_PAGE_URL).respond(200, text="never served")
+    async with make_client() as http:
+        with pytest.raises(RuntimeError, match="robots.txt cannot be evaluated"):
+            await http.fetch(RATES_PAGE_URL)
+        # No verdict was kept, so the next check reads the file again and fails again.
+        with pytest.raises(RuntimeError, match="robots.txt cannot be evaluated"):
+            await http.ensure_allowed(RATES_PAGE_URL)
+
+    assert robots.call_count == 2
+    assert page.call_count == 0
 
 
 @pytest.mark.parametrize(
@@ -1189,20 +1790,75 @@ async def test_cross_host_redirect_to_a_disallowed_url_is_not_requested(
             "url_has_userinfo",
             id="userinfo-location",
         ),
+        pytest.param({"Location": "data:text/plain,x"}, "unsupported_url", id="data-location"),
+        pytest.param(
+            {"Location": "javascript:alert(1)"}, "unsupported_url", id="javascript-location"
+        ),
+        pytest.param({"Location": "http://[::1"}, "invalid_redirect", id="unparseable-location"),
+        pytest.param(
+            {"Location": "http://xn--/files/rates.csv"}, "invalid_url", id="malformed-idna-host"
+        ),
+        pytest.param(
+            {"Location": "https://other.example.net:65536/files/rates.csv"},
+            "invalid_url",
+            id="port-out-of-range",
+        ),
     ],
 )
 async def test_unusable_redirect_fails_the_fetch(
-    headers: dict[str, str], reason: str, network: FakeNetwork, make_client: ClientFactory
+    headers: dict[str, str],
+    reason: str,
+    network: FakeNetwork,
+    make_client: ClientFactory,
+    sleep: FakeSleep,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     network.robots(CBK)
     network.router.get(INFLATION_URL).respond(302, headers=headers)
-    async with make_client() as http:
-        with pytest.raises(FetchFailed) as caught:
-            await http.fetch(INFLATION_URL)
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        async with make_client(scraper_min_interval_seconds=0.0) as http:
+            with pytest.raises(FetchFailed) as caught:
+                await http.fetch(INFLATION_URL)
 
     assert caught.value.reason == reason
     assert "SECRET" not in str(caught.value)
+    # Refused at once: one request, no retry, and the target never requested.
     assert network.urls() == [CBK_ROBOTS, INFLATION_URL]
+    assert sleep.delays == []
+    assert warnings_logged(caplog) == []
+
+
+@pytest.mark.parametrize(
+    ("location", "reason"),
+    [
+        pytest.param("data:text/plain,x", "unsupported_url", id="data"),
+        pytest.param("javascript:alert(1)", "unsupported_url", id="javascript"),
+        pytest.param("http://[::1", "invalid_redirect", id="unparseable"),
+    ],
+)
+async def test_robots_txt_redirect_to_an_unusable_location_fails_without_a_verdict(
+    location: str,
+    reason: str,
+    network: FakeNetwork,
+    make_client: ClientFactory,
+    sleep: FakeSleep,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    robots = network.router.get(CBK_ROBOTS).respond(302, headers={"Location": location})
+    page = network.router.get(INFLATION_URL).respond(200, text="never served")
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        async with make_client(scraper_min_interval_seconds=0.0) as http:
+            with pytest.raises(FetchFailed) as caught:
+                await http.fetch(INFLATION_URL)
+            # No verdict was kept for the origin, so a later check asks again and fails again.
+            with pytest.raises(FetchFailed) as again:
+                await http.ensure_allowed(BONDS_URL)
+
+    assert caught.value.reason == again.value.reason == reason
+    assert robots.call_count == 2
+    assert page.call_count == 0
+    assert sleep.delays == []
+    assert warnings_logged(caplog) == []
 
 
 # --- URL validation, fetch variants and decoding ---------------------------------------------
@@ -1227,6 +1883,15 @@ async def test_unusable_redirect_fails_the_fetch(
             "https:///statistics/", "unsupported_url", "<https URL without a host>", id="no-host"
         ),
         pytest.param(f"{CBK}/\x00", "invalid_url", "<invalid URL>", id="control-character"),
+        pytest.param(
+            "https://xn--/rates.csv", "invalid_url", "https://xn--/rates.csv", id="malformed-idna"
+        ),
+        pytest.param(
+            f"{CBK}:65536/rates.csv",
+            "invalid_url",
+            f"{CBK}:65536/rates.csv",
+            id="port-out-of-range",
+        ),
         pytest.param(
             "https://user:SECRET@www.centralbank.go.ke/rates.csv?token=SECRET#SECRET",
             "url_has_userinfo",
@@ -1297,6 +1962,74 @@ async def test_retries_and_failures_name_urls_without_userinfo_query_or_error_te
     assert f"GET {CBK}/moved/file.csv -> 404" in messages
 
 
+LIBRARY_LOGGERS = frozenset(
+    {
+        "httpx",
+        "httpcore.connection",
+        "httpcore.http11",
+        "httpcore.http2",
+        "httpcore.proxy",
+        "httpcore.socks",
+    }
+)
+# What httpcore traces at DEBUG once a response's headers are in, on a real connection; the mock
+# transport has no connection, so the mock source writes it.
+HEADERS_TRACE = (
+    "receive_response_headers.complete return_value=(b'HTTP/1.1', {status}, [{headers}])"
+)
+
+
+def library_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [record.getMessage() for record in caplog.records if record.name in LIBRARY_LOGGERS]
+
+
+async def test_library_records_of_own_requests_are_redacted_and_a_hosts_are_not(
+    network: FakeNetwork, make_client: ClientFactory, caplog: pytest.LogCaptureFixture
+) -> None:
+    trace = logging.getLogger("httpcore.http11")
+    userinfo_location = "https://bob:SECRET@other.example.net/files/rates.csv"
+
+    def traced_redirect(request: httpx.Request) -> httpx.Response:
+        trace.debug(
+            HEADERS_TRACE.format(status=302, headers=f"(b'Location', b'{userinfo_location}')")
+        )
+        return httpx.Response(302, headers={"Location": userinfo_location})
+
+    def traced_host_response(request: httpx.Request) -> httpx.Response:
+        trace.debug(HEADERS_TRACE.format(status=200, headers="(b'X-Host', b'hostheader')"))
+        return httpx.Response(200)
+
+    network.robots(CBK)
+    network.router.get(f"{CBK}/files/rates.csv?token=SECRET").respond(404)
+    network.router.get(f"{CBK}/moved?api_key=SECRET").mock(side_effect=traced_redirect)
+    with caplog.at_level(logging.DEBUG):
+        async with make_client(scraper_min_interval_seconds=0.0) as http:
+            with pytest.raises(FetchFailed) as missing:
+                await http.fetch(f"{CBK}/files/rates.csv?token=SECRET#SECRET")
+            with pytest.raises(FetchFailed) as refused:
+                await http.fetch(f"{CBK}/moved?api_key=SECRET")
+        own = library_messages(caplog)
+        caplog.clear()
+        # A host application's own client keeps the httpx and httpcore records it always had.
+        transport = httpx.MockTransport(traced_host_response)
+        async with httpx.AsyncClient(transport=transport) as host_client:
+            await host_client.get(f"{CBK}/host?hostquery=1#top")
+        host = library_messages(caplog)
+
+    assert missing.value.reason == "http_404"
+    assert refused.value.reason == "url_has_userinfo"
+    assert own == [
+        f'HTTP Request: GET {CBK_ROBOTS} "HTTP/1.1 200 OK"',
+        f'HTTP Request: GET {CBK}/files/rates.csv "HTTP/1.1 404 Not Found"',
+        "receive_response_headers.complete",
+        f'HTTP Request: GET {CBK}/moved "HTTP/1.1 302 Found"',
+    ]
+    assert host == [
+        HEADERS_TRACE.format(status=200, headers="(b'X-Host', b'hostheader')"),
+        f'HTTP Request: GET {CBK}/host?hostquery=1#top "HTTP/1.1 200 OK"',
+    ]
+
+
 @pytest.mark.parametrize(
     ("url", "expected"),
     [
@@ -1323,6 +2056,7 @@ async def test_retries_and_failures_name_urls_without_userinfo_query_or_error_te
         ),
         pytest.param("mailto:SECRET@example.net", "<mailto URL without a host>", id="mailto"),
         pytest.param(f"{CBK}/\x00?token=SECRET", "<invalid URL>", id="unparseable"),
+        pytest.param("http://xn--/x?token=SECRET", "http://xn--/x", id="malformed-idna-host"),
         pytest.param(
             httpx.URL("https://user:SECRET@www.centralbank.go.ke/x?token=SECRET"),
             f"{CBK}/x",
