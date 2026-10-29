@@ -1,0 +1,22 @@
+# Gazetted NSE exchange closures that the Public Holidays Act (Cap. 110) rules cannot compute.
+# verified_years: 2026,2027
+# Read by opennse_terminal.ingestion.calendar (parse_closures_csv via ExchangeCalendar.load_default).
+# Used only to date live NSE market-statistics snapshots; analytics and the seeder never read it.
+# Not listed (computed by rule): 1 Jan, 1 May, 1 Jun, 10 Oct (Mazingira Day), 20 Oct, 12 Dec, 25 Dec,
+#   26 Dec, Good Friday, Easter Monday, and section 4 Sunday substitutes such as 2027-10-11,
+#   2027-12-13 and 2027-12-27.
+# Listed: observed weekday closures only. Idd-ul-Fitr (Part I; date gazetted each year), Idd-ul-Azha
+#   when gazetted (Part II), and any ad hoc public holiday or NSE market closure.
+# Each row cites its Kenya Gazette notice or NSE market notice. Public official sources only.
+# Act: https://new.kenyalaw.org/akn/ke/act/1912/21/eng%402024-04-26/source
+# Notice 3955: https://new.kenyalaw.org/akn/ke/officialGazette/2026-03-18/50/eng%402026-03-18/source.pdf
+# Notice 7653 number per contemporaneous reports (Education News 2026-05-25; The Star 2026-05-26);
+#   confirm against the Gazette scan.
+# 2027 Islamic-calendar dates are provisional until gazetted
+# 2027 Idd-ul-Fitr is listed at its expected date (Jamia Mosque Nairobi tentative calendar; moon-dependent).
+# 2027 Idd-ul-Azha (expected 2027-05-17) is not listed: it closes the market only if gazetted.
+# Adding a year is a data-only change: add that year's rows, then extend the verified-years line.
+date,reason,reference
+2026-03-20,Idd-ul-Fitr,Kenya Gazette Notice No. 3955 of 18 March 2026 (Vol. CXXVIII No. 50 Special Issue)
+2026-05-27,Idd-ul-Azha (gazetted),Kenya Gazette Notice No. 7653 of 25 May 2026
+2027-03-10,Idd-ul-Fitr,expected — confirm against Kenya Gazette notice when published
