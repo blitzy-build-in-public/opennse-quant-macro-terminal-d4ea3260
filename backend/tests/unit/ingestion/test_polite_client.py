@@ -10,6 +10,8 @@ response size cap), compared with explicit bounds rather than float equality.
 
 import asyncio
 import logging
+import tracemalloc
+import zlib
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -32,6 +34,7 @@ from opennse_terminal.ingestion.http import (
     FetchedResponse,
     PoliteClient,
     build_user_agent,
+    describe_url,
 )
 
 LOGGER = "opennse_terminal.ingestion.http"
@@ -267,6 +270,40 @@ async def test_cookies_set_by_a_source_are_never_sent_back(
     assert all("cookie" not in sent.request.headers for sent in network.sent)
 
 
+async def test_cookie_set_while_a_body_streams_is_neither_stored_nor_sent_concurrently(
+    network: FakeNetwork, make_client: ClientFactory
+) -> None:
+    network.robots(CBK)
+    mid_body = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_body() -> AsyncIterator[bytes]:
+        yield b"first half, "
+        # Reached when the client asks for more: the headers, Set-Cookie included, are in.
+        mid_body.set()
+        await release.wait()
+        yield b"second half"
+
+    network.router.get(CSV_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, headers={"Set-Cookie": "session=abc; Path=/"}, content=slow_body()
+        )
+    )
+    network.router.get(INFLATION_URL).respond(200, text="fast")
+    async with make_client() as http:
+        slow = asyncio.create_task(http.get_bytes(CSV_URL))
+        await asyncio.wait_for(mid_body.wait(), timeout=5.0)
+        cookies_while_streaming = len(http._require_client().cookies.jar)
+        await http.fetch(INFLATION_URL)
+        release.set()
+        body = await slow
+
+    assert body == b"first half, second half"
+    assert cookies_while_streaming == 0
+    assert network.urls() == [CBK_ROBOTS, CSV_URL, INFLATION_URL]
+    assert all("cookie" not in sent.request.headers for sent in network.sent)
+
+
 # --- Per-host spacing ---------------------------------------------------------------------------
 
 
@@ -484,9 +521,15 @@ async def test_non_transient_transport_error_fails_without_retry(
         pytest.param("7", 7.0, 8.0, id="seconds"),
         pytest.param(" 7 ", 7.0, 8.0, id="seconds-with-whitespace"),
         pytest.param("120", 60.0, 60.0, id="seconds-capped-at-60"),
+        pytest.param("9" * 400, 60.0, 60.0, id="400-digit-seconds-capped-at-60"),
+        pytest.param("9" * 5000, 60.0, 60.0, id="5000-digit-seconds-capped-at-60"),
+        pytest.param("0007", 7.0, 8.0, id="seconds-with-leading-zeros"),
         pytest.param("0", 0.0, 0.0, id="zero"),
         pytest.param("Wed, 21 Oct 2015 07:28:00 GMT", 0.0, 0.0, id="http-date-in-the-past"),
         pytest.param("Wed, 21 Oct 2015 07:28:00 -0000", 0.0, 0.0, id="http-date-naive-zone"),
+        pytest.param(
+            f"Wed, 21 Oct {'9' * 30} 07:28:00 GMT", 2.0, 3.0, id="http-date-overflow-uses-backoff"
+        ),
         pytest.param("soon", 2.0, 3.0, id="malformed-uses-backoff"),
         pytest.param("-5", 2.0, 3.0, id="negative-uses-backoff"),
         pytest.param("", 2.0, 3.0, id="empty-uses-backoff"),
@@ -679,7 +722,7 @@ async def test_unreachable_robots_txt_disallows_the_whole_origin(
     assert any("unreachable" in message for message in warnings_logged(caplog))
 
 
-@pytest.mark.parametrize("status", [401, 403, 404, 410])
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 410, 451])
 async def test_unavailable_robots_txt_means_no_rules_apply(
     status: int, network: FakeNetwork, make_client: ClientFactory
 ) -> None:
@@ -722,6 +765,40 @@ async def test_robots_txt_network_failure_fails_the_fetch(
     assert page.call_count == 0
 
 
+@pytest.mark.parametrize(
+    ("status", "headers"),
+    [
+        pytest.param(301, {}, id="301-without-location"),
+        pytest.param(302, {}, id="302-without-location"),
+        pytest.param(307, {}, id="307-without-location"),
+        pytest.param(300, {"Location": OTHER_ROBOTS}, id="300-not-followed"),
+        pytest.param(304, {}, id="304-not-modified"),
+    ],
+)
+async def test_robots_txt_status_granting_nothing_fails_the_fetch(
+    status: int,
+    headers: dict[str, str],
+    network: FakeNetwork,
+    make_client: ClientFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    network.router.get(CBK_ROBOTS).respond(status, headers=headers)
+    page = network.router.get(INFLATION_URL).respond(200, text="never served")
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        async with make_client(scraper_min_interval_seconds=0.0) as http:
+            with pytest.raises(FetchFailed) as caught:
+                await http.fetch(INFLATION_URL)
+            # No allow-all verdict was kept for the origin, so a later check fails as well.
+            with pytest.raises(FetchFailed) as again:
+                await http.ensure_allowed(BONDS_URL)
+
+    assert caught.value.reason == again.value.reason == f"robots_http_{status}"
+    assert caught.value.url == again.value.url == CBK_ROBOTS
+    assert page.call_count == 0
+    assert set(network.urls()) == {CBK_ROBOTS}
+    assert any(f"answered HTTP {status}" in message for message in warnings_logged(caplog))
+
+
 # --- Response size ----------------------------------------------------------------------------
 
 
@@ -758,6 +835,45 @@ async def test_declared_content_length_over_the_cap_is_rejected_before_reading(
     assert body.produced == 0
 
 
+@pytest.mark.parametrize(
+    "content_length",
+    [
+        pytest.param("9" * 30, id="30-digits"),
+        pytest.param("9" * 5000, id="5000-digits"),
+    ],
+)
+async def test_declared_content_length_of_any_digit_count_over_the_cap_is_rejected_unread(
+    content_length: str, network: FakeNetwork, make_client: ClientFactory
+) -> None:
+    network.robots(CBK)
+    body = ChunkedBody(chunks=40)
+    network.router.get(PDF_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, headers={"Content-Length": content_length}, content=body
+        )
+    )
+    async with make_client() as http:
+        with pytest.raises(FetchFailed) as caught:
+            await http.fetch(PDF_URL)
+
+    assert caught.value.reason == "response_too_large"
+    assert body.produced == 0
+
+
+async def test_declared_content_length_with_leading_zeros_under_the_cap_is_accepted(
+    network: FakeNetwork, make_client: ClientFactory
+) -> None:
+    network.robots(CBK)
+    content = b"x" * 123
+    network.router.get(PDF_URL).respond(
+        200, headers={"Content-Length": "0" * 5000 + "123"}, content=content
+    )
+    async with make_client() as http:
+        body = await http.get_bytes(PDF_URL)
+
+    assert body == content
+
+
 async def test_body_of_exactly_the_cap_is_accepted(
     network: FakeNetwork, make_client: ClientFactory
 ) -> None:
@@ -767,6 +883,199 @@ async def test_body_of_exactly_the_cap_is_accepted(
         body = await http.get_bytes(PDF_URL)
 
     assert len(body) == MAX_RESPONSE_BYTES
+
+
+# --- Content codings ----------------------------------------------------------------------------
+
+PAYLOAD = b"YEAR,MONTH,Repo,Interbank Rate\n2026,September,8.75,8.75\n" * 200
+_WINDOW_BITS = {"gzip": 16 + zlib.MAX_WBITS, "deflate": zlib.MAX_WBITS, "raw": -zlib.MAX_WBITS}
+
+
+def encode(data: bytes, coding: str) -> bytes:
+    """``data`` as one gzip member (``"gzip"``), a zlib stream (``"deflate"``) or raw DEFLATE
+    data (``"raw"``, which some servers send as ``deflate``)."""
+    compressor = zlib.compressobj(9, zlib.DEFLATED, _WINDOW_BITS[coding])
+    return compressor.compress(data) + compressor.flush()
+
+
+class StreamedBody:
+    """``data`` streamed in ``chunk_size`` slices, as a network transport delivers a body, counting
+    the slices the client pulled. (A response built from bytes reaches the client already read.)"""
+
+    def __init__(self, data: bytes, chunk_size: int = 64 * 1024) -> None:
+        self.data = data
+        self.chunk_size = chunk_size
+        self.chunks = -(-len(data) // chunk_size)
+        self.produced = 0
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for start in range(0, len(self.data), self.chunk_size):
+            self.produced += 1
+            yield self.data[start : start + self.chunk_size]
+
+
+def mock_streamed(
+    network: FakeNetwork, url: str, content_encoding: str, body: StreamedBody
+) -> respx.Route:
+    return network.router.get(url).mock(
+        side_effect=lambda request: httpx.Response(
+            200, headers={"Content-Encoding": content_encoding}, content=body
+        )
+    )
+
+
+async def test_requests_ask_for_an_unencoded_body(
+    network: FakeNetwork, make_client: ClientFactory
+) -> None:
+    network.robots(CBK)
+    network.router.get(INFLATION_URL).respond(200, text="ok")
+    async with make_client() as http:
+        await http.fetch(INFLATION_URL)
+
+    assert network.urls() == [CBK_ROBOTS, INFLATION_URL]
+    assert [sent.request.headers["accept-encoding"] for sent in network.sent] == ["identity"] * 2
+
+
+@pytest.mark.parametrize("coding", ["gzip", "deflate"])
+async def test_compressed_body_expanding_past_the_cap_is_rejected_in_bounded_memory(
+    coding: str, network: FakeNetwork, make_client: ClientFactory
+) -> None:
+    network.robots(CBK)
+    # About 100 KiB on the wire that would expand to four times the cap.
+    bomb = StreamedBody(encode(b"\0" * (4 * MAX_RESPONSE_BYTES), coding))
+    mock_streamed(network, CSV_URL, coding, bomb)
+    tracemalloc.start()
+    try:
+        async with make_client() as http:
+            with pytest.raises(FetchFailed) as caught:
+                await http.get_bytes(CSV_URL)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert caught.value.reason == "response_too_large"
+    assert bomb.produced < bomb.chunks
+    # The decoded bytes kept never pass the cap; decoding adds at most a few small buffers.
+    assert peak < MAX_RESPONSE_BYTES + 4 * MIB
+
+
+@pytest.mark.parametrize("chunk_size", [1, 64 * 1024])
+@pytest.mark.parametrize(
+    ("content_encoding", "encoded", "decoded"),
+    [
+        pytest.param("gzip", encode(PAYLOAD, "gzip"), PAYLOAD, id="gzip"),
+        pytest.param("X-GZIP", encode(PAYLOAD, "gzip"), PAYLOAD, id="x-gzip"),
+        pytest.param("deflate", encode(PAYLOAD, "deflate"), PAYLOAD, id="deflate-zlib"),
+        pytest.param("deflate", encode(PAYLOAD, "raw"), PAYLOAD, id="deflate-raw"),
+        pytest.param(
+            "gzip",
+            encode(PAYLOAD[:1000], "gzip") + encode(PAYLOAD[1000:], "gzip"),
+            PAYLOAD,
+            id="gzip-two-members",
+        ),
+        pytest.param("identity, gzip", encode(PAYLOAD, "gzip"), PAYLOAD, id="identity-and-gzip"),
+        pytest.param("identity", PAYLOAD, PAYLOAD, id="identity"),
+        pytest.param("gzip", b"", b"", id="empty-gzip"),
+    ],
+)
+async def test_encoded_body_is_decoded_as_it_streams(
+    content_encoding: str,
+    encoded: bytes,
+    decoded: bytes,
+    chunk_size: int,
+    network: FakeNetwork,
+    make_client: ClientFactory,
+) -> None:
+    network.robots(CBK)
+    mock_streamed(network, CSV_URL, content_encoding, StreamedBody(encoded, chunk_size))
+    async with make_client() as http:
+        body = await http.get_bytes(CSV_URL)
+
+    assert body == decoded
+
+
+@pytest.mark.parametrize("coding", ["gzip", "deflate"])
+async def test_decoded_body_of_exactly_the_cap_is_accepted_and_one_byte_more_is_not(
+    coding: str, network: FakeNetwork, make_client: ClientFactory
+) -> None:
+    network.robots(CBK)
+    mock_streamed(
+        network, CSV_URL, coding, StreamedBody(encode(b"\0" * MAX_RESPONSE_BYTES, coding))
+    )
+    mock_streamed(
+        network, PDF_URL, coding, StreamedBody(encode(b"\0" * (MAX_RESPONSE_BYTES + 1), coding))
+    )
+    async with make_client() as http:
+        body = await http.get_bytes(CSV_URL)
+        with pytest.raises(FetchFailed) as caught:
+            await http.get_bytes(PDF_URL)
+
+    assert len(body) == MAX_RESPONSE_BYTES
+    assert caught.value.reason == "response_too_large"
+
+
+@pytest.mark.parametrize("content_encoding", ["br", "zstd", "compress", "gzip, gzip", "gzip, br"])
+async def test_unsupported_content_coding_fails_without_reading_the_body(
+    content_encoding: str, network: FakeNetwork, make_client: ClientFactory
+) -> None:
+    network.robots(CBK)
+    body = StreamedBody(encode(PAYLOAD, "gzip"))
+    mock_streamed(network, CSV_URL, content_encoding, body)
+    async with make_client() as http:
+        with pytest.raises(FetchFailed) as caught:
+            await http.get_bytes(CSV_URL)
+
+    assert caught.value.reason == "unsupported_content_encoding"
+    assert body.produced == 0
+
+
+@pytest.mark.parametrize(
+    ("content_encoding", "encoded"),
+    [
+        pytest.param("gzip", PAYLOAD, id="gzip-not-compressed"),
+        pytest.param("gzip", encode(PAYLOAD, "gzip")[:-12], id="gzip-truncated"),
+        pytest.param("gzip", encode(PAYLOAD, "gzip")[:-8] + bytes(8), id="gzip-bad-checksum"),
+        pytest.param("gzip", encode(PAYLOAD, "gzip") + b"trailing", id="gzip-trailing-garbage"),
+        pytest.param("deflate", encode(PAYLOAD, "deflate")[:-4], id="deflate-truncated"),
+        pytest.param("deflate", encode(PAYLOAD, "deflate") + b"x", id="deflate-data-after-end"),
+        pytest.param("deflate", b"x", id="deflate-one-byte"),
+    ],
+)
+async def test_undecodable_body_fails_the_fetch(
+    content_encoding: str, encoded: bytes, network: FakeNetwork, make_client: ClientFactory
+) -> None:
+    network.robots(CBK)
+    mock_streamed(network, CSV_URL, content_encoding, StreamedBody(encoded, chunk_size=7))
+    async with make_client() as http:
+        with pytest.raises(FetchFailed) as caught:
+            await http.get_bytes(CSV_URL)
+
+    assert caught.value.reason == "invalid_content_encoding"
+    assert network.urls() == [CBK_ROBOTS, CSV_URL]
+
+
+async def test_body_a_transport_has_already_read_is_taken_as_decoded(
+    network: FakeNetwork, make_client: ClientFactory
+) -> None:
+    # httpx.MockTransport reads, and decodes, a response built from bytes before the client
+    # sees it; the size cap and the supported codings still apply.
+    network.robots(CBK)
+    gzip_header = {"Content-Encoding": "gzip"}
+    network.router.get(CSV_URL).respond(200, content=encode(PAYLOAD, "gzip"), headers=gzip_header)
+    network.router.get(PDF_URL).respond(
+        200, content=encode(b"\0" * (MAX_RESPONSE_BYTES + 1), "gzip"), headers=gzip_header
+    )
+    network.router.get(BONDS_URL).respond(200, content=b"x", headers={"Content-Encoding": "br"})
+    async with make_client() as http:
+        body = await http.get_bytes(CSV_URL)
+        with pytest.raises(FetchFailed) as too_large:
+            await http.get_bytes(PDF_URL)
+        with pytest.raises(FetchFailed) as unsupported:
+            await http.get_bytes(BONDS_URL)
+
+    assert body == PAYLOAD
+    assert too_large.value.reason == "response_too_large"
+    assert unsupported.value.reason == "unsupported_content_encoding"
 
 
 # --- Redirects ---------------------------------------------------------------------------------
@@ -875,6 +1184,11 @@ async def test_cross_host_redirect_to_a_disallowed_url_is_not_requested(
             "unsupported_url",
             id="non-http-location",
         ),
+        pytest.param(
+            {"Location": "https://user:SECRET@other.example.net/files/rates.csv"},
+            "url_has_userinfo",
+            id="userinfo-location",
+        ),
     ],
 )
 async def test_unusable_redirect_fails_the_fetch(
@@ -887,6 +1201,7 @@ async def test_unusable_redirect_fails_the_fetch(
             await http.fetch(INFLATION_URL)
 
     assert caught.value.reason == reason
+    assert "SECRET" not in str(caught.value)
     assert network.urls() == [CBK_ROBOTS, INFLATION_URL]
 
 
@@ -894,26 +1209,131 @@ async def test_unusable_redirect_fails_the_fetch(
 
 
 @pytest.mark.parametrize(
-    ("url", "reason"),
+    ("url", "reason", "described"),
     [
-        pytest.param("ftp://www.centralbank.go.ke/rates.csv", "unsupported_url", id="ftp"),
-        pytest.param("/statistics/interest-rates/", "unsupported_url", id="relative"),
-        pytest.param("https:///statistics/", "unsupported_url", id="no-host"),
-        pytest.param(f"{CBK}/\x00", "invalid_url", id="control-character"),
+        pytest.param(
+            "ftp://www.centralbank.go.ke/rates.csv",
+            "unsupported_url",
+            "ftp://www.centralbank.go.ke/rates.csv",
+            id="ftp",
+        ),
+        pytest.param(
+            "/statistics/interest-rates/",
+            "unsupported_url",
+            "/statistics/interest-rates/",
+            id="relative",
+        ),
+        pytest.param(
+            "https:///statistics/", "unsupported_url", "<https URL without a host>", id="no-host"
+        ),
+        pytest.param(f"{CBK}/\x00", "invalid_url", "<invalid URL>", id="control-character"),
+        pytest.param(
+            "https://user:SECRET@www.centralbank.go.ke/rates.csv?token=SECRET#SECRET",
+            "url_has_userinfo",
+            f"{CBK}/rates.csv",
+            id="user-and-password",
+        ),
+        pytest.param(
+            "https://SECRET@www.centralbank.go.ke/rates.csv",
+            "url_has_userinfo",
+            f"{CBK}/rates.csv",
+            id="user-only",
+        ),
+        pytest.param(
+            "http://:SECRET@www.centralbank.go.ke:8080/rates.csv",
+            "url_has_userinfo",
+            "http://www.centralbank.go.ke:8080/rates.csv",
+            id="password-only",
+        ),
+        pytest.param(
+            "ftp://user:SECRET@www.centralbank.go.ke/rates.csv",
+            "unsupported_url",
+            "ftp://www.centralbank.go.ke/rates.csv",
+            id="ftp-with-userinfo",
+        ),
     ],
 )
-async def test_urls_that_are_not_absolute_http_are_rejected_unsent(
-    url: str, reason: str, network: FakeNetwork, make_client: ClientFactory
+async def test_urls_that_are_not_absolute_http_or_carry_userinfo_are_rejected_unsent(
+    url: str, reason: str, described: str, network: FakeNetwork, make_client: ClientFactory
 ) -> None:
     async with make_client() as http:
         with pytest.raises(FetchFailed) as caught:
             await http.fetch(url)
-        with pytest.raises(FetchFailed):
+        with pytest.raises(FetchFailed) as checked:
             await http.ensure_allowed(url)
 
-    assert caught.value.reason == reason
-    assert caught.value.url == url
+    assert caught.value.reason == checked.value.reason == reason
+    assert caught.value.url == checked.value.url == described
+    assert "SECRET" not in str(caught.value)
     assert network.sent == []
+
+
+async def test_retries_and_failures_name_urls_without_userinfo_query_or_error_text(
+    network: FakeNetwork, make_client: ClientFactory, caplog: pytest.LogCaptureFixture
+) -> None:
+    network.robots(CBK)
+    network.router.get(f"{CBK}/retry/file.csv?token=SECRET").mock(
+        side_effect=[
+            httpx.ConnectTimeout("timed out connecting to SECRET"),
+            httpx.Response(503),
+            httpx.Response(302, headers={"Location": "/moved/file.csv?token=SECRET#SECRET"}),
+        ]
+    )
+    network.router.get(f"{CBK}/moved/file.csv?token=SECRET").respond(404)
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        async with make_client(scraper_min_interval_seconds=0.0) as http:
+            with pytest.raises(FetchFailed) as caught:
+                await http.fetch(f"{CBK}/retry/file.csv?token=SECRET#SECRET")
+
+    assert caught.value.reason == "http_404"
+    assert caught.value.url == f"{CBK}/moved/file.csv"
+    assert "SECRET" not in str(caught.value)
+    messages = [record.getMessage() for record in caplog.records if record.name == LOGGER]
+    assert messages
+    assert not [message for message in messages if "SECRET" in message or "token" in message]
+    first, second = warnings_logged(caplog)
+    assert f"GET {CBK}/retry/file.csv attempt 1 of 4 failed (ConnectTimeout);" in first
+    assert f"GET {CBK}/retry/file.csv attempt 2 of 4 failed (HTTP 503);" in second
+    assert f"GET {CBK}/moved/file.csv -> 404" in messages
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        pytest.param(
+            "https://user:SECRET@www.centralbank.go.ke/uploads/a b.csv?token=SECRET#SECRET",
+            f"{CBK}/uploads/a%20b.csv",
+            id="userinfo-query-and-fragment-dropped",
+        ),
+        pytest.param(f"{CBK}:443/x", f"{CBK}/x", id="default-port-dropped"),
+        pytest.param("http://127.0.0.1:8080/x?y=1", "http://127.0.0.1:8080/x", id="port-kept"),
+        pytest.param("http://[::1]:8443/x", "http://[::1]:8443/x", id="ipv6-host"),
+        pytest.param("https://bücher.example/x", "https://xn--bcher-kva.example/x", id="idna"),
+        pytest.param(CBK, f"{CBK}/", id="empty-path"),
+        pytest.param(f"{CBK}/a%0Ab.csv", f"{CBK}/a%0Ab.csv", id="escapes-kept"),
+        pytest.param("/uploads/a b.csv?ver=2#top", "/uploads/a%20b.csv", id="relative-path"),
+        pytest.param("#top", "", id="fragment-only"),
+        pytest.param(
+            "//user:SECRET@other.example.net/x?q=1", "//other.example.net/x", id="network-path"
+        ),
+        pytest.param(
+            "https:user:SECRET@other.example.net/x",
+            "<https URL without a host>",
+            id="scheme-without-host",
+        ),
+        pytest.param("mailto:SECRET@example.net", "<mailto URL without a host>", id="mailto"),
+        pytest.param(f"{CBK}/\x00?token=SECRET", "<invalid URL>", id="unparseable"),
+        pytest.param(
+            httpx.URL("https://user:SECRET@www.centralbank.go.ke/x?token=SECRET"),
+            f"{CBK}/x",
+            id="httpx-url",
+        ),
+    ],
+)
+async def test_describe_url_keeps_only_scheme_host_port_and_path(
+    url: str | httpx.URL, expected: str
+) -> None:
+    assert describe_url(url) == expected
 
 
 async def test_fetch_returns_the_response_and_helpers_return_its_body(

@@ -12,10 +12,12 @@
   lower ``bond_code``), and a seeded one only when it has no real observation in the window.
 
 Points come back in ascending tenor, T-bills first on an equal tenor, with yields and tenors
-quantized to 2 dp (ROUND_HALF_UP). The loading paths of ``get_macro_overview`` need a database
-and belong to the integration suite; only its argument check, which runs before any query, is
-exercised here. Every expected value is a literal, and no database, network or filesystem is
-touched.
+quantized to 2 dp (ROUND_HALF_UP). The KPI snapshots are built from each indicator's latest and
+previous non-null values, which the service reads in SQL; the pure step that turns them into
+snapshots is exercised here on literal observations. The loading paths of ``get_macro_overview``
+need a database and belong to the integration suite; only its argument check, which runs before
+any query, is exercised here. Every expected value is a literal, and no database, network or
+filesystem is touched.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from opennse_terminal.models import macro as macro_models
 from opennse_terminal.models.macro import MACRO_INDICATOR_COLUMNS
-from opennse_terminal.quant.asof import MacroRow
+from opennse_terminal.quant.asof import AsOfValue, MacroRow
 from opennse_terminal.services import macro_service
 from opennse_terminal.services.macro_service import (
     INDICATORS,
@@ -148,6 +150,102 @@ def test_indicator_list_drifting_from_the_model_fails_at_import(
     ):
         spec.loader.exec_module(probe)
     assert probe_name not in sys.modules
+
+
+# ---------------------------------------------------------------------------------------------
+# KPI snapshots
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("column", "observed", "expected"),
+    [
+        pytest.param(
+            "inflation_yoy_pct",
+            {
+                "inflation_yoy_pct": [
+                    AsOfValue(Decimal("6.8050"), date(2026, 9, 30)),
+                    AsOfValue(Decimal("6.6040"), date(2026, 8, 31)),
+                ]
+            },
+            ("6.81", "2026-09-30", "6.60", "0.20"),
+            id="change_on_unrounded_values",
+        ),
+        pytest.param(
+            "cbr_rate_pct",
+            {
+                "cbr_rate_pct": [
+                    AsOfValue(Decimal("8.7500"), date(2026, 9, 30)),
+                    AsOfValue(Decimal("12.9950"), date(2024, 3, 31)),
+                ]
+            },
+            ("8.75", "2026-09-30", "13.00", "-4.25"),
+            id="sparse_column_previous_years_back",
+        ),
+        pytest.param(
+            "tbill_91d_pct",
+            {"tbill_91d_pct": [AsOfValue(Decimal("15.7234"), date(2026, 9, 30))]},
+            ("15.72", "2026-09-30", None, None),
+            id="latest_without_previous",
+        ),
+        pytest.param(
+            "interbank_rate_pct",
+            {},
+            (None, None, None, None),
+            id="never_observed_absent",
+        ),
+        pytest.param(
+            "interbank_rate_pct",
+            {"interbank_rate_pct": []},
+            (None, None, None, None),
+            id="never_observed_empty",
+        ),
+        pytest.param(
+            "fx_kes_usd",
+            {
+                "fx_kes_usd": [
+                    AsOfValue(Decimal("129.2049"), date(2026, 9, 30)),
+                    AsOfValue(Decimal("129.1650"), date(2026, 8, 31)),
+                ]
+            },
+            ("129.20", "2026-09-30", "129.17", "0.04"),
+            id="fx_money_kind",
+        ),
+        pytest.param(
+            "fx_reserves_usd_m",
+            {
+                "fx_reserves_usd_m": [
+                    AsOfValue(Decimal("7850.00"), date(2026, 9, 26)),
+                    AsOfValue(Decimal("7819.15"), date(2026, 9, 19)),
+                    AsOfValue(Decimal("7001.00"), date(2026, 9, 12)),
+                ]
+            },
+            ("7850.00", "2026-09-26", "7819.15", "30.85"),
+            id="entries_after_the_second_ignored",
+        ),
+    ],
+)
+def test_indicator_snapshot_takes_the_latest_and_previous_non_null_values(
+    column: str,
+    observed: dict[str, list[AsOfValue]],
+    expected: tuple[str | None, str | None, str | None, str | None],
+) -> None:
+    """Each tile shows its column's latest value and date and the non-null value before it,
+    however far back that lies, and ``change`` is their difference on the unrounded values,
+    rounded once half-up to 2 dp: 6.8050 - 6.6040 = 0.2010 -> 0.20 (rounding first would give
+    6.81 - 6.60 = 0.21), and 129.2049 - 129.1650 = 0.0399 -> 0.04 (not 0.03). A column with no
+    observation has a null value, date, previous value and change; every other tile is null here.
+    """
+    snapshots = macro_service._indicator_snapshots(observed)
+    dumped = [snapshot.model_dump(mode="json") for snapshot in snapshots]
+
+    assert [item["key"] for item in dumped] == list(MACRO_INDICATOR_COLUMNS)
+    fields = {
+        item["key"]: (item["value"], item["as_of"], item["previous_value"], item["change"])
+        for item in dumped
+    }
+    assert fields.pop(column) == expected
+    assert set(fields.values()) == {(None, None, None, None)}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -452,6 +550,93 @@ def test_curve_orders_tbills_and_bonds_by_tenor() -> None:
 def test_bond_observation_is_real_unless_seeded(source: str, is_real: bool) -> None:
     """Every source other than ``seed`` counts as real data."""
     assert bond(CURVE_DAY, "FXD1/2026/010", "10.00", source=source).is_real is is_real
+
+
+# ---------------------------------------------------------------------------------------------
+# Read bounds
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("day", "lookback", "start"),
+    [
+        pytest.param(date(2024, 10, 31), timedelta(days=62), date(2024, 8, 30), id="tbill"),
+        pytest.param(date(2024, 10, 31), timedelta(days=365), date(2023, 11, 1), id="bond"),
+        pytest.param(date(1, 1, 31), timedelta(days=62), date.min, id="clamped_at_date_min"),
+    ],
+)
+def test_reads_start_the_lookback_before_the_earliest_curve_day(
+    day: date, lookback: timedelta, start: date
+) -> None:
+    """The window reads open 62 days (T-bills) or 365 days (bonds) before the earliest curve
+    date: 2024-10-31 gives 2024-08-30 and 2023-11-01. A start before the first calendar day is
+    clamped to ``date.min`` rather than overflowing."""
+    assert macro_service._lookback_start(day, lookback) == start
+
+
+@pytest.mark.parametrize(
+    ("month_ends", "current_day", "ranges"),
+    [
+        pytest.param(
+            [
+                *(date(2024, 10, 31), date(2024, 11, 30), date(2024, 12, 31), date(2025, 1, 31)),
+                *(date(2025, 2, 28), date(2025, 3, 31), date(2025, 4, 30), date(2025, 5, 31)),
+                *(date(2025, 6, 30), date(2025, 7, 31), date(2025, 8, 31), date(2025, 9, 30)),
+                *(date(2025, 10, 31), date(2025, 11, 30), date(2025, 12, 31), date(2026, 1, 31)),
+                *(date(2026, 2, 28), date(2026, 3, 31), date(2026, 4, 30), date(2026, 5, 31)),
+                *(date(2026, 6, 30), date(2026, 7, 31), date(2026, 8, 31), date(2026, 9, 30)),
+            ],
+            date(2026, 9, 30),
+            ((date(2023, 11, 1), date(2026, 9, 30)),),
+            id="seeded_24_months_overlap",
+        ),
+        pytest.param(
+            [date(2000, 1, 31)],
+            date(2026, 1, 31),
+            (
+                (date(1999, 1, 31), date(2000, 1, 31)),
+                (date(2025, 1, 31), date(2026, 1, 31)),
+            ),
+            id="widely_separated_curves",
+        ),
+        pytest.param(
+            [date(2024, 1, 31)],
+            date(2025, 1, 31),
+            ((date(2023, 1, 31), date(2025, 1, 31)),),
+            id="touching_intervals_merged",
+        ),
+        pytest.param(
+            [date(2024, 1, 31)],
+            date(2025, 2, 1),
+            (
+                (date(2023, 1, 31), date(2024, 1, 31)),
+                (date(2024, 2, 2), date(2025, 2, 1)),
+            ),
+            id="one_day_gap_kept_apart",
+        ),
+        pytest.param(
+            [date(2025, 12, 31)],
+            date(2025, 12, 15),
+            ((date(2024, 12, 15), date(2025, 12, 31)),),
+            id="one_month_window_mid_month",
+        ),
+        pytest.param(
+            [date(1, 1, 31), date(1, 2, 28)],
+            date(1, 2, 28),
+            ((date.min, date(1, 2, 28)),),
+            id="clamped_at_date_min",
+        ),
+    ],
+)
+def test_bond_reads_cover_only_the_curve_intervals(
+    month_ends: list[date], current_day: date, ranges: tuple[tuple[date, date], ...]
+) -> None:
+    """The bond read spans the history curves, from 365 days before the earliest curve date to
+    the last month-end, and the current curve, the 365 days up to ``current_day``. Overlapping
+    or touching intervals (2024-01-31 and 2024-02-01) merge into one range; a one-day gap or a
+    26-year gap leaves two, so the bonds between them are never loaded. A ``current_day``
+    before a one-month window's month-end moves the start back to 365 days before it."""
+    assert macro_service._bond_read_ranges(month_ends, current_day) == ranges
 
 
 # ---------------------------------------------------------------------------------------------

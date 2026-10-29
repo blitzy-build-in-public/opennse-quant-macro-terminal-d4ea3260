@@ -35,7 +35,7 @@ from datetime import date
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Final
-from urllib.parse import quote, unquote, urljoin, urlsplit
+from urllib.parse import SplitResult, quote, unquote, urljoin, urlsplit
 
 from bs4 import BeautifulSoup, Tag
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -49,9 +49,11 @@ from opennse_terminal.ingestion.base import (
     normalize_header,
     parse_decimal_text,
 )
+from opennse_terminal.ingestion.http import describe_url
 from opennse_terminal.models.macro import MACRO_INDICATOR_COLUMNS
 
 __all__ = [
+    "CBK_APPROVED_ORIGINS",
     "CBK_BASE_URL",
     "COLUMN_QUANTUM",
     "MISSING_MARKERS",
@@ -86,6 +88,10 @@ logger = logging.getLogger("opennse_terminal.ingestion.cbk")
 
 CBK_BASE_URL: Final = "https://www.centralbank.go.ke"
 """Origin of every CBK release page and file."""
+
+CBK_APPROVED_ORIGINS: Final = frozenset({CBK_BASE_URL})
+"""Origins, as ``https://<host>``, that :func:`find_link` returns links on. A link qualifies only
+when it is HTTPS on one of these hosts, on the default port and without userinfo."""
 
 # Spelled out rather than taken from calendar.month_name, which follows the process locale.
 MONTHS: Final[Mapping[str, int]] = MappingProxyType(
@@ -351,16 +357,25 @@ def find_link(
     ``/uploads/interest_rates/<id>_Central Bank Rates_with Heads.csv``), so links are discovered
     by text, never hard-coded.
 
-    Candidates are ``http(s)`` anchors whose resolved path (URL-decoded, lowercased, without
-    query or fragment) ends with ``href_suffix`` and contains ``href_contains`` when given. The
-    first candidate whose anchor text contains ``text_contains`` (case-insensitive, whitespace
-    collapsed) wins; when none does, the first whose URL-decoded file name, with underscores read
-    as spaces, contains it. The URL is returned with unsafe characters percent-encoded (spaces
-    become ``%20``; existing escapes are kept).
+    Candidates are links on an approved CBK origin (:data:`CBK_APPROVED_ORIGINS`: HTTPS, the
+    default port, no userinfo) whose resolved path (URL-decoded, lowercased, without query or
+    fragment) ends with ``href_suffix`` and contains ``href_contains`` when given. An ``http(s)``
+    link anywhere else is never returned, so a listing page cannot direct a fetch to another
+    host, port or scheme, or make it carry credentials. The first candidate whose anchor text
+    contains ``text_contains`` (case-insensitive, whitespace collapsed) wins; when none does, the
+    first whose URL-decoded file name, with underscores read as spaces, contains it. The URL is
+    returned with unsafe characters percent-encoded (spaces become ``%20``; existing escapes,
+    query and fragment are kept).
+
+    Links in ``found`` and in the DEBUG log line are named by ``http.describe_url``: scheme, host,
+    port and path, never userinfo, query or fragment.
 
     Raises:
-        SourceLayoutChanged: No candidate matches; ``found`` lists up to 20 ``text -> href``
-            pairs: the candidates when there are any, else the page's anchors.
+        SourceLayoutChanged: ``"file link not on an approved CBK origin"`` when no candidate
+            matches but an ``http(s)`` link elsewhere would have; ``found`` lists up to 20 of
+            those as ``text -> link (problem)``. Otherwise ``"file link not found"`` when nothing
+            matches; ``found`` lists up to 20 ``text -> href`` pairs: the ``http(s)`` links of the
+            right type, whatever their origin, when there are any, else the page's anchors.
     """
     needle = clean_text(text_contains).lower()
     suffix = href_suffix.lower() if href_suffix is not None else None
@@ -369,6 +384,7 @@ def find_link(
     seen: list[str] = []
     candidate_seen: list[str] = []
     candidates: list[tuple[str, str, str]] = []  # (anchor text, file name, absolute URL)
+    off_origin: list[tuple[str, str, str]] = []  # (anchor text, file name, found entry)
     for anchor in soup.find_all("a", href=True):
         if not isinstance(anchor, Tag):
             continue
@@ -376,9 +392,14 @@ def find_link(
         if not isinstance(href, str) or not href.strip():
             continue
         anchor_text = clean_text(anchor.get_text(" "))
-        seen.append(f"{anchor_text} -> {href.strip()}")
-        absolute = urljoin(base_url, href.strip())
-        parts = urlsplit(absolute)
+        seen.append(f"{anchor_text} -> {describe_url(href.strip())}")
+        try:
+            absolute = urljoin(base_url, href.strip())
+            parts = urlsplit(absolute)
+        except ValueError:
+            # urlsplit refuses unbalanced IPv6 brackets and a host that NFKC normalization turns
+            # into URL delimiters; such an href is no link to follow.
+            continue
         if parts.scheme not in ("http", "https"):
             continue
         path = unquote(parts.path)
@@ -388,8 +409,13 @@ def find_link(
         if contains is not None and contains not in lowered:
             continue
         file_name = clean_text(path.rsplit("/", 1)[-1].replace("_", " "))
-        candidates.append((anchor_text, file_name, absolute))
         candidate_seen.append(seen[-1])
+        problem = _origin_problem(parts)
+        if problem is None:
+            candidates.append((anchor_text, file_name, absolute))
+        else:
+            entry = f"{anchor_text} -> {describe_url(absolute)} ({problem})"
+            off_origin.append((anchor_text, file_name, entry))
 
     match = next((url for text, _, url in candidates if needle in text.lower()), None)
     matched_by = "anchor text"
@@ -400,6 +426,18 @@ def find_link(
         expected = f"anchor containing {text_contains!r} ending {href_suffix!r}"
         if href_contains is not None:
             expected += f" with {href_contains!r} in its path"
+        refused = [
+            entry
+            for text, name, entry in off_origin
+            if needle in text.lower() or needle in name.lower()
+        ]
+        if refused:
+            origins = ", ".join(sorted(CBK_APPROVED_ORIGINS))
+            raise SourceLayoutChanged(
+                expected=[f"{expected} on {origins} (HTTPS, default port, no userinfo)"],
+                found=refused[:_LINK_SAMPLE_LIMIT],
+                message="file link not on an approved CBK origin",
+            )
         # Links of the right file type say most about what changed; else show the page's links.
         raise SourceLayoutChanged(
             expected=[expected],
@@ -407,8 +445,34 @@ def find_link(
             message="file link not found",
         )
     url = quote(match, safe=_QUOTE_SAFE)
-    logger.debug("found %r link by %s on %s: %s", text_contains, matched_by, base_url, url)
+    logger.debug(
+        "found %r link by %s on %s: %s",
+        text_contains,
+        matched_by,
+        describe_url(base_url),
+        describe_url(url),
+    )
     return url
+
+
+def _origin_problem(parts: SplitResult) -> str | None:
+    """Why the resolved ``http(s)`` link ``parts`` is not on an approved CBK origin (see
+    :data:`CBK_APPROVED_ORIGINS`), or ``None`` when it is."""
+    if parts.scheme != "https":
+        return "not HTTPS"
+    # Any "@" in the authority, even with empty userinfo, is refused: no CBK link has one.
+    if "@" in parts.netloc:
+        return "userinfo"
+    try:
+        port = parts.port
+    except ValueError:
+        return "invalid port"
+    if port not in (None, 443):
+        return f"port {port}"
+    # urlsplit lowercases the host name, as host names compare case-insensitively.
+    if f"https://{parts.hostname or ''}" not in CBK_APPROVED_ORIGINS:
+        return "host not approved"
+    return None
 
 
 def _own_rows(table: Tag) -> list[Tag]:
@@ -574,8 +638,9 @@ def validate_macro_records(
 
     Bounds are sanity limits, wide enough for the source's full published history, that catch
     parse, scale and column-shift errors rather than unusual genuine values. The shared run
-    thresholds (up to 10% rejected gives ``partial``, more or fewer rows than the pipeline's
-    minimum gives ``layout_changed``) are applied by ``execute_pipeline``, not here.
+    thresholds are applied by ``execute_pipeline``, not here: up to 10% of parsed rows rejected
+    gives ``partial``; more than 10% rejected, or fewer parsed rows than the pipeline's
+    ``min_rows``, gives ``layout_changed``.
 
     Raises:
         ValueError: A bound's low end exceeds its high end.

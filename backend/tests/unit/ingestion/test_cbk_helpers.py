@@ -14,6 +14,7 @@ under test. Numbers are ``Decimal`` throughout.
 """
 
 import importlib.util
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -27,6 +28,7 @@ import opennse_terminal.models.macro as macro_model
 from opennse_terminal.ingestion import cbk
 from opennse_terminal.ingestion.base import RejectedRow, SourceLayoutChanged, ValidationOutcome
 from opennse_terminal.ingestion.cbk import (
+    CBK_APPROVED_ORIGINS,
     CBK_BASE_URL,
     COLUMN_QUANTUM,
     MISSING_MARKERS,
@@ -101,6 +103,7 @@ def _table(headers: Sequence[str], *rows: Sequence[str]) -> str:
 
 def test_constants_hold_their_documented_values() -> None:
     assert CBK_BASE_URL == "https://www.centralbank.go.ke"
+    assert CBK_APPROVED_ORIGINS == frozenset({"https://www.centralbank.go.ke"})
     assert MISSING_MARKERS == frozenset({"", "-", "\u2013", "\u2014"})
     assert _same_decimal(TENOR_QUANTUM, "0.01")
     assert UPSERT_CHUNK_ROWS == 500
@@ -475,12 +478,12 @@ def test_find_link_considers_only_http_and_https_anchors() -> None:
         ("Central Bank Rates", "javascript:void(0)"),
         ("Central Bank Rates", "ftp://www.centralbank.go.ke/uploads/rates.csv"),
         ("Central Bank Rates", "   "),
-        ("Central Bank Rates", "http://www.centralbank.go.ke/uploads/rates.csv"),
+        ("Central Bank Rates", "https://www.centralbank.go.ke/uploads/rates.csv"),
     )
 
     url = find_link(html, RATES_PAGE_URL, text_contains="Central Bank Rates")
 
-    assert url == "http://www.centralbank.go.ke/uploads/rates.csv"
+    assert url == "https://www.centralbank.go.ke/uploads/rates.csv"
 
 
 @pytest.mark.parametrize(
@@ -593,6 +596,21 @@ def test_find_link_filters_on_the_path_with_href_contains() -> None:
             [f"Release {n} -> /uploads/releases/{n}.csv" for n in range(1, 21)],
             id="at-most-20-links-sampled",
         ),
+        pytest.param(
+            _anchors(
+                ("Home", "https://user:SECRET@www.centralbank.go.ke/?token=SECRET#SECRET"),
+                ("Contact", "mailto:SECRET@centralbank.go.ke"),
+                ("Central Bank Rates", "https://[::1/uploads/rates.csv"),
+            ),
+            {"text_contains": "Central Bank Rates", "href_suffix": ".csv"},
+            ["anchor containing 'Central Bank Rates' ending '.csv'"],
+            [
+                "Home -> https://www.centralbank.go.ke/",
+                "Contact -> <mailto URL without a host>",
+                "Central Bank Rates -> <invalid URL>",
+            ],
+            id="anchors-named-without-userinfo-query-or-fragment-and-unparseable-skipped",
+        ),
     ],
 )
 def test_find_link_raises_layout_changed_when_nothing_matches(
@@ -604,6 +622,134 @@ def test_find_link_raises_layout_changed_when_nothing_matches(
     assert excinfo.value.expected == expected
     assert excinfo.value.found == found
     assert excinfo.value.message == "file link not found"
+
+
+@pytest.mark.parametrize(
+    ("text", "href", "link", "problem"),
+    [
+        pytest.param(
+            "Central Bank Rates",
+            "http://www.centralbank.go.ke/uploads/rates.csv",
+            "http://www.centralbank.go.ke/uploads/rates.csv",
+            "not HTTPS",
+            id="plain-http-on-the-cbk-host",
+        ),
+        pytest.param(
+            "Central Bank Rates",
+            "http://169.254.169.254/latest/central_bank_rates.csv",
+            "http://169.254.169.254/latest/central_bank_rates.csv",
+            "not HTTPS",
+            id="link-local-http",
+        ),
+        pytest.param(
+            "Central Bank Rates",
+            "https://169.254.169.254/latest/central_bank_rates.csv",
+            "https://169.254.169.254/latest/central_bank_rates.csv",
+            "host not approved",
+            id="link-local-https",
+        ),
+        pytest.param(
+            "Central Bank Rates",
+            "https://other.example.net/uploads/rates.csv",
+            "https://other.example.net/uploads/rates.csv",
+            "host not approved",
+            id="other-host",
+        ),
+        pytest.param(
+            "Central Bank Rates",
+            "//other.example.net/uploads/rates.csv",
+            "https://other.example.net/uploads/rates.csv",
+            "host not approved",
+            id="scheme-relative-other-host",
+        ),
+        pytest.param(
+            "Central Bank Rates",
+            "https://www.centralbank.go.ke.other.example.net/uploads/rates.csv",
+            "https://www.centralbank.go.ke.other.example.net/uploads/rates.csv",
+            "host not approved",
+            id="cbk-host-as-a-prefix",
+        ),
+        pytest.param(
+            "Central Bank Rates",
+            "https://user:SECRET@www.centralbank.go.ke/uploads/rates.csv?token=SECRET#SECRET",
+            "https://www.centralbank.go.ke/uploads/rates.csv",
+            "userinfo",
+            id="userinfo-on-the-cbk-host",
+        ),
+        pytest.param(
+            "Central Bank Rates",
+            "https://www.centralbank.go.ke:8443/uploads/rates.csv",
+            "https://www.centralbank.go.ke:8443/uploads/rates.csv",
+            "port 8443",
+            id="other-port-on-the-cbk-host",
+        ),
+        pytest.param(
+            "Central Bank Rates",
+            "https://www.centralbank.go.ke:https/uploads/rates.csv",
+            "<invalid URL>",
+            "invalid port",
+            id="invalid-port",
+        ),
+        pytest.param(
+            "Download",
+            "https://other.example.net/uploads/1_Central_Bank_Rates.csv",
+            "https://other.example.net/uploads/1_Central_Bank_Rates.csv",
+            "host not approved",
+            id="file-name-match-on-another-host",
+        ),
+    ],
+)
+def test_find_link_refuses_a_matching_link_off_the_approved_cbk_origin(
+    text: str, href: str, link: str, problem: str
+) -> None:
+    html = _anchors(("Home", "/"), (text, href))
+
+    with pytest.raises(SourceLayoutChanged) as excinfo:
+        find_link(html, RATES_PAGE_URL, text_contains="Central Bank Rates", href_suffix=".csv")
+
+    assert excinfo.value.message == "file link not on an approved CBK origin"
+    assert excinfo.value.expected == [
+        "anchor containing 'Central Bank Rates' ending '.csv' "
+        "on https://www.centralbank.go.ke (HTTPS, default port, no userinfo)"
+    ]
+    assert excinfo.value.found == [f"{text} -> {link} ({problem})"]
+
+
+def test_find_link_returns_an_approved_link_after_matching_links_off_the_cbk_origin() -> None:
+    html = _anchors(
+        ("Central Bank Rates", "https://other.example.net/uploads/rates.csv"),
+        ("Central Bank Rates", "https://user:SECRET@www.centralbank.go.ke/uploads/rates.csv"),
+        ("Download", "/uploads/interest_rates/2_Central_Bank_Rates.csv"),
+    )
+
+    url = find_link(html, RATES_PAGE_URL, text_contains="Central Bank Rates", href_suffix=".csv")
+
+    assert url == "https://www.centralbank.go.ke/uploads/interest_rates/2_Central_Bank_Rates.csv"
+
+
+def test_find_link_logs_its_result_without_userinfo_query_or_fragment(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    html = _anchors(("Central Bank Rates", "/uploads/rates.csv?token=SECRET#SECRET"))
+
+    with caplog.at_level(logging.DEBUG, logger="opennse_terminal.ingestion.cbk"):
+        url = find_link(
+            html,
+            f"{RATES_PAGE_URL}?session=SECRET",
+            text_contains="Central Bank Rates",
+            href_suffix=".csv",
+        )
+
+    assert url == "https://www.centralbank.go.ke/uploads/rates.csv?token=SECRET#SECRET"
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "opennse_terminal.ingestion.cbk"
+    ] == [
+        "found 'Central Bank Rates' link by anchor text on "
+        "https://www.centralbank.go.ke/statistics/interest-rates/: "
+        "https://www.centralbank.go.ke/uploads/rates.csv"
+    ]
 
 
 # --- HTML tables ----------------------------------------------------------------------------

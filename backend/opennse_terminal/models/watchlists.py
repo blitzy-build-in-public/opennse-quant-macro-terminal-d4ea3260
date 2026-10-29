@@ -64,8 +64,11 @@ class TerminalWatchlist(TerminalBase):
     tickers.
 
     ``updated_at`` refreshes through ``onupdate`` only when a column of this row changes. Adding or
-    removing an item changes only ``terminal_watchlist_items``, so the service bumps
-    ``updated_at = func.now()`` explicitly whenever an item is actually inserted or deleted.
+    removing an item changes only ``terminal_watchlist_items``, so the service sets
+    ``updated_at = statement_timestamp()`` explicitly whenever an item is actually inserted or
+    deleted. It uses ``statement_timestamp()`` rather than ``now()`` because ``now()`` is frozen at
+    the start of the enclosing transaction: inside a host's or a test's outer transaction, where
+    each service commit only releases a savepoint, it would never move past ``created_at``.
 
     ``items`` loads eagerly with ``selectin`` (an implicit lazy load fails under ``AsyncSession``)
     and is ordered by ticker, so the API returns ``tickers`` sorted. ``passive_deletes`` leaves the

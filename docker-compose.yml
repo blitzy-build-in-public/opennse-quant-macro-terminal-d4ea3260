@@ -19,7 +19,10 @@ services:
       POSTGRES_PASSWORD: opennse
       POSTGRES_DB: opennse
     ports:
-      - "5432:5432"
+      # Loopback only, so the throwaway superuser credentials above are unreachable from other
+      # hosts. Remote access is an explicit opt-in: a compose override file that replaces this
+      # list (ports: !override), used only with secured, non-default credentials.
+      - "127.0.0.1:5432:5432"
     volumes:
       - opennse-pgdata:/var/lib/postgresql/data
       # Creates opennse_test. The entrypoint runs init scripts only when it initialises an empty

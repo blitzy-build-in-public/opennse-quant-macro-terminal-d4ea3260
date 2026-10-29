@@ -1,9 +1,12 @@
 """Macro overview service: CBK indicator snapshots, rate history, coverage and the yield curve.
 
 Serves ``GET /api/v1/terminal/macro/overview``. It reads only what the CBK pipelines, CSV imports
-and the seeder stored in ``terminal_macro_indicators`` and ``terminal_bond_yields`` (two queries),
-resolves every value at full ``Decimal`` precision and rounds each output value exactly once with
-:func:`~opennse_terminal.quant.numeric.quantize_out` while building the response.
+and the seeder stored in ``terminal_macro_indicators`` and ``terminal_bond_yields``, in at most
+three statements (one returns at most two values per indicator; the other two load only rows
+dated inside the requested window and the lookbacks of the curves it serves, never the stored
+history between or around them), resolves every value at full ``Decimal`` precision and rounds
+each output value exactly once with :func:`~opennse_terminal.quant.numeric.quantize_out` while
+building the response.
 
 Units: ``*_pct`` values are percentage points (``6.80`` means 6.80%), ``fx_kes_usd`` is KES per
 USD, ``fx_reserves_usd_m`` is millions of USD and tenors are years.
@@ -18,12 +21,18 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Final
 
-from sqlalchemy import select
+from sqlalchemy import false, func, literal, or_, select, true, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from opennse_terminal.models import TerminalBondYield, TerminalMacroIndicator
 from opennse_terminal.models.macro import MACRO_INDICATOR_COLUMNS
-from opennse_terminal.quant.asof import AsOfValue, MacroColumn, MacroRow, macro_as_of
+from opennse_terminal.quant.asof import (
+    DEFAULT_MACRO_MAX_STALENESS_DAYS,
+    AsOfValue,
+    MacroColumn,
+    MacroRow,
+    macro_as_of,
+)
 from opennse_terminal.quant.numeric import QuantizeKind, quantize_out
 from opennse_terminal.schemas.common import CoverageMeta, SeriesPoint
 from opennse_terminal.schemas.macro import (
@@ -92,7 +101,8 @@ _FIXED_COUPON_PREFIX: Final = "FXD"
 _SEED_SOURCE: Final = "seed"
 _UNKNOWN_SOURCE: Final = "unknown"
 _BOND_LOOKBACK: Final = timedelta(days=365)
-_ONE_DAY: Final = timedelta(days=1)
+# yield_curve_at resolves T-bill yields with macro_as_of's default staleness limit.
+_TBILL_LOOKBACK: Final = timedelta(days=DEFAULT_MACRO_MAX_STALENESS_DAYS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,31 +304,20 @@ def _coverage(macro_rows: Sequence[MacroRow], requested_start: date) -> Coverage
     )
 
 
-def _latest_and_previous(
-    macro_rows: Sequence[MacroRow], column: MacroColumn
-) -> tuple[AsOfValue | None, AsOfValue | None]:
-    """The latest non-null ``column`` value over all rows and the non-null value before it."""
-    latest = macro_as_of(
-        macro_rows, column, macro_rows[-1].observation_date, max_staleness_days=None
-    )
-    if latest is None or latest.observation_date == date.min:
-        return latest, None
-    previous = macro_as_of(
-        macro_rows, column, latest.observation_date - _ONE_DAY, max_staleness_days=None
-    )
-    return latest, previous
-
-
-def _indicator_snapshots(macro_rows: Sequence[MacroRow]) -> list[IndicatorSnapshot]:
+def _indicator_snapshots(observed: Mapping[str, Sequence[AsOfValue]]) -> list[IndicatorSnapshot]:
     """One snapshot per :data:`INDICATORS` entry, each column resolved independently.
 
+    ``observed`` maps an indicator column to its non-null observations, newest first, however far
+    back in history they lie: the first gives ``value`` and ``as_of``, the second
+    ``previous_value``, and any further entry is ignored. A column that is absent or maps to no
+    observation was never observed, so its value, date, previous value and change are all null.
     ``change`` is ``value - previous_value`` computed on the unrounded values, then quantized.
     """
-    if not macro_rows:
-        return []
     snapshots: list[IndicatorSnapshot] = []
     for key, label, unit, kind in INDICATORS:
-        latest, previous = _latest_and_previous(macro_rows, key)
+        history = observed.get(key, ())
+        latest = history[0] if history else None
+        previous = history[1] if len(history) > 1 else None
         value = None if latest is None else latest.value
         previous_value = None if previous is None else previous.value
         change = (
@@ -378,12 +377,120 @@ def _rates_series(window_rows: Sequence[MacroRow]) -> list[RatesPoint]:
 # ---------------------------------------------------------------------------------------------
 
 
-async def _load_macro(
+def _lookback_start(day: date, lookback: timedelta) -> date:
+    """``day - lookback``, or ``date.min`` when that would fall before the first calendar day."""
+    try:
+        return day - lookback
+    except OverflowError:
+        return date.min
+
+
+def _bond_read_ranges(
+    month_ends: Sequence[date], current_day: date
+) -> tuple[tuple[date, date], ...]:
+    """The closed ``(start, end)`` date ranges, oldest first, holding every FXD bond a curve reads.
+
+    Each curve reads the 365 days up to its date. The history curves at the date-sorted,
+    non-empty ``month_ends`` lie at most a month apart, so together they read one interval: from
+    365 days before the earliest curve date to the last month-end. The earliest curve date is the
+    first month-end, or ``current_day`` when that is earlier (a one-month window whose latest
+    observation falls before the month-end). The current curve at ``current_day`` reads from 365
+    days before it to ``current_day``. The two intervals come back as one range when they overlap
+    or touch, and as two otherwise, so the bonds dated between a window and a much later current
+    curve, which no curve reads, are never loaded. Starts are clamped at ``date.min``.
+    """
+    history_start = _lookback_start(min(month_ends[0], current_day), _BOND_LOOKBACK)
+    history_end = month_ends[-1]
+    current_start = _lookback_start(current_day, _BOND_LOOKBACK)
+    # Subtracting the dates cannot overflow, as adding a day to a history_end of date.max would.
+    if (current_start - history_end).days <= 1:
+        return ((history_start, max(history_end, current_day)),)
+    return ((history_start, history_end), (current_start, current_day))
+
+
+async def _load_latest(
     session: AsyncSession,
+) -> tuple[date | None, date | None, dict[str, list[AsOfValue]]]:
+    """Read the window anchors and each indicator's latest two non-null values in one statement.
+
+    Returns the latest macro observation date and the latest FXD bond observation date, each
+    ``None`` when no such row is stored, and a map from every indicator column observed at least
+    once to its latest non-null value and the non-null value before it, newest first, however far
+    back they lie. The statement returns at most 16 value rows (two per indicator) plus the
+    anchors. Each indicator's part is a backward scan of the unique ``observation_date`` index
+    that stops at its column's second non-null value, so for a column observed on recent dates it
+    touches only the newest index entries; for a sparse column it scans back as far as needed, and
+    for a column never observed, the whole index. The one-row anchors are LEFT JOINed to the parts
+    so they arrive even when no indicator was ever observed; that row carries a null indicator and
+    contributes no value.
+    """
+    macro_columns = TerminalMacroIndicator.__table__.c
+    anchors = select(
+        select(func.max(TerminalMacroIndicator.observation_date))
+        .scalar_subquery()
+        .label("latest_macro_date"),
+        select(func.max(TerminalBondYield.observation_date))
+        .where(TerminalBondYield.bond_code.startswith(_FIXED_COUPON_PREFIX))
+        .scalar_subquery()
+        .label("latest_bond_date"),
+    ).subquery("anchors")
+    observed = union_all(
+        *(
+            select(
+                literal(column).label("indicator"),
+                TerminalMacroIndicator.observation_date,
+                macro_columns[column].label("value"),
+            )
+            .where(macro_columns[column].is_not(None))
+            .order_by(TerminalMacroIndicator.observation_date.desc())
+            .limit(2)
+            for column in MACRO_INDICATOR_COLUMNS
+        )
+    ).subquery("observed")
+    result = await session.execute(
+        select(
+            anchors.c.latest_macro_date,
+            anchors.c.latest_bond_date,
+            observed.c.indicator,
+            observed.c.observation_date,
+            observed.c.value,
+        )
+        .select_from(anchors.outerjoin(observed, true()))
+        .order_by(observed.c.observation_date.desc())
+    )
+    latest_macro_date: date | None = None
+    latest_bond_date: date | None = None
+    observations: dict[str, list[AsOfValue]] = {}
+    for macro_date, bond_date, indicator, observation_date, value in result.tuples():
+        latest_macro_date, latest_bond_date = macro_date, bond_date
+        if indicator is not None:
+            observations.setdefault(indicator, []).append(AsOfValue(value, observation_date))
+    return latest_macro_date, latest_bond_date, observations
+
+
+async def _load_macro(
+    session: AsyncSession, since: date
 ) -> tuple[list[MacroRow], dict[date, Mapping[str, str]]]:
-    """Load every macro row in date order, with each row's ``source_by_field`` by date."""
-    records = await session.scalars(
-        select(TerminalMacroIndicator).order_by(TerminalMacroIndicator.observation_date)
+    """Load the macro rows dated on or after ``since``, in date order, with their provenance.
+
+    Only the date, the indicator columns and ``source_by_field`` are read; each row's string
+    ``source_by_field`` entries are returned keyed by its observation date.
+    """
+    records = await session.execute(
+        select(
+            TerminalMacroIndicator.observation_date,
+            TerminalMacroIndicator.inflation_yoy_pct,
+            TerminalMacroIndicator.cbr_rate_pct,
+            TerminalMacroIndicator.interbank_rate_pct,
+            TerminalMacroIndicator.tbill_91d_pct,
+            TerminalMacroIndicator.tbill_182d_pct,
+            TerminalMacroIndicator.tbill_364d_pct,
+            TerminalMacroIndicator.fx_kes_usd,
+            TerminalMacroIndicator.fx_reserves_usd_m,
+            TerminalMacroIndicator.source_by_field,
+        )
+        .where(TerminalMacroIndicator.observation_date >= since)
+        .order_by(TerminalMacroIndicator.observation_date)
     )
     macro_rows: list[MacroRow] = []
     sources_by_date: dict[date, Mapping[str, str]] = {}
@@ -409,8 +516,15 @@ async def _load_macro(
     return macro_rows, sources_by_date
 
 
-async def _load_bonds(session: AsyncSession, since: date | None) -> list[BondObservation]:
-    """Load FXD bond observations dated on or after ``since`` (all when ``None``), in date order."""
+async def _load_bonds(
+    session: AsyncSession, ranges: Sequence[tuple[date, date]]
+) -> list[BondObservation]:
+    """Load the FXD bond observations dated inside any of ``ranges``, in date order.
+
+    Each range is a closed ``(start, end)`` pair of dates, both ends included, as
+    :func:`_bond_read_ranges` returns them. The dates are bound parameters, and each range is a
+    scan of the ``observation_date`` index. An empty ``ranges`` matches no observation.
+    """
     statement = select(
         TerminalBondYield.observation_date,
         TerminalBondYield.bond_code,
@@ -418,8 +532,13 @@ async def _load_bonds(session: AsyncSession, since: date | None) -> list[BondObs
         TerminalBondYield.yield_pct,
         TerminalBondYield.source,
     ).where(TerminalBondYield.bond_code.startswith(_FIXED_COUPON_PREFIX))
-    if since is not None:
-        statement = statement.where(TerminalBondYield.observation_date >= since)
+    # false() is dropped from the OR as soon as one range is present.
+    statement = statement.where(
+        or_(
+            false(),
+            *(TerminalBondYield.observation_date.between(start, end) for start, end in ranges),
+        )
+    )
     statement = statement.order_by(TerminalBondYield.observation_date, TerminalBondYield.bond_code)
     result = await session.execute(statement)
     return [
@@ -474,8 +593,25 @@ async def get_macro_overview(session: AsyncSession, history_months: int) -> Macr
 
     Units: ``*_pct`` values are percentage points (``6.80`` means 6.80%), ``fx_kes_usd`` is KES
     per USD, ``fx_reserves_usd_m`` is millions of USD and tenors are years. Rates, FX values,
-    reserves and tenors are quantized to 2 dp. With nothing stored every list is empty and the
-    window ends at the current month; this function never raises for missing data.
+    reserves and tenors are quantized to 2 dp. With only FXD bonds stored the window ends at the
+    month of the latest bond observation and ``latest`` is empty; with nothing stored every list
+    is empty and the window ends at the current month. This function never raises for missing
+    data.
+
+    Reads take at most three statements. Statement 1 returns at most two values per indicator;
+    the rows statements 2 and 3 load are bounded by the window and the lookbacks of its curves and
+    the current curve, never by the stored history. The earliest curve date is
+    ``requested_start``, or the current curve's date when that is earlier (a one-month window
+    whose latest observation falls before the month-end).
+
+    1. The latest macro and FXD bond observation dates, and each indicator's latest two non-null
+       values, resolved in SQL. With nothing stored the response is built from this alone.
+    2. The macro rows from 62 days before the earliest curve date on, which the series, the
+       coverage and the T-bill legs of every curve need. Skipped when no macro row exists.
+    3. The FXD bond observations the curves read: from 365 days before the earliest curve date
+       to the last window month-end, and the 365 days up to the current curve's date. The two
+       intervals are read as one date range when they overlap or touch and as two otherwise, so
+       bonds dated between the window and a much later current curve are never loaded.
 
     Args:
         session: An async session on the terminal database; it is only read.
@@ -487,28 +623,38 @@ async def get_macro_overview(session: AsyncSession, history_months: int) -> Macr
     if history_months < 1:
         raise ValueError(f"history_months must be >= 1, got {history_months}")
 
-    macro_rows, sources_by_date = await _load_macro(session)
-    if macro_rows:
-        month_ends = _window_month_ends(macro_rows[-1].observation_date, history_months)
-        # The first month-end's curve looks back 365 days for bond observations.
-        bond_rows = await _load_bonds(session, since=month_ends[0] - _BOND_LOOKBACK)
+    latest_macro_date, latest_bond_date, observed = await _load_latest(session)
+    if latest_macro_date is not None:
+        window_end = latest_macro_date
+    elif latest_bond_date is not None:
+        # Only bonds are stored (cbk_bonds ran before any rate release): the window then ends at
+        # the latest bond month so the curve still renders.
+        window_end = latest_bond_date
     else:
-        # Only bonds may be stored (cbk_bonds ran before any rate release): the window then ends
-        # at the latest bond month so the curve still renders. The table holds at most a few
-        # thousand FXD rows, so loading them all costs no more than the bounded query.
-        bond_rows = await _load_bonds(session, since=None)
-        if not bond_rows:
-            return _empty_overview(history_months)
-        month_ends = _window_month_ends(bond_rows[-1].observation_date, history_months)
-
+        return _empty_overview(history_months)
+    month_ends = _window_month_ends(window_end, history_months)
     requested_start = month_ends[0]
+    current_day = max(day for day in (latest_macro_date, latest_bond_date) if day is not None)
+    # Every curve, at each window month-end and at current_day, looks back 62 days for T-bill
+    # yields and 365 days for bond observations. With a one-month window current_day can fall
+    # before that month's end, so the reads start from the earlier of the two dates. The macro
+    # read needs no upper bound: no macro row is dated after latest_macro_date, which is never
+    # after month_ends[-1]. FXD bonds can run on to a current_day long after the window, so the
+    # bond read is limited to the history and current curve intervals.
+    earliest_curve_day = min(requested_start, current_day)
+    macro_since = _lookback_start(earliest_curve_day, _TBILL_LOOKBACK)
+    bond_ranges = _bond_read_ranges(month_ends, current_day)
+
+    macro_rows: list[MacroRow] = []
+    sources_by_date: dict[date, Mapping[str, str]] = {}
+    if latest_macro_date is not None:
+        macro_rows, sources_by_date = await _load_macro(session, since=macro_since)
+    bond_rows = await _load_bonds(session, bond_ranges)
     window_rows = macro_rows[_first_on_or_after(macro_rows, requested_start) :]
-    latest_dates = [rows[-1].observation_date for rows in (macro_rows, bond_rows) if rows]
-    current_day = max(latest_dates)
 
     overview = MacroOverviewResponse(
         coverage=_coverage(macro_rows, requested_start),
-        latest=_indicator_snapshots(macro_rows),
+        latest=[] if latest_macro_date is None else _indicator_snapshots(observed),
         inflation_series=_inflation_series(window_rows),
         rates_series=_rates_series(window_rows),
         yield_curve=YieldCurve(
@@ -523,11 +669,14 @@ async def get_macro_overview(session: AsyncSession, history_months: int) -> Macr
         ),
     )
     logger.debug(
-        "macro overview: %d macro rows, %d FXD bond rows, window %s to %s, curve at %s",
-        len(macro_rows),
-        len(bond_rows),
+        "macro overview: window %s to %s, curve at %s; read %d macro rows from %s and %d FXD "
+        "bond rows in %s",
         requested_start,
         month_ends[-1],
         current_day,
+        len(macro_rows),
+        macro_since,
+        len(bond_rows),
+        ", ".join(f"[{start}, {end}]" for start, end in bond_ranges),
     )
     return overview
