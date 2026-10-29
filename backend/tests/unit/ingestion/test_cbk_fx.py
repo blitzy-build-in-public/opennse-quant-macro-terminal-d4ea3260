@@ -163,6 +163,17 @@ def mutated_csv(fx_csv: bytes) -> bytes:
 
 
 @pytest.fixture(scope="module")
+def unreadable_year_csv(fx_csv: bytes) -> bytes:
+    """The recorded file with January 2025's year made unreadable (``bad``) and February 2025's
+    left blank, so a year carried past the unreadable one would date February 2025 in 2024."""
+    mutated = fx_csv
+    for stated, replacement in ((b"\n2025,1,", b"\nbad,1,"), (b"\n2025,2,", b"\n,2,")):
+        assert mutated.count(stated) == 1, f"the recorded file has no single {stated!r} row"
+        mutated = mutated.replace(stated, replacement, 1)
+    return mutated
+
+
+@pytest.fixture(scope="module")
 def fx_records(fx_csv: bytes) -> list[MacroRecord]:
     return parse_fx_csv(fx_csv)
 
@@ -316,6 +327,40 @@ def test_parse_raises_layout_changed_when_the_usd_header_is_renamed(mutated_csv:
     assert "united states dollar" not in excinfo.value.found
 
 
+def test_an_unreadable_year_stops_the_carry_until_a_year_is_stated_again(
+    make_settings: Callable[..., Any],
+) -> None:
+    data = (
+        b",Kenya Shilling End Period Exchange Rates\n"
+        b"Year,Month,United States dollar\n"
+        b"2025,1,129.00\n"
+        b"bad,1,130.00\n"
+        b",2,131.00\n"
+        b"2026,3,132.00\n"
+    )
+
+    records = parse_fx_csv(data)
+
+    # The blank-year row after "bad" is left undated, never dated in 2025.
+    assert [
+        (record.observation_date, dict(record.values), record.errors) for record in records
+    ] == [
+        (date(2025, 1, 31), {FX: Decimal("129.00")}, ()),
+        (None, {FX: Decimal("130.00")}, ("invalid_year:bad",)),
+        (None, {FX: Decimal("131.00")}, ("no_year",)),
+        (date(2026, 3, 31), {FX: Decimal("132.00")}, ()),
+    ]
+
+    outcome = CbkFxPipeline(make_settings()).validate(records)
+
+    # Only the stated-year rows reach the writer; both rows of the unreadable year are rejected.
+    assert outcome.valid == [records[0], records[3]]
+    assert [(row.index, row.reason) for row in outcome.rejected] == [
+        (4, "invalid_year:bad"),
+        (5, "no_year"),
+    ]
+
+
 # --- Full runs against a seeded clone --------------------------------------------------------
 
 
@@ -425,6 +470,46 @@ async def test_full_run_writes_cbk_rates_with_provenance_and_a_rerun_changes_not
     assert second.result.run_id != result.run_id
     assert_polite_sequence(second, csv_url, min_interval)
     assert snapshot_values(await macro_snapshot(engine)) == snapshot_values(after)
+
+
+async def test_rows_after_an_unreadable_year_are_rejected_and_no_stale_year_rate_is_written(
+    seeded_database: _Clone, run_fx: FxRunner, unreadable_year_csv: bytes, csv_url: str
+) -> None:
+    engine = seeded_database.engine
+    rejected_months = (date(2025, 1, 31), date(2025, 2, 28))
+    before = await macro_snapshot(engine)
+    assert all(before[day]["source_by_field"][FX] == "seed" for day in rejected_months)
+
+    run = await run_fx(seeded_database, unreadable_year_csv)
+
+    result = run.result
+    assert result.status is RunStatus.PARTIAL
+    assert result.rows_fetched == FIXTURE_MONTHS
+    assert result.rows_rejected == 2
+    assert result.rows_written == FIXTURE_MONTHS - 2
+    assert [(entry["index"], entry["reason"]) for entry in result.details["rejected"]] == [
+        (387, "invalid_year:bad"),
+        (388, "no_year"),
+    ]
+    assert_polite_sequence(run, csv_url, seeded_database.settings.scraper_min_interval_seconds)
+
+    row = await run_row(engine, result.run_id)
+    assert row["status"] == "partial"
+    assert (row["rows_fetched"], row["rows_written"], row["rows_rejected"]) == (
+        FIXTURE_MONTHS,
+        FIXTURE_MONTHS - 2,
+        2,
+    )
+
+    after = await macro_snapshot(engine)
+    # The file's own February 2024 rate, not February 2025's 129.23 dated under a carried 2024.
+    february_2024 = after[date(2024, 2, 29)]
+    assert february_2024[FX] == Decimal("143.59")
+    assert february_2024["source_by_field"][FX] == "cbk_fx"
+    # The two rejected months keep their seeded rows, values and provenance alike.
+    assert {day: after[day] for day in rejected_months} == {
+        day: before[day] for day in rejected_months
+    }
 
 
 # --- Live source (skipped by default) --------------------------------------------------------

@@ -33,6 +33,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from opennse_terminal.ingestion.base import (
+    MAX_INVALID_FRACTION,
     RunResult,
     RunStatus,
     SourceLayoutChanged,
@@ -85,6 +86,20 @@ SPACING_SECONDS = 2.0
 _THEAD = re.compile(r"<thead>.*?</thead>", re.DOTALL)
 _RENAMED_CELL = re.compile(r">12-Month Inflation<")
 _ROW_YEAR = re.compile(r'(<tr id="table_172_row_\d+">\s*<td style="">)(\d{4})(</td>)')
+_ROW_THROUGH_MONTH = re.compile(
+    r'<tr id="table_172_row_\d+">\s*<td style="">[^<]*</td>\s*<td style="">[^<]*</td>'
+)
+SURPLUS_CELL = '<td style="">note</td>'
+# More than 10% of the recorded rows, the share above which a run ends layout_changed.
+SHIFTED_ROWS = 30
+# The September 2026 row with a note cell after Month: its cells as details.rejected shows them.
+SHIFTED_ANCHOR_CELLS = {
+    "year": "2026",
+    "month": "September",
+    "annual average inflation": "note",
+    "12-month inflation": "5.44",
+    "extra_1": "6.76",
+}
 
 
 # --- Fakes and helpers ----------------------------------------------------------------------
@@ -219,6 +234,12 @@ def blank_repeated_years(html: str) -> tuple[str, int]:
         return match.group(0)
 
     return _ROW_YEAR.sub(blank, html), blanked
+
+
+def shift_rows(html: str, rows: int) -> tuple[str, int]:
+    """The page with a non-blank cell inserted after ``Month`` in its first ``rows`` body rows,
+    which moves each of their values one column right; returns the page and the rows changed."""
+    return _ROW_THROUGH_MONTH.subn(lambda match: match.group(0) + SURPLUS_CELL, html, count=rows)
 
 
 def single_row_page(*cells: str) -> str:
@@ -366,6 +387,16 @@ def test_parse_carries_a_blank_year_forward(page: str) -> None:
             [(ANCHOR, {}, ("short_row",))],
             id="short-row",
         ),
+        pytest.param(
+            ("2026", "September", "note", "5.44", "6.76"),
+            [(ANCHOR, {}, ("long_row",))],
+            id="long-row",
+        ),
+        pytest.param(
+            ("2026", "September", "5.44", "6.76", ""),
+            [(ANCHOR, {INFLATION: Decimal("6.76")}, ())],
+            id="trailing-blank-cell",
+        ),
     ],
 )
 def test_parse_handles_each_row_shape(
@@ -456,6 +487,83 @@ async def test_layout_change_ends_the_run_without_writing(
     assert recorded.details["source_url"] == INFLATION_URL
 
     assert await macro_snapshot(engine) == before
+
+
+async def test_shifted_cells_in_over_a_tenth_of_rows_end_the_run_without_writing(
+    seeded_database: SeededDatabase, page: str
+) -> None:
+    shifted, changed = shift_rows(page, SHIFTED_ROWS)
+    assert changed == SHIFTED_ROWS
+    assert SHIFTED_ROWS > MAX_INVALID_FRACTION * RECORDED_MONTHS
+    engine = seeded_database.engine
+    before = await macro_snapshot(engine)
+
+    served = await run(seeded_database, shifted)
+
+    result = served.result
+    assert result.status is RunStatus.LAYOUT_CHANGED
+    assert (result.rows_fetched, result.rows_written, result.rows_rejected) == (
+        RECORDED_MONTHS,
+        0,
+        SHIFTED_ROWS,
+    )
+    assert result.error_message == (
+        f"{SHIFTED_ROWS} of {RECORDED_MONTHS} rows rejected, more than 10% of the rows parsed"
+    )
+    assert result.details["expected"] == {"min_rows": MIN_ROWS, "max_invalid_fraction": "0.10"}
+    assert result.details["found"] == {"parsed": RECORDED_MONTHS, "rejected": SHIFTED_ROWS}
+    rejected = result.details["rejected"]
+    assert [(row["index"], row["reason"]) for row in rejected] == [
+        (line, "long_row") for line in range(1, SHIFTED_ROWS + 1)
+    ]
+    assert rejected[0]["row"] == SHIFTED_ANCHOR_CELLS
+    assert_one_polite_request(served)
+
+    recorded = await run_row(engine, result.run_id)
+    assert (recorded.pipeline, recorded.trigger, recorded.status) == (
+        "cbk_inflation",
+        "cli",
+        "layout_changed",
+    )
+    assert (recorded.rows_fetched, recorded.rows_written, recorded.rows_rejected) == (
+        RECORDED_MONTHS,
+        0,
+        SHIFTED_ROWS,
+    )
+    assert recorded.error_message == result.error_message
+    assert recorded.details["found"] == result.details["found"]
+    assert recorded.details["rejected"] == rejected
+
+    # Neither the shifted Annual Average values nor any valid row was written.
+    assert await macro_snapshot(engine) == before
+
+
+async def test_one_shifted_row_is_rejected_and_its_month_keeps_the_seeded_value(
+    seeded_database: SeededDatabase, page: str
+) -> None:
+    shifted, changed = shift_rows(page, 1)
+    assert changed == 1
+    engine = seeded_database.engine
+
+    served = await run(seeded_database, shifted)
+
+    result = served.result
+    assert result.status is RunStatus.PARTIAL
+    assert (result.rows_fetched, result.rows_rejected) == (RECORDED_MONTHS, 1)
+    assert 0 < result.rows_written <= RECORDED_MONTHS - 1
+    assert result.details["rejected"] == [
+        {"index": 1, "reason": "long_row", "row": SHIFTED_ANCHOR_CELLS}
+    ]
+    recorded = await run_row(engine, result.run_id)
+    assert (recorded.status, recorded.rows_rejected) == ("partial", 1)
+
+    after = await macro_snapshot(engine)
+    # 2026-09-30 keeps the seeded 6.80: neither the shifted 5.44 nor the source's 6.76 is written.
+    assert after[ANCHOR].values == SEEDED_ANCHOR_ROW
+    assert after[ANCHOR].provenance == dict.fromkeys(MACRO_INDICATOR_COLUMNS, "seed")
+    # The unshifted rows are still written.
+    assert after[AUGUST].values[INFLATION] == Decimal("6.59")
+    assert after[AUGUST].provenance[INFLATION] == "cbk_inflation"
 
 
 async def test_full_run_merges_the_twelve_month_rate_into_the_seeded_history(

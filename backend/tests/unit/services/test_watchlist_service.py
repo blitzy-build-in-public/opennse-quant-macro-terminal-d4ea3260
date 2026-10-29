@@ -40,6 +40,7 @@ connection waiting on it. Nothing outside the test's own clone is touched.
 """
 
 import asyncio
+import logging
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -131,6 +132,7 @@ LOCAL: Final = HostPrincipal("local")
 OTHER: Final = HostPrincipal("host-user-42")
 MISSING_WATCHLIST: Final = uuid.UUID("00000000-0000-4000-8000-000000000000")
 LOCK_WAIT_SECONDS: Final = 10
+FORGING_TICKER: Final = "Z\r\nINFO FORGED"
 
 SessionFactory = async_sessionmaker[AsyncSession]
 WatchlistCall = Callable[[AsyncSession, OwnerPrincipal, uuid.UUID], Awaitable[object]]
@@ -569,6 +571,52 @@ async def test_item_change_with_an_unknown_ticker_is_404(
     assert_coded(excinfo.value, 404, code, field, message)
     assert await committed_items(factory, core_id) == SEEDED_TICKERS
     assert await committed_updated_at(factory, core_id) == updated_before
+
+
+@pytest.mark.parametrize(
+    ("call", "listed_first"),
+    [
+        pytest.param(partial(add_item, ticker=FORGING_TICKER), False, id="add_item"),
+        pytest.param(partial(remove_item, ticker=FORGING_TICKER), True, id="remove_item"),
+    ],
+)
+async def test_item_change_logs_a_control_character_ticker_escaped(
+    session: AsyncSession,
+    factory: SessionFactory,
+    caplog: pytest.LogCaptureFixture,
+    call: WatchlistCall,
+    listed_first: bool,
+) -> None:
+    """A stored ticker holding CR and LF reaches the DEBUG record of a real item change as its
+    ``repr``, so the record stays on one line and cannot forge another."""
+    async with factory() as setup:
+        setup.add(
+            TerminalEquity(
+                ticker=FORGING_TICKER,
+                company_name="Forged Holdings",
+                sector="Banking",
+                shares_outstanding=1_000,
+                source="csv_import",
+            )
+        )
+        await setup.commit()
+    created = await create_watchlist(session, LOCAL, WatchlistCreate(name="Forgery"))
+    if listed_first:
+        await add_item(session, LOCAL, created.id, FORGING_TICKER)
+    caplog.clear()
+
+    with caplog.at_level(logging.DEBUG, logger=watchlist_service.logger.name):
+        await call(session, LOCAL, created.id)
+
+    [message] = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == watchlist_service.logger.name
+    ]
+    assert "\r" not in message
+    assert "\n" not in message
+    assert repr(FORGING_TICKER) in message
+    assert message.endswith(": changed=True")
 
 
 async def test_updated_at_advances_inside_a_hosts_outer_transaction(

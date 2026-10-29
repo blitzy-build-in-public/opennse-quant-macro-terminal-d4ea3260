@@ -105,6 +105,9 @@ def parse_inflation_table(html: str) -> list[MacroRecord]:
     are dropped. Problems are returned on the record for ``validate`` to reject, never raised:
 
     - ``short_row``: fewer than four cells;
+    - ``long_row``: a non-blank cell beyond the four, so the cells may be shifted and the value
+      cell is not read (blank trailing cells are allowed); the extra cells are kept in ``raw`` as
+      ``extra_<n>``;
     - ``invalid_year:<text>``: a non-blank year cell that is not a year from 1900 to 2100;
     - ``no_year``: a blank year cell with no year to carry forward, either before the first year
       or after an invalid one (which is never skipped over, so no row is dated by the wrong year);
@@ -115,15 +118,22 @@ def parse_inflation_table(html: str) -> list[MacroRecord]:
         SourceLayoutChanged: No table with :data:`EXPECTED_HEADERS`.
     """
     table = extract_table(html, EXPECTED_HEADERS)
+    width = len(EXPECTED_HEADERS)
     records: list[MacroRecord] = []
     carried_year: int | None = None
     for index, cells in table.rows:
         errors: list[str] = []
-        if len(cells) < len(EXPECTED_HEADERS):
+        if len(cells) < width:
             errors.append("short_row")
+        # Cells arrive cleaned, so a trailing cell holding only whitespace is "" and is allowed on
+        # purpose. A non-blank one means the cells may be shifted, so the value cell is not read
+        # by position.
+        long_row = any(cells[width:])
+        if long_row:
+            errors.append("long_row")
 
-        # A short row's year still moves the carried year, so blank-year rows after it are not
-        # dated by an older one.
+        # A short or long row's year still moves the carried year, so blank-year rows after it
+        # are not dated by an older one.
         year_text = cells[_YEAR_INDEX] if len(cells) > _YEAR_INDEX else ""
         if year_text:
             carried_year = parse_year(year_text)
@@ -140,7 +150,7 @@ def parse_inflation_table(html: str) -> list[MacroRecord]:
                 errors.append(f"unknown_month:{month_text}")
 
         values: dict[str, Decimal] = {}
-        if len(cells) > _VALUE_INDEX:
+        if len(cells) > _VALUE_INDEX and not long_row:
             value_text = cells[_VALUE_INDEX]
             if not is_missing_cell(value_text):
                 try:
@@ -153,12 +163,16 @@ def parse_inflation_table(html: str) -> list[MacroRecord]:
         observation_date: date | None = None
         if carried_year is not None and month is not None:
             observation_date = month_end(carried_year, month)
+        raw = dict(zip(table.headers, cells, strict=False))
+        # Cells beyond the headers are kept as extra_<n>, so a rejected long row shows them.
+        for position, cell in enumerate(cells[width:], start=1):
+            raw[f"extra_{position}"] = cell
         records.append(
             MacroRecord(
                 observation_date=observation_date,
                 values=values,
                 errors=tuple(errors),
-                raw=dict(zip(table.headers, cells, strict=False)),
+                raw=raw,
                 line=index,
             )
         )

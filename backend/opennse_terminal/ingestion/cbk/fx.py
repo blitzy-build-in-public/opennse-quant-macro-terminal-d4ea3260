@@ -13,8 +13,9 @@ Source: Central Bank of Kenya, the public "Exchange Rates End Period" statistica
 - **File layout:** a title line, then the header on row 2 (``Year,Month,United States dollar,
   Sterling pound,Euro,...``), then one row per month from January 1993. Only ``Year``, ``Month``
   and ``United States dollar`` are read; every other currency column is ignored. A blank
-  ``Year`` takes the last valid year above it; ``Month`` is a number 1-12 (names are accepted
-  too). A missing rate (``-`` or blank) is skipped, never written as null.
+  ``Year`` takes the nearest stated year above it, unless that year is unreadable, when the row
+  is rejected (``no_year``); ``Month`` is a number 1-12 (names are accepted too). A missing rate
+  (``-`` or blank) is skipped, never written as null.
 - **Target:** ``terminal_macro_indicators.fx_kes_usd`` (NUMERIC(12,4)) in KES per one USD,
   dated at the month-end of the reference month and quantized to 4 dp with ``ROUND_HALF_UP``.
 - **Validation:** at least 300 parsed rows, and every rate within [10, 1,000] KES per USD: a
@@ -136,8 +137,10 @@ def parse_fx_csv(data: bytes) -> list[MacroRecord]:
     Kenya" and blank rows are dropped by ``cbk.read_cbk_csv``. For each data row, in file order:
 
     - **Year.** A non-blank ``Year`` cell read by ``cbk.parse_year`` becomes the current year;
-      an unreadable one adds ``invalid_year:<text>`` and is not carried to later rows. A blank
-      cell takes the current year, or adds ``no_year`` when no year has been seen yet.
+      an unreadable one adds ``invalid_year:<text>`` and clears the current year. A blank cell
+      takes the current year, or adds ``no_year`` when there is none to carry forward, either
+      before the first year or after an invalid one (which is never skipped over, so no row is
+      dated by the wrong year).
     - **Month.** A number 1-12 or a month name (``cbk.parse_month``), else
       ``unknown_month:<text>``.
     - **Date.** ``observation_date`` is the month-end of that year and month, or ``None`` when
@@ -168,18 +171,16 @@ def parse_fx_csv(data: bytes) -> list[MacroRecord]:
     for line, row in table.rows:
         errors: list[str] = []
 
+        # An unreadable year also clears the carried one, so blank-year rows after it are never
+        # dated by the last valid year above it.
         year_text = clean_text(row["year"])
-        year: int | None
         if year_text:
-            year = parse_year(year_text)
-            if year is None:
+            current_year = parse_year(year_text)
+            if current_year is None:
                 errors.append(f"invalid_year:{year_text}")
-            else:
-                current_year = year
-        else:
-            year = current_year
-            if year is None:
-                errors.append("no_year")
+        elif current_year is None:
+            errors.append("no_year")
+        year = current_year
 
         month_text = clean_text(row["month"])
         month = parse_month(month_text)

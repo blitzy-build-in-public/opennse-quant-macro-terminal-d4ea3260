@@ -400,7 +400,8 @@ async def add_item(
     if added:
         await _touch(session, locked_id)
     await session.commit()
-    logger.debug("Watchlist %s add %s: changed=%s", locked_id, normalised, added)
+    # %r escapes CR, LF and other control characters a stored ticker may hold: no forged lines.
+    logger.debug("Watchlist %s add %r: changed=%s", locked_id, normalised, added)
     return await _reload(session, principal, locked_id)
 
 
@@ -428,5 +429,6 @@ async def remove_item(
     if removed:
         await _touch(session, locked_id)
     await session.commit()
-    logger.debug("Watchlist %s remove %s: changed=%s", locked_id, normalised, removed)
+    # %r escapes CR, LF and other control characters a stored ticker may hold: no forged lines.
+    logger.debug("Watchlist %s remove %r: changed=%s", locked_id, normalised, removed)
     return await _reload(session, principal, locked_id)
