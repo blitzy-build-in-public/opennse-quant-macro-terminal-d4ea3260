@@ -7,6 +7,8 @@ FastAPI, SQLAlchemy, the models or the services. It holds:
 
 * :class:`TerminalRequestModel` and :class:`TerminalResponseModel`, the bases of every schema;
 * the coded error contract: :data:`ErrorCode`, :class:`ErrorDetail` and :class:`ErrorResponse`;
+* the OpenAPI documentation of FastAPI's standard 422 list: :class:`ValidationErrorItem` and
+  :class:`ValidationErrorResponse`;
 * :data:`Flag`, the base reason codes that accompany null or qualified metric values;
 * bounded request aliases (:data:`RequestDecimal`, :data:`Kes`, :data:`ShareCount`, ...);
 * the shared response shapes :class:`CoverageMeta`, :class:`SeriesPoint` and
@@ -56,6 +58,8 @@ __all__ = [
     "TerminalRequestModel",
     "TerminalResponseModel",
     "Ticker",
+    "ValidationErrorItem",
+    "ValidationErrorResponse",
 ]
 
 
@@ -251,11 +255,56 @@ class ErrorDetail(TerminalResponseModel):
 class ErrorResponse(TerminalResponseModel):
     """OpenAPI documentation of a coded error body, for ``responses={404: {"model": ...}}``.
 
-    FastAPI's standard single-field validation 422, whose ``detail`` is a list of
-    ``{type, loc, msg, input}`` entries, is left unchanged and is not modelled here.
+    A 422 can also be FastAPI's standard single-field validation list, which the router leaves
+    unchanged and :class:`ValidationErrorResponse` documents. A route that declares a 422 therefore
+    names ``ErrorResponse | ValidationErrorResponse``, so its OpenAPI schema admits both shapes.
     """
 
     detail: ErrorDetail = Field(description="The coded error: code, message and offending field.")
+
+
+class ValidationErrorItem(TerminalResponseModel):
+    """One entry of FastAPI's standard 422 ``detail`` list: a single-field validation failure.
+
+    OpenAPI documentation only; FastAPI builds each entry from a Pydantic error, without its
+    documentation URL, and the entry carries no stable terminal code. Named apart from FastAPI's
+    own ``ValidationError`` component, which the same OpenAPI document may also hold.
+    """
+
+    loc: list[str | int] = Field(
+        description=(
+            "Location of the failing value: its source (query, path, body), then its name and "
+            'any nested key or list index, for example ["query", "min_pe"].'
+        ),
+    )
+    msg: str = Field(description="Human-readable explanation of the failure.")
+    type: str = Field(description="Pydantic error type, for example less_than_equal or missing.")
+    input: Any = Field(
+        default=None,
+        description="The rejected input value; null when the value is missing altogether.",
+    )
+    ctx: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            'Context of the failed constraint, for example {"ge": 5}; omitted when the error '
+            "has none."
+        ),
+    )
+
+
+class ValidationErrorResponse(TerminalResponseModel):
+    """OpenAPI documentation of FastAPI's standard 422 body for single-field validation failures.
+
+    Pydantic field constraints, unknown request keys and undecodable JSON bodies fail with this
+    shape, which the router leaves to FastAPI unchanged: it registers no exception handler. Its
+    ``detail`` is a list where a coded :class:`ErrorResponse` has an object, so a client tells the
+    two 422 shapes apart by the JSON type of ``detail``. Named apart from FastAPI's own
+    ``HTTPValidationError`` component, which the same OpenAPI document may also hold.
+    """
+
+    detail: list[ValidationErrorItem] = Field(
+        description="One entry per failed single-field check.",
+    )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -361,13 +410,19 @@ JavaScript."""
 PositiveShareCount = Annotated[int, Field(ge=1, le=MAX_SHARE_COUNT)]
 """A share count in shares, 1 to 10^12."""
 
-Ticker = Annotated[str, Field(min_length=1, max_length=16)]
-"""An NSE ticker symbol such as ``SCOM``, as stored in ``terminal_equities.ticker``
-(``VARCHAR(16)``). Not case-normalized; an unknown ticker is a coded 404 or 422."""
+# PostgreSQL text cannot hold a NUL character, so a ticker or sector carrying one is refused as a
+# single-field 422 here rather than failing as a 500 when the service queries it.
+_NO_NUL_PATTERN: Final = r"^[^\x00]*$"
 
-SectorName = Annotated[str, Field(min_length=1, max_length=100)]
+Ticker = Annotated[str, Field(min_length=1, max_length=16, pattern=_NO_NUL_PATTERN)]
+"""An NSE ticker symbol such as ``SCOM``, as stored in ``terminal_equities.ticker``
+(``VARCHAR(16)``). A NUL character is FastAPI's standard 422. Not case-normalized; an unknown
+ticker is a coded 404 or 422."""
+
+SectorName = Annotated[str, Field(min_length=1, max_length=100, pattern=_NO_NUL_PATTERN)]
 """A sector name such as ``Banking``, as stored in ``terminal_equities.sector``
-(``VARCHAR(100)``). Not normalized; an unknown sector is a coded 404."""
+(``VARCHAR(100)``). A NUL character is FastAPI's standard 422. Not normalized; an unknown sector
+is a coded 404."""
 
 
 # ---------------------------------------------------------------------------------------------

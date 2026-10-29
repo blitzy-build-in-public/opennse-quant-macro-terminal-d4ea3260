@@ -27,7 +27,12 @@ from typing import Annotated, Final
 from fastapi import APIRouter, Path, status
 
 from opennse_terminal.api.deps import PrincipalDep, SessionDep, TerminalJsonRoute
-from opennse_terminal.schemas import ErrorResponse, Watchlist, WatchlistCreate
+from opennse_terminal.schemas import (
+    ErrorResponse,
+    ValidationErrorResponse,
+    Watchlist,
+    WatchlistCreate,
+)
 from opennse_terminal.services import watchlist_service
 
 __all__ = [
@@ -86,7 +91,10 @@ async def list_watchlists(session: SessionDep, principal: PrincipalDep) -> list[
     summary="Create a watchlist",
     responses={
         409: {"model": ErrorResponse, "description": "watchlist_name_taken"},
-        422: {"model": ErrorResponse, "description": "unknown_ticker or standard validation error"},
+        422: {
+            "model": ErrorResponse | ValidationErrorResponse,
+            "description": "unknown_ticker or standard validation error",
+        },
     },
 )
 async def create_watchlist(

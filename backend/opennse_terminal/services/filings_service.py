@@ -57,6 +57,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Any, Final, TypeGuard, TypeVar, overload
 
+import anyio
 from fastapi import HTTPException, status
 from sqlalchemy import ColumnElement, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
@@ -196,9 +197,9 @@ async def _run_to_completion(
     """Run ``awaitable`` as its own task until it is done, however often the caller is cancelled
     meanwhile, and return the finished task with whether a cancellation was requested.
 
-    Used for the transaction commit and the run-row writes, so a cancelled request never leaves
-    the commit's outcome unknown or its run row ``running``. The task's result or exception stays
-    on it for the caller to read.
+    Used for the PDF parse, the transaction commit and the run-row writes, so a cancelled request
+    never outlives its parse thread, leaves the commit's outcome unknown or leaves its run row
+    ``running``. The task's result or exception stays on it for the caller to read.
     """
     task = asyncio.create_task(awaitable)
     cancel_requested = False
@@ -346,15 +347,35 @@ async def _check_preconditions(session: AsyncSession, form: PdfIngestForm) -> No
 async def _extract(
     upload_bytes: bytes, form: PdfIngestForm, settings: TerminalSettings
 ) -> ExtractionResult:
-    """Parse the PDF in a worker thread, mapping the parser's rejections to coded 422s."""
-    try:
-        return await run_in_threadpool(
-            extract_line_items,
-            upload_bytes,
-            list(form.items),
-            period_end_date=form.period_end_date,
-            max_pages=settings.pdf_max_pages,
+    """Parse the PDF in a worker thread, mapping the parser's rejections to coded 422s.
+
+    A worker thread cannot be stopped, so this returns only once the parse has ended, however
+    often the request is cancelled meanwhile, and the route's parse slot stays held for the whole
+    parse. A task cancellation (``Task.cancel()``) that arrives meanwhile is re-raised as
+    ``asyncio.CancelledError`` once the thread has finished, before the parse's outcome is
+    mapped. A cancelled anyio cancel scope around the request (a host's task group or timeout)
+    is held off until then and takes effect at the caller's next await.
+    """
+    # The shield keeps a cancelled anyio scope from re-delivering its cancellation on every pass
+    # of the wait, which would spin the event loop for as long as the parse runs.
+    with anyio.CancelScope(shield=True):
+        task, cancel_requested = await _run_to_completion(
+            run_in_threadpool(
+                extract_line_items,
+                upload_bytes,
+                list(form.items),
+                period_end_date=form.period_end_date,
+                max_pages=settings.pdf_max_pages,
+            )
         )
+    if cancel_requested:
+        # The cancellation supersedes the parse's outcome, which is still retrieved so that
+        # asyncio never reports it as an unhandled exception.
+        if not task.cancelled():
+            task.exception()
+        raise asyncio.CancelledError
+    try:
+        return task.result()
     except PdfEncrypted as exc:
         raise _coded_error(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -627,11 +648,14 @@ async def ingest_pdf(
       parameters (the file name, the form fields, the extraction), never reaches the response,
       a log or a traceback.
     * The transaction is committed here (services own write transactions). The run-row insert,
-      the commit and the run-row writes run to completion even if the request is cancelled
-      meanwhile. A cancellation received while the row is inserted finishes it ``failed`` with
-      ``cancelled`` and then re-raises; a cancelled request whose row could not be started
-      re-raises the cancellation without one, logged once: at WARNING as ``cancelled`` when the
-      cancellation ended the insert itself, otherwise at ERROR as the insert's fault.
+      the parse, the commit and the run-row writes run to completion even if the request is
+      cancelled meanwhile. A worker thread cannot be stopped, so a request cancelled while
+      parsing raises its cancellation only once the parse thread has ended, and the route's
+      parse slot stays held until then. A cancellation received while the row is inserted
+      finishes it ``failed`` with ``cancelled`` and then re-raises; a cancelled request whose
+      row could not be started re-raises the cancellation without one, logged once: at WARNING
+      as ``cancelled`` when the cancellation ended the insert itself, otherwise at ERROR as the
+      insert's fault.
 
     Args:
         session: The request session; the filing and fundamentals writes share its transaction.

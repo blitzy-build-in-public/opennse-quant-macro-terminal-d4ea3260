@@ -745,8 +745,8 @@ async def test_concurrency_limit_returns_429(
     """With both parse slots held, a third upload is answered at once with 429 ``ingest_busy``.
 
     The service is replaced by one that holds its slot until released, so no parse or database
-    write happens. The held requests are always released and awaited, which frees the
-    process-wide semaphore for later tests and leaves no pending task.
+    write happens. The held requests are always released and awaited, which frees the app's
+    parse slots for later tests and leaves no pending task.
     """
     configure_settings(pdf_max_concurrency=2)
     calls = 0

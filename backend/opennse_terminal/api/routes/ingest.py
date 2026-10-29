@@ -14,8 +14,12 @@ Limits, in the order they apply:
    endpoint runs, so a check inside the endpoint could not bound it.
 2. The file itself: more than ``TERMINAL_PDF_MAX_BYTES`` is 413 ``file_too_large``, and bytes that
    do not start with ``%PDF-`` are 415 ``not_a_pdf``.
-3. At most ``TERMINAL_PDF_MAX_CONCURRENCY`` (2) parses run per process. A request beyond it is
-   answered at once with 429 ``ingest_busy`` and ``Retry-After: 5``; it never queues.
+3. At most ``TERMINAL_PDF_MAX_CONCURRENCY`` (2) parses run at once per mounted router, which is
+   per process for the standalone app and for a host that mounts ``terminal_router`` once. A
+   request beyond it is answered at once with 429 ``ingest_busy`` and ``Retry-After: 5``; it
+   never queues. Each mount counts its own active parses across settings changes: a lower limit
+   applies to new requests at once while parses admitted under the old one finish, so a request
+   is admitted only while fewer parses than the limit in force are running.
 
 A request rejected by these limits writes nothing and records no run row. Every coded error is the
 body ``{"detail": {"code", "message", "field"}}`` and carries no extraction. Single-field form
@@ -26,6 +30,8 @@ The sub-router carries no prefix, tags, middleware or exception handlers: ``api/
 it under ``/api/v1/terminal``, where the router-level principal dependency applies, and the route
 adds ``require_ingest_permission``, which a host overrides to restrict ingestion. ``include_router``
 preserves the route class, so the request-size guard travels with ``terminal_router`` into a host.
+The module holds no mutable state: the parse limiter and the settings-fallback warning belong to
+each mounted copy of the route (see :class:`TerminalUploadRoute`).
 
 Annotations are evaluated at runtime (no ``from __future__ import annotations``), because FastAPI
 reads the ``Annotated`` form and dependency metadata from the route signature.
@@ -34,7 +40,8 @@ reads the ``Annotated`` form and dependency metadata from the route signature.
 import asyncio
 import inspect
 import logging
-from collections.abc import Callable, Coroutine, Mapping
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
+from contextlib import asynccontextmanager
 from datetime import date
 from typing import Annotated, Any, Final
 
@@ -69,10 +76,18 @@ from opennse_terminal.schemas import (
     IngestPdfResponse,
     LineItemName,
     PeriodType,
+    ValidationErrorResponse,
 )
 from opennse_terminal.services import filings_service
 
-__all__ = ["MULTIPART_OVERHEAD_BYTES", "TerminalUploadRoute", "ingest_pdf", "router"]
+__all__ = [
+    "MULTIPART_OVERHEAD_BYTES",
+    "PdfParseLimiter",
+    "TerminalUploadRoute",
+    "get_pdf_parse_limiter",
+    "ingest_pdf",
+    "router",
+]
 
 MULTIPART_OVERHEAD_BYTES: Final = 1_048_576
 """Bytes a request may carry beyond ``TERMINAL_PDF_MAX_BYTES`` for multipart boundaries, part
@@ -91,11 +106,10 @@ DEFAULT_FILE_NAME: Final = "upload.pdf"
 _NO_NUL_PATTERN: Final = r"^[^\x00]*$"
 # FastAPI's own answer to a body it cannot read, reused when the client disconnects mid-body.
 _BODY_ERROR_MESSAGE: Final = "There was an error parsing the body"
+# ASGI scope key under which the route hands its mount's parse limiter to the endpoint.
+_PARSE_LIMITER_SCOPE_KEY: Final = "opennse_terminal.pdf_parse_limiter"
 
 logger = logging.getLogger("opennse_terminal.api.routes.ingest")
-
-_settings_fallback_warned = False
-_parse_semaphore: tuple[int, asyncio.Semaphore] | None = None
 
 
 # ---------------------------------------------------------------------------------------------
@@ -108,7 +122,9 @@ class _RequestTooLargeError(Exception):
     request limit."""
 
 
-async def _resolve_settings(request: Request) -> TerminalSettings:
+async def _resolve_settings(
+    request: Request, on_fallback: Callable[[object], None]
+) -> TerminalSettings:
     """The settings that govern this request, honouring a host's ``get_terminal_settings``
     override.
 
@@ -116,9 +132,9 @@ async def _resolve_settings(request: Request) -> TerminalSettings:
     override registered on the application in ``app.dependency_overrides``, else
     ``get_terminal_settings``. An override must be a zero-argument callable, as in
     ``lambda: TerminalSettings(...)``; it may be async. One that returns anything other than a
-    ``TerminalSettings`` is logged once and the cached default settings apply instead.
+    ``TerminalSettings`` is passed to ``on_fallback`` and the cached default settings apply
+    instead.
     """
-    global _settings_fallback_warned
     overrides: Mapping[Any, Any] = getattr(request.scope.get("app"), "dependency_overrides", {})
     provider = overrides.get(get_terminal_settings, get_terminal_settings)
     value = provider()
@@ -126,13 +142,7 @@ async def _resolve_settings(request: Request) -> TerminalSettings:
         value = await value
     if isinstance(value, TerminalSettings):
         return value
-    if not _settings_fallback_warned:
-        _settings_fallback_warned = True
-        logger.warning(
-            "The get_terminal_settings override returned %s, not TerminalSettings; the upload "
-            "size guard uses the default settings",
-            type(value).__name__,
-        )
+    on_fallback(value)
     return get_terminal_settings()
 
 
@@ -168,16 +178,45 @@ class TerminalUploadRoute(APIRoute):
     A router cannot carry middleware, and ``include_router`` preserves the route class, so the
     guard reaches every host that mounts ``terminal_router`` without any ingress setting. A host
     proxy may impose a stricter limit.
+
+    Each handler built by :meth:`get_route_handler` also owns the state of one mount. FastAPI
+    builds one handler for every application that includes ``terminal_router``, and replaces it
+    (and with it that state) only if routes are added to the terminal routers after mounting,
+    which neither the product nor the ``include_router`` host contract does. The handler owns:
+
+    * a :class:`PdfParseLimiter`, which counts that mount's active parses for its whole life,
+      whatever ``pdf_max_concurrency`` each request's settings carry. The handler places it in
+      the request scope, where :func:`get_pdf_parse_limiter` hands it to the endpoint;
+    * the once-only warning logged when the mount's ``get_terminal_settings`` override returns
+      something other than ``TerminalSettings``.
+
+    Two hosts in one process therefore never share upload accounting. Nothing is keyed on the
+    settings object, which an override such as ``lambda: TerminalSettings(...)`` builds anew for
+    every request.
     """
 
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
-        """Wrap FastAPI's handler with the request-size check."""
+        """Wrap FastAPI's handler with the request-size check and this mount's parse limiter."""
         # Built here, synchronously: FastAPI resolves an included route's context during this
         # call, so deferring it to request time would lose that context.
         original = super().get_route_handler()
+        limiter = PdfParseLimiter()
+        fallback_warned = False
+
+        def warn_settings_fallback(value: object) -> None:
+            nonlocal fallback_warned
+            if fallback_warned:
+                return
+            fallback_warned = True
+            logger.warning(
+                "The get_terminal_settings override returned %s, not TerminalSettings; the upload "
+                "size guard uses the default settings",
+                type(value).__name__,
+            )
 
         async def guarded(request: Request) -> Response:
-            settings = await _resolve_settings(request)
+            request.scope[_PARSE_LIMITER_SCOPE_KEY] = limiter
+            settings = await _resolve_settings(request, warn_settings_fallback)
             limit = settings.pdf_max_bytes + MULTIPART_OVERHEAD_BYTES
             header = request.headers.get("content-length")
             if header is not None:
@@ -224,17 +263,112 @@ router = APIRouter(route_class=TerminalUploadRoute)
 # ---------------------------------------------------------------------------------------------
 
 
-def _get_parse_semaphore(limit: int) -> asyncio.Semaphore:
-    """The process-wide parse semaphore for ``limit`` slots, created on first use.
+class PdfParseLimiter:
+    """Non-blocking admission of PDF parses, resized in place to each request's limit.
 
-    It is recreated only when ``TERMINAL_PDF_MAX_CONCURRENCY`` changes; a request already holding
-    a slot of the previous semaphore releases that one. The route never waits on it (it checks
-    ``locked()`` and acquires only a free slot), so the semaphore never binds to an event loop.
+    One ``asyncio.Semaphore``, created with the limiter and kept for its whole life, holds the
+    free parse slots. :meth:`slot` first resizes it to the request's ``pdf_max_concurrency``
+    without losing a slot that is in use:
+
+    * a higher limit adds the extra slots at once, first cancelling slots still due to retire;
+    * a lower limit removes free slots at once and retires the rest as running parses finish, so
+      parses admitted under the old limit complete while new requests already meet the new one.
+
+    A request is therefore admitted only while fewer parses than the limit in force are active.
+    Admission never waits: a free slot is taken at once, or the request is refused. The semaphore
+    is acquired only while it has a free slot, so it never binds to an event loop. Like every
+    asyncio primitive, a limiter serves the coroutines of one event loop at a time.
     """
-    global _parse_semaphore
-    if _parse_semaphore is None or _parse_semaphore[0] != limit:
-        _parse_semaphore = (limit, asyncio.Semaphore(limit))
-    return _parse_semaphore[1]
+
+    def __init__(self) -> None:
+        self._semaphore = asyncio.Semaphore(0)
+        self._limit = 0
+        self._active = 0
+        self._retiring = 0
+
+    @property
+    def limit(self) -> int:
+        """The limit in force: the latest request's ``pdf_max_concurrency``, 0 before the first."""
+        return self._limit
+
+    @property
+    def active(self) -> int:
+        """Parses holding a slot. It exceeds :attr:`limit` only while parses admitted under a
+        higher limit are still running."""
+        return self._active
+
+    @asynccontextmanager
+    async def slot(self, limit: int) -> AsyncIterator[bool]:
+        """Resize to ``limit`` slots and take a free one, without waiting.
+
+        Yields ``True`` when a slot was taken; it is given back when the block exits, also on an
+        exception or a cancellation. Yields ``False`` when every slot is in use, and the caller
+        refuses the request.
+
+        Raises:
+            ValueError: ``limit`` is below 1, which ``TerminalSettings`` never allows.
+        """
+        if limit < 1:
+            raise ValueError(f"The PDF parse limit must be at least 1, got {limit}")
+        # Nothing here suspends before the slot is taken: resizing and acquiring a free slot of
+        # an unlocked semaphore complete without yielding to the event loop, so checking for a
+        # free slot and taking it cannot interleave with another request.
+        await self._resize(limit)
+        admitted = not self._semaphore.locked()
+        if admitted:
+            await self._semaphore.acquire()
+            self._active += 1
+        try:
+            yield admitted
+        finally:
+            if admitted:
+                self._release()
+
+    async def _resize(self, limit: int) -> None:
+        """Make ``limit`` the limit in force, keeping every slot in use."""
+        if limit > self._limit:
+            added = limit - self._limit
+            cancelled = min(added, self._retiring)
+            self._retiring -= cancelled
+            for _ in range(added - cancelled):
+                self._semaphore.release()
+        elif limit < self._limit:
+            removed = self._limit - limit
+            while removed and not self._semaphore.locked():
+                await self._semaphore.acquire()
+                removed -= 1
+            self._retiring += removed
+        self._limit = limit
+
+    def _release(self) -> None:
+        """Give back a slot, or retire it while active parses exceed the limit in force."""
+        self._active -= 1
+        if self._retiring:
+            self._retiring -= 1
+        else:
+            self._semaphore.release()
+
+
+async def get_pdf_parse_limiter(request: Request) -> PdfParseLimiter:
+    """The parse limiter of the mount serving ``request``.
+
+    :class:`TerminalUploadRoute` puts its mount's limiter in the request scope before any
+    dependency runs. A host can override this dependency, for example to share one
+    :class:`PdfParseLimiter` between several mounts.
+
+    Raises:
+        RuntimeError: ``request`` was not served by ``TerminalUploadRoute``.
+    """
+    limiter = request.scope.get(_PARSE_LIMITER_SCOPE_KEY)
+    if not isinstance(limiter, PdfParseLimiter):
+        raise RuntimeError(
+            "POST /ingest/pdf must be served by TerminalUploadRoute, which supplies the parse "
+            "limiter"
+        )
+    return limiter
+
+
+ParseLimiterDep = Annotated[PdfParseLimiter, Depends(get_pdf_parse_limiter)]
 
 
 def _rejection(
@@ -288,7 +422,7 @@ def _blank_to_none(value: str | None) -> str | None:
         },
         415: {"model": ErrorResponse, "description": "not_a_pdf: no %PDF- header"},
         422: {
-            "model": ErrorResponse,
+            "model": ErrorResponse | ValidationErrorResponse,
             "description": (
                 "Coded: pdf_encrypted, pdf_unreadable, too_many_pages, "
                 "commit_requires_ticker_and_period or commit_requires_kes; or FastAPI's standard "
@@ -308,6 +442,7 @@ def _blank_to_none(value: str | None) -> str | None:
 async def ingest_pdf(
     session: SessionDep,
     settings: SettingsDep,
+    limiter: ParseLimiterDep,
     file: Annotated[
         UploadFile,
         File(description="PDF with a text layer; at most TERMINAL_PDF_MAX_BYTES bytes."),
@@ -392,17 +527,6 @@ async def ingest_pdf(
             "The uploaded file is not a PDF: it does not start with %PDF-.",
             "file",
         )
-    semaphore = _get_parse_semaphore(settings.pdf_max_concurrency)
-    # No await may come between this check and the acquisition below, so that checking for a
-    # free slot and taking it cannot interleave with another request on the event loop.
-    if semaphore.locked():
-        raise _rejection(
-            status.HTTP_429_TOO_MANY_REQUESTS,
-            "ingest_busy",
-            f"All {settings.pdf_max_concurrency} PDF parse slots are in use; retry shortly.",
-            None,
-            headers={"Retry-After": RETRY_AFTER_SECONDS},
-        )
     # Only the stored copy is cleaned: NUL characters are dropped because PostgreSQL text cannot
     # hold them, and the name is cut to the column length.
     file_name = (file.filename or "").replace("\x00", "")[:FILE_NAME_MAX_LENGTH] or (
@@ -417,5 +541,16 @@ async def ingest_pdf(
         items=tuple(items or ALL_LINE_ITEMS),
         commit=commit,
     )
-    async with semaphore:
+    # A free slot is checked for and taken without waiting, and given back when the block exits,
+    # also when the service raises or the request is cancelled. A cancelled service call returns
+    # only once its parse thread has ended, so the slot is held for as long as that parse runs.
+    async with limiter.slot(settings.pdf_max_concurrency) as admitted:
+        if not admitted:
+            raise _rejection(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "ingest_busy",
+                f"All {settings.pdf_max_concurrency} PDF parse slots are in use; retry shortly.",
+                None,
+                headers={"Retry-After": RETRY_AFTER_SECONDS},
+            )
         return await filings_service.ingest_pdf(session, settings, data, file_name, form)

@@ -36,12 +36,17 @@ MAX_WATCHLIST_NAME_LENGTH: Final = 100
 MAX_WATCHLIST_TICKERS: Final = 100
 """Most tickers a ``POST /watchlists`` body may list."""
 
+# PostgreSQL text cannot hold a NUL character, so a name carrying one is refused as a
+# single-field 422 here rather than failing as a 500 when the service queries it.
+_NO_NUL_PATTERN: Final = r"^[^\x00]*$"
+
 
 class WatchlistCreate(TerminalRequestModel):
     """Body of ``POST /watchlists``.
 
-    Ticker elements are bounded to 1-16 characters here. The service normalizes them to upper
-    case, removes duplicates and answers an unknown ticker with the coded 422 ``unknown_ticker``.
+    Ticker elements are bounded to 1-16 characters here, and a NUL character in the name or a
+    ticker is FastAPI's standard 422. The service normalizes tickers to upper case, removes
+    duplicates and answers an unknown ticker with the coded 422 ``unknown_ticker``.
     """
 
     # Whitespace is stripped before the length check, so a blank name fails min_length=1 with
@@ -49,12 +54,15 @@ class WatchlistCreate(TerminalRequestModel):
     name: Annotated[
         str,
         StringConstraints(
-            strip_whitespace=True, min_length=1, max_length=MAX_WATCHLIST_NAME_LENGTH
+            strip_whitespace=True,
+            min_length=1,
+            max_length=MAX_WATCHLIST_NAME_LENGTH,
+            pattern=_NO_NUL_PATTERN,
         ),
     ] = Field(
         description=(
-            "Watchlist name, 1-100 characters after surrounding whitespace is removed; unique "
-            "per owner."
+            "Watchlist name, 1-100 characters after surrounding whitespace is removed, with no "
+            "NUL character; unique per owner."
         ),
     )
     tickers: list[Ticker] = Field(

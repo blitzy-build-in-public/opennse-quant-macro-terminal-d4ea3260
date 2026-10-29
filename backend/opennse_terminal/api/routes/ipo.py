@@ -24,6 +24,7 @@ from opennse_terminal.schemas import (
     IpoScenario,
     IpoValuationRequest,
     IpoValuationResponse,
+    ValidationErrorResponse,
 )
 from opennse_terminal.services import ipo_service
 
@@ -64,7 +65,7 @@ async def list_ipo_scenarios(session: SessionDep) -> list[IpoScenario]:
     summary="DCF, comparable multiples, blended fair value and sensitivity matrix",
     responses={
         422: {
-            "model": ErrorResponse,
+            "model": ErrorResponse | ValidationErrorResponse,
             "description": (
                 "Coded cross-field rule, a detail object with code, message and field "
                 "(wacc_not_above_terminal_growth, shares_offered_exceeds_outstanding or "

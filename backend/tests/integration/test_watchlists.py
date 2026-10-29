@@ -70,12 +70,14 @@ def field(response: httpx.Response) -> str | None:
     return None if value is None else str(value)
 
 
-def assert_validation_list(response: httpx.Response, offending: str) -> None:
-    """Assert FastAPI's standard 422 body: a ``detail`` list with an entry for ``offending``."""
+def assert_validation_list(response: httpx.Response, *offending: str | int) -> None:
+    """Assert FastAPI's standard 422 body: a ``detail`` list with an entry whose ``loc`` ends
+    with ``offending``, for example ``"watchlist_id"`` or ``"body", "tickers", 0``."""
     assert response.status_code == 422, response.text
     detail = response.json()["detail"]
     assert isinstance(detail, list), f"expected the standard validation list, got {detail!r}"
-    assert any(entry["loc"][-1] == offending for entry in detail), detail
+    suffix = list(offending)
+    assert any(entry["loc"][-len(suffix) :] == suffix for entry in detail), detail
 
 
 async def names(client: httpx.AsyncClient) -> list[str]:
@@ -218,26 +220,34 @@ async def test_create_rejects_unknown_ticker(
 @pytest.mark.parametrize(
     ("body", "offending"),
     [
-        pytest.param({"name": "x" * 101}, "name", id="name-too-long"),
-        pytest.param({"name": ""}, "name", id="name-empty"),
-        pytest.param({"name": "x", "owner_key": "y"}, "owner_key", id="extra-key-forbidden"),
+        pytest.param({"name": "x" * 101}, ("body", "name"), id="name-too-long"),
+        pytest.param({"name": ""}, ("body", "name"), id="name-empty"),
+        pytest.param(
+            {"name": "x", "owner_key": "y"}, ("body", "owner_key"), id="extra-key-forbidden"
+        ),
+        pytest.param({"name": "bad\x00name"}, ("body", "name"), id="name-nul"),
+        pytest.param({"name": "A\x00B"}, ("body", "name"), id="name-nul-between-letters"),
+        pytest.param(
+            {"name": "Bad", "tickers": ["SCOM\x00"]}, ("body", "tickers", 0), id="ticker-nul"
+        ),
     ],
 )
 async def test_field_bounds_use_standard_validation_list(
     client: httpx.AsyncClient,
     db_session: AsyncSession,
-    body: dict[str, str],
-    offending: str,
+    body: dict[str, Any],
+    offending: tuple[str | int, ...],
 ) -> None:
     """Single-field failures get FastAPI's standard 422 list, with no stable code and no write.
 
-    The extra-key case also shows that a body can never choose the owner.
+    The extra-key case also shows that a body can never choose the owner. PostgreSQL text cannot
+    hold a NUL character, so the NUL cases show validation refusing one before any query.
     """
     before = await watchlist_count(db_session)
 
     response = await client.post(f"{BASE}/watchlists", json=body)
 
-    assert_validation_list(response, offending)
+    assert_validation_list(response, *offending)
     assert await watchlist_count(db_session) == before
     assert await names(client) == [SEEDED_WATCHLIST]
 

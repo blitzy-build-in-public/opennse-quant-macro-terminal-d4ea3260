@@ -30,7 +30,8 @@ held here:
   ``currency_conflict``; 500 ``internal_error`` for a server fault, raised ``from None`` so
   neither the response, a log nor a traceback carries the fault's text.
 - **Cancellation**: a request cancelled while its run row is inserted, or before its commit,
-  rolls back and records ``cancelled``; one cancelled during its commit still commits and records
+  rolls back and records ``cancelled``, and one cancelled while parsing re-raises only once its
+  parse thread has ended; one cancelled during its commit still commits and records
   ``succeeded``, then re-raises; one whose row could not be started re-raises without a row.
 
 The request-size, magic-byte and concurrency checks (413, 415, 429) belong to the route, not to
@@ -1425,8 +1426,9 @@ async def test_request_cancelled_while_parsing_rolls_back_and_records_cancelled(
     engine: AsyncEngine,
     settings: TerminalSettings,
 ) -> None:
-    """A request cancelled while its PDF is being parsed re-raises the cancellation, writes no
-    filing or fundamentals row and finishes its run row ``failed`` with ``cancelled``."""
+    """A request cancelled while its PDF is being parsed re-raises the cancellation only once its
+    parse thread has ended, writes no filing or fundamentals row and finishes its run row
+    ``failed`` with ``cancelled``."""
     seeded = await scom_fundamentals(engine)
     parse_started = threading.Event()
     release_parse = threading.Event()
@@ -1447,10 +1449,13 @@ async def test_request_cancelled_while_parsing_rolls_back_and_records_cancelled(
 
     assert await asyncio.to_thread(parse_started.wait, 30)
     request.cancel()
+    done, _ = await asyncio.wait({request}, timeout=0.5)
+    assert not done, "the cancelled request ended while its parse thread was still running"
+    assert not parse_done.is_set()
     release_parse.set()
     with pytest.raises(asyncio.CancelledError):
         await request
-    assert await asyncio.to_thread(parse_done.wait, 60)
+    assert parse_done.is_set()
 
     assert await filing_count(engine) == 0
     assert await scom_fundamentals(engine) == seeded

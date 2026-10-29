@@ -28,6 +28,8 @@ from opennse_terminal.schemas.common import (
     TerminalRequestModel,
     TerminalResponseModel,
     Ticker,
+    ValidationErrorItem,
+    ValidationErrorResponse,
 )
 from opennse_terminal.schemas.cycles import (
     DEFAULT_WINDOW_DAYS,
@@ -218,6 +220,8 @@ __all__ = [
     "TerminalRequestModel",
     "TerminalResponseModel",
     "Ticker",
+    "ValidationErrorItem",
+    "ValidationErrorResponse",
     "ValuationBandsResponse",
     "WaccAxisValue",
     "Watchlist",

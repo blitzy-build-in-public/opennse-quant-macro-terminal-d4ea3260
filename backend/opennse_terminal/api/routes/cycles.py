@@ -30,6 +30,7 @@ from opennse_terminal.schemas import (
     MAX_WINDOW_MONTHS,
     BacktestResponse,
     ErrorResponse,
+    ValidationErrorResponse,
 )
 from opennse_terminal.services import cycle_service
 
@@ -44,7 +45,7 @@ SECTOR_MAX_LENGTH: Final = 100
 _BACKTEST_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
     404: {"model": ErrorResponse, "description": "unknown_ticker or unknown_sector"},
     422: {
-        "model": ErrorResponse,
+        "model": ErrorResponse | ValidationErrorResponse,
         "description": (
             "Coded rule error (no_event_dates, conflicting_window_units, window_out_of_range) "
             "or standard validation error"

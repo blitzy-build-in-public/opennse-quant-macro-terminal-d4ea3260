@@ -43,6 +43,7 @@ from opennse_terminal.schemas import (
     ScreenerParams,
     ScreenerResponse,
     SectorHeatmapResponse,
+    ValidationErrorResponse,
     ValuationBandsResponse,
 )
 from opennse_terminal.services import market_service
@@ -126,7 +127,7 @@ _CODED_OR_VALIDATION_422: Final = (
 _SCREENER_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
     404: {"model": ErrorResponse, "description": "unknown_sector or watchlist_not_found"},
     422: {
-        "model": ErrorResponse,
+        "model": ErrorResponse | ValidationErrorResponse,
         "description": _CODED_OR_VALIDATION_422.format(
             codes="min_exceeds_max, with field set to the min_* parameter"
         ),
@@ -136,7 +137,7 @@ _SCREENER_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
 _BANDS_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
     404: {"model": ErrorResponse, "description": "unknown_ticker or unknown_sector"},
     422: {
-        "model": ErrorResponse,
+        "model": ErrorResponse | ValidationErrorResponse,
         "description": _CODED_OR_VALIDATION_422.format(codes="exactly_one_subject"),
     },
 }
@@ -148,7 +149,7 @@ _ANOMALIES_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
 _FLOWS_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
     404: {"model": ErrorResponse, "description": "unknown_ticker or unknown_sector"},
     422: {
-        "model": ErrorResponse,
+        "model": ErrorResponse | ValidationErrorResponse,
         "description": _CODED_OR_VALIDATION_422.format(
             codes="conflicting_subjects or start_after_end"
         ),

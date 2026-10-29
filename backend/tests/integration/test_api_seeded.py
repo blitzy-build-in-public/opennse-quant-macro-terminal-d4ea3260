@@ -300,6 +300,36 @@ async def test_screener_anomalies_only_includes_the_planted_eabl_volume_spike(
         assert row["is_volume_anomaly"] or row["is_turnover_anomaly"]
 
 
+async def test_screener_sector_keeps_its_constituents_and_unknown_sector_is_404(
+    client: httpx.AsyncClient,
+) -> None:
+    body = await get_json(client, "/market/screener", {"sector": "Banking"})
+
+    assert body["count"] == len(body["rows"]) == 5
+    assert {row["ticker"] for row in body["rows"]} == BANKS
+
+    response = await client.get(f"{BASE}/market/screener", params={"sector": "Agriculture"})
+    assert response.status_code == 404, response.text
+    assert response.json()["detail"]["code"] == "unknown_sector"
+    assert response.json()["detail"]["field"] == "sector"
+
+
+@pytest.mark.parametrize("sector", ["\x00", "Ban\x00king"], ids=["nul", "nul-inside-name"])
+async def test_screener_sector_with_nul_is_the_standard_422(
+    client: httpx.AsyncClient, sector: str
+) -> None:
+    """PostgreSQL text cannot hold a NUL character, so validation refuses one with FastAPI's
+    standard list before the sector lookup queries the database."""
+    response = await client.get(f"{BASE}/market/screener", params={"sector": sector})
+
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert isinstance(detail, list), detail
+    assert [(entry["loc"], entry["type"], entry["input"]) for entry in detail] == [
+        (["query", "sector"], "string_pattern_mismatch", sector)
+    ]
+
+
 async def test_sector_heatmap_covers_four_sectors_over_twelve_month_ends(
     client: httpx.AsyncClient,
 ) -> None:
