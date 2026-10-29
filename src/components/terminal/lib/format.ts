@@ -58,7 +58,12 @@ const MONTH_ABBREVIATIONS = [
  * - `z`: a dimensionless Z-score, `2.92`;
  * - `index`: a base-100 index level, `100.00`;
  * - `usd_m`: millions of US dollars, `USD 7,850.00 m`;
- * - `kes_per_usd`: an exchange rate, `129.20 KES/USD`.
+ * - `kes_per_usd`: an exchange rate, `129.20 KES/USD`;
+ * - `tenor`: a tenor in years, 2 dp from the server, `0.25y`;
+ * - `discount_factor`: a dimensionless DCF discount factor, 6 dp from the server, `0.847458`.
+ *
+ * Every kind shows the fraction digits exactly as received, so the server's 2 dp tenors and 6 dp
+ * discount factors are neither rounded nor padded here.
  */
 export type DecimalKind =
   | "kes"
@@ -68,12 +73,14 @@ export type DecimalKind =
   | "z"
   | "index"
   | "usd_m"
-  | "kes_per_usd";
+  | "kes_per_usd"
+  | "tenor"
+  | "discount_factor";
 
 /** Options for {@link formatDecimal}. */
 export interface FormatOptions {
   /**
-   * Whether to add the kind's unit affixes (`KES `, `%`, `×`, `USD … m`, ` KES/USD`).
+   * Whether to add the kind's unit affixes (`KES `, `%`, `×`, `USD … m`, ` KES/USD`, `y`).
    * Default `true`. With `false` only the signed, grouped number is returned.
    */
   unit?: boolean;
@@ -94,6 +101,8 @@ const UNIT_AFFIXES: Record<DecimalKind, { prefix: string; suffix: string }> = {
   index: { prefix: "", suffix: "" },
   usd_m: { prefix: "USD ", suffix: " m" },
   kes_per_usd: { prefix: "", suffix: " KES/USD" },
+  tenor: { prefix: "", suffix: "y" },
+  discount_factor: { prefix: "", suffix: "" },
 };
 
 /** A plain decimal string: optional sign, integer digits, optional fraction digits. */
@@ -132,6 +141,8 @@ function groupDigits(digits: string): string {
  * @example formatDecimal("12.5", "pct", { signed: true }) === "+12.5%"
  * @example formatDecimal("0.00", "pct", { signed: true }) === "0.00%"
  * @example formatDecimal("33.25", "per_share") === "KES 33.25"
+ * @example formatDecimal("0.25", "tenor") === "0.25y"
+ * @example formatDecimal("0.847458", "discount_factor") === "0.847458"
  * @example formatDecimal(null, "ratio") === "—"
  */
 export function formatDecimal(
