@@ -288,6 +288,7 @@ def test_monetary_value_must_fit_the_money_columns(
         ("KShs bn", 1_000_000_000, Decimal("87000000000"), "KES"),
         ("USD '000", 1_000, Decimal("87000"), "USD"),
         ("US$ million", 1_000_000, Decimal("87000000"), "USD"),
+        ("All amounts in USD, in thousands", 1_000, Decimal("87000"), "USD"),
     ],
 )
 def test_scale_and_currency_markers(
@@ -662,6 +663,13 @@ GROUP_COMPANY_VALUES = ("1,234,567", "1,100,000", "934,000", "880,000")
         ),
         (
             GROUP_COMPANY_COLS,
+            [("Group", 300.0), ("Group", 370.0), ("Company", 440.0), ("Company", 510.0)],
+            GROUP_COMPANY_VALUES,
+            None,
+            Decimal("1234567000"),
+        ),
+        (
+            GROUP_COMPANY_COLS,
             [("Consolidated", 300.0), ("Company", 440.0)],
             GROUP_COMPANY_VALUES,
             None,
@@ -694,6 +702,7 @@ GROUP_COMPANY_VALUES = ("1,234,567", "1,100,000", "934,000", "880,000")
     ids=[
         "entities_above_years",
         "entities_above_years_prior_period",
+        "entity_above_every_year",
         "consolidated_is_group",
         "entities_centred_between_years",
         "entities_on_the_header_row",
@@ -1041,9 +1050,10 @@ def test_highest_priority_label_decides_the_item(
 
 
 @pytest.mark.parametrize(
-    ("rows", "status", "value"),
+    ("item", "rows", "status", "value"),
     [
         (
+            "net_income",
             [
                 row("Profit attributable to owners of the parent per share", "1.23", "1.10"),
                 row("Profit attributable to owners of the parent", "500", "450"),
@@ -1052,21 +1062,34 @@ def test_highest_priority_label_decides_the_item(
             Decimal("500000"),
         ),
         (
+            "net_income",
             [row("Profit attributable to owners of the parent per share", "1.23", "1.10")],
             "not_found",
             None,
         ),
+        (
+            "revenue",
+            [row("Revenue per share", "2.50", "2.10"), row("Revenue", "1,234", "1,100")],
+            "found",
+            Decimal("1234000"),
+        ),
+        ("revenue", [row("Revenue per share", "2.50", "2.10")], "not_found", None),
     ],
-    ids=["per_share_line_beside_the_total", "per_share_line_alone"],
+    ids=[
+        "per_share_line_beside_the_total",
+        "per_share_line_alone",
+        "revenue_per_share_beside_revenue",
+        "revenue_per_share_alone",
+    ],
 )
 def test_per_share_labels_are_excluded_for_monetary_items(
-    rows: list[StatementRow], status: str, value: Decimal | None
+    item: str, rows: list[StatementRow], status: str, value: Decimal | None
 ) -> None:
-    result = extract(income_page(rows, columns=YEAR_COLS), items=["net_income"])
+    result = extract(income_page(rows, columns=YEAR_COLS), items=[item])
 
-    net_income = only_item(result)
-    assert net_income.status == status
-    assert net_income.value == value
+    extracted = only_item(result)
+    assert extracted.status == status
+    assert extracted.value == value
 
 
 @pytest.mark.parametrize(
@@ -2054,8 +2077,13 @@ def test_encrypted_pdf_is_rejected(empty_password_opens: bool) -> None:
 
 @pytest.mark.parametrize(
     "pdf_bytes",
-    [b"not a pdf at all", b"%PDF-1.4\nthis is not a PDF body\n", b""],
-    ids=["garbage", "magic_bytes_only", "empty"],
+    [
+        b"not a pdf at all",
+        b"%PDF-1.4\nthis is not a PDF body\n",
+        b"%PDF-1.4\n" + b"\x00garbage" * 64,
+        b"",
+    ],
+    ids=["garbage", "magic_bytes_only", "magic_bytes_then_binary_garbage", "empty"],
 )
 def test_unparseable_bytes_are_unreadable(pdf_bytes: bytes) -> None:
     with pytest.raises(PdfUnreadable, match="could not be parsed"):
