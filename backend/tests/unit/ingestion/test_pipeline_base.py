@@ -1029,6 +1029,10 @@ def test_normalize_header(text: str, expected: str) -> None:
         pytest.param("(1,234.5)", True, "-1234.5", id="parentheses-negative"),
         pytest.param("( 1,234.5 )", True, "-1234.5", id="parentheses-with-spaces"),
         pytest.param("(5)", True, "-5", id="shortest-parentheses"),
+        # A zero is never negative: str() of Decimal("-0") is "-0", so these prove the sign.
+        pytest.param("-0", True, "0", id="minus-zero"),
+        pytest.param("-0.00", True, "0.00", id="minus-zero-with-scale"),
+        pytest.param("+0", True, "0", id="plus-zero"),
         pytest.param("-12.5", False, "-12.5", id="minus"),
         pytest.param("+12.5", True, "12.5", id="plus"),
         pytest.param("\u221212.5", True, "-12.5", id="unicode-minus"),

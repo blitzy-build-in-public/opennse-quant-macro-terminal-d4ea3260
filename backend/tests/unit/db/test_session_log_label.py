@@ -1,8 +1,9 @@
 """Tests for the credential-free database label of ``opennse_terminal.db.session``.
 
 ``database_log_label`` is the only form in which the session module logs or quotes a database URL.
-It must drop the username, the password before ``@`` and every query value, because asyncpg also
-reads the password from ``?password=...``, which ``render_as_string(hide_password=True)`` prints.
+It is a prose label, never a URL or a libpq ``key=value`` connection string, and must drop the
+driver, the username, the password before ``@`` and every query value, because asyncpg also reads
+the password from ``?password=...``, which ``render_as_string(hide_password=True)`` prints.
 
 Every case runs without PostgreSQL: engines are created but never connect. The secrets are
 synthetic markers, so a leak shows as the marker in a label, an error message or a log record.
@@ -34,8 +35,11 @@ MARKED_URL = (
     f"postgresql+asyncpg://{USER_MARKER}:{USERINFO_PW_MARKER}@db.example:5432/opennse"
     f"?password={QUERY_PW_MARKER}&application_name={QUERY_VALUE_MARKER}"
 )
-MARKED_URL_LABEL = "postgresql+asyncpg://db.example:5432/opennse"
+MARKED_URL_LABEL = 'database "opennse" on db.example:5432'
 PLACEHOLDER = "<unparseable database URL>"
+INVALID_URL_MESSAGE = (
+    "database URL is not valid; expected postgresql+asyncpg://user:password@host:port/database"
+)
 
 
 @pytest.fixture
@@ -58,37 +62,54 @@ def _assert_no_secret(text: str) -> None:
         pytest.param(make_url(MARKED_URL), MARKED_URL_LABEL, id="url-object"),
         pytest.param(
             f"postgresql+asyncpg://{USER_MARKER}@localhost/opennse",
-            "postgresql+asyncpg://localhost/opennse",
+            'database "opennse" on localhost',
             id="username-only-no-port",
         ),
         pytest.param(
             f"postgresql+asyncpg://{USER_MARKER}:{USERINFO_PW_MARKER}@/opennse_c1?host=/run/pg",
-            "postgresql+asyncpg:///opennse_c1",
+            'database "opennse_c1"',
             id="unix-socket-host-in-query",
         ),
         pytest.param(
             f"postgresql+asyncpg://{USER_MARKER}@/db?host=host-a:5432&host=host-b"
             f"&password={QUERY_PW_MARKER}",
-            "postgresql+asyncpg:///db",
+            'database "db"',
             id="multihost-in-query",
         ),
         pytest.param(
             f"postgresql+asyncpg://{USER_MARKER}:{USERINFO_PW_MARKER}@[::1]:5433/opennse",
-            "postgresql+asyncpg://[::1]:5433/opennse",
+            'database "opennse" on [::1]:5433',
             id="ipv6-host",
+        ),
+        pytest.param(
+            f"postgresql+asyncpg://{USER_MARKER}:{USERINFO_PW_MARKER}@localhost:5432",
+            "default database on localhost:5432",
+            id="no-database",
+        ),
+        pytest.param("postgresql+asyncpg://", "default database", id="no-host-no-database"),
+        pytest.param(
+            f'postgresql+asyncpg://{USER_MARKER}@db\nexample/op"en\nnse',
+            'database "op\\"en\\nnse" on db\\nexample',
+            id="quote-and-newline-escaped",
         ),
         pytest.param(
             f"mysql+pymysql://{USER_MARKER}:{USERINFO_PW_MARKER}@db.example:3306/app"
             f"?password={QUERY_PW_MARKER}",
-            "mysql+pymysql://db.example:3306/app",
+            'database "app" on db.example:3306',
             id="other-driver",
         ),
     ],
 )
-def test_label_keeps_only_driver_host_port_and_database(url: str | URL, expected: str) -> None:
+def test_label_names_only_the_database_host_and_port(url: str | URL, expected: str) -> None:
     label = database_log_label(url)
 
     assert label == expected
+    # A prose label: no driver, and neither a URL nor a libpq key=value connection string.
+    assert "://" not in label
+    assert "=" not in label
+    assert "postgresql" not in label
+    assert "mysql" not in label
+    assert "\n" not in label
     _assert_no_secret(label)
 
 
@@ -115,18 +136,47 @@ def test_label_of_an_unreliable_url_is_the_fixed_placeholder(url: str) -> None:
     assert database_log_label(url) == PLACEHOLDER
 
 
-def test_build_engine_scheme_error_quotes_only_the_label() -> None:
-    # The settings validator already rejects other drivers; model_construct skips it, as a host
-    # that builds the settings object itself could.
-    settings = TerminalSettings.model_construct(
-        database_url=MARKED_URL.replace("postgresql+asyncpg://", "postgresql+psycopg://")
-    )
+@pytest.mark.parametrize(
+    ("database_url", "expected"),
+    [
+        pytest.param(
+            MARKED_URL.replace("postgresql+asyncpg://", "postgresql+psycopg://"),
+            "database URL must use the postgresql+asyncpg:// scheme; "
+            'got driver "postgresql+psycopg" for database "opennse" on db.example:5432',
+            id="other-driver",
+        ),
+        pytest.param(
+            f"postgresql+asyncpg://{USER_MARKER}:{USERINFO_PW_MARKER}@h:{QUERY_VALUE_MARKER}/db",
+            INVALID_URL_MESSAGE,
+            id="non-numeric-port",
+        ),
+        pytest.param(f"not a url {USERINFO_PW_MARKER}", INVALID_URL_MESSAGE, id="not-a-url"),
+        pytest.param(
+            f"postgresql+asyncpg://{USER_MARKER}:{USERINFO_PW_MARKER}@db.example/opennse"
+            f"?prepared_statement_cache_size={QUERY_VALUE_MARKER}",
+            'database URL has an invalid query parameter value for database "opennse" on '
+            "db.example",
+            id="query-value-of-the-wrong-type",
+        ),
+    ],
+)
+def test_build_engine_errors_are_source_neutral_and_quote_only_the_label(
+    database_url: str, expected: str
+) -> None:
+    # model_construct skips the settings validator, which rejects the other driver and the
+    # non-URL text, as a host that builds the settings object itself could.
+    settings = TerminalSettings.model_construct(database_url=database_url)
 
-    with pytest.raises(ValueError, match="postgresql\\+asyncpg:// scheme") as raised:
+    with pytest.raises(ValueError) as raised:
         build_engine(settings)
 
     message = str(raised.value)
-    assert message.endswith("got postgresql+psycopg://db.example:5432/opennse")
+    assert message == expected
+    # The caller adds where the URL came from; the session layer cannot know it.
+    assert "TERMINAL_DATABASE_URL" not in message
+    # No parser error, which can quote the URL, is chained into a traceback.
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__ or raised.value.__context__ is None
     _assert_no_secret(message)
 
 

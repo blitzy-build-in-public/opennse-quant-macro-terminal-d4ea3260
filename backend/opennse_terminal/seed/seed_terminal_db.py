@@ -1,10 +1,12 @@
 """Idempotent fallback seeder: fills the ``terminal_`` tables with deterministic Kenyan market data.
 
 Run it as ``python -m opennse_terminal.seed.seed_terminal_db [--database-url URL]`` or
-``opennse-terminal seed [--database-url URL]``; both call :func:`main`. The database comes from
-``TERMINAL_DATABASE_URL`` (or ``.env``), and ``--database-url`` overrides it. Exit codes: ``0``
-seeded (including a re-run that inserts nothing), ``1`` failed and rolled back, ``2`` the schema
-is not at the packaged migration head ("run `opennse-terminal migrate upgrade head` first").
+``opennse-terminal seed [--database-url URL]``; both call :func:`main`, and ``--help`` lists the
+examples and exit codes. The database comes from ``TERMINAL_DATABASE_URL`` (or ``.env``), and
+``--database-url`` overrides it. Exit codes: ``0`` seeded (including a re-run that inserts
+nothing); ``1`` failed and rolled back, or invalid arguments or settings; ``2`` the schema is not
+at the packaged migration head ("run `opennse-terminal migrate upgrade head` first"); ``130``
+interrupted by Ctrl-C, with any uncommitted seed transaction rolled back.
 
 What is written. The records of :func:`opennse_terminal.seed.synthetic.generate_all`: the eight
 attachment counters, their synthetic daily prices and fundamentals, the macro and bond history,
@@ -52,7 +54,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from types import MappingProxyType
-from typing import Final, TypeAlias
+from typing import Final, NoReturn, TypeAlias
 
 import sqlalchemy as sa
 from pydantic import ValidationError
@@ -110,7 +112,35 @@ SCHEMA_HINT: Final = "run `opennse-terminal migrate upgrade head` first"
 _EXIT_OK: Final = 0
 _EXIT_FAILED: Final = 1
 _EXIT_SCHEMA_NOT_AT_HEAD: Final = 2
+# 128 + SIGINT, the shell's code for a command stopped by Ctrl-C.
+_EXIT_INTERRUPTED: Final = 130
+_INTERRUPTED_MESSAGE: Final = (
+    "seeding interrupted; any uncommitted seed transaction was rolled back, "
+    "and re-running the seeder is safe"
+)
 _SEED_CALENDAR: Final = "synthetic"
+# Where main() took the database URL from, named in the messages about the URL itself.
+_URL_SOURCE_FLAG: Final = "--database-url"
+_URL_SOURCE_ENV: Final = "TERMINAL_DATABASE_URL"
+_DEFAULT_PROG: Final = "python -m opennse_terminal.seed.seed_terminal_db"
+# argparse substitutes %(prog)s; a literal percent sign here would have to be written %%.
+_HELP_EPILOG: Final = """\
+The database URL comes from TERMINAL_DATABASE_URL (or .env in the working
+directory), and --database-url overrides it. The schema must be at the packaged
+migration head, so run `opennse-terminal migrate upgrade head` against the same
+database first. Seeding is idempotent: a re-run inserts no data rows and
+records only its own run.
+
+examples:
+  opennse-terminal migrate upgrade head && %(prog)s
+  %(prog)s --database-url 'postgresql+asyncpg://USER:PASSWORD@HOST:PORT/DATABASE'
+
+exit codes:
+  0    seeded, including a re-run that inserts nothing
+  1    failed and rolled back, or invalid arguments or settings
+  2    schema not at migration head: run `opennse-terminal migrate upgrade head` first
+  130  interrupted (Ctrl-C); any uncommitted seed transaction was rolled back
+"""
 
 # to_regclass returns NULL instead of raising for a missing relation, so an unmigrated database
 # is detected without aborting the transaction. The table name is a bound parameter.
@@ -437,59 +467,128 @@ async def seed(
     )
 
 
-async def run_seed(settings: TerminalSettings) -> int:
+async def _check_connection(engine: AsyncEngine) -> None:
+    """Open and release one connection of ``engine``; whatever connecting raises propagates.
+
+    SQLAlchemy does not wrap asyncpg's connect errors (``OSError`` subclasses such as
+    ``ConnectionRefusedError`` and ``socket.gaierror``, ``TimeoutError``, and asyncpg's own
+    server errors), so they look like any statement failure. Connecting once before the first
+    statement separates a database that cannot be reached from a seed that fails. The pool keeps
+    the connection for the seed session that follows.
+    """
+    async with engine.connect():
+        pass
+
+
+def _connect_failure_reason(exc: Exception) -> str:
+    """Return the reason printed for a failed connection attempt.
+
+    An ``OSError`` (a refused connection, an unresolvable host, a missing socket file, or asyncio's
+    ``Multiple exceptions: ...`` for a host with several addresses) carries only the OS reason and
+    the address, so its text is used; an empty ``TimeoutError``, asyncpg's connect timeout, reads
+    ``timed out``. Anything else, asyncpg's server errors such as ``InvalidPasswordError`` and
+    ``InvalidCatalogNameError`` included, is named by type only: the server's message can quote
+    the user name.
+    """
+    if isinstance(exc, OSError):
+        text = str(exc)
+        if text:
+            return text
+        if isinstance(exc, TimeoutError):
+            return "timed out"
+    return type(exc).__name__
+
+
+async def run_seed(settings: TerminalSettings, *, url_source: str = "settings.database_url") -> int:
     """Seed the database of ``settings`` on an engine of its own and return an exit code.
 
-    ``0`` seeded (a re-run that inserts nothing included); ``2`` the schema is not at head, with
-    the :class:`SchemaNotAtHeadError` message, which contains :data:`SCHEMA_HINT`, printed to
-    stderr; ``1`` any other failure, the engine's creation included. A ``ValueError`` from
-    :func:`build_engine` prints its own message, which quotes the URL only through
-    :func:`database_log_label`; any other error creating the engine (such as SQLAlchemy's
-    ``ArgumentError`` for a multi-host URL without every port) prints a fixed line naming only
-    its exception type. A failure once the engine exists is logged at ERROR with its type name
-    only, never its text or traceback, which can carry SQL parameters such as
-    ``default_owner_key``. The engine is disposed whenever it was created. A coroutine, so code
-    that already runs an event loop (such as test fixtures) awaits it.
+    ``url_source`` names where ``settings.database_url`` came from, for the messages about the URL
+    itself; :func:`main` passes ``--database-url`` or ``TERMINAL_DATABASE_URL``. The INFO line
+    ``seeding <label>`` names the database through :func:`database_log_label` only. Each outcome
+    below is reported exactly once:
+
+    * ``0``: seeded, a re-run that inserts nothing included; :func:`seed` logs the summary.
+    * ``2``: the schema is not at head. The :class:`SchemaNotAtHeadError` message, which ends with
+      :data:`SCHEMA_HINT`, is printed to stderr.
+    * ``1``, printed to stderr: an invalid URL, as ``cannot seed: <build_engine's message> (from
+      <url_source>)``, a message that quotes the URL only through its label; any other error
+      creating the engine (such as SQLAlchemy's ``ArgumentError`` for a multi-host URL without
+      every port), as ``cannot seed: could not create a database engine from <url_source>
+      (<type>)``, by type only because its text can quote parts of the URL; a database that
+      cannot be reached, as ``cannot seed: could not connect to <label>: <reason>`` (see
+      :func:`_connect_failure_reason`).
+    * ``1``, logged at ERROR: a failure once connected, by its type name only, never its text or
+      traceback, which can carry SQL parameters such as ``default_owner_key``.
+
+    The engine is disposed whenever it was created. ``asyncio.CancelledError`` and
+    ``KeyboardInterrupt`` are not caught: they propagate after that disposal. A coroutine, so
+    code that already runs an event loop (such as test fixtures) awaits it.
     """
-    engine: AsyncEngine | None = None
     try:
         engine = build_engine(settings)
-        logger.info("seeding %s", database_log_label(engine.url))
+    except ValueError as exc:
+        # build_engine's own messages quote the URL only through database_log_label.
+        print(f"cannot seed: {exc} (from {url_source})", file=sys.stderr)
+        return _EXIT_FAILED
+    except Exception as exc:
+        # Other construction errors are reported by type only: their text can quote parts of the
+        # URL, such as the ports of a multi-host query.
+        print(
+            f"cannot seed: could not create a database engine from {url_source} "
+            f"({type(exc).__name__})",
+            file=sys.stderr,
+        )
+        return _EXIT_FAILED
+    try:
+        label = database_log_label(engine.url)
+        logger.info("seeding %s", label)
+        try:
+            await _check_connection(engine)
+        except Exception as exc:
+            reason = _connect_failure_reason(exc)
+            print(f"cannot seed: could not connect to {label}: {reason}", file=sys.stderr)
+            return _EXIT_FAILED
         async with async_sessionmaker(engine, expire_on_commit=False)() as session:
             await seed(session, settings=settings)
     except SchemaNotAtHeadError as exc:
         print(str(exc), file=sys.stderr)
-        logger.error("%s", exc)
         return _EXIT_SCHEMA_NOT_AT_HEAD
     except Exception as exc:
-        if engine is None and isinstance(exc, ValueError):
-            # build_engine's own messages quote the URL only through database_log_label.
-            print(str(exc), file=sys.stderr)
-            logger.error("cannot seed: %s", exc)
-        elif engine is None:
-            # Other construction errors are reported by type only: their text can quote parts of
-            # the URL, such as the ports of a multi-host query.
-            message = (
-                "cannot seed: could not create a database engine from TERMINAL_DATABASE_URL "
-                f"({type(exc).__name__})"
-            )
-            print(message, file=sys.stderr)
-            logger.error("%s", message)
-        else:
-            # Type name only, with no traceback: SQLAlchemy errors embed the statement's
-            # parameters, such as default_owner_key.
-            logger.error("seeding failed: %s", type(exc).__name__)
+        # Type name only, with no traceback: SQLAlchemy errors embed the statement's parameters,
+        # such as default_owner_key.
+        logger.error("seeding failed: %s", type(exc).__name__)
         return _EXIT_FAILED
     finally:
-        if engine is not None:
-            await engine.dispose()
+        await engine.dispose()
     return _EXIT_OK
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """Return the seeder's argument parser; ``opennse-terminal seed`` forwards its argv here."""
-    parser = argparse.ArgumentParser(
-        description="Seed the terminal_ tables with deterministic fallback data."
+class _SeedArgumentParser(argparse.ArgumentParser):
+    """An ``ArgumentParser`` whose usage errors exit 1 instead of argparse's 2.
+
+    The seeder's exit code 2 means the schema is not at head, so a mistyped option or a missing
+    value must not read as "run the migrations first".
+    """
+
+    def error(self, message: str) -> NoReturn:
+        """Print the usage and ``<prog>: error: <message>`` to stderr, then exit with 1."""
+        self.print_usage(sys.stderr)
+        self.exit(_EXIT_FAILED, f"{self.prog}: error: {message}\n")
+
+
+def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
+    """Return the seeder's argument parser; ``opennse-terminal seed`` forwards its argv here.
+
+    ``prog`` is the command shown in the usage line, the help and the error messages. It defaults
+    to ``python -m opennse_terminal.seed.seed_terminal_db``; ``opennse-terminal seed`` passes its
+    own. The help ends with the URL's source, the migrate-first precondition, examples and the
+    exit codes. A usage error exits 1, never 2 (see :class:`_SeedArgumentParser`).
+    """
+    parser = _SeedArgumentParser(
+        prog=prog if prog is not None else _DEFAULT_PROG,
+        description="Seed the terminal_ tables with deterministic fallback data.",
+        epilog=_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--database-url",
@@ -503,16 +602,30 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Parse ``argv`` (default ``sys.argv[1:]``), seed, and return the exit code (0, 1 or 2).
+def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
+    """Parse ``argv`` (default ``sys.argv[1:]``), seed, and return the exit code.
+
+    ``0`` seeded, and after ``-h``/``--help``; ``1`` failed and rolled back, or invalid arguments
+    or settings; ``2`` the schema is not at head; ``130`` interrupted by Ctrl-C, reported in one
+    line on stderr rather than a traceback. It never raises ``SystemExit``: argparse's exits for
+    ``--help`` and usage errors become the returned code, so ``opennse-terminal seed`` and other
+    in-process callers always receive an int. ``prog`` is passed to :func:`build_parser`.
 
     Runs :func:`run_seed` with ``asyncio.run``, so it must be called outside a running event
     loop; async callers await :func:`run_seed` or :func:`seed` instead, or call this through
     ``asyncio.to_thread``. Invalid settings (for example a non-asyncpg ``--database-url``) print
     the validation message, which never repeats the URL, and return 1.
     """
-    args = build_parser().parse_args(argv)
+    try:
+        args = build_parser(prog=prog).parse_args(argv)
+    except SystemExit as exc:
+        # argparse has already printed the help (code 0) or the usage error (code 1, see
+        # _SeedArgumentParser); None is sys.exit()'s success.
+        if exc.code is None:
+            return _EXIT_OK
+        return exc.code if isinstance(exc.code, int) else _EXIT_FAILED
     database_url: str | None = args.database_url
+    url_source = _URL_SOURCE_FLAG if database_url is not None else _URL_SOURCE_ENV
     try:
         settings = (
             TerminalSettings(database_url=database_url)
@@ -522,7 +635,13 @@ def main(argv: list[str] | None = None) -> int:
     except ValidationError as exc:
         print(f"invalid terminal settings: {exc}", file=sys.stderr)
         return _EXIT_FAILED
-    return asyncio.run(run_seed(settings))
+    try:
+        return asyncio.run(run_seed(settings, url_source=url_source))
+    except KeyboardInterrupt:
+        # asyncio.run cancels the seed on Ctrl-C and then raises KeyboardInterrupt. The seed
+        # transaction commits only at the very end, so nothing partial is kept.
+        print(_INTERRUPTED_MESSAGE, file=sys.stderr)
+        return _EXIT_INTERRUPTED
 
 
 if __name__ == "__main__":

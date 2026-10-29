@@ -12,6 +12,11 @@ history is recorded in its own version table, :data:`VERSION_TABLE`, and
 :func:`include_terminal_only` limits autogenerate to ``terminal_`` tables, so a host database's
 ``alembic_version`` and its tables are never read, written or proposed for change.
 
+Connecting is bounded by :data:`CONNECT_TIMEOUT_SECONDS`. A connect failure or timeout raises
+``ConnectionError`` naming the migration and the database, host and port through
+``opennse_terminal.db.session.database_log_label``, never the driver URL, the user, the password
+or the query string.
+
 Never import ``opennse_terminal.migrations.env``: Alembic loads it by path, and importing it runs
 migrations. Importing this package itself has no side effects: it opens no connection, reads no
 settings and registers no models.
@@ -30,6 +35,7 @@ from sqlalchemy.exc import ArgumentError
 from opennse_terminal.db.base import TABLE_PREFIX
 
 __all__ = [
+    "CONNECT_TIMEOUT_SECONDS",
     "SCRIPT_LOCATION",
     "VERSION_TABLE",
     "build_alembic_config",
@@ -45,6 +51,11 @@ SCRIPT_LOCATION: Final[str] = "opennse_terminal:migrations"
 
 VERSION_TABLE: Final[str] = "terminal_alembic_version"
 """The terminal's own Alembic version table. A host's ``alembic_version`` is never touched."""
+
+CONNECT_TIMEOUT_SECONDS: Final[float] = 10.0
+"""Seconds ``env.py`` allows asyncpg to establish the migration connection (TCP, TLS and
+authentication) before raising ``ConnectionError``. asyncpg's own default is 60 s; 10 s matches the
+scrapers' connect timeout."""
 
 _ASYNC_DRIVERNAME: Final[str] = "postgresql+asyncpg"
 """The only driver ``env.py`` can migrate with: it builds an async engine."""
@@ -162,6 +173,13 @@ def run_upgrade(database_url: str, revision: str = "head") -> None:
     ``postgresql+asyncpg://`` URL (``ValueError`` otherwise). Only ``terminal_`` tables and
     :data:`VERSION_TABLE` are created or changed; upgrading an already current database is a
     no-op.
+
+    Connecting is bounded by :data:`CONNECT_TIMEOUT_SECONDS`. A connect failure or timeout raises
+    ``ConnectionError`` naming the migration, its target revision and the database, host and port
+    through ``database_log_label`` (for example ``database "opennse" on localhost:5432``), never
+    the driver URL, the user, the password or the query string; the original ``OSError`` is its
+    ``__cause__``. Errors the server reports, such as a rejected password or a missing database,
+    propagate unchanged from asyncpg.
     """
     _require_no_running_loop("run_upgrade")
     command.upgrade(build_alembic_config(database_url), revision)
@@ -176,6 +194,9 @@ def run_downgrade(database_url: str, revision: str) -> None:
     keeps :data:`VERSION_TABLE`, now empty; that is intended, since only what the revisions
     created is dropped. Checks that every ``terminal_`` table is gone must therefore exclude
     :data:`VERSION_TABLE` or assert that it holds no rows.
+
+    A connect failure or timeout raises the same credential-free ``ConnectionError`` as
+    :func:`run_upgrade`, within :data:`CONNECT_TIMEOUT_SECONDS`.
     """
     _require_no_running_loop("run_downgrade")
     command.downgrade(build_alembic_config(database_url), revision)

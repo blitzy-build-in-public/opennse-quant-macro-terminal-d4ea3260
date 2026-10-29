@@ -539,8 +539,9 @@ def parse_decimal_text(text: str | None, *, parentheses_negative: bool = True) -
     ``Decimal("-1234.5")`` when ``parentheses_negative`` is true.
 
     The result is exact at any length and exponent, whatever the active ``decimal`` context: a
-    parenthesized non-zero number equals its leading-minus form digit for digit, and ``(0)``
-    stays a positive zero. Range checks are the caller's.
+    parenthesized non-zero number equals its leading-minus form digit for digit. A zero is
+    always a positive zero with the printed scale, so ``(0)``, ``-0`` and ``+0`` read as
+    ``Decimal("0")`` and ``-0.00`` as ``Decimal("0.00")``. Range checks are the caller's.
 
     Returns ``None`` for ``None``, an empty cell, ``-``, ``—``, ``–``, ``n/a`` (any case) and
     anything that is not a finite decimal number (``NaN``, ``Infinity``, stray letters). The
@@ -563,9 +564,11 @@ def parse_decimal_text(text: str | None, *, parentheses_negative: bool = True) -
         value = Decimal(cleaned)
     except InvalidOperation:
         return None
-    # copy_negate is exact: unlike unary minus it never rounds to the context's precision or
-    # overflows its exponent range. A zero is left as is, so "(0)" stays a positive zero.
-    return value.copy_negate() if negative and not value.is_zero() else value
+    # copy_abs and copy_negate are exact: unlike abs() and unary minus they never round to the
+    # context's precision or overflow its exponent range. A zero, "-0" included, is made positive.
+    if value.is_zero():
+        return value.copy_abs()
+    return value.copy_negate() if negative else value
 
 
 def dedupe_by_key(

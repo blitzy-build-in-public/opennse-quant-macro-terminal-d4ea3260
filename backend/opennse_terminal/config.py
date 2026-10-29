@@ -45,10 +45,12 @@ class TerminalSettings(BaseSettings):
     so ``app.dependency_overrides[get_terminal_settings] = lambda: TerminalSettings(
     database_url=...)`` configures the mounted router from the host's own configuration.
 
-    ``database_url`` carries the database password. Never log the settings object or the raw
-    URL; log ``opennse_terminal.db.session.database_log_label(url)`` instead, which keeps only the
-    driver, host, port and database. ``render_as_string(hide_password=True)`` is not a safe
-    substitute: it prints query values, and asyncpg accepts the password as ``?password=...``.
+    ``database_url`` carries the database password. Never log the settings object, the raw URL or
+    any other connection string; log ``opennse_terminal.db.session.database_log_label(url)``
+    instead, a prose label naming only the database, host and port (for example
+    ``database "opennse" on localhost:5432``). ``render_as_string(hide_password=True)`` is not a
+    safe substitute: it prints query values, and asyncpg accepts the password as
+    ``?password=...``.
     ``repr()`` and ``str()`` leave ``database_url`` out, but ``model_dump()`` still includes it.
     """
 

@@ -183,6 +183,18 @@ def test_lone_dash_reads_as_zero(dash: str) -> None:
     assert revenue.raw_value == dash
 
 
+def test_minus_zero_reads_as_a_positive_zero() -> None:
+    result = extract(income_page([row("Revenue", "-0", "4")], columns=YEAR_COLS), items=["revenue"])
+
+    revenue = only_item(result)
+    assert revenue.status == "found"
+    assert revenue.raw_value == "-0"
+    assert revenue.scale_applied == 1000
+    assert revenue.value == Decimal(0)
+    # Decimal("-0") == 0 too; only its string form, "-0", tells the sign apart.
+    assert str(revenue.value) == "0"
+
+
 def test_decimal_amount_is_scaled_exactly() -> None:
     result = extract(
         income_page([row("Revenue", "", "1,234.5", "1,100")], scale_note="KShs million"),
@@ -190,6 +202,59 @@ def test_decimal_amount_is_scaled_exactly() -> None:
     )
 
     assert only_item(result).value == Decimal("1234500000")
+
+
+def test_amount_beyond_28_significant_digits_is_scaled_exactly() -> None:
+    # 29 significant digits printed; the default decimal context would round the product to 28.
+    result = extract(
+        text_page([INCOME_TITLE, THOUSANDS, "Revenue 1,234,567,890.1234567890123456789"]),
+        items=["revenue"],
+    )
+
+    revenue = only_item(result)
+    assert revenue.status == "found"
+    assert revenue.raw_value == "1,234,567,890.1234567890123456789"
+    assert revenue.scale_applied == 1000
+    assert revenue.value == Decimal("1234567890123.4567890123456789")
+    assert str(revenue.value) == "1234567890123.4567890123456789"
+
+
+# terminal_fundamentals money columns are NUMERIC(24,2): a value must round, at 2 places, to a
+# magnitude below 10^22.
+@pytest.mark.parametrize(
+    ("raw", "status", "value"),
+    [
+        ("9999999999999999999999.99", "found", "9999999999999999999999.99"),
+        ("9999999999999999999999.994", "found", "9999999999999999999999.994"),
+        ("9999999999999999999999.995", "ambiguous", None),
+        ("10000000000000000000000", "ambiguous", None),
+        ("(10000000000000000000000)", "ambiguous", None),
+        ("1234567890123456789012345678901234567890", "ambiguous", None),
+    ],
+    ids=[
+        "largest_cents",
+        "rounds_down_to_the_largest_cents",
+        "rounds_up_to_ten_to_the_22",
+        "ten_to_the_22",
+        "negative_ten_to_the_22",
+        "forty_digits",
+    ],
+)
+def test_monetary_value_must_fit_the_money_columns(
+    raw: str, status: str, value: str | None
+) -> None:
+    result = extract(text_page(["Notes", f"Revenue {raw}"]), items=["revenue"])
+
+    revenue = only_item(result)
+    assert revenue.status == status
+    assert revenue.raw_value == raw
+    if value is None:
+        assert revenue.value is None
+        assert revenue.candidates == [Candidate("Revenue", 1, raw, None)]
+    else:
+        assert revenue.value == Decimal(value)
+        assert str(revenue.value) == value
+        assert revenue.candidates == []
 
 
 @pytest.mark.parametrize(
@@ -296,6 +361,146 @@ def test_page_without_marker_inherits_the_document_scale(
     assert cash_flow.page_number == len(markers) + 1
     assert result.detected_scale == scale
     assert result.warnings == []
+
+
+def test_scale_words_in_narrative_prose_do_not_set_the_document_scale() -> None:
+    result = extract(
+        text_page(["Chairman's statement", "Revenue grew to KShs 310 billion this year, up 12%."]),
+        text_page(["Directors' report", "The group recorded a profit of KShs 42 billion."]),
+        income_page(
+            [row("Revenue", "310,000", "277,000")], scale_note="KShs million", columns=YEAR_COLS
+        ),
+        position_page(
+            [row("Total borrowings", "90,000", "80,000")], scale_note=None, columns=YEAR_COLS
+        ),
+        cashflow_page(
+            [row("Net cash generated from operating activities", "50,000", "40,000")],
+            scale_note="KShs million",
+            columns=YEAR_COLS,
+        ),
+        items=["revenue", "total_debt", "operating_cash_flow"],
+    )
+
+    assert item_named(result, "total_debt") == ExtractedLineItem(
+        item="total_debt",
+        status="found",
+        value=Decimal("90000000000"),
+        unit="KES",
+        raw_value="90,000",
+        scale_applied=1_000_000,
+        page_number=4,
+        matched_label="Total borrowings",
+    )
+    assert item_named(result, "revenue").value == Decimal("310000000000")
+    assert item_named(result, "operating_cash_flow").value == Decimal("50000000000")
+    assert result.detected_scale == 1_000_000
+    assert result.warnings == []
+
+
+@pytest.mark.parametrize(
+    ("lines", "scale", "value", "warnings"),
+    [
+        (
+            ["Sustainability report", "We reached customers in thousands of villages."],
+            1,
+            Decimal("310000000"),
+            ["scale_not_detected"],
+        ),
+        (
+            ["Financial highlights", "Revenue (KShs bn) 310"],
+            1,
+            Decimal("310000000"),
+            ["scale_not_detected"],
+        ),
+        (
+            [
+                "Chairman's statement",
+                "The statement of financial position remains strong at KShs 90 billion.",
+            ],
+            1,
+            Decimal("310000000"),
+            ["scale_not_detected"],
+        ),
+        (
+            [NOTES_TITLE, "Amounts in KShs million"],
+            1_000_000,
+            Decimal("310000000000000"),
+            [],
+        ),
+        (
+            [NOTES_TITLE, "All figures are in KShs '000, unless otherwise stated"],
+            1_000,
+            Decimal("310000000000"),
+            [],
+        ),
+        (
+            ["Summary financial information (KShs million)"],
+            1_000_000,
+            Decimal("310000000000000"),
+            [],
+        ),
+        (
+            [NOTES_TITLE, "Our customers live in thousands of villages.", "Figures in KShs mn"],
+            1_000_000,
+            Decimal("310000000000000"),
+            [],
+        ),
+        (
+            ["Sustainability report", "We measure customers (in thousands), not revenue."],
+            1,
+            Decimal("310000000"),
+            ["scale_not_detected"],
+        ),
+        (
+            ["Sustainability report", "Our customer base (in millions) continues to grow."],
+            1,
+            Decimal("310000000"),
+            ["scale_not_detected"],
+        ),
+        (
+            ["Financial highlights (in millions)"],
+            1,
+            Decimal("310000000"),
+            ["scale_not_detected"],
+        ),
+        (
+            ["Five-year review (in millions of Kenya shillings)"],
+            1_000_000,
+            Decimal("310000000000000"),
+            [],
+        ),
+    ],
+    ids=[
+        "prose",
+        "data_line_with_a_unit_label",
+        "prose_opening_with_a_statement_title",
+        "caption_with_lead_in_words",
+        "caption_with_punctuation",
+        "parenthesized_caption",
+        "caption_after_prose",
+        "parenthesized_unit_inside_a_sentence",
+        "parenthesized_unit_mid_sentence",
+        "parenthesized_unit_without_a_currency",
+        "parenthesized_caption_naming_shillings",
+    ],
+)
+def test_only_a_unit_caption_sets_the_scale_of_a_page_that_is_not_a_statement(
+    lines: list[str], scale: int, value: Decimal, warnings: list[str]
+) -> None:
+    result = extract(
+        text_page(lines),
+        income_page(
+            [row("Revenue", "310,000,000", "277,000,000")], scale_note=None, columns=YEAR_COLS
+        ),
+        items=["revenue"],
+    )
+
+    revenue = only_item(result)
+    assert revenue.status == "found"
+    assert revenue.value == value
+    assert revenue.scale_applied == scale
+    assert result.detected_scale == scale
+    assert result.warnings == warnings
 
 
 # ---------------------------------------------------------------------------------------------
@@ -877,6 +1082,128 @@ def test_items_are_read_from_their_statement_page_not_the_notes(
     assert extracted.page_number == 2
 
 
+def test_a_statement_title_mentioned_on_a_notes_page_does_not_classify_it() -> None:
+    result = extract(
+        cashflow_page(
+            [row("Net cash generated from operating activities", "", "120,000", "110,000")]
+        ),
+        text_page(
+            [
+                NOTES_TITLE,
+                "(c) Statement of cash flows policy",
+                "Net cash generated from operating activities 9,999",
+            ]
+        ),
+        items=["operating_cash_flow"],
+    )
+
+    cash_flow = only_item(result)
+    assert cash_flow.status == "found"
+    assert cash_flow.value == Decimal("120000000")
+    assert cash_flow.page_number == 1
+    assert cash_flow.candidates == []
+
+
+@pytest.mark.parametrize(
+    ("title", "item", "label", "status", "page_number", "candidates"),
+    [
+        (
+            "Consolidated and separate statement of financial position",
+            "total_debt",
+            "Total borrowings",
+            "found",
+            2,
+            [],
+        ),
+        (
+            "Group statement of cash flows",
+            "operating_cash_flow",
+            "Net cash from operating activities",
+            "found",
+            2,
+            [],
+        ),
+        (
+            "Interim condensed statement of profit or loss for the period ended 30 June 2025",
+            "revenue",
+            "Revenue",
+            "found",
+            2,
+            [],
+        ),
+        (
+            "Group and company balance sheets (continued)",
+            "total_debt",
+            "Total borrowings",
+            "found",
+            2,
+            [],
+        ),
+        (
+            "3. Statement of cash flows",
+            "operating_cash_flow",
+            "Net cash from operating activities",
+            "ambiguous",
+            1,
+            ["999", "1,234"],
+        ),
+        (
+            "Amounts as shown in the statement of financial position",
+            "total_debt",
+            "Total borrowings",
+            "ambiguous",
+            1,
+            ["999", "1,234"],
+        ),
+        (
+            "The statement of financial position remains strong",
+            "total_debt",
+            "Total borrowings",
+            "ambiguous",
+            1,
+            ["999", "1,234"],
+        ),
+        (
+            "Basis of preparation of the income statement",
+            "revenue",
+            "Revenue",
+            "ambiguous",
+            1,
+            ["999", "1,234"],
+        ),
+    ],
+    ids=[
+        "entity_qualifiers",
+        "group_qualifier",
+        "presentation_qualifiers_and_trailing_text",
+        "entities_and_continued",
+        "after_a_list_marker",
+        "mid_sentence",
+        "sentence_opening_with_the_title",
+        "after_a_heading",
+    ],
+)
+def test_a_page_is_a_statement_only_when_a_line_opens_with_its_title(
+    title: str,
+    item: str,
+    label: str,
+    status: str,
+    page_number: int,
+    candidates: list[str],
+) -> None:
+    # A page whose title is a mere mention is no statement page, so every page is searched and
+    # the notes page's 999 competes with the page's own 1,234.
+    notes = text_page([NOTES_TITLE, f"{label} 999"])
+    titled = statement(title, [row(label, "", "1,234", "1,100")])
+
+    result = extract(notes, titled, items=[item])
+
+    extracted = only_item(result)
+    assert extracted.status == status
+    assert extracted.page_number == page_number
+    assert raw_candidates(extracted) == candidates
+
+
 @pytest.mark.parametrize(
     ("item", "line"),
     [("revenue", "Revenue 1,234"), ("total_debt", "Total borrowings 1,234")],
@@ -978,6 +1305,68 @@ def test_debt_components_are_summed(first: str, second: str) -> None:
             DerivationPart(second, 1, Decimal("3000000")),
         ],
     )
+
+
+def test_debt_components_are_summed_exactly() -> None:
+    # The 30-digit sum would be rounded to 28 digits by the default decimal context.
+    result = extract(
+        text_page(
+            [
+                POSITION_TITLE,
+                "Borrowings - current 1234567890123.4567890123456789",
+                "Borrowings - non-current 1",
+            ]
+        ),
+        items=["total_debt"],
+    )
+
+    debt = only_item(result)
+    assert debt.status == "derived"
+    assert debt.value == Decimal("1234567890124.4567890123456789")
+    assert str(debt.value) == "1234567890124.4567890123456789"
+    assert debt.derivation == [
+        DerivationPart("Borrowings - current", 1, Decimal("1234567890123.4567890123456789")),
+        DerivationPart("Borrowings - non-current", 1, Decimal("1")),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("current", "non_current", "value", "candidates"),
+    [
+        (
+            "6000000000000000000000",
+            "6000000000000000000000",
+            Decimal("6000000000000000000000"),
+            [Decimal("6000000000000000000000"), Decimal("6000000000000000000000")],
+        ),
+        ("10000000000000000000000", "1", None, [None, Decimal("1")]),
+    ],
+    ids=["sum_beyond_the_money_columns", "component_beyond_the_money_columns"],
+)
+def test_debt_beyond_the_money_columns_is_ambiguous(
+    current: str, non_current: str, value: Decimal | None, candidates: list[Decimal | None]
+) -> None:
+    result = extract(
+        text_page(
+            [
+                POSITION_TITLE,
+                f"Borrowings - current {current}",
+                f"Borrowings - non-current {non_current}",
+            ]
+        ),
+        items=["total_debt"],
+    )
+
+    debt = only_item(result)
+    assert debt.status == "ambiguous"
+    assert debt.derivation == []
+    # The reported line is the first debt line on the page.
+    assert debt.matched_label == "Borrowings - current"
+    assert debt.value == value
+    assert debt.candidates == [
+        Candidate("Borrowings - current", 1, current, candidates[0]),
+        Candidate("Borrowings - non-current", 1, non_current, candidates[1]),
+    ]
 
 
 def test_debt_total_line_alone_is_used_beside_components() -> None:
@@ -1227,6 +1616,45 @@ def test_ebitda_with_an_ambiguous_part_is_ambiguous(
     assert raw_candidates(ebitda) == candidates
 
 
+def test_ebitda_sum_beyond_the_money_columns_is_ambiguous() -> None:
+    # Each part fits NUMERIC(24,2); their sum, 1.1 x 10^22, does not.
+    result = extract(
+        text_page(
+            [
+                INCOME_TITLE,
+                "Operating profit 9000000000000000000000",
+                "Depreciation and amortisation (2000000000000000000000)",
+            ]
+        ),
+        items=["ebitda"],
+    )
+
+    assert only_item(result) == ExtractedLineItem(
+        item="ebitda",
+        status="ambiguous",
+        value=None,
+        unit="KES",
+        raw_value=None,
+        scale_applied=1,
+        page_number=1,
+        matched_label="Operating profit",
+        candidates=[
+            Candidate(
+                "Operating profit",
+                1,
+                "9000000000000000000000",
+                Decimal("9000000000000000000000"),
+            ),
+            Candidate(
+                "Depreciation and amortisation",
+                1,
+                "(2000000000000000000000)",
+                Decimal("-2000000000000000000000"),
+            ),
+        ],
+    )
+
+
 OPERATING_PROFIT = row("Operating profit", "6", "400,000", "350,000")
 
 
@@ -1397,11 +1825,19 @@ def test_share_count_is_scaled_by_its_column_hint(hint: str, scale: int, value: 
     ("raw", "status", "value"),
     [
         ("1,234.5", "ambiguous", None),
+        # 32 significant digits: rounded to the default context's 28 it would look whole.
+        ("1,000,000.0000000000000000000000001", "ambiguous", None),
         ("(100)", "ambiguous", None),
         ("1,000,000,000,001", "ambiguous", None),
         ("1,000,000,000,000", "found", Decimal("1000000000000")),
     ],
-    ids=["fractional", "negative", "above_the_maximum", "at_the_maximum"],
+    ids=[
+        "fractional",
+        "fractional_beyond_28_digits",
+        "negative",
+        "above_the_maximum",
+        "at_the_maximum",
+    ],
 )
 def test_share_count_must_be_a_whole_count_within_bounds(
     raw: str, status: str, value: Decimal | None

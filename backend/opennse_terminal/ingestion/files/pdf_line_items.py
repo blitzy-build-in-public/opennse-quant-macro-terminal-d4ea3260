@@ -9,8 +9,18 @@ no OCR: a PDF without a text layer yields ``no_items`` with the warning ``no_tex
 How a value is chosen:
 
 * Pages are classified by their title region (first 8 lines) as income statement, statement of
-  financial position or statement of cash flows; each item is searched on its preferred
-  statement pages, or on every page when the document has none of that type.
+  financial position or statement of cash flows: the first line there that opens with a
+  statement title, after qualifier words such as "Consolidated" or "Group" only, decides; a
+  title mentioned mid-line ("(c) Statement of cash flows policy") does not. Each item is
+  searched on its preferred statement pages, or on every page when the document has none of
+  that type.
+* A page's scale is the first scale marker in its header region (the lines through its first
+  column-header row and a units line directly below it, else the first 8 lines). On a page that
+  is not a statement only a unit caption counts: a caption line ("Amounts in KShs million") or a
+  parenthesized money unit that closes its line ("Prospectus summary (USD '000)"), never prose
+  such as "Revenue grew to KShs 310 billion" or "customers (in thousands)". A page without a
+  marker inherits the most frequent page scale; with none anywhere the scale is x1 and the
+  warning ``scale_not_detected`` is added.
 * Labels are matched as anchored patterns in priority order (never substrings, so "cost of
   sales" is not "sales"); the highest-priority pattern with any match decides the item.
 * The number on a matched line is selected by column evidence, never by token position: the
@@ -21,11 +31,16 @@ How a value is chosen:
 * ``(1,234)`` is -1234, a lone dash is 0, and monetary values are ``raw x page scale`` in
   ``Decimal`` ("KShs '000" is x1,000, "KShs million" x1,000,000, "billion"/"bn"
   x1,000,000,000). Share counts are never scaled by the page scale, only by a unit hint of their
-  own line or column. Values are not rounded here.
+  own line or column. Values are exact, never rounded: scaling moves the printed digits' decimal
+  point and derived totals are summed without precision limit, whatever the active ``decimal``
+  context. A zero is never negative.
 
 Units: monetary items are whole KES after scaling, or whole USD when a statement header is in
-USD (``currency="USD"``, warning ``non_kes_currency``; nothing is converted). Shares are integral
-``Decimal`` counts of at most ``MAX_SHARE_COUNT``.
+USD (``currency="USD"``, warning ``non_kes_currency``; nothing is converted). A monetary value,
+derived totals included, must fit the NUMERIC(24,2) columns of ``terminal_fundamentals``: its
+magnitude, rounded half-up to 2 decimal places, below 10^22. A value beyond that has no value
+(``None``) and makes its item ``ambiguous``, never committed. Shares are integral ``Decimal``
+counts of at most ``MAX_SHARE_COUNT``.
 """
 
 import contextlib
@@ -37,7 +52,16 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date
-from decimal import Decimal
+from decimal import (
+    MAX_EMAX,
+    MAX_PREC,
+    MIN_EMIN,
+    Context,
+    Decimal,
+    Inexact,
+    InvalidOperation,
+    Rounded,
+)
 from typing import Final, Literal, Protocol
 
 import pdfplumber
@@ -140,7 +164,9 @@ class DerivationPart:
 @dataclass(frozen=True, slots=True)
 class Candidate:
     """One conflicting match of an ``ambiguous`` item: the token as printed and its scaled value
-    (``None`` when the token is not a number)."""
+    (``None`` when the token is not a number or not a valid value for the item: a monetary value
+    beyond the NUMERIC(24,2) range, or a share count that is fractional, negative or above
+    ``MAX_SHARE_COUNT``)."""
 
     label: str
     page_number: int
@@ -152,10 +178,12 @@ class Candidate:
 class ExtractedLineItem:
     """Extraction outcome for one requested item (field names mirror ``schemas.ingest``).
 
-    ``value`` is scaled (whole units of ``unit``); ``raw_value`` is the selected token exactly as
-    printed and ``scale_applied`` its multiplier. ``derivation`` is non-empty only for
-    ``derived`` items and ``candidates`` (at most five) only for ``ambiguous`` ones. A
-    ``not_found`` item has every optional field ``None`` and both lists empty.
+    ``value`` is scaled (whole units of ``unit``), exact and never a negative zero; a monetary
+    ``value`` is below 10^22 in magnitude once rounded to 2 places, so it fits NUMERIC(24,2).
+    ``raw_value`` is the selected token exactly as printed and ``scale_applied`` its multiplier.
+    ``derivation`` is non-empty only for ``derived`` items and ``candidates`` (at most five) only
+    for ``ambiguous`` ones. A ``not_found`` item has every optional field ``None`` and both lists
+    empty.
     """
 
     item: str
@@ -233,8 +261,31 @@ _HEADER_FILLER_RE: Final = re.compile(
     r"|\(?(?:restated|audited|unaudited)\)?"
     r"|years?|period|months|ended|the|and|in|of|kenya|kenyan|shillings|us|dollars"
 )
+# Words that may precede a statement title on its title line, as in "Consolidated and separate
+# statement of financial position" or "Group statement of cash flows". A title after any other
+# word, a list marker such as "(c)" or "3." included, is a mention, not the page's title.
+_TITLE_QUALIFIERS: Final = (
+    "consolidated",
+    "company",
+    "group",
+    "and",
+    "separate",
+    "standalone",
+    "bank",
+    "interim",
+    "condensed",
+    "abridged",
+    "summary",
+    "summarised",
+    "summarized",
+    "audited",
+    "unaudited",
+)
+# Used with ``re.match`` on a normalized line: the line must start with the title, optionally
+# after qualifier words; any text may follow it.
 _TITLE_RE: Final = re.compile(
-    r"\b(?:"
+    rf"(?:(?:{'|'.join(_TITLE_QUALIFIERS)}) )*"
+    r"(?:"
     r"(?P<income>statements? of profit or loss|income statements?"
     r"|statements? of comprehensive income)"
     r"|(?P<position>statements? of financial position|balance sheets?)"
@@ -254,8 +305,40 @@ _SCALE_MARKER_RE: Final = re.compile(
 _SCALE_VALUES: Final[Mapping[str, int]] = types.MappingProxyType(
     {"thousand": 1_000, "million": 1_000_000, "billion": 1_000_000_000}
 )
+# Lead-in words of a unit caption on a page that is not a statement, as in "Amounts in KShs
+# million" or "All figures are in KShs '000 unless otherwise stated". They are kept apart from
+# _HEADER_FILLER_RE, which also decides column-header rows, so they never make a header row.
+_CAPTION_LEAD_INS: Final = frozenset(
+    {
+        "all",
+        "amount",
+        "amounts",
+        "figures",
+        "values",
+        "currency",
+        "units",
+        "are",
+        "is",
+        "expressed",
+        "presented",
+        "reported",
+        "stated",
+        "shown",
+        "unless",
+        "otherwise",
+        "indicated",
+        "noted",
+    }
+)
+# Punctuation that may wrap a caption word: "(All amounts in KShs '000, unless otherwise stated)".
+_CAPTION_PUNCTUATION: Final = "(),;:."
+# A parenthesized group of a normalized line: "(usd '000)" in "Prospectus summary (USD '000)".
+_PARENTHESIZED_RE: Final = re.compile(r"\(([^()]*)\)")
 _USD_RE: Final = re.compile(r"\busd\b|\bus\$")
 _CURRENCY_RE: Final = re.compile(r"\b(?:kshs|kes|shs|ksh|usd|us\$)")
+# Currency names that, with _CURRENCY_RE, make a parenthesized unit group a money caption, as in
+# "Five-year review (in millions of Kenya shillings)".
+_CURRENCY_NAME_RE: Final = re.compile(r"\b(?:shillings|dollars)\b")
 _SHARE_UNIT_RE: Final = re.compile(
     r"(?P<thousand>'000|\bthousands?\b)"
     r"|(?P<million>\bmillions?\b|\bmn\b)"
@@ -717,9 +800,18 @@ def _lines(page_number: int, words: Sequence[_Word]) -> tuple[_Line, ...]:
 
 
 def _classify_page(lines: Sequence[_Line]) -> _StatementKind | None:
-    """Statement kind from the first statement title in the title region (first 8 lines)."""
+    """Statement kind from the first title line, in reading order, of the title region (first 8
+    lines); ``None`` when no line there is a title line.
+
+    A title line starts with a statement title, optionally after qualifier words only
+    (:data:`_TITLE_QUALIFIERS`: "Consolidated and separate statement of financial position",
+    "Group statement of cash flows"); any text may follow the title ("... for the year ended
+    31 December 2025", "... and other comprehensive income", "(continued)"). A title after any
+    other word is a mention, not a title: a list marker ("(c) Statement of cash flows policy",
+    "3. Balance sheet") or a sentence ("... as shown in the statement of financial position").
+    """
     for line in lines[:_TITLE_REGION_LINES]:
-        match = _TITLE_RE.search(line.text)
+        match = _TITLE_RE.match(line.text)
         if match is not None and match.lastgroup is not None:
             return _STATEMENT_KINDS[match.lastgroup]
     return None
@@ -737,25 +829,99 @@ def _header_region(lines: Sequence[_Line]) -> Sequence[_Line]:
     return lines[:end]
 
 
-def _scale_marker(region: Sequence[_Line]) -> int | None:
-    """The first scale marker in reading order within the header region, if any."""
+def _caption_word(text: str) -> str:
+    """A normalized word without the parentheses, commas, semicolons, colons and full stops
+    that may wrap it in a caption ("(kshs" and "'000," become "kshs" and "'000")."""
+    return text.strip(_CAPTION_PUNCTUATION)
+
+
+def _is_caption_line(line: _Line) -> bool:
+    """A unit caption line: every word, bar its wrapping punctuation, is a period word, a header
+    word (entity, note, unit or filler) or a caption lead-in word (:data:`_CAPTION_LEAD_INS`),
+    as in "Amounts in KShs million", "In thousands of Kenya shillings" or "KShs '000". A line
+    holding any other word, a sentence or an amount such as "310", is not a caption."""
+    for word in line.words:
+        core = _caption_word(word.norm)
+        if not (_is_period_word(core) or _is_header_word(core) or core in _CAPTION_LEAD_INS):
+            return False
+    return True
+
+
+def _unit_parenthetical_marker(line: _Line) -> re.Match[str] | None:
+    """The first scale marker of ``line.text`` inside a parenthesized money-unit caption that
+    closes the line ("Prospectus summary (USD '000)", "Summary financial information (KShs
+    million)", "Five-year review (in millions of Kenya shillings)"); ``None`` when there is none.
+
+    A group qualifies only when it closes the line, nothing but caption punctuation following
+    its ")": a heading followed by its unit caption qualifies, a parenthetical inside a sentence
+    ("We measure customers (in thousands), not revenue") does not. The group must also be made
+    only of header words and name a currency (KShs, KES, Shs, Ksh, USD, US$, shillings or
+    dollars), so a count of customers or shares ("Financial highlights (in millions)", "(bn)")
+    is not a money unit. The line must hold no value token other than period and unit words, so
+    "Number of shares (bn) 40" is a data line, not a caption. The line's end is found once and
+    each group is searched once, so the cost is linear in the line's length."""
+    for word in line.words:
+        if _is_value_token(word.norm) and not (
+            _is_period_word(word.norm) or _is_header_word(word.norm)
+        ):
+            return None
+    # Where the line's trailing run of caption punctuation and spaces begins: a group whose ")"
+    # reaches it closes the line.
+    line_end = len(line.text.rstrip(_CAPTION_PUNCTUATION + " "))
+    for group in _PARENTHESIZED_RE.finditer(line.text):
+        if group.end() < line_end:
+            continue
+        start, end = group.span(1)
+        if not all(_is_header_word(_caption_word(text)) for text in group.group(1).split()):
+            continue
+        if (
+            _CURRENCY_RE.search(line.text, start, end) is None
+            and _CURRENCY_NAME_RE.search(line.text, start, end) is None
+        ):
+            continue
+        marker = _SCALE_MARKER_RE.search(line.text, start, end)
+        if marker is not None:
+            return marker
+    return None
+
+
+def _scale_marker(region: Sequence[_Line], *, captions_only: bool) -> int | None:
+    """The scale of the first qualifying marker, in reading order, within the header region;
+    ``None`` when no marker there qualifies.
+
+    On a statement page every marker in the header region qualifies. With ``captions_only``, for
+    a page that is not a statement, only a marker on a unit caption does: a caption line
+    (:func:`_is_caption_line`, "Amounts in KShs million") or a parenthesized money-unit group
+    that names a currency and closes a line without amounts (:func:`_unit_parenthetical_marker`,
+    "Prospectus summary (USD '000)"). A marker in prose ("Revenue grew to KShs 310 billion",
+    "customers in thousands of villages", "We measure customers (in thousands), not revenue"),
+    in a parenthesized group naming no currency ("Financial highlights (in millions)") or on a
+    data line ("Number of shares (bn) 40") never sets a page scale, so such a page inherits the
+    document's scale and takes no part in choosing it.
+    """
     for line in region:
-        match = _SCALE_MARKER_RE.search(line.text)
-        if match is not None and match.lastgroup is not None:
-            return _SCALE_VALUES[match.lastgroup]
+        if not captions_only or _is_caption_line(line):
+            marker = _SCALE_MARKER_RE.search(line.text)
+        else:
+            marker = _unit_parenthetical_marker(line)
+        if marker is not None and marker.lastgroup is not None:
+            return _SCALE_VALUES[marker.lastgroup]
     return None
 
 
 def _analyse_page(page_number: int, words: Sequence[_Word]) -> _Page:
     """Lines, statement kind, scale marker, USD marker and per-line column evidence of one
-    page; the column evidence takes one forward pass over the lines."""
+    page; the column evidence takes one forward pass over the lines. The scale marker is read
+    from the header region: any marker there on a statement page, only a unit caption's on any
+    other page (see :func:`_scale_marker`)."""
     lines = _lines(page_number, words)
     region = _header_region(lines)
+    kind = _classify_page(lines)
     return _Page(
         number=page_number,
         lines=lines,
-        kind=_classify_page(lines),
-        marker_scale=_scale_marker(region),
+        kind=kind,
+        marker_scale=_scale_marker(region, captions_only=kind is None),
         has_usd=any(_USD_RE.search(line.text) is not None for line in region),
         headers=_page_headers(lines),
     )
@@ -976,6 +1142,66 @@ def _select_value(document: _Document, page: _Page, index: int) -> _Reading:
 # ---------------------------------------------------------------------------------------------
 
 
+# terminal_fundamentals money columns are NUMERIC(24,2): 22 integer digits and 2 decimal places.
+# PostgreSQL rounds a stored value half-up to those places and rejects it unless it then stays
+# below 10^22, so 10^22 - 0.005, the smallest magnitude that rounds to 10^22, is the bound.
+_MONEY_LIMIT: Final = Decimal("9999999999999999999999.995")
+"""Exclusive bound on the magnitude of a monetary value, extracted or derived."""
+
+
+def _scaled(amount: Decimal, scale: int) -> Decimal:
+    """``amount x scale`` exactly, for a power-of-ten ``scale`` (1, 1,000, 1,000,000 or
+    1,000,000,000).
+
+    The printed digits are kept and the decimal point moved right by the scale's power of ten,
+    so the product is never rounded, whatever the active ``decimal`` context. A whole product
+    has a zero exponent ("1,234" x1,000 is ``Decimal("1234000")``, never ``1.234E+6``) and a
+    fractional one keeps exactly the printed digits ("1,234.5678" x1,000 is
+    ``Decimal("1234567.8")``). A zero is returned as a positive zero.
+
+    Raises ``ValueError`` for a scale that is not a positive power of ten, or a NaN or infinite
+    amount; neither occurs, since every scale is 1 or comes from a scale marker or a unit hint,
+    and value tokens are finite numbers.
+    """
+    power = len(str(scale)) - 1
+    if scale != 10**power:
+        raise ValueError(f"a scale must be a positive power of ten, not {scale}")
+    sign, digits, exponent = amount.as_tuple()
+    if not isinstance(exponent, int):
+        raise ValueError(f"{amount!r} is not a finite amount")
+    shifted = exponent + power
+    # A whole product takes trailing zeros rather than a positive exponent: at most ``power`` of
+    # them, so an amount that already has a positive exponent keeps it.
+    padding = min(max(shifted, 0), power)
+    value = Decimal((sign, (*digits, *(0,) * padding), shifted - padding))
+    return value.copy_abs() if value.is_zero() else value
+
+
+def _exact_sum(values: Sequence[Decimal]) -> Decimal:
+    """The sum of ``values`` (``0`` for none), exact at any length, never a negative zero.
+
+    The additions run in a local context of unbounded precision and exponent range, never the
+    active one, so adding finite numbers is exact; ``Inexact`` and ``Rounded`` are trapped, so a
+    sum that lost a digit would raise rather than be returned rounded.
+    """
+    if not values:
+        return Decimal(0)
+    context = Context(
+        prec=MAX_PREC, Emax=MAX_EMAX, Emin=MIN_EMIN, traps=[InvalidOperation, Inexact, Rounded]
+    )
+    total = values[0]
+    for value in values[1:]:
+        total = context.add(total, value)
+    return total.copy_abs() if total.is_zero() else total
+
+
+def _fits_money_column(value: Decimal) -> bool:
+    """Whether a monetary ``value`` can be committed to a NUMERIC(24,2) column of
+    ``terminal_fundamentals``: its magnitude is below ``_MONEY_LIMIT``. Exact under any
+    ``decimal`` context, since ``copy_abs`` and comparisons never round."""
+    return value.copy_abs() < _MONEY_LIMIT
+
+
 def _money_scale(reading: _Reading) -> int:
     """Multiplier of a monetary reading: its page's scale (the page's own marker, else the
     document's inherited scale)."""
@@ -983,8 +1209,12 @@ def _money_scale(reading: _Reading) -> int:
 
 
 def _money_value(reading: _Reading, amount: Decimal) -> Decimal | None:
-    """A monetary value: the printed amount times the page scale, in ``Decimal``."""
-    return amount * Decimal(reading.scale)
+    """A monetary value: the printed amount times the page scale, exact (:func:`_scaled`) in
+    whole units of the statement currency. ``None`` when the value cannot be committed to a
+    NUMERIC(24,2) money column (:func:`_fits_money_column`), which makes its item
+    ``ambiguous``."""
+    value = _scaled(amount, reading.scale)
+    return value if _fits_money_column(value) else None
 
 
 def _unit_multiplier(text: str) -> int | None:
@@ -1009,9 +1239,9 @@ def _share_scale(reading: _Reading) -> int:
 
 
 def _share_value(reading: _Reading, amount: Decimal) -> Decimal | None:
-    """An integral share count in 0..``MAX_SHARE_COUNT``, or ``None`` when the scaled amount is
-    fractional, negative or too large."""
-    value = amount * Decimal(_share_scale(reading))
+    """An integral share count in 0..``MAX_SHARE_COUNT``, or ``None`` when the amount, scaled
+    exactly by its unit hint (:func:`_scaled`), is fractional, negative or too large."""
+    value = _scaled(amount, _share_scale(reading))
     if value != value.to_integral_value() or not 0 <= value <= MAX_SHARE_COUNT:
         return None
     return Decimal(int(value))
@@ -1147,9 +1377,10 @@ def _debt_on_page(document: _Document, page: _Page) -> _Outcome | None:
 
     A total line ("total borrowings", "loans and borrowings", "total debt", in that priority)
     is used alone. Otherwise exactly one current and one non-current component, or one
-    short-term and one long-term component, are summed into a ``derived`` value. A generic
-    "borrowings" line, a lone component, more than two components, repeated or unpaired
-    component types, or an unread component line is ambiguous. No section-heading inference.
+    short-term and one long-term component, are summed exactly into a ``derived`` value. A
+    generic "borrowings" line, a lone component, more than two components, repeated or unpaired
+    component types, an unread component line, or a component or sum beyond the NUMERIC(24,2)
+    range (:func:`_fits_money_column`) is ambiguous. No section-heading inference.
     """
     totals: list[list[_Reading]] = [[] for _ in _DEBT_TOTALS]
     matched: list[_Reading] = []
@@ -1185,11 +1416,21 @@ def _debt_on_page(document: _Document, page: _Page) -> _Outcome | None:
         return None
     evidence = _evidence(matched, _MONEY)
     kinds = frozenset(kind for kind, _ in components)
+    # Each component is valued by _money_value: an unread line, or an amount beyond the money
+    # column's range, has no value and gives no part.
+    values = [_reading_value(reading, _MONEY) for _, reading in components]
+    parts = tuple(
+        DerivationPart(reading.label, reading.page_number, value)
+        for (_, reading), value in zip(components, values, strict=True)
+        if value is not None
+    )
+    total = _exact_sum([part.value for part in parts])
     summable = (
         not has_generic
         and len(components) == 2
         and kinds in _DEBT_PAIRS
-        and all(reading.amount is not None for _, reading in components)
+        and len(parts) == len(components)
+        and _fits_money_column(total)
     )
     if not summable:
         first = matched[0]
@@ -1202,14 +1443,9 @@ def _debt_on_page(document: _Document, page: _Page) -> _Outcome | None:
             label=first.label,
             evidence=evidence,
         )
-    parts = tuple(
-        DerivationPart(reading.label, reading.page_number, reading.amount * Decimal(reading.scale))
-        for _, reading in components
-        if reading.amount is not None
-    )
     return _Outcome(
         status="derived",
-        value=sum((part.value for part in parts), Decimal(0)),
+        value=total,
         raw_value=None,
         scale=components[0][1].scale,
         page_number=page.number,
@@ -1273,8 +1509,10 @@ def _depreciation_and_amortisation(document: _Document) -> list[_Outcome] | None
 
 def _derive_ebitda(document: _Document) -> _Outcome | None:
     """EBITDA derived as operating profit plus the absolute value of D&A (expense lines may be
-    printed in parentheses). A missing part gives ``None`` (not found); an ambiguous part makes
-    EBITDA ambiguous, reported with that part's line and candidates but no value."""
+    printed in parentheses), summed exactly. A missing part gives ``None`` (not found); an
+    ambiguous part makes EBITDA ambiguous, reported with that part's line and candidates but no
+    value. A sum beyond the NUMERIC(24,2) range (:func:`_fits_money_column`) is ambiguous too,
+    reported with the operating profit line and every part's candidates but no value."""
     operating = _match_item(document, _OPERATING_PROFIT, _MONEY)
     if operating is None:
         return None
@@ -1291,12 +1529,23 @@ def _derive_ebitda(document: _Document) -> _Outcome | None:
             or outcome.page_number is None
         ):
             return replace(outcome, status="ambiguous", value=None, raw_value=None, parts=())
-        value = outcome.value if position == 0 else abs(outcome.value)
+        # copy_abs is exact; abs() would round to the active context's precision.
+        value = outcome.value if position == 0 else outcome.value.copy_abs()
         parts.append(DerivationPart(outcome.label, outcome.page_number, value))
     evidence = tuple(candidate for outcome in outcomes for candidate in outcome.evidence)
+    total = _exact_sum([part.value for part in parts])
+    if not _fits_money_column(total):
+        return replace(
+            operating,
+            status="ambiguous",
+            value=None,
+            raw_value=None,
+            parts=(),
+            evidence=evidence[:_MAX_CANDIDATES],
+        )
     return _Outcome(
         status="derived",
-        value=sum((part.value for part in parts), Decimal(0)),
+        value=total,
         raw_value=None,
         scale=operating.scale,
         page_number=operating.page_number,

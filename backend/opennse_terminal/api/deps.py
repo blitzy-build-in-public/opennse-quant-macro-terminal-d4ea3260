@@ -17,16 +17,21 @@ Overrides are keyed by function identity, so the aliases below wrap these exact 
 ``opennse_terminal.api`` re-exports the same objects. Authentication stays pluggable: the terminal
 has no user model, user lookup, token parsing or auth table, only the opaque principal subject.
 
+:class:`TerminalJsonRoute` is the route class of every terminal sub-router that binds a JSON body.
+
 Annotations here are evaluated at runtime (no ``from __future__ import annotations``), because
 FastAPI reads the ``Annotated`` dependency metadata of every alias used in a route signature.
 """
 
-from collections.abc import AsyncIterator
+import json
+import sys
+from collections.abc import AsyncIterator, Callable, Coroutine
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Annotated, Final
+from typing import Annotated, Any, Final
 
-from fastapi import Depends
+from fastapi import Depends, Request, Response
+from fastapi.routing import APIRoute
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from opennse_terminal.config import TerminalSettings
@@ -36,6 +41,7 @@ __all__ = [
     "PrincipalDep",
     "SessionDep",
     "SettingsDep",
+    "TerminalJsonRoute",
     "TerminalPrincipal",
     "get_terminal_principal",
     "get_terminal_session",
@@ -156,3 +162,128 @@ async def require_ingest_permission(principal: PrincipalDep) -> None:
     (possibly host-overridden) principal first, and gives an override's signature the caller.
     """
     return None
+
+
+_MAX_JSON_NESTING: Final = 200
+"""Deepest array or object nesting a terminal JSON body may have, as in pydantic-core's own JSON
+parser. Terminal bodies nest at most two levels. FastAPI renders a rejected input with an encoder
+that recurses once per level, which exhausts Python's recursion limit near 1,000 levels."""
+
+_JSON_NESTING_MESSAGE: Final = f"JSON nesting exceeds the {_MAX_JSON_NESTING}-level limit"
+_LONE_SURROGATE_MESSAGE: Final = "JSON text contains an unpaired UTF-16 surrogate"
+
+
+def _has_lone_surrogate(text: str) -> bool:
+    """Whether ``text`` holds a surrogate code point, which no UTF-8 response can carry.
+
+    The standard-library decoder keeps an unpaired ``\\ud800``-style escape, or the raw bytes of
+    one, as a lone surrogate; a valid escaped pair is decoded to a single code point instead.
+    """
+    if text.isascii():
+        return False
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
+def _undecodable_reason(value: object) -> str | None:
+    """Why a decoded JSON body cannot be answered as a JSON 422, or ``None`` when it can.
+
+    The standard-library decoder accepts two inputs on which FastAPI's error rendering fails with
+    a 500: arrays or objects nested more than :data:`_MAX_JSON_NESTING` levels, and strings or
+    keys holding an unpaired surrogate. Pydantic-core's own JSON parser rejects both. The walk is
+    iterative, so it cannot exhaust the interpreter stack itself.
+    """
+    pending: list[tuple[object, int]] = [(value, 0)]
+    while pending:
+        node, depth = pending.pop()
+        if isinstance(node, str):
+            if _has_lone_surrogate(node):
+                return _LONE_SURROGATE_MESSAGE
+        elif isinstance(node, dict | list):
+            if depth >= _MAX_JSON_NESTING:
+                return _JSON_NESTING_MESSAGE
+            children = [*node, *node.values()] if isinstance(node, dict) else node
+            pending.extend((child, depth + 1) for child in children)
+    return None
+
+
+class _TerminalJsonRequest(Request):
+    """A request whose JSON body either decodes to a renderable value or raises ``JSONDecodeError``.
+
+    FastAPI answers only ``json.JSONDecodeError`` from body decoding with its standard 422 list;
+    any other failure of the standard-library decoder becomes a 400 with a string ``detail``.
+    Each such failure is re-raised here as a ``JSONDecodeError`` that names the cause without
+    Python's own advice text, so FastAPI emits its ``json_invalid`` entry:
+
+    * text that is not valid in its detected encoding (``UnicodeDecodeError``), positioned at the
+      first invalid character;
+    * nesting too deep for the decoder (``RecursionError``), or deeper than
+      :data:`_MAX_JSON_NESTING` levels, and strings holding an unpaired surrogate
+      (see :func:`_undecodable_reason`);
+    * an integer literal longer than ``sys.get_int_max_str_digits()`` digits (``ValueError``).
+
+    Every other body decodes exactly as before.
+    """
+
+    async def json(self) -> Any:
+        """Return the decoded JSON body, or raise ``json.JSONDecodeError`` for any failure."""
+        try:
+            decoded = await super().json()
+        except json.JSONDecodeError:
+            raise
+        except UnicodeDecodeError as exc:
+            # A subclass of ValueError, so it is handled before the integer-limit branch.
+            body = await self.body()
+            raise json.JSONDecodeError(
+                f"Invalid {exc.encoding} text: {exc.reason}",
+                body.decode(exc.encoding, "replace"),
+                len(body[: exc.start].decode(exc.encoding, "replace")),
+            ) from exc
+        except RecursionError as exc:
+            body = await self.body()
+            raise json.JSONDecodeError(
+                _JSON_NESTING_MESSAGE, body.decode("utf-8", "replace"), 0
+            ) from exc
+        except ValueError as exc:
+            # The decoder's only other ValueError: int() refusing a literal over the digit limit.
+            body = await self.body()
+            raise json.JSONDecodeError(
+                f"Integer literal exceeds the {sys.get_int_max_str_digits()}-digit limit",
+                body.decode("utf-8", "replace"),
+                0,
+            ) from exc
+        reason = _undecodable_reason(decoded)
+        if reason is not None:
+            body = await self.body()
+            raise json.JSONDecodeError(reason, body.decode("utf-8", "replace"), 0)
+        return decoded
+
+
+class TerminalJsonRoute(APIRoute):
+    """Route class of every terminal sub-router that binds a JSON request body.
+
+    The sub-routers of ``POST /ipo/valuation`` and ``POST /watchlists`` are declared
+    ``APIRouter(route_class=TerminalJsonRoute)``. The route hands its endpoint a request whose
+    JSON decoding failures all raise ``json.JSONDecodeError`` (deep nesting, an over-long integer
+    literal, invalid UTF-8 or an unpaired surrogate). FastAPI therefore answers every undecodable
+    body with its standard 422 list, one ``json_invalid`` entry at ``loc = ["body", <position>]``
+    whose ``ctx.error`` names the cause, instead of a 400 with a string ``detail``, and a host's
+    ``RequestValidationError`` handler still applies. Every other body is validated as before.
+
+    ``include_router`` preserves the route class, so the behaviour travels with
+    ``terminal_router`` into a host; it registers no middleware or exception handler.
+    """
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        """Wrap FastAPI's handler so that it reads the body through ``_TerminalJsonRequest``."""
+        # Built here, synchronously: FastAPI resolves an included route's context during this
+        # call, so deferring it to request time would lose that context.
+        handler = super().get_route_handler()
+
+        async def terminal_json_handler(request: Request) -> Response:
+            return await handler(_TerminalJsonRequest(request.scope, request.receive))
+
+        return terminal_json_handler

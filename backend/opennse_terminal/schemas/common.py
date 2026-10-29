@@ -2,8 +2,8 @@
 
 The schema modules are a pure JSON contract, mirrored one-to-one by
 ``src/components/terminal/types.ts``. This module therefore imports only the standard library,
-Pydantic and :mod:`opennse_terminal.config`; it never imports FastAPI, SQLAlchemy, the models or
-the services. It holds:
+Pydantic (with its ``pydantic_core``) and :mod:`opennse_terminal.config`; it never imports
+FastAPI, SQLAlchemy, the models or the services. It holds:
 
 * :class:`TerminalRequestModel` and :class:`TerminalResponseModel`, the bases of every schema;
 * the coded error contract: :data:`ErrorCode`, :class:`ErrorDetail` and :class:`ErrorResponse`;
@@ -19,10 +19,19 @@ serializer. Requests accept a ``Decimal`` as a JSON number or string.
 """
 
 import datetime as dt
+import math
 from decimal import Decimal
-from typing import Annotated, Final, Literal, get_args
+from typing import Annotated, Any, Final, Literal, Self, get_args
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ModelWrapValidatorHandler,
+    ValidationError,
+    model_validator,
+)
+from pydantic_core import InitErrorDetails, PydanticCustomError
 
 from opennse_terminal.config import MAX_SHARE_COUNT
 
@@ -50,6 +59,68 @@ __all__ = [
 ]
 
 
+def _contains_non_finite(value: object) -> bool:
+    """Whether ``value`` is a NaN or infinite float, or a dict or list holding one at any depth.
+
+    The walk is iterative, so a deeply nested input cannot exhaust the interpreter stack.
+    """
+    pending = [value]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, float):
+            if not math.isfinite(node):
+                return True
+        elif isinstance(node, dict):
+            pending.extend(node.values())
+        elif isinstance(node, list):
+            pending.extend(node)
+    return False
+
+
+def _json_safe_scalar_or_shell(value: object) -> object:
+    """One level of :func:`_json_safe_input`.
+
+    Returns an empty dict or list for a dict or list, the JSON literal spelling (``"NaN"``,
+    ``"Infinity"`` or ``"-Infinity"``) for a non-finite float, and ``value`` itself otherwise.
+    """
+    if isinstance(value, dict):
+        return {}
+    if isinstance(value, list):
+        return []
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return "NaN"
+        return "Infinity" if value > 0 else "-Infinity"
+    return value
+
+
+def _json_safe_input(value: object) -> object:
+    """A copy of ``value`` with every non-finite float spelled as its JSON literal string.
+
+    NaN becomes ``"NaN"``, positive infinity ``"Infinity"`` and negative infinity
+    ``"-Infinity"``, at any depth inside dicts and lists; every other value, dict key and list
+    position is kept. The copy is built iteratively, so a deeply nested input cannot exhaust the
+    interpreter stack, and ``value`` itself is never modified.
+    """
+    root = _json_safe_scalar_or_shell(value)
+    pending: list[tuple[object, object]] = [(value, root)]
+    while pending:
+        source, target = pending.pop()
+        if isinstance(source, dict) and isinstance(target, dict):
+            for key, item in source.items():
+                copy = _json_safe_scalar_or_shell(item)
+                target[key] = copy
+                if isinstance(copy, dict | list):
+                    pending.append((item, copy))
+        elif isinstance(source, list) and isinstance(target, list):
+            for item in source:
+                copy = _json_safe_scalar_or_shell(item)
+                target.append(copy)
+                if isinstance(copy, dict | list):
+                    pending.append((item, copy))
+    return root
+
+
 class TerminalRequestModel(BaseModel):
     """Base of every request body and parameter model: unknown keys are rejected.
 
@@ -58,9 +129,48 @@ class TerminalRequestModel(BaseModel):
     ``model_validator`` or ``field_validator`` hooks, because those errors would carry no stable
     code. Pure check functions such as ``quant.dcf.assumption_violations`` and the services or
     routes test them instead and raise the coded 422 described by :class:`ErrorDetail`.
+
+    The one model-level hook, :meth:`_render_non_finite_inputs`, checks no rule and adds no
+    error. FastAPI decodes a JSON body with the standard library, which reads the literals
+    ``NaN``, ``Infinity`` and ``-Infinity``, and a number that overflows such as ``1e999999``, as
+    non-finite floats. Pydantic rejects them, but FastAPI's standard 422 handler serializes each
+    error's ``input`` with ``allow_nan=False`` and would fail with a 500 instead. The hook only
+    rewrites such an input as the string of its JSON literal, so the rejection reaches the client
+    as FastAPI's standard 422 list.
     """
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _render_non_finite_inputs(cls, data: Any, handler: ModelWrapValidatorHandler[Self]) -> Self:
+        """Validate ``data`` unchanged, making a rejected non-finite JSON number renderable.
+
+        Valid input returns the validated model and invalid input raises a ``ValidationError``
+        with the same errors (type, location, message and context) as without the hook. Only
+        when an error's ``input`` holds a NaN or infinite float, at any depth inside dicts and
+        lists, are the errors raised again with each input copied by :func:`_json_safe_input`;
+        those errors then carry no documentation URL, which FastAPI's 422 list omits anyway.
+        """
+        try:
+            return handler(data)
+        except ValidationError as exc:
+            errors = exc.errors(include_url=False)
+            if not any(_contains_non_finite(error["input"]) for error in errors):
+                raise
+            # Every error is rebuilt as a custom error that carries its type, rendered message
+            # and context verbatim. Rebuilding a pydantic-core error from its type string would
+            # render the message again from the context, which can differ: a Decimal bound of
+            # 30.00 renders as 30.
+            line_errors: list[InitErrorDetails] = [
+                {
+                    "type": PydanticCustomError(error["type"], error["msg"], error.get("ctx")),
+                    "loc": error["loc"],
+                    "input": _json_safe_input(error["input"]),
+                }
+                for error in errors
+            ]
+            raise ValidationError.from_exception_data(exc.title, line_errors) from None
 
 
 class TerminalResponseModel(BaseModel):

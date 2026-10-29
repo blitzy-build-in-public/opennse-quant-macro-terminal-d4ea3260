@@ -19,18 +19,25 @@ Isolation contract with a host database:
 """
 
 import asyncio
+from contextlib import AsyncExitStack
 from typing import Any, Final
 
 from alembic import context
+from alembic.util import CommandError
 from sqlalchemy import pool
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import URL, Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 # Imported for its side effect: it registers all 11 terminal_ tables on TerminalBase.metadata, so
 # autogenerate compares the complete schema instead of proposing to drop unregistered tables.
 import opennse_terminal.models  # noqa: F401
 from opennse_terminal.db.base import TerminalBase
-from opennse_terminal.migrations import VERSION_TABLE, include_terminal_only
+from opennse_terminal.db.session import database_log_label
+from opennse_terminal.migrations import (
+    CONNECT_TIMEOUT_SECONDS,
+    VERSION_TABLE,
+    include_terminal_only,
+)
 
 config = context.config
 target_metadata = TerminalBase.metadata
@@ -86,17 +93,76 @@ def do_run_migrations(connection: Connection) -> None:
         context.run_migrations()
 
 
+def _target_revision_label() -> str:
+    """Return `` to revision '<id>'`` for the running command's destination, else ``""``.
+
+    Alembic resolves ``head`` to the revision id and ``base`` to ``None``. Commands without a
+    destination (``current``, ``check``, ``revision``) raise ``KeyError`` here and an
+    unresolvable destination raises ``CommandError``; neither may replace the connect error being
+    reported, so both give no label.
+    """
+    try:
+        revision = context.get_revision_argument()
+    except (KeyError, CommandError):
+        return ""
+    if revision is None:
+        return " to revision 'base'"
+    if isinstance(revision, str):
+        return f" to revision {revision!r}"
+    return ""
+
+
+def _connect_failure_message(url: URL, exc: OSError) -> str:
+    """Describe a failed migration connect to ``url`` without any credential.
+
+    The message names the operation and its target revision, the database through
+    ``database_log_label`` (database, host and port in prose; never the driver URL, the user, the
+    password or the query string) and the cause: the deadline when asyncpg's own timeout expired,
+    otherwise the error type and its ``strerror`` when set.
+    """
+    if isinstance(exc, TimeoutError) and exc.errno is None:
+        # asyncpg's deadline expired; a TimeoutError carrying an errno is the OS's ETIMEDOUT.
+        cause = f"timed out after {CONNECT_TIMEOUT_SECONDS:g} s"
+    elif exc.strerror:
+        cause = f"{type(exc).__name__}: {exc.strerror}"
+    else:
+        cause = type(exc).__name__
+    return (
+        f"terminal migration{_target_revision_label()} could not connect to "
+        f"{database_log_label(url)}: {cause}"
+    )
+
+
 async def run_async_migrations() -> None:
     """Open a single-use async engine on ``sqlalchemy.url`` and migrate through ``run_sync``.
 
     ``NullPool`` keeps no connection alive after the run, and the engine is always disposed.
+    asyncpg gets ``CONNECT_TIMEOUT_SECONDS`` (from :mod:`opennse_terminal.migrations`) to
+    establish the connection, TCP, TLS and authentication included, instead of its 60 s default.
+    An ``OSError`` while connecting (the timeout, a refused connection, an unresolvable host) is
+    raised as ``ConnectionError`` whose message names the operation, the target revision and the
+    database, host and port through ``database_log_label``, never the driver URL, the user, the
+    password or the query string, with the original error as ``__cause__``. Errors the server
+    reports, such as a rejected password or a missing database, and every error raised while
+    migrating propagate unchanged.
     """
     engine_options = config.get_section(config.config_ini_section, {})
     if not engine_options.get("sqlalchemy.url"):
         raise RuntimeError(_MISSING_URL_MESSAGE)
-    engine = async_engine_from_config(engine_options, prefix="sqlalchemy.", poolclass=pool.NullPool)
+    engine = async_engine_from_config(
+        engine_options,
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+        connect_args={"timeout": CONNECT_TIMEOUT_SECONDS},
+    )
     try:
-        async with engine.connect() as connection:
+        # The exit stack closes the connection exactly as ``async with engine.connect()`` does,
+        # while only the connect step sits inside the translating ``try``.
+        async with AsyncExitStack() as stack:
+            try:
+                connection = await stack.enter_async_context(engine.connect())
+            except OSError as exc:
+                raise ConnectionError(_connect_failure_message(engine.url, exc)) from exc
             await connection.run_sync(do_run_migrations)
     finally:
         await engine.dispose()
