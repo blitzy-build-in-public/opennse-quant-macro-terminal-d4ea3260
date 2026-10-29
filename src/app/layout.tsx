@@ -8,6 +8,9 @@ import "./globals.css";
 // next/font is deliberately not used: Google fonts are fetched at build time, which would make
 // `next build` depend on the network. Borders and offsets use Tailwind's logical utilities
 // (border-be, border-bs, inset-s, inset-bs), which render as bottom/top/left in this LTR layout.
+// The body's surface colours carry Tailwind's `!` (important) modifier: Next's built-in 404 page
+// injects unlayered `body` colours (white, or black under prefers-color-scheme: dark), and those
+// beat layered utilities, so `!` keeps the slate shell surface on every Not Found route.
 
 export const metadata: Metadata = {
   title: "OpenNSE Quant & Macro Terminal",
@@ -35,7 +38,7 @@ const HOME_LINK_CLASS = `rounded text-base font-semibold tracking-tight text-sla
 export default function RootLayout({ children }: Readonly<{ children: ReactNode }>) {
   return (
     <html lang="en">
-      <body className="min-h-screen bg-slate-950 font-sans text-slate-100 antialiased">
+      <body className="min-h-screen bg-slate-950! font-sans text-slate-100! antialiased">
         <a
           href="#main-content"
           className={`sr-only focus-visible:not-sr-only focus-visible:absolute focus-visible:inset-s-4 focus-visible:inset-bs-4 focus-visible:z-50 focus-visible:rounded focus-visible:bg-slate-800 focus-visible:px-3 focus-visible:py-1.5 focus-visible:text-sm focus-visible:text-slate-100 ${FOCUS_RING_CLASS}`}
