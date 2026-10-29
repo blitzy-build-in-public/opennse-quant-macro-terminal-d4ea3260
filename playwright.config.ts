@@ -18,9 +18,12 @@
  * a value defined in the process environment wins, even an empty one; otherwise the first of the
  * repository-root files .env.production.local, .env.local, .env.production and .env (with
  * NODE_ENV=test: .env.test.local, .env.test and .env) that sets it, with `$VAR` references
- * expanded; otherwise http://localhost:8000. Both web servers receive that same value. The host
- * fixture needs it forwarded, because Next.js reads env files only from e2e/host-fixture for that
- * app.
+ * expanded; otherwise http://localhost:8000. It must be a loopback origin (localhost, 127.0.0.0/8
+ * or [::1], any port) without userinfo, a query or a fragment; any other value stops this config
+ * from loading, before either web server starts, so an e2e run never proxies to a remote API.
+ * next.config.ts itself still accepts remote origins. Both web servers receive the same
+ * normalized value. The host fixture needs it forwarded, because Next.js reads env files only from
+ * e2e/host-fixture for that app.
  */
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -139,7 +142,36 @@ function resolveApiOrigin(): string {
   return resolved ?? DEFAULT_API_ORIGIN;
 }
 
-const apiOrigin = resolveApiOrigin();
+/**
+ * The e2e upstream policy: `value` accepted and normalized as next.config.ts accepts it (an
+ * absolute http(s) URL without userinfo, a query or a fragment; the origin plus any path prefix,
+ * trailing slashes removed), and in addition required to name a loopback host on any port, so
+ * neither test server can proxy to a remote API. It throws while this config loads, before either
+ * web server starts. No message echoes the value: it may hold a password or a token.
+ */
+function requireLoopbackApiOrigin(value: string): string {
+  const url = URL.canParse(value) ? new URL(value) : null;
+  // The raw text is searched because a bare "?" or "#" leaves url.search and url.hash empty.
+  if (url?.username || url?.password || /[?#]/.test(value)) {
+    throw new Error(`${API_ORIGIN_KEY} must not carry userinfo, a query string or a fragment`);
+  }
+  // "localhost:8000" parses as a URL with the scheme "localhost:", so the scheme is checked too.
+  if (url?.protocol !== "http:" && url?.protocol !== "https:") {
+    throw new Error(`${API_ORIGIN_KEY} must be an absolute http(s) URL`);
+  }
+  // The parser lowercases hosts and rewrites 127.1 or 2130706433 as dotted decimal, so these
+  // tests see canonical forms. foo.localhost, "localhost.", 0.0.0.0 and IPv4-mapped IPv6 are
+  // refused: whether each reaches the loopback interface depends on the resolver or the OS.
+  const host = url.hostname;
+  if (host !== "localhost" && host !== "[::1]" && !/^127(?:\.\d{1,3}){3}$/.test(host)) {
+    throw new Error(
+      `${API_ORIGIN_KEY} must be a loopback origin for e2e runs: localhost, 127.0.0.0/8 or [::1]`,
+    );
+  }
+  return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+}
+
+const apiOrigin = requireLoopbackApiOrigin(resolveApiOrigin());
 
 export default defineConfig({
   testDir: "./e2e",
@@ -176,8 +208,9 @@ export default defineConfig({
       // `next start` serves the existing production build. Its rewrites to the API were baked in
       // when `npm run build` evaluated next.config.ts, so that build must have used the same
       // TERMINAL_API_ORIGIN; passing it here does not re-point an older build. apiOrigin follows
-      // the build's own precedence, so it equals the baked origin while the environment and env
-      // files are unchanged since the build.
+      // the build's own precedence and normalization, so while the environment and env files are
+      // unchanged since the build it equals the baked origin, which then passed the same loopback
+      // check.
       command: "npm run start -- --port 3000",
       url: "http://localhost:3000",
       reuseExistingServer: !process.env.CI,
@@ -188,7 +221,8 @@ export default defineConfig({
       // Launched from the repository root; the fixture's own next.config.mjs compiles the widget
       // folder outside its project directory and rewrites /api/v1/terminal/* to TERMINAL_API_ORIGIN.
       // It never reads the root env files, so the same apiOrigin as the standalone server is its
-      // only source. `next dev` compiles on the first request, hence the longer timeout.
+      // only source, and its config enforces the same loopback rule when launched on its own.
+      // `next dev` compiles on the first request, hence the longer timeout.
       command: "npx next dev e2e/host-fixture --port 3100",
       url: "http://localhost:3100",
       reuseExistingServer: !process.env.CI,

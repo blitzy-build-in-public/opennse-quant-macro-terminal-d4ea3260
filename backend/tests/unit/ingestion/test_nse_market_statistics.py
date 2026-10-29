@@ -1,9 +1,11 @@
 """Tests for the NSE market-statistics pipeline's pure stages
 (``opennse_terminal.ingestion.nse.market_statistics``).
 
-Everything here runs without PostgreSQL, a browser or a network. Sector tables are parsed from the
-recorded fragments ``fixtures/nse/sectors/<option value>.html``, captured together for the
-2026-10-27 session, and the page from ``fixtures/nse/page_shell.html``: the page as the 07:30
+Everything here runs without PostgreSQL, a browser or a network. The fixtures are reconstructed
+test fixtures for a 2026-10-27 session scenario, not live captures. Sector tables are parsed from
+``fixtures/nse/sectors/<option value>.html``, each reproducing one sector's rendered table: real
+counter names and ISINs, with values reconstructed for the session as each file's header states.
+The page comes from ``fixtures/nse/page_shell.html``, a reconstruction of the page as the 07:30
 Africa/Nairobi job sees it, with 13 sector options, the price-list link ``27-OCT-26.pdf`` and a
 "Statistics as of" label one day ahead of the values. Session dating, the stale guard and the
 continuity check are pure functions, tested on literal quotes and stored rows. Full runs that map
@@ -24,7 +26,13 @@ import pytest
 from bs4 import BeautifulSoup
 
 from opennse_terminal.config import MAX_SHARE_COUNT, TerminalSettings
-from opennse_terminal.ingestion.base import AmbiguousSession, FetchFailed, SourceLayoutChanged
+from opennse_terminal.ingestion.base import (
+    AmbiguousSession,
+    FetchFailed,
+    RunStatus,
+    SourceLayoutChanged,
+    evaluate_thresholds,
+)
 from opennse_terminal.ingestion.http import PoliteClient, build_user_agent
 from opennse_terminal.ingestion.nse.market_statistics import (
     CHANGE_PCT_BOUND,
@@ -375,6 +383,90 @@ def test_short_row_is_kept_with_nulls_for_validation_to_reject() -> None:
     assert (item.volume, item.close_price, item.change_pct) == (None, None, None)
 
 
+def placeholder_row(text: str, attributes: str = 'colspan="5"') -> str:
+    """A body row of one cell spanning the table, as a table library renders a message."""
+    return f"<tr><td {attributes}>{text}</td></tr>"
+
+
+def placeholder_table(text: str, attributes: str = 'colspan="5"') -> str:
+    """A captured ``table.nsetable`` with the source headers and one placeholder row."""
+    head = "".join(f"<th>{header}</th>" for header in SOURCE_HEADERS)
+    return (
+        f'<table class="nsetable"><thead><tr>{head}</tr></thead>'
+        f"<tbody>{placeholder_row(text, attributes)}</tbody></table>"
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "attributes"),
+    [
+        pytest.param(
+            "No data available in table",
+            'valign="top" colspan="5" class="dataTables_empty"',
+            id="datatables-empty-table",
+        ),
+        pytest.param(
+            "No matching records found",
+            'valign="top" colspan="5" class="dataTables_empty"',
+            id="datatables-zero-records",
+        ),
+        pytest.param("NO DATA", 'colspan="5"', id="upper-case"),
+        pytest.param("No records found.", 'colspan="5"', id="final-period"),
+        pytest.param("  No\u00a0data \n available ", 'colspan="5"', id="whitespace-runs"),
+        pytest.param("No record found", 'colspan="3"', id="partial-span"),
+        pytest.param("", 'colspan="5"', id="empty-cell"),
+    ],
+)
+def test_no_data_placeholder_row_is_skipped(text: str, attributes: str) -> None:
+    assert parse_sector_table(placeholder_table(text, attributes)) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Service unavailable", "Error loading data", "Please try again later", "Loading..."],
+)
+def test_other_single_cell_row_is_kept_for_validation_to_reject(
+    pipeline: MarketStatisticsPipeline, text: str
+) -> None:
+    sector = "Real Estate Investment Trust"
+    (item,) = parse_sector_table(placeholder_table(text), sector=sector)
+
+    assert (item.company, item.isin) == (text, "")
+    assert (item.volume, item.close_price, item.change_pct) == (None, None, None)
+
+    outcome = pipeline.validate([item])
+
+    assert outcome.valid == []
+    (rejected,) = outcome.rejected
+    assert set(rejected.reason.split(";")) == {
+        "invalid_isin",
+        "invalid_close",
+        "invalid_volume",
+        "invalid_change",
+    }
+    assert rejected.row == {"company": text, "sector": sector}
+
+
+def test_error_placeholder_in_one_sector_is_counted_and_makes_the_run_partial(
+    pipeline: MarketStatisticsPipeline, page_shell: str, sector_html: Mapping[str, str]
+) -> None:
+    recorded = len(parse_page(snapshot(page_shell, sector_html)).quotes)
+    error_row = placeholder_row("Service unavailable")
+    real = sector_html["real"].replace("</tbody>", f"{error_row}</tbody>")
+    assert real != sector_html["real"]
+
+    records = pipeline.parse(snapshot(page_shell, {**sector_html, "real": real}))
+    outcome = pipeline.validate(records)
+
+    assert len(records) == recorded + 1
+    (rejected,) = outcome.rejected
+    assert records[rejected.index].company == "Service unavailable"
+    assert rejected.row["sector"] == LABEL_BY_SLUG["real"]
+    assert "invalid_isin" in rejected.reason.split(";")
+    assert len(outcome.valid) == recorded
+    assert evaluate_thresholds(len(records), len(outcome.rejected), MIN_ROWS) is RunStatus.PARTIAL
+
+
 # --- Page parsing and dates -------------------------------------------------------------------
 
 
@@ -715,6 +807,57 @@ def test_validate_accepts_the_inclusive_bounds(
 
     assert outcome.valid == [record]
     assert outcome.rejected == []
+
+
+OUT_OF_BOUND_CHANGES = (
+    "1e1000000",
+    "-1E+1000000",
+    "25.0000000000000000000000000001",
+    "-25.0000000000000000000000000001",
+)
+"""Change cells the parser keeps exact but the default ``decimal`` context cannot hold: an
+exponent beyond its ``Emax`` and, just outside the bound, 30 significant digits against its 28."""
+
+
+@pytest.mark.parametrize(
+    "change_text",
+    OUT_OF_BOUND_CHANGES,
+    ids=["above-emax", "negative-above-emax", "above-plus-25", "below-minus-25"],
+)
+def test_validate_rejects_an_exact_change_beyond_the_bound_without_rounding(
+    pipeline: MarketStatisticsPipeline, change_text: str
+) -> None:
+    # abs() would raise decimal.Overflow for the exponents and round the others to 25.
+    (item,) = parse_sector_table(inline_table(SOURCE_HEADERS, (*EQUITY_CELLS[:4], change_text)))
+    assert item.change_pct == Decimal(change_text)
+
+    outcome = pipeline.validate([item])
+
+    assert outcome.valid == []
+    assert [(row.index, row.reason) for row in outcome.rejected] == [(0, "invalid_change")]
+    assert outcome.rejected[0].row["change (%)"] == change_text
+
+
+def test_out_of_bound_changes_are_counted_and_make_the_run_partial(
+    pipeline: MarketStatisticsPipeline, page_shell: str, sector_html: Mapping[str, str]
+) -> None:
+    # Rows appended to the recorded Banking table reach the shared thresholds as rejected rows,
+    # so the run ends partial with every recorded row kept, not failed.
+    injected = "".join(
+        f"<tr><td>Injected {index}</td><td>{ticker_and_isin(index)[1]}</td><td>1000</td>"
+        f"<td>10.00</td><td>{change}</td></tr>"
+        for index, change in enumerate(OUT_OF_BOUND_CHANGES)
+    )
+    tables = {**sector_html, "bank": sector_html["bank"].replace("</tbody>", f"{injected}</tbody>")}
+
+    records = pipeline.parse(snapshot(page_shell, tables))
+    outcome = pipeline.validate(records)
+
+    assert [(row.row["change (%)"], row.row["sector"], row.reason) for row in outcome.rejected] == [
+        (change, "Banking", "invalid_change") for change in OUT_OF_BOUND_CHANGES
+    ]
+    assert outcome.valid == parse_page(snapshot(page_shell, sector_html)).quotes
+    assert evaluate_thresholds(len(records), len(outcome.rejected), MIN_ROWS) is RunStatus.PARTIAL
 
 
 # --- Live source (skipped by default) ---------------------------------------------------------

@@ -192,6 +192,21 @@ _ISO_DATE_RE: Final = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})(?!\w)")
 _NUMERIC_DATE_RE: Final = re.compile(r"(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})(?!\w)")
 _DAY_MONTH_YEAR_RE: Final = re.compile(r"(\d{1,2})[\s./,-]+([a-z]+)\.?[\s./,-]+(\d{4})(?!\w)")
 _MONTH_DAY_YEAR_RE: Final = re.compile(r"([a-z]+)\.?\s+(\d{1,2}),?\s+(\d{4})(?!\w)")
+# A lone colspan body cell reading one of these (lowercased, no final period): an empty sector.
+_NO_DATA_PLACEHOLDERS: Final = frozenset(
+    {
+        "no data",
+        "no data available",
+        "no data available in table",
+        "no data found",
+        "no matching records found",
+        "no records",
+        "no records found",
+        "no record found",
+        "no results found",
+        "no entries",
+    }
+)
 
 # Browser-side helpers shared by the fetcher's page scripts. The page holds bond and derivative
 # tables besides the equity one, each after its own <select> filter, and until the default sector
@@ -632,11 +647,16 @@ def parse_sector_table(html: str, *, sector: str = "") -> list[NseQuote]:
     """Parse one captured sector table into quotes, without I/O.
 
     The header row (the first ``thead`` row, else the first row holding ``th`` cells) must read
-    exactly :data:`EXPECTED_HEADERS` once normalized. Every other row with data becomes a quote:
-    rows whose cells are all empty and single ``colspan`` "no data" rows are skipped, and a row
-    with the wrong number of cells is kept with null values so validation rejects it. Volume is
-    an integer (thousands separators allowed, a dash meaning no trades), close and change are
-    exact ``Decimal`` values, and a cell that does not convert is ``None``.
+    exactly :data:`EXPECTED_HEADERS` once normalized. Every other row becomes a quote, except
+    two kinds that hold no data and are skipped: a row whose cells are all empty, and a single
+    ``colspan`` cell whose text, normalized like a header and without a final period, is a
+    recognized empty-table placeholder (:data:`_NO_DATA_PLACEHOLDERS`, for example DataTables'
+    "No data available in table" or "No matching records found"). Any other row is kept: one
+    with the wrong number of cells, such as a single cell reading "Service unavailable", gets
+    null values (and an empty ISIN without a second cell), so validation rejects and counts it
+    rather than the sector vanishing uncounted. Volume is an integer (thousands separators
+    allowed, a dash meaning no trades), close and change are exact ``Decimal`` values, and a
+    cell that does not convert is ``None``.
 
     Raises:
         SourceLayoutChanged: The fragment has no ``table.nsetable`` or its headers differ.
@@ -675,7 +695,15 @@ def parse_sector_table(html: str, *, sector: str = "") -> list[NseQuote]:
             continue
         cells = _child_tags(row, ("td",))
         texts = [_text(cell) for cell in cells]
-        if not any(texts) or (len(cells) == 1 and cells[0].has_attr("colspan")):
+        if not any(texts):
+            continue
+        if (
+            len(cells) == 1
+            and cells[0].has_attr("colspan")
+            and normalize_header(texts[0]).rstrip(". ") in _NO_DATA_PLACEHOLDERS
+        ):
+            # An empty sector's placeholder. Any other lone cell, an error message included, is
+            # kept so validation rejects and counts it.
             continue
         quotes.append(_quote_from_cells(texts, sector))
     return quotes
@@ -998,7 +1026,10 @@ def _rejection_reasons(quote: NseQuote) -> list[str]:
     elif close is not None and Decimal(volume) * close >= _TURNOVER_LIMIT:
         # Beyond NUMERIC(24,2): one such row would otherwise fail the whole write.
         reasons.append("invalid_turnover")
-    if quote.change_pct is None or abs(quote.change_pct) > CHANGE_PCT_BOUND:
+    change = quote.change_pct
+    # copy_abs and the comparison are exact: abs() would round to the context's precision (a
+    # change just above 25 reading as 25) or overflow its exponent range (1e1000000 raising).
+    if change is None or not change.is_finite() or change.copy_abs() > CHANGE_PCT_BOUND:
         reasons.append("invalid_change")
     return reasons
 

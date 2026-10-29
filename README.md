@@ -133,7 +133,10 @@ npm run test:e2e
   boundary), then the same script with `--self-test`.
 - `npm run test:e2e` starts the standalone app on port 3000 and the host fixture on port 3100. It
   never starts the API or the database, and it expects `npm run build` to have used the same
-  `TERMINAL_API_ORIGIN`.
+  `TERMINAL_API_ORIGIN`. The Playwright run and the host fixture accept only a loopback origin
+  (`localhost`, `127.0.0.0/8` or `[::1]`, any port) without userinfo, a query or a fragment:
+  otherwise Playwright stops before starting either server, and the fixture exits when it loads
+  its config. The standalone `next.config.ts` still accepts remote origins.
 
 ## Architecture
 
