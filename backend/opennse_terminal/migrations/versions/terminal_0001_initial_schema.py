@@ -146,6 +146,7 @@ def upgrade() -> None:
             ["ticker"],
             ["terminal_equities.ticker"],
             name=op.f("fk_terminal_corporate_filings_ticker_terminal_equities"),
+            onupdate="CASCADE",
             ondelete="SET NULL",
         ),
         sa.UniqueConstraint("file_sha256", name=op.f("uq_terminal_corporate_filings_file_sha256")),
@@ -533,6 +534,7 @@ def upgrade() -> None:
             ["ticker"],
             ["terminal_equities.ticker"],
             name=op.f("fk_terminal_watchlist_items_ticker_terminal_equities"),
+            onupdate="CASCADE",
             ondelete="CASCADE",
         ),
     )

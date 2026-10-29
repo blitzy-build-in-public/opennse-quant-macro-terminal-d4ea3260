@@ -26,7 +26,8 @@ class TerminalWatchlistItem(TerminalBase):
 
     The composite primary key (``watchlist_id``, ``ticker``) is the conflict target that makes
     adding an item idempotent (``INSERT ... ON CONFLICT DO NOTHING``). Both foreign keys cascade
-    on delete: removing a watchlist or a counter removes its items in the database.
+    on delete: removing a watchlist or a counter removes its items in the database. The ticker
+    foreign key also cascades on update, so renaming a counter's ticker carries over to its items.
 
     The item declares no relationship back to its watchlist; services never navigate from an
     item to its list, and the absence of the attribute rules out an implicit lazy load under the
@@ -43,7 +44,7 @@ class TerminalWatchlistItem(TerminalBase):
     )
     ticker: Mapped[str] = mapped_column(
         String(16),
-        ForeignKey("terminal_equities.ticker", ondelete="CASCADE"),
+        ForeignKey("terminal_equities.ticker", onupdate="CASCADE", ondelete="CASCADE"),
         primary_key=True,
         nullable=False,
     )

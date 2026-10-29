@@ -67,8 +67,9 @@ class TerminalCorporateFiling(TerminalBase):
       items are never committed.
 
     ``ticker`` is null for unlisted IPO issuers, which are identified by ``company_name``; deleting
-    the equity sets it to null rather than removing the extraction. ``period_type`` (``FY`` or
-    ``H1``) and ``period_end_date`` are as supplied with the upload.
+    the equity sets it to null rather than removing the extraction, and renaming the equity's
+    ticker carries over to the filing. ``period_type`` (``FY`` or ``H1``) and ``period_end_date``
+    are as supplied with the upload.
 
     ``currency`` defaults to KES. A statement presented in USD keeps ``currency = 'USD'`` and its
     items are stored unconverted; such a filing is never committed to fundamentals.
@@ -96,7 +97,7 @@ class TerminalCorporateFiling(TerminalBase):
     # Rendered as fk_terminal_corporate_filings_ticker_terminal_equities (54 characters).
     ticker: Mapped[str | None] = mapped_column(
         String(16),
-        ForeignKey("terminal_equities.ticker", ondelete="SET NULL"),
+        ForeignKey("terminal_equities.ticker", onupdate="CASCADE", ondelete="SET NULL"),
         nullable=True,
     )
     company_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
