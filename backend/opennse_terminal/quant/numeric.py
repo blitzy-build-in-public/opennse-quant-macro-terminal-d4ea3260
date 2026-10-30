@@ -206,10 +206,10 @@ def require_statistics_input(value: Decimal, label: str) -> None:
 
     Why: those functions sum each ``Decimal`` as an exact integer ratio. NaN and infinity have none
     and fail with a misleading ``AttributeError`` (sNaN with ``InvalidOperation``), while the
-    ratio of a finite value has about as many digits as its coefficient plus its absolute exponent:
-    1E+999999 or 1E-999999 costs about 70 s, and a 200,000-digit coefficient several seconds.
-    Within the bounds no ratio exceeds about 100 digits, so the statistics stay cheap. A zero has
-    the ratio 0/1 whatever its exponent.
+    ratio of a finite value has about as many digits as its coefficient plus its absolute exponent.
+    The cost of the statistics grows with that size, so an unbounded input such as ``1E+999999``,
+    ``1E-999999`` or a 200,000-digit coefficient can stall them. Within the bounds no ratio exceeds
+    about 100 digits, so the statistics stay cheap. A zero has the ratio 0/1 whatever its exponent.
 
     ``label`` names the value in the error message, for example ``"row value on 2026-01-19"``. The
     message reports the value's class, adjusted exponent or digit count, never all of its digits.

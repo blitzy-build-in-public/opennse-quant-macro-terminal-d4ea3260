@@ -417,7 +417,6 @@ context.configure(
 )
 ```
 
-
 ## Host integration: frontend
 
 The widgets are client components with explicit props and no host dependencies, in the single
@@ -642,7 +641,6 @@ pytest backend/tests
 No secrets are required, because every source is public; `opennse`/`opennse` are the development
 container's throwaway credentials. `.env` is git-ignored; never commit it.
 
-
 ## Data sources and compliance
 
 All market and macro data comes from public sources: the NSE's public market-statistics web page,
@@ -765,4 +763,3 @@ DELETE FROM terminal_equities e WHERE e.source = 'seed'
 The seeded fundamentals rows (the per-column updates clear their values but keep the rows) and the
 "NSE Core 8" watchlist reference all eight seeded tickers, so the last statement keeps those
 equities until those rows are removed too.
-
