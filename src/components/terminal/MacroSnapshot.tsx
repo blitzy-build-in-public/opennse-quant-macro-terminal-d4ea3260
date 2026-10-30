@@ -55,6 +55,11 @@ const VALUE_CLASS = `${KPI_VALUE_CLASS} text-slate-100 text-balance`;
 // the direction is carried by the arrow and the sign, never by a colour.
 const CHANGE_CLASS = "m-0 flex flex-wrap items-baseline gap-1 text-xs tabular-nums text-slate-300";
 const AS_OF_CLASS = "m-0 text-xs text-slate-400";
+// The loading skeleton's heights are the loaded tile grid, measured on the standalone page with the
+// seeded data at each viewport width where it reflows, so the card keeps its height when the data
+// arrives.
+const SKELETON_HEIGHT_CLASS =
+  "h-[38.75rem] min-[325px]:h-[37.75rem] min-[326px]:h-[33.75rem] min-[327px]:h-[33.5rem] min-[392px]:h-[32.5rem] min-[401px]:h-[31.75rem] min-[402px]:h-[30.75rem] min-[768px]:h-[15rem]";
 
 /** Direction of an indicator's change against its previous value. */
 type ChangeDirection = "up" | "down" | "flat";
@@ -206,7 +211,7 @@ export function MacroSnapshot({
       error={error}
       onRetry={refetch}
       className={className}
-      skeletonClassName="h-40"
+      skeletonClassName={SKELETON_HEIGHT_CLASS}
     >
       <dl className={GRID_CLASS}>
         {latest.map((item) => (

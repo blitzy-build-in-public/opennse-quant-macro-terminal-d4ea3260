@@ -208,6 +208,11 @@ const WINDOW_DAYS = 180;
 const WINDOW_MONTHS = 12;
 /** The endpoint accepts at most 8 `event_dates`. */
 const MAX_EVENT_DATES = 8;
+/**
+ * Code of the API's 422 when the request names no event and no cycle is stored: there is nothing
+ * to backtest yet, so the widget shows its empty state rather than an error.
+ */
+const NO_EVENT_DATES_CODE = "no_event_dates";
 const ISO_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
 /** A complete date input value. Past year 9999 the input reports a five- or six-digit year. */
 const DATE_VALUE_PATTERN = /^(\d{4,})-\d{2}-\d{2}$/;
@@ -380,6 +385,12 @@ const UNKNOWN_STATUS_CLASS =
 const CONTROLS_CLASS = "flex flex-col gap-3 text-xs text-slate-300";
 const TOOLBAR_CLASS = "flex flex-wrap items-center gap-x-6 gap-y-2";
 const GROUP_CLASS = "flex flex-wrap items-center gap-1";
+// The stored cycles' chips arrive with the first response, so until then the Events row reserves
+// their height, measured on the standalone page with the seeded cycles at each viewport width
+// where the chips wrap: wrapped beneath the label below 852px, beside it in one row from there.
+// The controls, and with them the card, therefore keep their height from loading to ready.
+const EVENTS_GROUP_LOADING_CLASS =
+  "flex min-h-[9.25rem] flex-wrap content-start items-center gap-1 min-[405px]:min-h-[7.125rem] min-[462px]:min-h-[5rem] min-[808px]:min-h-[2.875rem] min-[852px]:min-h-[1.625rem] min-[852px]:content-center";
 const GROUP_LABEL_CLASS = "me-1 text-slate-400";
 const CHIP_LIST_CLASS = "m-0 flex list-none flex-wrap items-center gap-2 p-0";
 const CHIP_DATE_CLASS = "text-slate-400";
@@ -400,6 +411,10 @@ const CHIP_ERROR_CLASS = "m-0 text-xs text-rose-400";
 const BODY_CLASS = "flex flex-col gap-5";
 const BODY_FETCHING_CLASS =
   "flex flex-col gap-5 opacity-60 motion-safe:transition-opacity motion-safe:duration-200 motion-safe:ease-out";
+// The loaded body's height, measured on the standalone page with the seeded cycles at each
+// viewport width where it reflows, so the card keeps its height when the data arrives.
+const SKELETON_HEIGHT_CLASS =
+  "h-[74.625rem] min-[329px]:h-[73.625rem] min-[353px]:h-[72.375rem] min-[358px]:h-[71.375rem] min-[407px]:h-[70.125rem] min-[443px]:h-[68.625rem] min-[449px]:h-[67.625rem] min-[475px]:h-[66.125rem] min-[511px]:h-[65.125rem] min-[556px]:h-[63.875rem] min-[632px]:h-[62.625rem] min-[863px]:h-[61.375rem] min-[1093px]:h-[60.125rem]";
 const SECTION_CLASS = "m-0 flex min-w-0 flex-col gap-2";
 const SECTION_HEADER_CLASS = "flex flex-wrap items-baseline justify-between gap-2";
 // Recharts 3 makes each chart's `<svg class="recharts-surface">` a tabindex 0 application, so it
@@ -1806,10 +1821,15 @@ function TickerCount({
 /**
  * Event and election cycle backtester over `GET /cycles/backtest`.
  *
- * Controls (rendered in every state, so an error such as `no_event_dates` can be recovered from
- * by editing the events): a "±180 days" or "±12 months" window preset, removable event chips with
- * a custom-date input (at most 8 events), and a metric toggle across price index, P/E index,
- * turnover index and cumulative foreign flow.
+ * Controls (rendered in every state, so the events can be edited while empty or after an error): a
+ * "±180 days" or "±12 months" window preset, removable event chips with a custom-date input (at
+ * most 8 events), and a metric toggle across price index, P/E index, turnover index and
+ * cumulative foreign flow.
+ *
+ * States: when the request names no event and no cycle is stored, the API's `no_event_dates` 422
+ * is shown as the empty state ("No data yet — run the seeder or an ingestion job"), without a
+ * Retry, and adding an event date from it sends a new request. Every other failure shows the API's
+ * message and a Retry.
  *
  * Views: one solid line per cycle against calendar days from the event, a dashed "Projection
  * (mean of …)" line for each partial or awaiting cycle, a reference line at the event, and the
@@ -1896,8 +1916,14 @@ export function CycleBacktester({
     getHeaders,
     isEmpty: (response) => response.cycles.length === 0,
   });
+  // `no_event_dates` means neither the request nor the stored cycles hold an event, so it is the
+  // empty state: a Retry could never succeed and the API's message names a storage table. Every
+  // other failure keeps the error state with its message and Retry.
+  const noEvents = state === "error" && error?.code === NO_EVENT_DATES_CODE;
+  const frameState: WidgetState = noEvents ? "empty" : state;
 
-  const cycles = data?.cycles;
+  // An earlier payload's stored cycles are gone once the API reports none, so no chip shows them.
+  const cycles = noEvents ? undefined : data?.cycles;
   const chips = eventDates ?? cycles?.map((cycle) => cycle.event_date) ?? [];
   const chartModel = useMemo(() => buildChartModel(cycles ?? [], metric), [cycles, metric]);
   // A key the current chart no longer draws names no marker, so it is never shown.
@@ -2145,7 +2171,11 @@ export function CycleBacktester({
         </p>
       ) : null}
 
-      <div className={GROUP_CLASS}>
+      <div
+        className={
+          chips.length === 0 && frameState === "loading" ? EVENTS_GROUP_LOADING_CLASS : GROUP_CLASS
+        }
+      >
         <span id={chipsLabelId} className={GROUP_LABEL_CLASS}>
           Events
         </span>
@@ -2250,7 +2280,7 @@ export function CycleBacktester({
         data-testid="cycle-update-status"
         className="sr-only"
       >
-        {describeUpdateStatus(state, data, isFetching)}
+        {describeUpdateStatus(frameState, data, isFetching)}
       </p>
     </div>
   );
@@ -2808,11 +2838,11 @@ export function CycleBacktester({
     <WidgetFrame
       testId="terminal-cycle-backtester"
       title="Election & cycle backtester"
-      state={state}
-      error={error}
-      onRetry={handleRetry}
+      state={frameState}
+      error={noEvents ? null : error}
+      onRetry={noEvents ? undefined : handleRetry}
       className={className}
-      skeletonClassName="h-96"
+      skeletonClassName={SKELETON_HEIGHT_CLASS}
       controls={controls}
     >
       {body}

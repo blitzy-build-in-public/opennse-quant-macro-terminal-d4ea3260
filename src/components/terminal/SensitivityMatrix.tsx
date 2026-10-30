@@ -5,7 +5,7 @@ import type { ReactElement, ReactNode } from "react";
 
 import { EMPTY_VALUE, compareDecimal, formatDecimal } from "./lib/format";
 import { SECTION_HEADING_CLASS } from "./shared/headingAndTileClasses";
-import type { DecimalString, SensitivityCell, SensitivityMatrixData } from "./types";
+import type { DecimalString, SensitivityCell, SensitivityMatrixData, WidgetState } from "./types";
 
 /**
  * Props of {@link SensitivityMatrix}. The component is presentational and never fetches, so it
@@ -364,6 +364,10 @@ function MatrixCell({
  * false, so server and client output still match on hydration; it runs no effects.
  * `IpoValuationSandbox` renders it, and a host that calls `POST /ipo/valuation` itself can render
  * it from the response's `sensitivity`.
+ *
+ * The root carries `data-testid="terminal-sensitivity-matrix"` and `data-state`: `"ready"` with
+ * the table, or `"empty"` with a "No sensitivity data" note when `rows` or `cols` is empty. It
+ * never fetches, so the state is never `"loading"` or `"error"`.
  */
 export function SensitivityMatrix({
   data,
@@ -374,10 +378,11 @@ export function SensitivityMatrix({
   const captionId = useId();
   const rootClass =
     className === undefined || className === "" ? ROOT_CLASS : `${ROOT_CLASS} ${className}`;
+  const state: WidgetState = data.rows.length === 0 || data.cols.length === 0 ? "empty" : "ready";
 
-  if (data.rows.length === 0 || data.cols.length === 0) {
+  if (state === "empty") {
     return (
-      <div data-testid="terminal-sensitivity-matrix" className={rootClass}>
+      <div data-testid="terminal-sensitivity-matrix" data-state={state} className={rootClass}>
         <p className="text-sm text-slate-400">No sensitivity data</p>
       </div>
     );
@@ -388,7 +393,7 @@ export function SensitivityMatrix({
   const cols = axisEntries(data.cols);
 
   return (
-    <div data-testid="terminal-sensitivity-matrix" className={rootClass}>
+    <div data-testid="terminal-sensitivity-matrix" data-state={state} className={rootClass}>
       {/* The visible description; screen readers get the same text once, as the caption. */}
       <p aria-hidden="true" className={`${SECTION_HEADING_CLASS} pb-2 text-start`}>
         {CAPTION_TEXT}

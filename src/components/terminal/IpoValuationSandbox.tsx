@@ -308,6 +308,13 @@ const ADVANCED_GRID_CLASS = "mt-2 grid grid-cols-[repeat(auto-fill,minmax(11rem,
 const CARD_GRID_CLASS = "grid grid-cols-[repeat(auto-fill,minmax(max(12rem,30%),1fr))] gap-3";
 const OUTPUT_CLASS =
   "flex min-w-0 flex-col gap-4 motion-safe:transition-opacity motion-safe:duration-200 motion-safe:ease-out";
+// The loaded workspace's height and the first valuation output's height (cards, chart and matrix),
+// measured on the standalone page with the seeded preset at each viewport width where they reflow,
+// so the card keeps its height when the presets arrive and again when the first result does.
+const SKELETON_HEIGHT_CLASS =
+  "h-[205.34375rem] min-[323px]:h-[204.09375rem] min-[353px]:h-[202.84375rem] min-[363px]:h-[201.84375rem] min-[429px]:h-[200.59375rem] min-[430px]:h-[181.59375rem] min-[435px]:h-[180.59375rem] min-[437px]:h-[179.59375rem] min-[439px]:h-[178.34375rem] min-[462px]:h-[162.09375rem] min-[489px]:h-[156.84375rem] min-[524px]:h-[155.59375rem] min-[595px]:h-[154.34375rem] min-[618px]:h-[150.21875rem] min-[660px]:h-[149.21875rem] min-[666px]:h-[141.96875rem] min-[707px]:h-[138.46875rem] min-[739px]:h-[137.21875rem] min-[806px]:h-[131.84375rem] min-[922px]:h-[89.59375rem] min-[932px]:h-[88.34375rem] min-[1003px]:h-[87.09375rem] min-[1075px]:h-[79.84375rem] min-[1116px]:h-[76.34375rem] min-[1147px]:h-[75.09375rem]";
+const PENDING_OUTPUT_CLASS =
+  "h-[85.96875rem] rounded bg-slate-800 motion-safe:animate-pulse min-[435px]:h-[84.96875rem] min-[437px]:h-[83.96875rem] min-[462px]:h-[67.71875rem] min-[489px]:h-[62.46875rem] min-[666px]:h-[55.21875rem] min-[707px]:h-[51.71875rem] min-[922px]:h-[62.46875rem] min-[1075px]:h-[55.21875rem] min-[1116px]:h-[51.71875rem]";
 // Keyboard focus on the chart's `<svg tabindex="0">` gets the controls' sky outline. A mouse click
 // focuses the svg or one of Recharts' internal layers (tabindex -1) without :focus-visible, and
 // that focus draws no ring. When Tab scrolls the chart into view, the svg's scroll-my-2 keeps the
@@ -1323,7 +1330,9 @@ function SandboxWorkspace({
               <ValuationOutput result={result} isRecalculating={isRecalculating} />
             ) : isRecalculating ? (
               <div data-testid="ipo-valuation-pending">
-                <div aria-hidden="true" className="h-96 rounded bg-slate-800 motion-safe:animate-pulse" />
+                {/* Sized to the first valuation's output (cards, chart and matrix), so the card
+                    keeps its height from the frame's skeleton through the first result. */}
+                <div aria-hidden="true" className={PENDING_OUTPUT_CLASS} />
                 <span className="sr-only">Calculating the fair value…</span>
               </div>
             ) : generalError === null ? (
@@ -1436,7 +1445,7 @@ export function IpoValuationSandbox({
       error={error}
       onRetry={refetch}
       className={className}
-      skeletonClassName="h-[36rem]"
+      skeletonClassName={SKELETON_HEIGHT_CLASS}
       actions={presetSelector}
     >
       {scenario === undefined ? null : (

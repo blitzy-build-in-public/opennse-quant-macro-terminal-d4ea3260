@@ -113,6 +113,10 @@ const LEGEND_ITEM_CLASS = "flex items-center gap-2";
 // to its line.
 const SWATCH_CLASS = "h-2 w-4 shrink-0 forced-color-adjust-none";
 const PARTIAL_COVERAGE_CLASS = "mt-2 mb-0 text-xs text-amber-300";
+// The loading skeleton's heights are the loaded chart and legend, measured on the standalone page
+// with the seeded data at each viewport width where they reflow, so the card keeps its height
+// when the data arrives.
+const SKELETON_HEIGHT_CLASS = "h-[20.25rem] min-[323px]:h-[19rem] min-[473px]:h-[17.75rem]";
 // Mirrors `TOOLTIP_CONTENT_STYLE` (slate-900 surface, slate-700 border, slate-300 12px text) with
 // classes, since this custom tooltip is an HTML element rather than Recharts' default content.
 const TOOLTIP_CLASS =
@@ -370,7 +374,7 @@ export function InflationTrajectoryChart(props: InflationTrajectoryChartProps): 
       error={error}
       onRetry={refetch}
       className={className}
-      skeletonClassName="h-64"
+      skeletonClassName={SKELETON_HEIGHT_CLASS}
     >
       <div className={CHART_CLASS}>
         <ResponsiveContainer width="100%" height="100%" onResize={handleResize}>

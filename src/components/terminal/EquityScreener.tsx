@@ -107,6 +107,9 @@ const DRAFT_DEBOUNCE_MS = 400;
 const DEFAULT_SORT: ScreenerSort = "market_cap_kes";
 const DEFAULT_ORDER: SortOrder = "desc";
 
+/** Empty-state copy when the filters exclude every counter of a universe that has data. */
+const NO_MATCH_MESSAGE = "No counters match these filters";
+
 /** The screener's nullable metrics, each explained by its own flag codes when null. */
 type NullableMetric =
   | "change_pct"
@@ -257,7 +260,10 @@ function withSort(filters: ScreenerFilters, column: ScreenerSort): ScreenerFilte
   return { ...filters, sort: column, order };
 }
 
-/** Whether a filter that narrows the rows is set; an empty result is then "no match". */
+/**
+ * Whether a filter that narrows the rows is set, so that an empty result over a universe with
+ * data reads as "no counters match" rather than as data not loaded yet.
+ */
 function hasActiveFilter(filters: ScreenerFilters): boolean {
   return (
     isSet(filters.sector) ||
@@ -449,6 +455,11 @@ const WATCHLIST_NOTICE_EMPTY_CLASS = "sr-only";
 const BODY_CLASS = "flex flex-col gap-4 motion-safe:transition-opacity motion-safe:duration-200";
 const BODY_DIMMED_CLASS =
   "flex flex-col gap-4 opacity-60 motion-safe:transition-opacity motion-safe:duration-200";
+// The loaded body's height (counter table and sector summary), measured on the standalone page
+// with the seeded data at each viewport width where it reflows, so the card keeps its height when
+// the data arrives.
+const SKELETON_HEIGHT_CLASS =
+  "h-[44.25rem] min-[337px]:h-[43.25rem] min-[338px]:h-[42.25rem] min-[352px]:h-[41.25rem] min-[375px]:h-[40.25rem] min-[389px]:h-[39rem] min-[431px]:h-[38rem] min-[789px]:h-[37rem]";
 const CONTEXT_CLASS = "flex flex-wrap gap-x-3 gap-y-1 text-xs text-slate-400";
 const COUNT_CLASS = "font-medium text-slate-200";
 // The applied watchlist's full name; a long one wraps anywhere instead of widening the card.
@@ -545,7 +556,9 @@ const TURNOVER_BADGE_CLASS =
 const FLAGS_CELL_CLASS = "px-2 py-1.5 text-start text-xs text-slate-400";
 const FLAG_LIST_CLASS = "flex min-w-[10rem] flex-wrap gap-1";
 const FLAG_CLASS = "rounded bg-slate-800 px-1 py-0.5 font-mono text-xs text-slate-300";
-const MESSAGE_CELL_CLASS = "px-2 py-4 text-center text-sm text-slate-400";
+// Shown in place of the counter table, outside its sideways scroll, with the frame's empty copy
+// style, so it starts at the card's content edge however wide the table would be.
+const NO_RESULT_NOTE_CLASS = "text-sm text-slate-400";
 
 const SUMMARY_SECTION_CLASS = "flex flex-col gap-2";
 const SUMMARY_NOTE_CLASS = "text-xs text-slate-400";
@@ -966,21 +979,26 @@ function useOverflowEnd(): [(node: HTMLElement | null) => void, boolean] {
  * and flag tooltips; and the sector summary from `sector_aggregates`.
  *
  * Selects and the checkbox apply at once. Numeric filters apply 400 ms after typing stops, or on
- * Enter or blur; their text is sent exactly as typed, so values stay exact decimals. Errors tied
- * to a request field, such as `min_exceeds_max` on `min_pe`, appear beneath that field while the
- * last result stays on screen; any other failure shows the frame's error state with Retry. The
- * filter panel is rendered in every state. The watchlist selector lists the calling principal's
- * watchlists from `GET /watchlists` and refreshes them whenever it is focused. That request is
- * independent of the counters: if it fails before any list has loaded, the selector is disabled
- * and a message with its own Retry appears beneath it while the counters stay usable, and a list
- * that loaded earlier stays selectable after a later failure. The options and every list name
- * shown come from that request alone. Lists passed as `watchlists` only signal a change: an array
- * with new content fetches the watchlists again, and an applied list it drops from the previous
- * array was deleted by the caller, so the filter is cleared at once. Each newer payload is then
- * compared with the one before: an applied watchlist it no longer holds is cleared, and one whose
- * tickers changed has its counters fetched again while the previous rows stay dimmed. A screener
- * request answered with `watchlist_not_found` clears the filter as well and never shows its
- * identifier. Every clearing returns to all counters with a notice naming the list when known.
+ * Enter or blur; their text is sent exactly as typed, so values stay exact decimals. A result
+ * without rows shows the frame's empty state: "No counters match these filters" when the filters
+ * it answered excluded every counter of a universe that has data, and the default seeder copy
+ * when no data is loaded. Errors tied to a request field, such as `min_exceeds_max` on `min_pe`,
+ * appear beneath that field while the last result stays on screen (its rows dimmed, or its empty
+ * state); before any result has loaded, a note asking for the errors to be corrected takes the
+ * table's place. Any other failure shows the frame's error state with Retry. The filter panel is
+ * rendered in every state, so filters stay usable when nothing matches. The watchlist selector
+ * lists the calling principal's watchlists from `GET /watchlists` and refreshes them whenever it
+ * is focused. That request is independent of the counters: if it fails before any list has
+ * loaded, the selector is disabled and a message with its own Retry appears beneath it while the
+ * counters stay usable, and a list that loaded earlier stays selectable after a later failure.
+ * The options and every list name shown come from that request alone. Lists passed as
+ * `watchlists` only signal a change: an array with new content fetches the watchlists again, and
+ * an applied list it drops from the previous array was deleted by the caller, so the filter is
+ * cleared at once. Each newer payload is then compared with the one before: an applied watchlist
+ * it no longer holds is cleared, and one whose tickers changed has its counters fetched again
+ * while the previous rows stay dimmed. A screener request answered with `watchlist_not_found`
+ * clears the filter as well and never shows its identifier. Every clearing returns to all
+ * counters with a notice naming the list when known.
  */
 export function EquityScreener({
   apiBaseUrl,
@@ -1013,8 +1031,9 @@ export function EquityScreener({
   // The filters the shown response answered. A new query aborts the request it supersedes, so a
   // response always answers the filters current when it arrives, and they are recorded during
   // that render. Until a refetch settles, the previous response stays on screen under filters
-  // that may have changed since, such as a cleared watchlist or a Reset, so it is judged by the
-  // filters it answered: a dimmed "no match" never turns into the empty-database state meanwhile.
+  // that may have changed since, such as a cleared watchlist or a Reset, so its empty copy is
+  // judged by the filters it answered: a "no match" never turns into the empty-database copy
+  // meanwhile.
   const [answered, setAnswered] = useState<AnsweredFilters>(() => ({
     response: undefined,
     filters: applied,
@@ -1024,10 +1043,9 @@ export function EquityScreener({
     query: screenerQuery(applied),
     apiBaseUrl,
     getHeaders,
-    // With a narrowing filter set, no rows is a "no match" inside the table, so the filters stay.
-    isEmpty: (response) =>
-      response.rows.length === 0 &&
-      !hasActiveFilter(response === answered.response ? answered.filters : applied),
+    // No rows is the empty state whatever the filters; the frame renders the filter panel in
+    // every state, so the filters stay usable and the empty copy below names the cause.
+    isEmpty: (response) => response.rows.length === 0,
   });
   if (screener.data !== answered.response) {
     setAnswered({ response: screener.data, filters: applied });
@@ -1139,11 +1157,23 @@ export function EquityScreener({
   const otherFieldErrors = Object.entries(fieldErrors).filter(
     ([field]) => !INPUT_FIELDS.has(field),
   );
-  const state: WidgetState =
-    screener.state === "error" && hasFieldErrors ? "ready" : screener.state;
   const response = screener.data;
+  // A field error keeps the last result on screen beside the inputs: its rows, dimmed, or its
+  // empty state. Before any result has loaded, the ready body asks for the errors to be fixed.
+  let state: WidgetState = screener.state;
+  if (screener.state === "error" && hasFieldErrors) {
+    state = response !== undefined && response.rows.length === 0 ? "empty" : "ready";
+  }
   const rows = response?.rows ?? [];
   const aggregates = response?.sector_aggregates ?? [];
+  // The empty copy names the cause of the empty result on screen. `sector_aggregates` covers the
+  // whole universe whatever the filters, so sector data without rows under a narrowing filter
+  // means the filters excluded every counter, while no sector data means nothing is loaded yet
+  // (the default seeder copy). The filters are those the shown response answered, so clearing
+  // them from a no-match result keeps the no-match copy until the new rows arrive.
+  const shownFilters = response === answered.response ? answered.filters : applied;
+  const emptyMessage =
+    aggregates.length > 0 && hasActiveFilter(shownFilters) ? NO_MATCH_MESSAGE : undefined;
   const sectors = sectorOptions(response?.sector_aggregates, applied.sector);
   const activeSort = applied.sort ?? DEFAULT_SORT;
   const activeOrder = applied.order ?? DEFAULT_ORDER;
@@ -1448,34 +1478,6 @@ export function EquityScreener({
   const [countersScrollRef, countersOverflowEnd] = useOverflowEnd();
   const [summaryScrollRef, summaryOverflowEnd] = useOverflowEnd();
 
-  let tableBody: ReactElement | ReactElement[];
-  if (response === undefined) {
-    tableBody = (
-      <tr>
-        <td colSpan={COUNTER_COLUMNS.length} className={MESSAGE_CELL_CLASS}>
-          Correct the filter errors above to load counters
-        </td>
-      </tr>
-    );
-  } else if (rows.length === 0) {
-    tableBody = (
-      <tr data-testid="screener-no-match">
-        <td colSpan={COUNTER_COLUMNS.length} className={MESSAGE_CELL_CLASS}>
-          No counters match these filters
-        </td>
-      </tr>
-    );
-  } else {
-    tableBody = rows.map((row) => (
-      <CounterRow
-        key={row.ticker}
-        row={row}
-        onSelectTicker={onSelectTicker}
-        selected={row.ticker === selectedTicker}
-      />
-    ));
-  }
-
   return (
     <WidgetFrame
       testId="terminal-equity-screener"
@@ -1484,7 +1486,8 @@ export function EquityScreener({
       error={hasFieldErrors ? null : error}
       onRetry={handleRetry}
       className={className}
-      skeletonClassName="h-96"
+      skeletonClassName={SKELETON_HEIGHT_CLASS}
+      emptyMessage={emptyMessage}
       controls={controls}
     >
       <div className={dimmed ? BODY_DIMMED_CLASS : BODY_CLASS} aria-busy={screener.isFetching}>
@@ -1504,40 +1507,55 @@ export function EquityScreener({
             </span>
           </p>
         ) : null}
-        <div className={SCROLL_FRAME_CLASS}>
-          <div
-            ref={countersScrollRef}
-            role="region"
-            aria-labelledby={countersCaptionId}
-            tabIndex={0}
-            data-overflow-end={countersOverflowEnd ? "true" : "false"}
-            className={SCROLL_REGION_CLASS}
-          >
-            <table className={TABLE_CLASS}>
-              <caption id={countersCaptionId} className="sr-only">
-                Screener counters
-              </caption>
-              <thead>
-                <tr>
-                  {COUNTER_COLUMNS.map((column) => (
-                    <CounterHeader
-                      key={column.id}
-                      column={column}
-                      activeSort={activeSort}
-                      activeOrder={activeOrder}
-                      onSort={handleSort}
+        {response === undefined ? (
+          // Ready without a result only after a field error on the first request: there are no
+          // counters to show, so the note takes the table's place rather than a full-width cell.
+          <p className={NO_RESULT_NOTE_CLASS}>Correct the filter errors above to load counters</p>
+        ) : (
+          <div className={SCROLL_FRAME_CLASS}>
+            <div
+              ref={countersScrollRef}
+              role="region"
+              aria-labelledby={countersCaptionId}
+              tabIndex={0}
+              data-overflow-end={countersOverflowEnd ? "true" : "false"}
+              className={SCROLL_REGION_CLASS}
+            >
+              <table className={TABLE_CLASS}>
+                <caption id={countersCaptionId} className="sr-only">
+                  Screener counters
+                </caption>
+                <thead>
+                  <tr>
+                    {COUNTER_COLUMNS.map((column) => (
+                      <CounterHeader
+                        key={column.id}
+                        column={column}
+                        activeSort={activeSort}
+                        activeOrder={activeOrder}
+                        onSort={handleSort}
+                      />
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className={TBODY_CLASS}>
+                  {rows.map((row) => (
+                    <CounterRow
+                      key={row.ticker}
+                      row={row}
+                      onSelectTicker={onSelectTicker}
+                      selected={row.ticker === selectedTicker}
                     />
                   ))}
-                </tr>
-              </thead>
-              <tbody className={TBODY_CLASS}>{tableBody}</tbody>
-            </table>
+                </tbody>
+              </table>
+            </div>
+            <div
+              aria-hidden="true"
+              className={countersOverflowEnd ? SCROLL_FADE_CLASS : SCROLL_FADE_HIDDEN_CLASS}
+            />
           </div>
-          <div
-            aria-hidden="true"
-            className={countersOverflowEnd ? SCROLL_FADE_CLASS : SCROLL_FADE_HIDDEN_CLASS}
-          />
-        </div>
+        )}
         {response !== undefined ? (
           <div className={SUMMARY_SECTION_CLASS}>
             <h3 id={summaryHeadingId} className={SECTION_HEADING_CLASS}>

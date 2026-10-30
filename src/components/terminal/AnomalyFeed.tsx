@@ -259,7 +259,7 @@ export function AnomalyFeed({
       error={error}
       onRetry={refetch}
       emptyMessage={EMPTY_FEED_MESSAGE}
-      skeletonClassName="h-48"
+      skeletonClassName="h-[25.5rem]"
       className={className}
       actions={
         // The header renders in every state, so the status region stays mounted, and keeps its

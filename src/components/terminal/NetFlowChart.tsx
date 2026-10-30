@@ -80,6 +80,11 @@ const BODY_CLASS =
 // A superseded result stays on screen, dimmed, while the request for a new subject is pending.
 const BODY_UPDATING_CLASS =
   "flex flex-col gap-3 opacity-60 motion-safe:transition-opacity motion-safe:duration-200 motion-safe:ease-out";
+// The loaded body's height for the whole market, the view the standalone screener page opens on,
+// measured there with the seeded data at each viewport width where it reflows, so the card keeps
+// its height when the data arrives.
+const SKELETON_HEIGHT_CLASS =
+  "h-[63.875rem] min-[323px]:h-[62.875rem] min-[392px]:h-[55.75rem] min-[394px]:h-[54.75rem] min-[439px]:h-[53.5rem] min-[458px]:h-[45rem] min-[476px]:h-[43.25rem] min-[527px]:h-[42rem] min-[548px]:h-[39.625rem] min-[658px]:h-[41.375rem] min-[685px]:h-[39.625rem] min-[770px]:h-[38.375rem] min-[858px]:h-[35rem] min-[893px]:h-[33.25rem] min-[1016px]:h-[30.875rem] min-[1024px]:h-[43.25rem] min-[1038px]:h-[42rem] min-[1080px]:h-[39.625rem]";
 const UPDATING_CLASS = "text-xs text-slate-400";
 const META_CLASS =
   "flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-slate-400";
@@ -727,9 +732,11 @@ function NetFlowBody({ data, rollingWindow, isUpdating }: NetFlowBodyProps): Rea
  * flow as a line, coverage of the sessions with flow data, and range totals. Local net flow is the
  * negative of foreign net flow, since aggregate buys equal aggregate sells.
  *
- * Per-ticker foreign flow is not published on public pages, so a range without it reports
- * `no_flow_data` with an inline explanation instead of the empty state. With no props the whole
- * market is shown.
+ * A response with no sessions (an empty `series`, as from an unseeded database) shows the frame's
+ * empty state, whatever its status. Per-ticker foreign flow is not published on public pages, so
+ * a range whose sessions carry no foreign flow reports `no_flow_data`: the widget stays ready and
+ * explains it inline, beside the coverage and the flag codes. With no props the whole market is
+ * shown.
  */
 export function NetFlowChart({
   ticker,
@@ -747,13 +754,15 @@ export function NetFlowChart({
     query: { ticker: subjectTicker, sector: subjectSector, rolling_window: rollingWindow },
     apiBaseUrl,
     getHeaders,
-    isEmpty: (response) => response.series.length === 0 && response.status !== "no_flow_data",
+    // No session at all is the empty state, whatever the status: an unseeded database answers
+    // `no_flow_data` with an empty series. Sessions with turnover but no foreign flow stay ready.
+    isEmpty: (response) => response.series.length === 0,
   });
 
   // The title names the requested subject rather than `data.subject`, because the previous
-  // subject's result stays on screen while a new one loads.
+  // subject's result, or its empty message, stays on screen while a new one loads.
   const subjectLabel = subjectTicker ?? subjectSector ?? MARKET_LABEL;
-  const isUpdating = isFetching && state === "ready";
+  const isUpdating = isFetching && (state === "ready" || state === "empty");
 
   return (
     <WidgetFrame
@@ -763,7 +772,7 @@ export function NetFlowChart({
       error={error}
       onRetry={refetch}
       className={className}
-      skeletonClassName="h-64"
+      skeletonClassName={SKELETON_HEIGHT_CLASS}
       actions={
         isUpdating ? (
           <span role="status" className={UPDATING_CLASS}>

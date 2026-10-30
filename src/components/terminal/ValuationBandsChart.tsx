@@ -89,6 +89,11 @@ const BODY_CLASS =
 // While a new lookback for the same subject loads, the previous bands stay on screen, dimmed.
 const BODY_UPDATING_CLASS =
   "flex flex-col gap-3 opacity-60 motion-safe:transition-opacity motion-safe:duration-150 motion-safe:ease-out";
+// The loaded body's height for SCOM, measured on the standalone screener page with the seeded data
+// at each viewport width where it reflows, so the card keeps its height when the bands arrive
+// after each change of subject.
+const SKELETON_HEIGHT_CLASS =
+  "h-[59rem] min-[330px]:h-[38.5rem] min-[466px]:h-[33.375rem] min-[602px]:h-[28.25rem] min-[1024px]:h-[33.375rem] min-[1188px]:h-[28.25rem]";
 const META_CLASS = "text-xs text-slate-400";
 const UPDATING_CLASS = "text-sky-300";
 const STATUS_NOTE_CLASS = "text-xs text-amber-300";
@@ -750,7 +755,7 @@ export function ValuationBandsChart({
       error={error}
       onRetry={onRetry}
       emptyMessage={subject === null ? NO_SUBJECT_MESSAGE : undefined}
-      skeletonClassName="h-64"
+      skeletonClassName={SKELETON_HEIGHT_CLASS}
       className={className}
     >
       {shown !== undefined ? <BandsBody data={shown} updating={query.isFetching} /> : null}

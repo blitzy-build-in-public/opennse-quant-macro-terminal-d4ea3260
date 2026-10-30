@@ -164,6 +164,10 @@ const LEGEND_ITEM_CLASS = "flex items-center gap-2";
 // The keys alone link each curve name to its line, so they keep their colours under forced colours.
 const SWATCH_CLASS = "h-2 w-4 shrink-0 forced-color-adjust-none";
 const NOTE_CLASS = "m-0 text-xs text-slate-400";
+// The loading skeleton's heights are the loaded chart, legend and note, measured on the standalone
+// page with the seeded data at each viewport width where they reflow, so the card keeps its
+// height when the data arrives.
+const SKELETON_HEIGHT_CLASS = "h-[21.5rem] min-[457px]:h-[20.5rem] min-[487px]:h-[19.25rem]";
 // The tooltip shades are those of chartTheme's TOOLTIP_CONTENT_STYLE (slate-900 surface, slate-700
 // border, slate-300 text at 12px), written as utilities because the widgets style their own HTML
 // with Tailwind classes only, never inline styles.
@@ -529,7 +533,7 @@ export function YieldCurveChart({
       error={query.error}
       onRetry={query.refetch}
       className={className}
-      skeletonClassName="h-64"
+      skeletonClassName={SKELETON_HEIGHT_CLASS}
     >
       <figure className={FIGURE_CLASS}>
         <div className={CHART_CLASS}>

@@ -47,10 +47,22 @@ export interface WidgetFrameProps {
    */
   emptyMessage?: string;
   /**
-   * One complete Tailwind height class for the loading skeleton, such as `"h-64"`, so the
-   * skeleton matches the size of the loaded widget. Default `"h-48"`. It must be a literal class
-   * written in the calling widget's source: Tailwind's scanner (and a host's `@source` or
-   * `content` glob) only generates classes it can read literally, never computed ones.
+   * Tailwind height classes for the loading skeleton. The skeleton replaces only the body, so
+   * these size it to the loaded widget's body, and the card keeps its height when the data
+   * arrives. They follow the loaded body's height across viewport widths: a base height for the
+   * narrowest screens plus one `min-[<N>px]:` variant at each width where the body reflows, such
+   * as `"h-[21.5rem] min-[457px]:h-[20.5rem] min-[487px]:h-[19.25rem]"`.
+   * - Thresholds are integer `px`: Tailwind 3.2+ drops an arbitrary `min-*` variant whose unit
+   *   differs from its `px` screens, and Tailwind 4 orders arbitrary breakpoints by their value.
+   *   Named `sm:`, `md:` or `lg:` variants are not mixed in, so the cascade follows the
+   *   thresholds in both versions.
+   * - Heights are arbitrary `rem` values (the measured px / 16), which both versions generate,
+   *   rather than Tailwind 4's computed spacing steps beyond Tailwind 3's fixed scale.
+   * - A Tailwind 3 host without arbitrary `min-*` variants falls back to the base height.
+   *
+   * Default `"h-48"`. Every class must be complete and written literally in the calling widget's
+   * source: Tailwind's scanner (and a host's `@source` or `content` glob) only generates classes
+   * it can read literally, never computed ones.
    */
   skeletonClassName?: string;
   /** Extra classes merged onto the root element. */
@@ -152,8 +164,12 @@ function renderBody({
 }: WidgetFrameProps): ReactNode {
   switch (state) {
     case "loading":
+      // Keyed apart from the ready body, so React mounts the loaded content in new nodes rather
+      // than reusing the pulsing skeleton as its first element: when a reused node's animation
+      // stops and its display type changes at once, Chrome records a layout shift from the
+      // viewport's corner, although nothing moves.
       return (
-        <div aria-busy="true">
+        <div key="loading" aria-busy="true">
           <div
             aria-hidden="true"
             className={joinClasses(SKELETON_CLASS, skeletonClassName || DEFAULT_SKELETON_HEIGHT)}
@@ -191,7 +207,7 @@ function renderBody({
         </div>
       );
     case "ready":
-      return <div className={READY_CLASS}>{children}</div>;
+      return <div key="ready" className={READY_CLASS}>{children}</div>;
     default: {
       const unreachable: never = state;
       return unreachable;
@@ -204,8 +220,9 @@ function renderBody({
  * `data-testid` and `data-state`, optional header actions and always-visible controls, one
  * polite status region (`role="status"`) that stays mounted in every state, and a body chosen by
  * `state`:
- * - `loading`: a skeleton sized by `skeletonClassName`, marked `aria-busy`, while the status
- *   region announces "Loading…";
+ * - `loading`: a skeleton in place of the body, pulsing unless the user prefers reduced motion
+ *   and sized by `skeletonClassName` to the loaded body's height so the card does not jump when
+ *   the data arrives, marked `aria-busy`, while the status region announces "Loading…";
  * - `empty`: `emptyMessage`, or {@link EMPTY_MESSAGE}, shown inside the status region after the
  *   title, which only screen readers get, so the empty result is announced;
  * - `error`: an alert with the error's `message` and, when `onRetry` is given, a Retry button

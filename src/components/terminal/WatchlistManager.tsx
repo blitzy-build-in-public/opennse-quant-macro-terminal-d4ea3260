@@ -22,7 +22,7 @@ import {
   TEXT_FIELD_CLASS,
 } from "./shared/controlStyles";
 import { FieldErrorText, WidgetFrame } from "./shared/WidgetFrame";
-import type { TerminalWidgetProps, Watchlist, WatchlistCreate } from "./types";
+import type { TerminalWidgetProps, Watchlist, WatchlistCreate, WidgetState } from "./types";
 
 /** Props of {@link WatchlistManager}. */
 export interface WatchlistManagerProps extends TerminalWidgetProps {
@@ -62,6 +62,8 @@ const GENERAL_ERROR_KEY = "_general";
 
 const NOT_FOUND_MESSAGE = "That watchlist no longer exists. The watchlists have been reloaded.";
 const FALLBACK_ERROR_MESSAGE = "The request failed. Please try again.";
+/** The frame's empty message: the creation form sits above it, in the frame's controls. */
+const EMPTY_LISTS_MESSAGE = "No watchlists yet — create one above";
 
 // Every class token below is written out in full, never assembled from fragments (strings are
 // only joined from complete tokens), so Tailwind's source scan and a host's `@source` directive or
@@ -69,7 +71,7 @@ const FALLBACK_ERROR_MESSAGE = "The request failed. Please try again.";
 // on devices that can hover, and transitions run only when the user has not asked for reduced
 // motion. Labels, inputs, the secondary buttons and the chips use the shared control classes of
 // `shared/controlStyles`, so they match the other widgets' controls.
-const BODY_CLASS = "flex flex-col gap-4";
+const CONTROLS_CLASS = "flex flex-col gap-4";
 const FORM_CLASS = "flex flex-col gap-3";
 const FIELDS_CLASS = "flex flex-wrap gap-3";
 const FIELD_CLASS = "flex min-w-0 flex-1 basis-48 flex-col gap-1";
@@ -100,8 +102,11 @@ const CONFIRM_BUTTON_CLASS =
   "cursor-pointer rounded border border-rose-600 bg-rose-700 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-rose-800 active:bg-rose-900 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const GENERAL_ERROR_CLASS =
   "rounded border border-rose-900 bg-slate-950 px-3 py-2 text-xs text-rose-300";
-const EMPTY_LISTS_CLASS = "text-sm text-slate-400";
 const LISTS_CLASS = "flex flex-col gap-3";
+// The loaded lists' height, measured on the standalone page with the seeded watchlist at each
+// viewport width where it reflows, so the card keeps its height when the lists arrive.
+const SKELETON_HEIGHT_CLASS =
+  "h-[14.625rem] min-[327px]:h-[13.625rem] min-[392px]:h-[11.625rem] min-[690px]:h-[9.625rem] min-[1280px]:h-[11.625rem]";
 const LIST_ITEM_CLASS = "rounded border border-slate-800 bg-slate-950 p-3";
 // The list header keeps its actions top-right whatever the name's length. The title grows from a
 // zero basis (`flex-1`) with no minimum width (`min-w-0`), so a long or unbroken name wraps inside
@@ -302,8 +307,12 @@ function RemoveIcon(): ReactElement {
  * /watchlists/{id}/items/{ticker}`), with no optimistic update to roll back. It loads them again
  * only after a mutation finds its watchlist gone or times out.
  *
- * An empty list of watchlists is a ready state, so the creation form is always offered. A failed
- * initial load shows the frame's error state with Retry; a failed mutation shows its message
+ * The creation form, the widget's own error line and its status announcements sit in the frame's
+ * controls, so they stay in place in every state, and the frame shows the empty state ("No
+ * watchlists yet — create one above") while the shown lists are empty. Create stays
+ * `aria-disabled` while `GET /watchlists` is loading or has failed, because each response is
+ * mirrored onto the loaded lists and there are none to mirror it onto; the inputs stay editable.
+ * A failed load shows the frame's error state with Retry; a failed mutation shows its message
  * beneath the input it concerns (`field-error-name`, `field-error-tickers`,
  * `field-error-ticker-<id>`) until that input is edited or the next request succeeds, or else on
  * the widget's own error line, and the lists stay usable.
@@ -333,7 +342,6 @@ export function WatchlistManager({
     path: "/watchlists",
     apiBaseUrl,
     getHeaders,
-    isEmpty: () => false,
   });
 
   const [local, setLocal] = useState<LocalLists | null>(null);
@@ -376,6 +384,11 @@ export function WatchlistManager({
   }, [target]);
 
   const lists = local !== null && local.base === query.data ? local.lists : (query.data ?? []);
+  // The lists are loaded once the query is ready or empty. Its own empty test sees only the
+  // fetched payload, so the frame decides from the shown lists, which include every mirrored
+  // mutation: deleting the last watchlist empties the frame, and creating one fills it.
+  const loaded = query.state === "ready" || query.state === "empty";
+  const frameState: WidgetState = loaded ? (lists.length === 0 ? "empty" : "ready") : query.state;
 
   /**
    * Run one mutation. On success the returned lists become the shown lists, every error is
@@ -467,7 +480,9 @@ export function WatchlistManager({
 
   function handleCreate(event: FormEvent<HTMLFormElement>): void {
     event.preventDefault();
-    if (inFlight.current) return;
+    // Before the lists load there is nothing to add the created list to: the pending or retried
+    // `GET /watchlists` would replace it, and `onWatchlistsChange` would miss the other lists.
+    if (inFlight.current || !loaded) return;
     const trimmedName = name.trim();
     // The repeat leaves the success announcement in place and shows no error for the cleared form.
     if (isRepeatSubmit(CREATE_FORM_KEY, trimmedName, event.timeStamp)) return;
@@ -637,6 +652,7 @@ export function WatchlistManager({
   }
 
   const buttonDisabled = busy ? true : undefined;
+  const createDisabled = busy || !loaded ? true : undefined;
   const nameId = `${baseId}-name`;
   const nameErrorId = `${baseId}-name-error`;
   const tickersId = `${baseId}-tickers`;
@@ -771,99 +787,99 @@ export function WatchlistManager({
     );
   }
 
+  // Rendered by the frame in every state, so the form, the error line and the announcements stay
+  // in place, and keep keyboard focus, as the lists load, empty, fill or fail.
+  const controls = (
+    <div className={CONTROLS_CLASS}>
+      <form
+        className={FORM_CLASS}
+        onSubmit={handleCreate}
+        noValidate
+        aria-label="Create a watchlist"
+      >
+        <div className={FIELDS_CLASS}>
+          <div className={FIELD_CLASS}>
+            <label htmlFor={nameId} className={FIELD_LABEL_CLASS}>
+              New watchlist name
+            </label>
+            <input
+              id={nameId}
+              ref={nameInputRef}
+              type="text"
+              data-testid="watchlist-name-input"
+              value={name}
+              onChange={(event) => {
+                setName(event.target.value);
+                clearError("name");
+              }}
+              autoComplete="off"
+              aria-invalid={nameError ? true : undefined}
+              aria-describedby={nameError ? nameErrorId : undefined}
+              className={INPUT_CLASS}
+            />
+            <FieldErrorText field="name" message={nameError} id={nameErrorId} />
+          </div>
+          <div className={FIELD_CLASS}>
+            <label htmlFor={tickersId} className={FIELD_LABEL_CLASS}>
+              Tickers (optional)
+            </label>
+            <input
+              id={tickersId}
+              type="text"
+              data-testid="watchlist-tickers-input"
+              value={tickersText}
+              onChange={(event) => {
+                setTickersText(event.target.value);
+                clearError("tickers");
+              }}
+              placeholder="e.g. SCOM, KCB"
+              autoComplete="off"
+              autoCapitalize="characters"
+              spellCheck={false}
+              aria-invalid={tickersError ? true : undefined}
+              aria-describedby={tickersError ? tickersErrorId : undefined}
+              className={INPUT_CLASS}
+            />
+            <FieldErrorText field="tickers" message={tickersError} id={tickersErrorId} />
+          </div>
+        </div>
+        <button
+          type="submit"
+          data-testid="watchlist-create-button"
+          aria-disabled={createDisabled}
+          className={PRIMARY_BUTTON_CLASS}
+        >
+          Create
+        </button>
+      </form>
+
+      {generalError ? (
+        <p role="alert" data-testid="watchlist-error" className={GENERAL_ERROR_CLASS}>
+          {generalError}
+        </p>
+      ) : null}
+
+      <p role="status" className={STATUS_CLASS}>
+        {busy ? "Saving…" : notice}
+      </p>
+    </div>
+  );
+
   return (
     <WidgetFrame
       testId="terminal-watchlist-manager"
       title="Watchlists"
-      state={query.state}
+      state={frameState}
       error={query.error}
       onRetry={query.refetch}
+      emptyMessage={EMPTY_LISTS_MESSAGE}
       className={className}
-      skeletonClassName="h-48"
+      skeletonClassName={SKELETON_HEIGHT_CLASS}
+      controls={controls}
     >
-      <div className={BODY_CLASS}>
-        <form
-          className={FORM_CLASS}
-          onSubmit={handleCreate}
-          noValidate
-          aria-label="Create a watchlist"
-        >
-          <div className={FIELDS_CLASS}>
-            <div className={FIELD_CLASS}>
-              <label htmlFor={nameId} className={FIELD_LABEL_CLASS}>
-                New watchlist name
-              </label>
-              <input
-                id={nameId}
-                ref={nameInputRef}
-                type="text"
-                data-testid="watchlist-name-input"
-                value={name}
-                onChange={(event) => {
-                  setName(event.target.value);
-                  clearError("name");
-                }}
-                autoComplete="off"
-                aria-invalid={nameError ? true : undefined}
-                aria-describedby={nameError ? nameErrorId : undefined}
-                className={INPUT_CLASS}
-              />
-              <FieldErrorText field="name" message={nameError} id={nameErrorId} />
-            </div>
-            <div className={FIELD_CLASS}>
-              <label htmlFor={tickersId} className={FIELD_LABEL_CLASS}>
-                Tickers (optional)
-              </label>
-              <input
-                id={tickersId}
-                type="text"
-                data-testid="watchlist-tickers-input"
-                value={tickersText}
-                onChange={(event) => {
-                  setTickersText(event.target.value);
-                  clearError("tickers");
-                }}
-                placeholder="e.g. SCOM, KCB"
-                autoComplete="off"
-                autoCapitalize="characters"
-                spellCheck={false}
-                aria-invalid={tickersError ? true : undefined}
-                aria-describedby={tickersError ? tickersErrorId : undefined}
-                className={INPUT_CLASS}
-              />
-              <FieldErrorText field="tickers" message={tickersError} id={tickersErrorId} />
-            </div>
-          </div>
-          <button
-            type="submit"
-            data-testid="watchlist-create-button"
-            aria-disabled={buttonDisabled}
-            className={PRIMARY_BUTTON_CLASS}
-          >
-            Create
-          </button>
-        </form>
-
-        {generalError ? (
-          <p role="alert" data-testid="watchlist-error" className={GENERAL_ERROR_CLASS}>
-            {generalError}
-          </p>
-        ) : null}
-
-        {lists.length === 0 ? (
-          <p data-testid="watchlist-empty" className={EMPTY_LISTS_CLASS}>
-            No watchlists yet
-          </p>
-        ) : (
-          <ul className={LISTS_CLASS} aria-label="Saved watchlists">
-            {lists.map(renderList)}
-          </ul>
-        )}
-
-        <p role="status" className={STATUS_CLASS}>
-          {busy ? "Saving…" : notice}
-        </p>
-      </div>
+      <ul className={LISTS_CLASS} aria-label="Saved watchlists">
+        {lists.map(renderList)}
+      </ul>
     </WidgetFrame>
   );
 }

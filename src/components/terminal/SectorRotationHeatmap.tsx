@@ -148,6 +148,11 @@ const LEGEND_CLASS = "mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs t
 const LEGEND_LIST_CLASS = "flex flex-wrap items-center gap-x-3 gap-y-1";
 const LEGEND_ITEM_CLASS = "flex items-center gap-1";
 const SWATCH_CLASS = "inline-block h-3 w-3 rounded-sm";
+// The loading skeleton's heights are the loaded table and legend, measured on the standalone page
+// with the seeded data at each viewport width where they reflow, so the card keeps its height
+// when the data arrives.
+const SKELETON_HEIGHT_CLASS =
+  "h-[22.75rem] min-[325px]:h-[21.75rem] min-[339px]:h-[20.8125rem] min-[355px]:h-[19.84375rem] min-[489px]:h-[18.84375rem] min-[507px]:h-[17.59375rem] min-[560px]:h-[16.59375rem] min-[1003px]:h-[15.65625rem] min-[1017px]:h-[14.15625rem]";
 
 const NO_CELL_TITLE = "No data for this period";
 
@@ -437,7 +442,7 @@ export function SectorRotationHeatmap({
       error={query.error}
       onRetry={query.refetch}
       className={className}
-      skeletonClassName="h-56"
+      skeletonClassName={SKELETON_HEIGHT_CLASS}
       actions={toggle}
     >
       {query.data === undefined ? null : <HeatmapTable data={query.data} mode={mode} />}
