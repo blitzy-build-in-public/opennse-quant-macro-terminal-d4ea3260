@@ -35,15 +35,24 @@ from opennse_terminal.schemas.common import (
     SeriesPoint,
     TerminalRequestModel,
     TerminalResponseModel,
+    Ticker,
 )
 
 __all__ = [
+    "DEFAULT_HEATMAP_PERIODS",
+    "DEFAULT_LOOKBACK_SESSIONS",
+    "DEFAULT_LOOKBACK_YEARS",
+    "DEFAULT_ROLLING_WINDOW",
     "DEFAULT_THRESHOLD",
     "DEFAULT_Z_WINDOW",
+    "HEATMAP_PERIODS_MAX",
+    "LOOKBACK_SESSIONS_MAX",
+    "LOOKBACK_YEARS_MAX",
     "THRESHOLD_MAX",
     "THRESHOLD_MIN",
     "Z_WINDOW_MAX",
     "Z_WINDOW_MIN",
+    "AnomaliesParams",
     "AnomaliesResponse",
     "AnomalyItem",
     "AnomalyMetric",
@@ -52,6 +61,7 @@ __all__ = [
     "BandsStatus",
     "FlowPoint",
     "FlowTotals",
+    "FlowsParams",
     "FlowsResponse",
     "FlowsStatus",
     "HeatmapCell",
@@ -61,10 +71,12 @@ __all__ = [
     "ScreenerRow",
     "ScreenerSort",
     "SectorAggregate",
+    "SectorHeatmapParams",
     "SectorHeatmapResponse",
     "SectorHeatmapRow",
     "SortOrder",
     "SubjectType",
+    "ValuationBandsParams",
     "ValuationBandsResponse",
 ]
 
@@ -117,6 +129,28 @@ THRESHOLD_MAX: Final[Decimal] = Decimal("10")
 
 DEFAULT_THRESHOLD: Final[Decimal] = Decimal("2.0")
 """Default spike threshold: a Z-score of 2.0 or more is an anomaly."""
+
+HEATMAP_PERIODS_MAX: Final[int] = 36
+"""Largest number of sector-heatmap periods a caller may request."""
+
+DEFAULT_HEATMAP_PERIODS: Final[int] = 12
+"""Sector-heatmap periods ending at ``as_of`` when the request omits ``periods``."""
+
+LOOKBACK_YEARS_MAX: Final[int] = 15
+"""Longest valuation-band lookback a caller may request, in calendar years."""
+
+DEFAULT_LOOKBACK_YEARS: Final[int] = 5
+"""Valuation-band lookback, in calendar years, when the request omits ``lookback_years``."""
+
+LOOKBACK_SESSIONS_MAX: Final[int] = 250
+"""Most market sessions the anomaly feed may be asked to scan."""
+
+DEFAULT_LOOKBACK_SESSIONS: Final[int] = 20
+"""Market sessions, ending at the latest stored trade date, that the anomaly feed scans by
+default."""
+
+DEFAULT_ROLLING_WINDOW: Final[int] = 20
+"""Market sessions summed by the flow ``rolling_foreign_net_kes`` series by default."""
 
 
 # ---------------------------------------------------------------------------------------------
@@ -323,6 +357,63 @@ class ScreenerResponse(TerminalResponseModel):
 # ---------------------------------------------------------------------------------------------
 
 
+class SectorHeatmapParams(TerminalRequestModel):
+    """Query parameters of ``GET /market/sector-heatmap``.
+
+    The route declares it as a FastAPI query-parameter model, ``Annotated[SectorHeatmapParams,
+    Query()]``, so each field appears as an individual query parameter in OpenAPI and an unknown
+    parameter is FastAPI's standard 422 ``extra_forbidden``.
+    """
+
+    interval: HeatmapInterval = Field(
+        default="month",
+        description=(
+            "Period boundaries: the last market session on or before each month-end (month) or "
+            "each Friday (week)."
+        ),
+    )
+    periods: int = Field(
+        default=DEFAULT_HEATMAP_PERIODS,
+        ge=1,
+        le=HEATMAP_PERIODS_MAX,
+        description="Number of periods ending at as_of.",
+    )
+    as_of: dt.date | None = Field(
+        default=None,
+        description="Valuation date (YYYY-MM-DD); defaults to the latest stored trade_date.",
+    )
+
+
+class ValuationBandsParams(TerminalRequestModel):
+    """Query parameters of ``GET /market/valuation-bands``.
+
+    The route declares it as a FastAPI query-parameter model, ``Annotated[ValuationBandsParams,
+    Query()]``, so each field appears as an individual query parameter in OpenAPI and an unknown
+    parameter is FastAPI's standard 422 ``extra_forbidden``. Giving neither or both of ``ticker``
+    and ``sector`` is the service's coded 422 ``exactly_one_subject``, not a validation error here.
+    """
+
+    ticker: Ticker | None = Field(
+        default=None,
+        description="NSE ticker symbol, for example SCOM; an unknown ticker is a 404.",
+    )
+    sector: SectorName | None = Field(
+        default=None,
+        description="Sector name as stored, for example Banking; an unknown sector is a 404.",
+    )
+    metric: BandMetric = Field(default="pe", description="The banded multiple: pe or pb.")
+    lookback_years: int = Field(
+        default=DEFAULT_LOOKBACK_YEARS,
+        ge=1,
+        le=LOOKBACK_YEARS_MAX,
+        description="Lookback in calendar years, ending at as_of.",
+    )
+    as_of: dt.date | None = Field(
+        default=None,
+        description="Valuation date (YYYY-MM-DD); defaults to the latest stored trade_date.",
+    )
+
+
 class HeatmapCell(TerminalResponseModel):
     """Capitalization-weighted return of one sector, or of the market, over one period."""
 
@@ -430,6 +521,85 @@ class ValuationBandsResponse(TerminalResponseModel):
 # ---------------------------------------------------------------------------------------------
 # GET /market/anomalies and GET /market/flows
 # ---------------------------------------------------------------------------------------------
+
+
+class AnomaliesParams(TerminalRequestModel):
+    """Query parameters of ``GET /market/anomalies``.
+
+    The route declares it as a FastAPI query-parameter model, ``Annotated[AnomaliesParams,
+    Query()]``, so each field appears as an individual query parameter in OpenAPI and an unknown
+    parameter is FastAPI's standard 422 ``extra_forbidden``. The window and threshold bounds are
+    the ones :class:`ScreenerParams` declares, so the screener and the anomaly feed can never
+    accept different ranges.
+    """
+
+    metric: AnomalyMetric = Field(
+        default="both", description="Metric to scan: volume, turnover or both."
+    )
+    window: int = Field(
+        default=DEFAULT_Z_WINDOW,
+        ge=Z_WINDOW_MIN,
+        le=Z_WINDOW_MAX,
+        description="Rolling Z-score window N, in the ticker's own prior rows.",
+    )
+    threshold: RequestDecimal = Field(
+        default=DEFAULT_THRESHOLD,
+        ge=THRESHOLD_MIN,
+        le=THRESHOLD_MAX,
+        description="Spike threshold in standard deviations: z >= threshold is a spike.",
+    )
+    lookback_sessions: int = Field(
+        default=DEFAULT_LOOKBACK_SESSIONS,
+        ge=1,
+        le=LOOKBACK_SESSIONS_MAX,
+        description="Market sessions scanned, ending at the latest stored trade_date.",
+    )
+    ticker: Ticker | None = Field(
+        default=None,
+        description="NSE ticker symbol, for example SCOM; an unknown ticker is a 404.",
+    )
+    sector: SectorName | None = Field(
+        default=None,
+        description="Sector name as stored, for example Banking; an unknown sector is a 404.",
+    )
+
+
+class FlowsParams(TerminalRequestModel):
+    """Query parameters of ``GET /market/flows``.
+
+    The route declares it as a FastAPI query-parameter model, ``Annotated[FlowsParams,
+    Query()]``, so each field appears as an individual query parameter in OpenAPI and an unknown
+    parameter is FastAPI's standard 422 ``extra_forbidden``. Giving both ``ticker`` and ``sector``
+    is the service's coded 422 ``conflicting_subjects``, and a ``start`` after ``end`` its coded
+    422 ``start_after_end``, not validation errors here.
+    """
+
+    ticker: Ticker | None = Field(
+        default=None,
+        description="NSE ticker symbol, for example SCOM; an unknown ticker is a 404.",
+    )
+    sector: SectorName | None = Field(
+        default=None,
+        description="Sector name as stored, for example Banking; an unknown sector is a 404.",
+    )
+    as_of: dt.date | None = Field(
+        default=None,
+        description="Valuation date (YYYY-MM-DD); defaults to the latest stored trade_date.",
+    )
+    start: dt.date | None = Field(
+        default=None,
+        description="First date of the range (YYYY-MM-DD); defaults to end - 365 days.",
+    )
+    end: dt.date | None = Field(
+        default=None,
+        description="Last date of the range (YYYY-MM-DD); defaults to as_of.",
+    )
+    rolling_window: int = Field(
+        default=DEFAULT_ROLLING_WINDOW,
+        ge=Z_WINDOW_MIN,
+        le=Z_WINDOW_MAX,
+        description="Market sessions summed by rolling_foreign_net_kes.",
+    )
 
 
 class AnomalyItem(TerminalResponseModel):

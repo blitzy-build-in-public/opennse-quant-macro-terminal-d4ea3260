@@ -1,4 +1,4 @@
-"""Response contract of ``GET /macro/overview``: CBK indicators, rate history and yield curve.
+"""Request and response contract of ``GET /macro/overview``: CBK indicators, rates and the curve.
 
 Mirrored one-to-one by ``MacroOverviewResponse`` in ``src/components/terminal/types.ts``, so field
 names are the JSON keys. Every rate, FX, reserve and tenor value is a ``Decimal`` that the service
@@ -9,17 +9,25 @@ has already quantized (2 dp) and that Pydantic serializes as a JSON string. Unit
 
 import datetime as dt
 from decimal import Decimal
-from typing import Literal
+from typing import Final, Literal
 
 from pydantic import Field
 
-from opennse_terminal.schemas.common import CoverageMeta, SeriesPoint, TerminalResponseModel
+from opennse_terminal.schemas.common import (
+    CoverageMeta,
+    SeriesPoint,
+    TerminalRequestModel,
+    TerminalResponseModel,
+)
 
 __all__ = [
+    "DEFAULT_HISTORY_MONTHS",
+    "HISTORY_MONTHS_MAX",
     "IndicatorKey",
     "IndicatorSnapshot",
     "IndicatorUnit",
     "Instrument",
+    "MacroOverviewParams",
     "MacroOverviewResponse",
     "RatesPoint",
     "TenorLabel",
@@ -30,7 +38,7 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------------------------
-# Literals
+# Literals and limits
 # ---------------------------------------------------------------------------------------------
 
 IndicatorKey = Literal[
@@ -55,6 +63,35 @@ TenorLabel = Literal["91D", "182D", "364D", "2Y", "5Y", "10Y", "15Y", "20Y", "25
 
 Instrument = Literal["tbill", "bond"]
 """Instrument behind a yield-curve point: a CBK Treasury bill or an FXD Treasury bond."""
+
+HISTORY_MONTHS_MAX: Final[int] = 240
+"""Largest accepted ``history_months``: twenty years of month-ends."""
+
+DEFAULT_HISTORY_MONTHS: Final[int] = 24
+"""Month-ends in the history window when the request omits ``history_months``."""
+
+
+# ---------------------------------------------------------------------------------------------
+# Endpoint request
+# ---------------------------------------------------------------------------------------------
+
+
+class MacroOverviewParams(TerminalRequestModel):
+    """Query parameters of ``GET /macro/overview``.
+
+    The route declares it as a FastAPI query-parameter model, ``Annotated[MacroOverviewParams,
+    Query()]``, so its field appears as an individual query parameter in OpenAPI and an unknown
+    parameter is FastAPI's standard 422 ``extra_forbidden``.
+    """
+
+    history_months: int = Field(
+        default=DEFAULT_HISTORY_MONTHS,
+        ge=1,
+        le=HISTORY_MONTHS_MAX,
+        description=(
+            "Number of month-ends in the history window, ending at the latest observation month."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------------------------

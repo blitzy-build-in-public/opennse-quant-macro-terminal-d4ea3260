@@ -11,6 +11,7 @@ FastAPI, SQLAlchemy, the models or the services. It holds:
   :class:`ValidationErrorResponse`;
 * :data:`Flag`, the base reason codes that accompany null or qualified metric values;
 * bounded request aliases (:data:`RequestDecimal`, :data:`Kes`, :data:`ShareCount`, ...);
+* :class:`NoQueryParams`, the query-parameter model of an endpoint that declares none;
 * the shared response shapes :class:`CoverageMeta`, :class:`SeriesPoint` and
   :class:`HealthResponse`.
 
@@ -47,6 +48,7 @@ __all__ = [
     "Flag",
     "HealthResponse",
     "Kes",
+    "NoQueryParams",
     "NonNegativeKes",
     "Pct",
     "PositiveShareCount",
@@ -460,6 +462,15 @@ class SeriesPoint(TerminalResponseModel):
     value: Decimal | None = Field(
         description="The value on that date as a decimal string; null when undefined.",
     )
+
+
+class NoQueryParams(TerminalRequestModel):
+    """The query-parameter model of an endpoint that declares none, such as ``GET /health``.
+
+    The route declares it as ``Annotated[NoQueryParams, Query()]``: it adds no parameter to
+    OpenAPI, and any query parameter is FastAPI's standard 422 list of ``extra_forbidden``
+    entries.
+    """
 
 
 class HealthResponse(TerminalResponseModel):

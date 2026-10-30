@@ -5,45 +5,53 @@ under ``/api/v1/terminal``, and the router-level principal dependency applies he
 every terminal endpoint. Only the screener reads the principal, to scope its ``watchlist_id``
 filter to the caller's own watchlists; nothing here looks up users.
 
-The routes bind and bound single query parameters only. ``market_service`` checks every rule
-that relates two parameters and every unknown entity, raising the coded body
-``{"detail": {"code", "message", "field"}}`` (``min_exceeds_max``, ``exactly_one_subject``,
-``conflicting_subjects``, ``start_after_end``, ``unknown_ticker``, ``unknown_sector``,
-``watchlist_not_found``); a single-parameter type or range failure is FastAPI's standard 422 list.
-The service also rounds every value exactly once, and the responses serialize each ``Decimal`` as
-a JSON string. Decimal parameters are bound as ``Decimal``, never ``float``. The service is called
-through its module so that tests can replace it.
+Each route binds its query through one query-parameter model, ``Annotated[<Model>, Query()]``
+(``ScreenerParams``, ``SectorHeatmapParams``, ``ValuationBandsParams``, ``AnomaliesParams``,
+``FlowsParams``), which declares every parameter with its single-field bounds and forbids unknown
+keys: a single-parameter type or range failure, and an unknown parameter (``extra_forbidden``),
+is FastAPI's standard 422 list. ``market_service`` checks every rule that relates two parameters
+and every unknown entity, raising the coded body ``{"detail": {"code", "message", "field"}}``
+(``min_exceeds_max``, ``exactly_one_subject``, ``conflicting_subjects``, ``start_after_end``,
+``unknown_ticker``, ``unknown_sector``, ``watchlist_not_found``). The service also rounds every
+value exactly once, and the responses serialize each ``Decimal`` as a JSON string. Decimal
+parameters are bound as ``Decimal``, never ``float``. The service is called through its module so
+that tests can replace it.
 
 Annotations are evaluated at runtime (no ``from __future__ import annotations``), because FastAPI
 reads the ``Annotated`` metadata of every route signature.
 """
 
-from datetime import date
 from decimal import Decimal
 from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, Query
-from pydantic import Field
 
 from opennse_terminal.api.deps import PrincipalDep, SessionDep, SettingsDep
 from opennse_terminal.schemas import (
+    DEFAULT_HEATMAP_PERIODS,
+    DEFAULT_LOOKBACK_SESSIONS,
+    DEFAULT_LOOKBACK_YEARS,
+    DEFAULT_ROLLING_WINDOW,
     DEFAULT_THRESHOLD,
     DEFAULT_Z_WINDOW,
+    HEATMAP_PERIODS_MAX,
+    LOOKBACK_SESSIONS_MAX,
+    LOOKBACK_YEARS_MAX,
     THRESHOLD_MAX,
     THRESHOLD_MIN,
     Z_WINDOW_MAX,
     Z_WINDOW_MIN,
+    AnomaliesParams,
     AnomaliesResponse,
-    AnomalyMetric,
-    BandMetric,
     ErrorResponse,
+    FlowsParams,
     FlowsResponse,
-    HeatmapInterval,
-    RequestDecimal,
     ScreenerParams,
     ScreenerResponse,
+    SectorHeatmapParams,
     SectorHeatmapResponse,
     ValidationErrorResponse,
+    ValuationBandsParams,
     ValuationBandsResponse,
 )
 from opennse_terminal.services import market_service
@@ -64,9 +72,6 @@ __all__ = [
     "MIN_Z_WINDOW",
     "SECTOR_MAX_LENGTH",
     "TICKER_MAX_LENGTH",
-    "AsOfQuery",
-    "SectorQuery",
-    "TickerQuery",
     "get_anomalies",
     "get_flows",
     "get_screener",
@@ -75,8 +80,12 @@ __all__ = [
     "router",
 ]
 
-# The Z-score window and spike-threshold bounds are the ones ScreenerParams declares, so the
-# screener and the anomaly feed can never accept different ranges.
+# Every default and bound below is the one the query-parameter models declare: the defaults
+# DEFAULT_HEATMAP_PERIODS, DEFAULT_LOOKBACK_YEARS, DEFAULT_LOOKBACK_SESSIONS,
+# DEFAULT_ROLLING_WINDOW and DEFAULT_Z_WINDOW are re-exported from the schemas as they are, and
+# the names below alias the schema constants. The Z-score window and spike-threshold bounds are
+# shared by ScreenerParams and AnomaliesParams, so the screener and the anomaly feed can never
+# accept different ranges.
 DEFAULT_ANOMALY_THRESHOLD: Final[Decimal] = DEFAULT_THRESHOLD
 """Default spike threshold of the anomaly feed, in standard deviations (2.0)."""
 
@@ -92,26 +101,14 @@ MIN_Z_WINDOW: Final[int] = Z_WINDOW_MIN
 MAX_Z_WINDOW: Final[int] = Z_WINDOW_MAX
 """Largest accepted rolling window N, for the Z-score and the flow rolling sum (250)."""
 
-DEFAULT_LOOKBACK_SESSIONS: Final = 20
-"""Market sessions, ending at the latest stored trade date, that the anomaly feed scans."""
+MAX_LOOKBACK_SESSIONS: Final[int] = LOOKBACK_SESSIONS_MAX
+"""Largest accepted ``lookback_sessions`` (250)."""
 
-MAX_LOOKBACK_SESSIONS: Final = 250
-"""Largest accepted ``lookback_sessions``."""
+MAX_HEATMAP_PERIODS: Final[int] = HEATMAP_PERIODS_MAX
+"""Largest accepted ``periods`` (36)."""
 
-DEFAULT_HEATMAP_PERIODS: Final = 12
-"""Heatmap periods ending at ``as_of`` when the request omits ``periods``."""
-
-MAX_HEATMAP_PERIODS: Final = 36
-"""Largest accepted ``periods``."""
-
-DEFAULT_LOOKBACK_YEARS: Final = 5
-"""Valuation-band lookback, in calendar years, when the request omits ``lookback_years``."""
-
-MAX_LOOKBACK_YEARS: Final = 15
-"""Largest accepted ``lookback_years``."""
-
-DEFAULT_ROLLING_WINDOW: Final = 20
-"""Market sessions summed by the flow ``rolling_foreign_net_kes`` series by default."""
+MAX_LOOKBACK_YEARS: Final[int] = LOOKBACK_YEARS_MAX
+"""Largest accepted ``lookback_years`` (15)."""
 
 TICKER_MAX_LENGTH: Final = 16
 """Longest ``ticker`` parameter, matching ``terminal_equities.ticker`` (``VARCHAR(16)``)."""
@@ -121,7 +118,8 @@ SECTOR_MAX_LENGTH: Final = 100
 
 _CODED_OR_VALIDATION_422: Final = (
     "Coded business-rule error, a detail object with code, message and field ({codes}), or "
-    "FastAPI's standard validation list for a single-parameter type or range failure"
+    "FastAPI's standard validation list for a single-parameter type or range failure or an "
+    "unknown parameter"
 )
 
 _SCREENER_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
@@ -155,33 +153,6 @@ _FLOWS_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
         ),
     },
 }
-
-# PostgreSQL text cannot hold a NUL character, so a ticker or sector carrying one is refused as a
-# single-field 422 here rather than failing as a 500 when the service queries it.
-_NO_NUL_PATTERN: Final = r"^[^\x00]*$"
-
-TickerQuery = Annotated[
-    str | None,
-    Query(
-        min_length=1,
-        max_length=TICKER_MAX_LENGTH,
-        pattern=_NO_NUL_PATTERN,
-        description="NSE ticker symbol, for example SCOM; an unknown ticker is a 404.",
-    ),
-]
-SectorQuery = Annotated[
-    str | None,
-    Query(
-        min_length=1,
-        max_length=SECTOR_MAX_LENGTH,
-        pattern=_NO_NUL_PATTERN,
-        description="Sector name as stored, for example Banking; an unknown sector is a 404.",
-    ),
-]
-AsOfQuery = Annotated[
-    date | None,
-    Query(description="Valuation date (YYYY-MM-DD); defaults to the latest stored trade_date."),
-]
 
 router = APIRouter()
 
@@ -223,20 +194,7 @@ async def get_screener(
 async def get_sector_heatmap(
     session: SessionDep,
     settings: SettingsDep,
-    interval: Annotated[
-        HeatmapInterval,
-        Query(
-            description=(
-                "Period boundaries: the last market session on or before each month-end "
-                "(month) or each Friday (week)."
-            ),
-        ),
-    ] = "month",
-    periods: Annotated[
-        int,
-        Query(ge=1, le=MAX_HEATMAP_PERIODS, description="Number of periods ending at as_of."),
-    ] = DEFAULT_HEATMAP_PERIODS,
-    as_of: AsOfQuery = None,
+    params: Annotated[SectorHeatmapParams, Query()],
 ) -> SectorHeatmapResponse:
     """Return sector and market returns over ``periods`` periods (default 12, range 1-36).
 
@@ -244,12 +202,17 @@ async def get_sector_heatmap(
     constituents with a close within 10 calendar days on or before both boundaries;
     ``relative_return_pct`` is the sector return minus the market return and is null on the
     market row. A sector without a qualifying constituent has a null cell. The endpoint defines
-    no coded error: with no price data every list is empty.
+    no coded error: with no price data every list is empty. Every parameter and bound is declared
+    by ``SectorHeatmapParams``; an unknown parameter is a standard 422.
     """
     # settings is passed so that the no-data fallback as_of uses the configured (or host
     # supplied) timezone rather than the service's Africa/Nairobi default.
     return await market_service.get_sector_heatmap(
-        session, interval=interval, periods=periods, as_of=as_of, settings=settings
+        session,
+        interval=params.interval,
+        periods=params.periods,
+        as_of=params.as_of,
+        settings=settings,
     )
 
 
@@ -262,18 +225,7 @@ async def get_sector_heatmap(
 async def get_valuation_bands(
     session: SessionDep,
     settings: SettingsDep,
-    ticker: TickerQuery = None,
-    sector: SectorQuery = None,
-    metric: Annotated[BandMetric, Query(description="The banded multiple: pe or pb.")] = "pe",
-    lookback_years: Annotated[
-        int,
-        Query(
-            ge=1,
-            le=MAX_LOOKBACK_YEARS,
-            description="Lookback in calendar years, ending at as_of.",
-        ),
-    ] = DEFAULT_LOOKBACK_YEARS,
-    as_of: AsOfQuery = None,
+    params: Annotated[ValuationBandsParams, Query()],
 ) -> ValuationBandsResponse:
     """Return the daily ``metric`` (default ``pe``) bands over ``lookback_years`` (default 5).
 
@@ -285,16 +237,17 @@ async def get_valuation_bands(
     ``current_percentile`` in percent) is present only when ``status`` is ``ok``, which needs at
     least 60 daily values. ``series`` samples the last session of each ISO week, and
     ``coverage`` reports whether the data starts more than 7 days after the requested lookback
-    start.
+    start. Every parameter and bound is declared by ``ValuationBandsParams``; an unknown
+    parameter is a standard 422.
     """
     return await market_service.get_valuation_bands(
         session,
         settings,
-        ticker=ticker,
-        sector=sector,
-        metric=metric,
-        lookback_years=lookback_years,
-        as_of=as_of,
+        ticker=params.ticker,
+        sector=params.sector,
+        metric=params.metric,
+        lookback_years=params.lookback_years,
+        as_of=params.as_of,
     )
 
 
@@ -306,35 +259,7 @@ async def get_valuation_bands(
 )
 async def get_anomalies(
     session: SessionDep,
-    metric: Annotated[
-        AnomalyMetric,
-        Query(description="Metric to scan: volume, turnover or both."),
-    ] = "both",
-    window: Annotated[
-        int,
-        Query(
-            ge=MIN_Z_WINDOW,
-            le=MAX_Z_WINDOW,
-            description="Rolling Z-score window N, in the ticker's own prior rows.",
-        ),
-    ] = DEFAULT_Z_WINDOW,
-    # Bounded through pydantic Field, not Query(ge=..., le=...): Query types its bounds as
-    # float, and the threshold stays a Decimal end to end.
-    threshold: Annotated[
-        RequestDecimal,
-        Field(ge=MIN_THRESHOLD, le=MAX_THRESHOLD),
-        Query(description="Spike threshold in standard deviations: z >= threshold is a spike."),
-    ] = DEFAULT_ANOMALY_THRESHOLD,
-    lookback_sessions: Annotated[
-        int,
-        Query(
-            ge=1,
-            le=MAX_LOOKBACK_SESSIONS,
-            description="Market sessions scanned, ending at the latest stored trade_date.",
-        ),
-    ] = DEFAULT_LOOKBACK_SESSIONS,
-    ticker: TickerQuery = None,
-    sector: SectorQuery = None,
+    params: Annotated[AnomaliesParams, Query()],
 ) -> AnomaliesResponse:
     """Return the spikes of the last ``lookback_sessions`` (default 20) market sessions.
 
@@ -344,16 +269,17 @@ async def get_anomalies(
     negative Z-scores never are. ``value``, ``rolling_mean`` and ``rolling_stdev`` are in shares
     for volume and KES for turnover, and ``z_score`` in standard deviations. Items sort by
     ``trade_date`` descending, then ``z_score`` descending. Candidates are every equity, or
-    ``ticker``, or the equities of ``sector``.
+    ``ticker``, or the equities of ``sector``. Every parameter and bound is declared by
+    ``AnomaliesParams``, the threshold as a ``Decimal``; an unknown parameter is a standard 422.
     """
     return await market_service.get_anomalies(
         session,
-        metric=metric,
-        window=window,
-        threshold=threshold,
-        lookback_sessions=lookback_sessions,
-        ticker=ticker,
-        sector=sector,
+        metric=params.metric,
+        window=params.window,
+        threshold=params.threshold,
+        lookback_sessions=params.lookback_sessions,
+        ticker=params.ticker,
+        sector=params.sector,
     )
 
 
@@ -366,25 +292,7 @@ async def get_anomalies(
 async def get_flows(
     session: SessionDep,
     settings: SettingsDep,
-    ticker: TickerQuery = None,
-    sector: SectorQuery = None,
-    as_of: AsOfQuery = None,
-    start: Annotated[
-        date | None,
-        Query(description="First date of the range (YYYY-MM-DD); defaults to end - 365 days."),
-    ] = None,
-    end: Annotated[
-        date | None,
-        Query(description="Last date of the range (YYYY-MM-DD); defaults to as_of."),
-    ] = None,
-    rolling_window: Annotated[
-        int,
-        Query(
-            ge=MIN_Z_WINDOW,
-            le=MAX_Z_WINDOW,
-            description="Market sessions summed by rolling_foreign_net_kes.",
-        ),
-    ] = DEFAULT_ROLLING_WINDOW,
+    params: Annotated[FlowsParams, Query()],
 ) -> FlowsResponse:
     """Return the daily foreign and local net flows of a ticker, a sector or the whole market.
 
@@ -394,17 +302,18 @@ async def get_flows(
     ``start``, the sum over the last ``rolling_window`` (default 20) sessions, and the foreign
     net flow as a percentage of the same constituents' turnover. ``coverage_pct`` is the share
     of sessions with flow data, in percent; with none, ``status`` is ``no_flow_data`` and
-    ``totals`` is null.
+    ``totals`` is null. Every parameter and bound is declared by ``FlowsParams``; an unknown
+    parameter is a standard 422.
     """
     # settings is passed so that the no-data fallback as_of uses the configured (or host
     # supplied) timezone rather than the service's Africa/Nairobi default.
     return await market_service.get_flows(
         session,
-        ticker=ticker,
-        sector=sector,
-        as_of=as_of,
-        start=start,
-        end=end,
-        rolling_window=rolling_window,
+        ticker=params.ticker,
+        sector=params.sector,
+        as_of=params.as_of,
+        start=params.start,
+        end=params.end,
+        rolling_window=params.rolling_window,
         settings=settings,
     )

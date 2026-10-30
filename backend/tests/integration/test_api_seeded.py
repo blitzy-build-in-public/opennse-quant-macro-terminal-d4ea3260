@@ -40,6 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from opennse_terminal import __version__
 from opennse_terminal.config import TerminalSettings
+from opennse_terminal.main import create_app
 from opennse_terminal.models import (
     TerminalBondYield,
     TerminalCorporateFiling,
@@ -837,6 +838,160 @@ async def test_watchlist_create_add_remove_and_delete_lifecycle(
 
     remaining = await get_json(client, "/watchlists")
     assert [watchlist["name"] for watchlist in remaining] == [CORE_WATCHLIST]
+
+
+# ---------------------------------------------------------------------------------------------
+# Query parameters of the health, macro and market endpoints
+# ---------------------------------------------------------------------------------------------
+#
+# Each of these endpoints binds its query through one query-parameter model that forbids unknown
+# keys, so a misspelt parameter is FastAPI's standard 422 list rather than a 200 that silently
+# applies the defaults or widens the scope. The OpenAPI document lists each endpoint's declared
+# parameters, in order, with their defaults and bounds.
+
+# Query parameter -> (default, minimum, maximum, enum); None where the schema has none.
+QuerySpec = tuple[object, Decimal | None, Decimal | None, list[str] | None]
+
+NO_BOUNDS: Final[QuerySpec] = (None, None, None, None)
+
+
+def query_spec(parameter: JsonObject) -> QuerySpec:
+    """The default, bounds and enum an OpenAPI query parameter documents.
+
+    A nullable or Decimal parameter documents its bounds inside an ``anyOf`` member; bounds are
+    read back through ``str`` into ``Decimal``, so a bound of 0.5 compares exactly.
+    """
+    schema = parameter["schema"]
+    members = [schema, *schema.get("anyOf", [])]
+
+    def first(key: str) -> Any:
+        return next((member[key] for member in members if key in member), None)
+
+    minimum, maximum = first("minimum"), first("maximum")
+    return (
+        schema.get("default"),
+        None if minimum is None else Decimal(str(minimum)),
+        None if maximum is None else Decimal(str(maximum)),
+        first("enum"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "params", "unknown"),
+    [
+        pytest.param("/health", {"foo": "1"}, "foo", id="health"),
+        pytest.param(
+            "/macro/overview", {"histroy_months": "240"}, "histroy_months", id="macro-overview"
+        ),
+        pytest.param("/market/sector-heatmap", {"period": "1"}, "period", id="sector-heatmap"),
+        pytest.param(
+            "/market/valuation-bands",
+            {"ticker": "SCOM", "lookback": "1"},
+            "lookback",
+            id="valuation-bands",
+        ),
+        pytest.param("/market/anomalies", {"tickr": "SCOM"}, "tickr", id="anomalies"),
+        pytest.param("/market/flows", {"tickr": "SCOM"}, "tickr", id="flows"),
+        pytest.param("/market/screener", {"tickr": "SCOM"}, "tickr", id="screener"),
+    ],
+)
+async def test_unknown_query_parameter_is_the_standard_422(
+    client: httpx.AsyncClient, path: str, params: Mapping[str, str], unknown: str
+) -> None:
+    """A misspelt parameter, alone or beside a declared one, is refused with exactly one
+    ``extra_forbidden`` entry naming it and echoing its value."""
+    response = await client.get(f"{BASE}{path}", params=params)
+
+    assert response.status_code == 422, response.text
+    assert response.json() == {
+        "detail": [
+            {
+                "type": "extra_forbidden",
+                "loc": ["query", unknown],
+                "msg": "Extra inputs are not permitted",
+                "input": params[unknown],
+            }
+        ]
+    }
+
+
+@pytest.fixture(scope="module")
+def terminal_openapi() -> JsonObject:
+    """The OpenAPI document of the standalone app; reading it sends no request."""
+    document: JsonObject = create_app().openapi()
+    return document
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        pytest.param("/health", {}, id="health"),
+        pytest.param(
+            "/macro/overview",
+            {"history_months": (24, Decimal(1), Decimal(240), None)},
+            id="macro-overview",
+        ),
+        pytest.param(
+            "/market/sector-heatmap",
+            {
+                "interval": ("month", None, None, ["month", "week"]),
+                "periods": (12, Decimal(1), Decimal(36), None),
+                "as_of": NO_BOUNDS,
+            },
+            id="sector-heatmap",
+        ),
+        pytest.param(
+            "/market/valuation-bands",
+            {
+                "ticker": NO_BOUNDS,
+                "sector": NO_BOUNDS,
+                "metric": ("pe", None, None, ["pe", "pb"]),
+                "lookback_years": (5, Decimal(1), Decimal(15), None),
+                "as_of": NO_BOUNDS,
+            },
+            id="valuation-bands",
+        ),
+        pytest.param(
+            "/market/anomalies",
+            {
+                "metric": ("both", None, None, ["volume", "turnover", "both"]),
+                "window": (20, Decimal(5), Decimal(250), None),
+                "threshold": ("2.0", Decimal("0.5"), Decimal(10), None),
+                "lookback_sessions": (20, Decimal(1), Decimal(250), None),
+                "ticker": NO_BOUNDS,
+                "sector": NO_BOUNDS,
+            },
+            id="anomalies",
+        ),
+        pytest.param(
+            "/market/flows",
+            {
+                "ticker": NO_BOUNDS,
+                "sector": NO_BOUNDS,
+                "as_of": NO_BOUNDS,
+                "start": NO_BOUNDS,
+                "end": NO_BOUNDS,
+                "rolling_window": (20, Decimal(5), Decimal(250), None),
+            },
+            id="flows",
+        ),
+    ],
+)
+def test_documented_query_parameters_keep_their_defaults_and_bounds(
+    terminal_openapi: JsonObject, path: str, expected: Mapping[str, QuerySpec]
+) -> None:
+    """Each endpoint documents exactly its declared query parameters, in declaration order, each
+    optional and described, with the default and bounds of the API contract; the threshold
+    default is the Decimal string "2.0"."""
+    operation = terminal_openapi["paths"][f"{BASE}{path}"]["get"]
+    parameters = operation.get("parameters", [])
+
+    assert [parameter["name"] for parameter in parameters] == list(expected)
+    for parameter in parameters:
+        assert parameter["in"] == "query"
+        assert parameter["required"] is False
+        assert parameter["description"]
+    assert {parameter["name"]: query_spec(parameter) for parameter in parameters} == expected
 
 
 # ---------------------------------------------------------------------------------------------

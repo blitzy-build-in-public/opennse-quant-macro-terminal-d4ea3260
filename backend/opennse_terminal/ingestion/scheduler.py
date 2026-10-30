@@ -37,7 +37,6 @@ from apscheduler.events import (
     EVENT_JOB_ERROR,
     EVENT_JOB_EXECUTED,
     EVENT_JOB_MISSED,
-    EVENT_JOB_SUBMITTED,
     JobEvent,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -114,9 +113,7 @@ if not _SCHEDULED_PIPELINES <= registry.PIPELINES.keys():
         + ", ".join(sorted(_SCHEDULED_PIPELINES.difference(registry.PIPELINES)))
     )
 
-_LOGGED_EVENTS: Final = (
-    EVENT_JOB_SUBMITTED | EVENT_JOB_EXECUTED | EVENT_JOB_ERROR | EVENT_JOB_MISSED
-)
+_LOGGED_EVENTS: Final = EVENT_JOB_EXECUTED | EVENT_JOB_ERROR | EVENT_JOB_MISSED
 
 _STOP_SIGNALS: Final = (signal.SIGINT, signal.SIGTERM)
 
@@ -124,16 +121,17 @@ _STOP_SIGNALS: Final = (signal.SIGINT, signal.SIGTERM)
 def build_scheduler(settings: TerminalSettings) -> AsyncIOScheduler:
     """Build an ``AsyncIOScheduler`` holding every job of :data:`JOB_DEFINITIONS`, unstarted.
 
-    The scheduler and every cron trigger use ``settings.tzinfo``. Each job calls :func:`run_job`
-    with its id, its pipeline names and ``settings``; :func:`_log_job_event` is attached as the
-    listener for job submission, completion, misses and errors. Building needs no running event
-    loop: the scheduler binds to the running loop only when it is started.
+    The scheduler and every cron trigger use ``settings.tzinfo``. Each job calls
+    :func:`_run_scheduled_job` with its id, its pipeline names and ``settings``; it logs that the
+    job fired and runs :func:`run_job`. :func:`_log_job_event` is attached as the listener for job
+    completion, misses and errors. Building needs no running event loop: the scheduler binds to
+    the running loop only when it is started.
     """
     timezone = settings.tzinfo
     scheduler = AsyncIOScheduler(timezone=timezone, job_defaults=dict(JOB_DEFAULTS))
     for job in JOB_DEFINITIONS:
         scheduler.add_job(
-            run_job,
+            _run_scheduled_job,
             CronTrigger(
                 day_of_week=job.day_of_week,
                 hour=job.hour,
@@ -151,19 +149,26 @@ def build_scheduler(settings: TerminalSettings) -> AsyncIOScheduler:
 
 
 def _log_job_event(event: JobEvent) -> None:
-    """Log an APScheduler job event: fired and finished at INFO, missed at WARNING, an error at
-    ERROR. A job cancelled while the scheduler stops is logged at WARNING, because its runs are
-    recorded ``failed`` ("cancelled") rather than having failed. Exceptions are named by type
-    only, as everywhere in ingestion, so no exception text reaches a log line."""
+    """Log an APScheduler job event: finished at INFO, missed at WARNING, an error at ERROR.
+
+    The "fired" line is logged by :func:`_run_scheduled_job` itself, because APScheduler declares
+    a miss only after submitting the job, so a missed run is logged as missed only. A job
+    cancelled while the scheduler stops returns ``None`` from :func:`_run_scheduled_job`; its
+    completion is logged at WARNING, because it was stopped rather than having failed; the run it
+    interrupted is recorded as ``execute_pipeline`` describes. Exceptions are named by type only,
+    as everywhere in ingestion, so no exception text reaches a log line."""
     code = event.code
-    if code == EVENT_JOB_SUBMITTED:
-        logger.info(
-            "job %s fired (scheduled for %s)",
-            event.job_id,
-            ", ".join(str(run_time) for run_time in event.scheduled_run_times),
-        )
-    elif code == EVENT_JOB_EXECUTED:
-        logger.info("job %s finished (scheduled for %s)", event.job_id, event.scheduled_run_time)
+    if code == EVENT_JOB_EXECUTED:
+        if event.retval is None:
+            logger.warning(
+                "job %s was cancelled while running (scheduled for %s)",
+                event.job_id,
+                event.scheduled_run_time,
+            )
+        else:
+            logger.info(
+                "job %s finished (scheduled for %s)", event.job_id, event.scheduled_run_time
+            )
     elif code == EVENT_JOB_MISSED:
         logger.warning(
             "job %s missed its run scheduled for %s by more than %s seconds",
@@ -172,19 +177,41 @@ def _log_job_event(event: JobEvent) -> None:
             JOB_DEFAULTS["misfire_grace_time"],
         )
     elif code == EVENT_JOB_ERROR:
-        if isinstance(event.exception, asyncio.CancelledError):
-            logger.warning(
-                "job %s was cancelled while running (scheduled for %s)",
-                event.job_id,
-                event.scheduled_run_time,
-            )
-        else:
-            logger.error(
-                "job %s raised %s (scheduled for %s)",
-                event.job_id,
-                type(event.exception).__name__,
-                event.scheduled_run_time,
-            )
+        logger.error(
+            "job %s raised %s (scheduled for %s)",
+            event.job_id,
+            type(event.exception).__name__,
+            event.scheduled_run_time,
+        )
+
+
+async def _run_scheduled_job(
+    job_id: str, pipeline_names: Sequence[str], settings: TerminalSettings
+) -> list[RunResult] | None:
+    """The callable of every scheduled job: log that the job fired, then :func:`run_job`.
+
+    APScheduler awaits this only once the run time is within ``misfire_grace_time``, so the INFO
+    "fired" line is logged for runs that actually start and never for a missed one. Returns the
+    results of :func:`run_job`, or ``None`` when the job is cancelled: only APScheduler's
+    executor shutdown, or ``asyncio.run`` tearing down the loop, cancels a scheduled job's task,
+    and by the time the cancellation reaches this function ``execute_pipeline`` has finished
+    recording the run it interrupted (``failed`` with "cancelled" when the cancellation came
+    before the commit; otherwise the committed status stands). Never raises, since
+    :func:`run_job` raises only ``asyncio.CancelledError``, so APScheduler reports every run
+    through ``EVENT_JOB_EXECUTED``.
+    """
+    logger.info("job %s fired: running %s", job_id, ", ".join(pipeline_names))
+    try:
+        return await run_job(job_id, pipeline_names, settings)
+    except asyncio.CancelledError:
+        # The cancellation is absorbed here: APScheduler's coroutine wrapper would swallow it
+        # anyway, but only after logging it at ERROR with a full traceback. The task's pending
+        # cancellation is withdrawn because it is suppressed, and None marks the job cancelled
+        # for _log_job_event.
+        task = asyncio.current_task()
+        if task is not None:
+            task.uncancel()
+        return None
 
 
 async def run_job(
@@ -291,8 +318,12 @@ async def _wait_for_in_flight_jobs(scheduler: AsyncIOScheduler) -> None:
     """After ``scheduler.shutdown()``, wait until every job that was running has finished.
 
     ``AsyncIOScheduler`` applies ``shutdown()`` on a later loop iteration; its executor then
-    cancels each running job's task, and ``execute_pipeline`` rolls the run's data back, records
-    it ``failed`` ("cancelled") and releases its advisory lock with the connection.
+    cancels each running job's task, and ``execute_pipeline`` finishes recording the run it
+    interrupted, so no run row is left ``running``. A cancellation that came before the data
+    commit rolls the run's data back and records it ``failed`` ("cancelled"); otherwise the
+    committed status and ``rows_written`` stand. Either way the run's advisory lock is released.
+    Each cancelled job then returns ``None`` from :func:`_run_scheduled_job` and is logged once,
+    at WARNING, as cancelled while running.
     """
     # The tasks are awaited here instead of being left to asyncio.run's teardown, which cancels
     # every remaining task: that would include the tasks execute_pipeline runs its commit and
@@ -335,7 +366,9 @@ def run_forever(settings: TerminalSettings | None = None) -> None:
     ``settings`` defaults to a new ``TerminalSettings()``. The scheduler runs on an event loop of
     its own (``asyncio.run``), so this must be called from the main thread, where the stop
     signals are handled, and never from inside a running event loop. On a stop signal no further
-    job fires, and jobs already running are cancelled; their runs are recorded ``failed``
-    ("cancelled") before this returns. Further signals while stopping are ignored.
+    job fires, and jobs already running are cancelled. The run each one interrupted is finished,
+    never left ``running``: ``failed`` ("cancelled") when the cancellation came before its data
+    commit; otherwise the committed status stands. Each such job is logged once at WARNING, with
+    no traceback, before this returns. Further signals while stopping are ignored.
     """
     asyncio.run(_serve(settings if settings is not None else TerminalSettings()))
