@@ -1,6 +1,7 @@
 """Rolling Z-scores of daily volume and turnover, and the single spike rule.
 
-For one ticker, one metric ``x`` (volume in shares, or ``turnover_kes`` in KES) and day ``t``::
+For one ticker, one metric ``x`` (volume in shares, or ``turnover_kes`` in the equity's listing
+currency, KES by default, never converted) and day ``t``::
 
     z_t = (x_t - mean(W)) / sd(W)
 
@@ -58,7 +59,7 @@ _MIN_PERIODS_FLOOR: Final = 2
 
 
 class Observation(NamedTuple):
-    """One ticker's metric on one day: volume in shares or turnover in KES."""
+    """One ticker's metric on one day: volume in shares, or turnover in its listing currency."""
 
     trade_date: date
     value: Decimal
@@ -154,7 +155,8 @@ def rolling_zscores(
 
     A day without a row produces no point: the output has exactly one point per input row, in
     input order. ``z`` is dimensionless; ``rolling_mean`` and ``rolling_stdev`` are in the metric's
-    unit (shares for volume, KES for turnover). Nothing is rounded.
+    unit (shares for volume; for turnover, the equity's listing currency, KES by default, never
+    converted). Nothing is rounded.
 
     Args:
         rows: One ticker's ``(trade_date, value)`` pairs, such as :class:`Observation` records,

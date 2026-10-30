@@ -395,6 +395,65 @@ async def _active(engine: AsyncEngine, query: str) -> int:
         return int((await connection.execute(_ACTIVE_STATEMENTS, {"query": query})).scalar_one())
 
 
+def _exception_of(task: asyncio.Task[Any]) -> BaseException | None:
+    """What the finished ``task`` raised: its exception, a ``CancelledError`` if it was cancelled,
+    or ``None`` if it returned. Retrieved, so asyncio never reports it as unretrieved."""
+    if task.cancelled():
+        return asyncio.CancelledError()
+    return task.exception()
+
+
+async def _wait_for_write(writing: asyncio.Event, seed: asyncio.Task[Any]) -> None:
+    """Return once ``writing`` is set, racing it against the ``seed`` task that sets it.
+
+    A seed that ends first fails the wait at once, with the seed's own exception as the cause;
+    ``TimeoutError`` follows after :data:`_WAIT_SECONDS` when neither happens.
+    """
+    signal = asyncio.create_task(writing.wait())
+    try:
+        await asyncio.wait(
+            {signal, seed}, timeout=_WAIT_SECONDS, return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        signal.cancel()
+        # Waited for, so it never outlives the test; asyncio.wait does not raise its cancellation.
+        await asyncio.wait({signal})
+    if writing.is_set():
+        return
+    if seed.done():
+        raise AssertionError("the seed ended before its write began") from _exception_of(seed)
+    raise TimeoutError(f"the seed's write did not begin within {_WAIT_SECONDS} s")
+
+
+async def _wait_for_slow_statement(engine: AsyncEngine, seed: asyncio.Task[Any]) -> None:
+    """Return once a server session of the database runs :data:`_SLOW_STATEMENT`.
+
+    A ``seed`` task that has ended fails the wait at once, with its own exception as the cause;
+    ``TimeoutError`` follows after :data:`_WAIT_SECONDS` otherwise.
+    """
+    async with asyncio.timeout(_WAIT_SECONDS):
+        while not await _active(engine, _SLOW_STATEMENT):
+            if seed.done():
+                raise AssertionError(
+                    "the seed ended before its slow statement ran on the server"
+                ) from _exception_of(seed)
+            await asyncio.sleep(0.05)
+
+
+async def _finish_seed(seed: asyncio.Task[Any]) -> None:
+    """End the ``seed`` task before the session it runs on closes, whatever stopped the test.
+
+    A task still running is cancelled and waited for, up to :data:`_WAIT_SECONDS`, never with
+    ``wait_for``, which on timeout cancels again and then waits without a bound. Its outcome is
+    retrieved once it is done, now or after the bound, so asyncio never reports it. Nothing of its
+    own is raised, so the test's failure, if any, stays the one reported.
+    """
+    if not seed.done():
+        seed.cancel()
+        await asyncio.wait({seed}, timeout=_WAIT_SECONDS)
+    seed.add_done_callback(_exception_of)
+
+
 async def test_cancelled_seed_records_a_failed_run_and_rolls_back(
     seeded_database: _SeededDatabase,
     monkeypatch: pytest.MonkeyPatch,
@@ -426,14 +485,19 @@ async def test_cancelled_seed_records_a_failed_run_and_rolls_back(
                 dataset=object(),  # type: ignore[arg-type]
             )
         )
-        await asyncio.wait_for(writing.wait(), _WAIT_SECONDS)
-        async with asyncio.timeout(_WAIT_SECONDS):
-            while not await _active(engine, _SLOW_STATEMENT):
-                await asyncio.sleep(0.05)
+        # The task owns the session until it ends, so it is ended before the session closes,
+        # however this block exits.
+        try:
+            await _wait_for_write(writing, task)
+            await _wait_for_slow_statement(engine, task)
 
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, _WAIT_SECONDS)
+            task.cancel()
+            await asyncio.wait({task}, timeout=_WAIT_SECONDS)
+            assert task.done(), f"the cancelled seed did not end within {_WAIT_SECONDS} s"
+            with pytest.raises(asyncio.CancelledError):
+                task.result()
+        finally:
+            await _finish_seed(task)
 
     assert await _active(engine, _SLOW_STATEMENT) == 0
     assert await _counts(engine) == counts_before

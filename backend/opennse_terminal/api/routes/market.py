@@ -171,13 +171,19 @@ async def get_screener(
 ) -> ScreenerResponse:
     """Value every equity as of ``as_of`` (default the latest stored trade date), filter and sort.
 
-    Each row carries the latest close (KES per share) and its change (%), market cap (KES),
-    EPS (KES per share), P/E, P/B and EV/EBITDA (x), dividend yield (percentage points), volume
-    (shares), turnover (KES), and the rolling ``z_window`` (default 20) volume and turnover
-    Z-scores. A row is an anomaly when a Z-score is at or above ``anomaly_threshold`` (default
-    2.0, positive side only). Banking equities have a null EV/EBITDA with
-    ``ev_not_meaningful_for_banks``. A null metric fails every filter on it; rows sort by ``sort``
-    (default ``market_cap_kes``) in ``order`` (default ``desc``). ``sector_aggregates`` holds one
+    Each row carries the latest close (per share) and that session's turnover in the equity's
+    ``currency`` (KES by default), never converted, with the close's change (%), the volume
+    (shares) and the rolling ``z_window`` (default 20) volume and turnover Z-scores. Market cap
+    (KES), EPS (KES per share), P/E, P/B and EV/EBITDA (x) and dividend yield (percentage
+    points) are computed in KES only: a non-KES equity has them all null with
+    ``currency_mismatch``, and a KES equity whose fundamentals are not in KES has all but the
+    market cap null with it. A row is an anomaly, and ``anomalies_only`` keeps it, when its
+    unrounded Z-score is at or above ``anomaly_threshold`` (default 2.0, positive side only).
+    Banking equities have a null EV/EBITDA with ``ev_not_meaningful_for_banks``. A null metric
+    fails every filter on it; rows sort by ``sort`` (default ``market_cap_kes``) in ``order``
+    (default ``desc``). The metric filters, ``min_volume_z`` included, and ``sort`` compare the
+    2 dp values shown: a raw volume Z-score of 1.996 shows ``volume_z`` 2.00 and passes
+    ``min_volume_z=2`` but is not an anomaly at threshold 2. ``sector_aggregates`` holds one
     entry per sector, independent of the filters.
 
     ``watchlist_id`` resolves only among the caller principal's own watchlists. Every parameter
@@ -235,7 +241,10 @@ async def get_valuation_bands(
     day carrying its close of up to 10 calendar days before. Null days are excluded. ``stats``
     (mean, sample deviation, mean +/- 1 and 2 deviations, quartiles, min, max and current, in x;
     ``current_percentile`` in percent) is present only when ``status`` is ``ok``, which needs at
-    least 60 daily values. ``series`` samples the last session of each ISO week, and
+    least 60 daily values. ``series`` is a weekly as-of transport sample: one point per ISO week
+    with a non-null daily value, dated on the week's last market session on or before ``as_of``
+    and carrying the week's latest non-null daily value, which may come from an earlier session
+    than that date; weeks without a value are omitted, and ``stats`` uses the daily values.
     ``coverage`` reports whether the data starts more than 7 days after the requested lookback
     start. Every parameter and bound is declared by ``ValuationBandsParams``; an unknown
     parameter is a standard 422.
@@ -265,12 +274,14 @@ async def get_anomalies(
 
     Each row is scored against up to ``window`` (default 20) of the ticker's own rows from the
     ``2 x window`` market sessions before it; sessions without a row are skipped, never
-    zero-filled. A row is a spike when its Z-score is at or above ``threshold`` (default 2.0);
-    negative Z-scores never are. ``value``, ``rolling_mean`` and ``rolling_stdev`` are in shares
-    for volume and KES for turnover, and ``z_score`` in standard deviations. Items sort by
-    ``trade_date`` descending, then ``z_score`` descending. Candidates are every equity, or
-    ``ticker``, or the equities of ``sector``. Every parameter and bound is declared by
-    ``AnomaliesParams``, the threshold as a ``Decimal``; an unknown parameter is a standard 422.
+    zero-filled. A row is a spike when its unrounded Z-score is at or above ``threshold``
+    (default 2.0); negative Z-scores never are. ``value``, ``rolling_mean`` and ``rolling_stdev``
+    are in shares for volume and, for turnover, in the equity's listing currency (KES by
+    default), as stored and never converted to KES; ``z_score`` is in standard deviations,
+    rounded to 2 dp after the spike test. Items sort by ``trade_date`` descending, then
+    ``z_score`` descending. Candidates are every equity whatever its currency, or ``ticker``, or
+    the equities of ``sector``. Every parameter and bound is declared by ``AnomaliesParams``, the
+    threshold as a ``Decimal``; an unknown parameter is a standard 422.
     """
     return await market_service.get_anomalies(
         session,

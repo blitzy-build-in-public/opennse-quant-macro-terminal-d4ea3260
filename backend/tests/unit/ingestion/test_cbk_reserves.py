@@ -1,11 +1,19 @@
 """Tests for the ``cbk_reserves`` pipeline (``opennse_terminal.ingestion.cbk.reserves``).
 
-Source: Central Bank of Kenya, Weekly Bulletin. The listing page and the 2026-02-06 bulletin are
-recorded fixtures (``fixtures/cbk/weekly_bulletin_page.html`` and
-``fixtures/cbk/weekly_bulletin_2026-02-06.pdf``); every other PDF is written in the test by
-``helpers.pdf_builder``. Full runs are served by respx at the real CBK URLs with
-``assert_all_mocked=True``, so nothing reaches the network, and the run's ``PoliteClient`` spaces
-its requests on a fake clock that only the fake sleep advances, so no test really waits.
+Source: Central Bank of Kenya, Weekly Bulletin. ``fixtures/cbk/weekly_bulletin_page.html`` is a
+trimmed capture of the live CBK listing page. ``fixtures/cbk/weekly_bulletin_2026-02-06.pdf`` is a
+generated, deterministic reconstruction of the 2026-02-06 bulletin written by
+``helpers.pdf_builder``: it reproduces the bulletin's text layout (the "Table 2" title, the
+``08-Jan-26`` to ``05-Feb-26`` date row and the reserves row beneath it), not a real bulletin's
+bytes, and a line on its page marks it as a reconstructed test fixture. Its five header dates and
+its first and last reserves values (12,384 and 12,387) are that bulletin's reference figures; the
+three middle-week values (12,341, 12,296 and 12,352) and the other rows are invented. Parser
+coverage of the real bulletin layout therefore rests on this reconstruction and on the ``live``
+test. Every other PDF is written in the test by the same helper.
+
+Full runs are served by respx at the real CBK URLs with ``assert_all_mocked=True``, so nothing
+reaches the network, and the run's ``PoliteClient`` spaces its requests on a fake clock that only
+the fake sleep advances, so no test really waits.
 
 Reserves are millions of USD and are compared as exact ``Decimal`` values: ``NUMERIC(14,2)``
 reads back ``Decimal("12384.00")``, which equals ``Decimal("12384")``.
@@ -87,7 +95,8 @@ EXPECTED_RESERVES: dict[date, Decimal] = {
     date(2026, 1, 29): Decimal("12352"),
     date(2026, 2, 5): Decimal("12387"),
 }
-"""The 2026-02-06 bulletin's reserves (USD million), keyed by their column header dates."""
+"""The reconstructed 2026-02-06 bulletin fixture's reserves (USD million), keyed by their column
+header dates; the three middle-week values are invented."""
 
 SEEDED_DATE = date(2026, 9, 30)
 SEEDED_RESERVES = Decimal("7850.00")
@@ -144,11 +153,11 @@ Responder = Callable[[httpx.Request], httpx.Response]
 class FakeCbk:
     """The CBK weekly-bulletin pages as respx serves them to one test.
 
-    ``robots.txt`` allows everything, the listing page is the recorded fixture, and every listed
-    bulletin URL serves ``pdf_content[url]``, by default the recorded 2026-02-06 bulletin (the
-    same bytes at every URL stand in for the other bulletins). Every request is appended to
-    ``log`` as ``(fake time, URL)`` when it reaches the mock, so spacing and request counts are
-    measured on the fake timeline.
+    ``robots.txt`` allows everything, the listing page is the captured listing fixture, and every
+    listed bulletin URL serves ``pdf_content[url]``, by default the reconstructed 2026-02-06
+    bulletin fixture (the same bytes at every URL stand in for the other bulletins). Every request
+    is appended to ``log`` as ``(fake time, URL)`` when it reaches the mock, so spacing and
+    request counts are measured on the fake timeline.
     """
 
     def __init__(self, router: respx.MockRouter, listing_html: str, bulletin: bytes) -> None:

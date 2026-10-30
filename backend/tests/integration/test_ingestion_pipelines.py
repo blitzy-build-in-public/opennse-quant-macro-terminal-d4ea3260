@@ -1749,14 +1749,16 @@ class _BlockingPipeline(_QuotePipeline):
 
 class _GatedStagePipeline(_QuotePipeline):
     """Records the thread each synchronous stage runs in; the ``gate`` stage (``parse`` or
-    ``validate``) then blocks its thread until the test sets ``release``."""
+    ``validate``) then sets ``entered`` on the event loop that built the pipeline, and blocks its
+    thread until the test sets ``release``."""
 
     name = "test_gated"
 
     def __init__(self, settings: TerminalSettings, *, gate: str, **options: Any) -> None:
         super().__init__(settings, **options)
         self.gate = gate
-        self.entered = threading.Event()
+        self._loop = asyncio.get_running_loop()
+        self.entered = asyncio.Event()
         self.release = threading.Event()
         self.threads: dict[str, int] = {}
         self.finished: list[str] = []
@@ -1764,7 +1766,9 @@ class _GatedStagePipeline(_QuotePipeline):
     def _enter(self, stage: str) -> None:
         self.threads[stage] = threading.get_ident()
         if stage == self.gate:
-            self.entered.set()
+            # asyncio.Event is not thread-safe, so it is set on its loop, where the test awaits it
+            # alongside the run's task.
+            self._loop.call_soon_threadsafe(self.entered.set)
             # Bounded, so a stage run on the event-loop thread fails the test instead of hanging.
             if not self.release.wait(timeout=10):
                 raise TimeoutError(f"{stage} was never released")
@@ -1822,6 +1826,90 @@ def _open_closing_clients(
 def _other_tasks() -> set[asyncio.Task[Any]]:
     """Tasks of the running loop other than the test's own: a finished run leaves none."""
     return asyncio.all_tasks() - {cast(asyncio.Task[Any], asyncio.current_task())}
+
+
+def _run_ended_early(run: asyncio.Task[Any], what: str) -> NoReturn:
+    """Fail the test because the finished ``run`` ended before ``what``, naming its outcome: the
+    exception it raised (also the failure's cause), or that it ended cancelled or returned."""
+    if run.cancelled():
+        pytest.fail(f"the run ended cancelled before {what}")
+    error = run.exception()
+    if error is not None:
+        raise AssertionError(f"the run raised {error!r} before {what}") from error
+    pytest.fail(f"the run returned {run.result()!r} before {what}")
+
+
+async def _stage_reached(stage: asyncio.Event, run: asyncio.Task[Any], what: str) -> None:
+    """Wait until ``stage`` is set, which ``run`` does on reaching ``what``.
+
+    The wait is bounded by ``WAIT_SECONDS`` and watches the run: a run that ends before setting
+    ``stage`` fails the test at once with its own outcome (:func:`_run_ended_early`). The
+    waiter's task is cancelled and awaited before this returns or raises, so it never outlives
+    the call.
+    """
+    if stage.is_set():
+        return
+    waiter = asyncio.create_task(stage.wait())
+    try:
+        await asyncio.wait({waiter, run}, timeout=WAIT_SECONDS, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        waiter.cancel()
+        await asyncio.wait({waiter})
+    if stage.is_set():
+        return
+    if run.done():
+        _run_ended_early(run, what)
+    pytest.fail(f"the run did not reach {what} within {WAIT_SECONDS:g} s")
+
+
+async def _run_result(run: asyncio.Task[RunResult]) -> RunResult:
+    """``run``'s result once it is done, or the exception it ended with raised
+    (``CancelledError`` when it ended cancelled), as ``await run`` gives them.
+
+    The wait is bounded by ``WAIT_SECONDS`` and never cancels ``run``: a run absorbs a
+    cancellation while one of its steps finishes, so cancelling a stuck run would not end it.
+    """
+    await asyncio.wait({run}, timeout=WAIT_SECONDS)
+    if not run.done():
+        pytest.fail(f"the run did not finish within {WAIT_SECONDS:g} s")
+    return run.result()
+
+
+async def _finish_run(
+    run: asyncio.Task[Any],
+    engine: _EngineDouble,
+    pipeline: Pipeline[Any, Any],
+    *,
+    before: set[asyncio.Task[Any]],
+) -> None:
+    """End whatever ``run`` still has in progress, however far the test got: the cleanup of a
+    test that started it, run from its ``finally``.
+
+    Cancelling a run cannot end a step it waits for through cancellation (the ``running``
+    insert, the commit, the final update, a ``parse`` or ``validate`` thread), so every gate
+    the test holds is released first: the engine's insert, update and commit holds and a gated
+    stage's ``release``. A run still pending is then cancelled at once, since some (a blocked
+    fetch, a client close that never returns) end only that way, and waited for, bounded by
+    ``WAIT_SECONDS``: a failing test reports promptly, and a run its test already awaited is
+    left as it ended. The tasks it left behind, not in ``before`` (shielded steps,
+    worker-thread stages), are waited for too, so no stage thread is still running. Each
+    finished task's outcome is consumed, so asyncio never reports it, and nothing is raised, so
+    a failing test reports its own failure.
+    """
+    for hold in (engine.insert_release, engine.update_release, engine.commit_release):
+        if hold is not None:
+            hold.set()
+    if isinstance(pipeline, _GatedStagePipeline):
+        pipeline.release.set()
+    if not run.done():
+        run.cancel()
+        await asyncio.wait({run}, timeout=WAIT_SECONDS)
+    left_behind = _other_tasks() - before
+    if left_behind:
+        await asyncio.wait(left_behind, timeout=WAIT_SECONDS)
+    for task in (run, *left_behind):
+        if task.done() and not task.cancelled():
+            task.exception()
 
 
 async def _execute(
@@ -3470,61 +3558,69 @@ async def test_cancelled_run_rolls_back_records_failed_and_reraises(
     settings: TerminalSettings, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.INFO, logger=LOGGER)
+    before = _other_tasks()
     engine = _EngineDouble()
     pipeline = _BlockingPipeline(settings, source_url=NSE_URL)
     task = asyncio.create_task(_execute(pipeline, engine, _HttpDouble(), trigger="schedule"))
-    await pipeline.fetch_started.wait()
+    try:
+        await _stage_reached(pipeline.fetch_started, task, "its fetch")
 
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await _run_result(task)
 
-    (data,) = engine.data_connections
-    assert (data.outcome, data.closed) == (ROLLED_BACK, True)
-    (insert,) = engine.inserts
-    run_id = insert.params["id"]
-    (update,) = engine.updates
-    assert update.params["id_1"] == run_id
-    assert update.params["status"] == "failed"
-    assert update.params["error_message"] == "cancelled"
-    assert (update.params["rows_fetched"], update.params["rows_written"]) == (0, 0)
-    assert update.params["rows_rejected"] == 0
-    assert update.params["source_url"] == NSE_URL
-    details = dict(update.params["details"])
-    _pop_duration(details)
-    assert details == {"source_url": NSE_URL}
-    (record,) = _warnings_and_errors(caplog)
-    assert (record.levelno, record.getMessage()) == (
-        logging.ERROR,
-        f"ingestion run {run_id} (test_blocking) failed: cancelled",
-    )
-    assert record.exc_info is None
+        (data,) = engine.data_connections
+        assert (data.outcome, data.closed) == (ROLLED_BACK, True)
+        (insert,) = engine.inserts
+        run_id = insert.params["id"]
+        (update,) = engine.updates
+        assert update.params["id_1"] == run_id
+        assert update.params["status"] == "failed"
+        assert update.params["error_message"] == "cancelled"
+        assert (update.params["rows_fetched"], update.params["rows_written"]) == (0, 0)
+        assert update.params["rows_rejected"] == 0
+        assert update.params["source_url"] == NSE_URL
+        details = dict(update.params["details"])
+        _pop_duration(details)
+        assert details == {"source_url": NSE_URL}
+        (record,) = _warnings_and_errors(caplog)
+        assert (record.levelno, record.getMessage()) == (
+            logging.ERROR,
+            f"ingestion run {run_id} (test_blocking) failed: cancelled",
+        )
+        assert record.exc_info is None
+    finally:
+        await _finish_run(task, engine, pipeline, before=before)
 
 
 async def test_cancelled_run_still_reraises_when_its_run_row_cannot_be_written(
     settings: TerminalSettings, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.INFO, logger=LOGGER)
+    before = _other_tasks()
     engine = _EngineDouble(fail_run_updates=True)
     pipeline = _BlockingPipeline(settings)
     task = asyncio.create_task(_execute(pipeline, engine, _HttpDouble()))
-    await pipeline.fetch_started.wait()
+    try:
+        await _stage_reached(pipeline.fetch_started, task, "its fetch")
 
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await _run_result(task)
 
-    run_id = engine.inserts[0].params["id"]
-    not_recorded, failed = _warnings_and_errors(caplog)
-    # The audit error is named by its type only: no message text and no traceback.
-    assert (not_recorded.levelno, not_recorded.getMessage()) == (
-        logging.ERROR,
-        f"could not record ingestion run {run_id} (test_blocking) as failed: RuntimeError",
-    )
-    assert not_recorded.exc_info is None
-    assert "run row update failed" not in caplog.text
-    assert failed.getMessage() == f"ingestion run {run_id} (test_blocking) failed: cancelled"
-    assert failed.exc_info is None
+        run_id = engine.inserts[0].params["id"]
+        not_recorded, failed = _warnings_and_errors(caplog)
+        # The audit error is named by its type only: no message text and no traceback.
+        assert (not_recorded.levelno, not_recorded.getMessage()) == (
+            logging.ERROR,
+            f"could not record ingestion run {run_id} (test_blocking) as failed: RuntimeError",
+        )
+        assert not_recorded.exc_info is None
+        assert "run row update failed" not in caplog.text
+        assert failed.getMessage() == f"ingestion run {run_id} (test_blocking) failed: cancelled"
+        assert failed.exc_info is None
+    finally:
+        await _finish_run(task, engine, pipeline, before=before)
 
 
 # --- Worker-thread stages, cancel-safe recording and the committed outcome --------------------
@@ -3534,25 +3630,29 @@ async def test_cancelled_run_still_reraises_when_its_run_row_cannot_be_written(
 async def test_parse_and_validate_run_in_a_worker_thread_while_the_loop_stays_free(
     settings: TerminalSettings, gate: str
 ) -> None:
+    before = _other_tasks()
     engine = _EngineDouble()
     pipeline = _GatedStagePipeline(settings, gate=gate, cells=["1.00", "2.00"])
     task = asyncio.create_task(_execute(pipeline, engine, _HttpDouble()))
-    assert await asyncio.to_thread(pipeline.entered.wait, 10)
+    try:
+        await _stage_reached(pipeline.entered, task, f"its {gate} stage")
 
-    # The gated stage holds its thread, yet timers and other coroutines keep running.
-    await asyncio.sleep(0.02)
-    assert not task.done()
-    pipeline.release.set()
-    result = await task
+        # The gated stage holds its thread, yet timers and other coroutines keep running.
+        await asyncio.sleep(0.02)
+        assert not task.done()
+        pipeline.release.set()
+        result = await _run_result(task)
 
-    assert result.status is RunStatus.SUCCEEDED
-    assert (result.rows_fetched, result.rows_written) == (2, 2)
-    assert pipeline.finished == ["parse", "validate"]
-    assert set(pipeline.threads) == {"parse", "validate"}
-    assert threading.get_ident() not in pipeline.threads.values()
-    # Still one data transaction, committed after both stages.
-    (data,) = engine.data_connections
-    assert data.outcome == COMMITTED
+        assert result.status is RunStatus.SUCCEEDED
+        assert (result.rows_fetched, result.rows_written) == (2, 2)
+        assert pipeline.finished == ["parse", "validate"]
+        assert set(pipeline.threads) == {"parse", "validate"}
+        assert threading.get_ident() not in pipeline.threads.values()
+        # Still one data transaction, committed after both stages.
+        (data,) = engine.data_connections
+        assert data.outcome == COMMITTED
+    finally:
+        await _finish_run(task, engine, pipeline, before=before)
 
 
 @pytest.mark.parametrize(
@@ -3574,66 +3674,74 @@ async def test_cancellation_waits_for_the_running_stage_then_rolls_back(
     engine = _EngineDouble()
     pipeline = _GatedStagePipeline(settings, gate=gate, cells=["1.00", "2.00"])
     task = asyncio.create_task(_execute(pipeline, engine, _HttpDouble()))
-    assert await asyncio.to_thread(pipeline.entered.wait, 10)
+    try:
+        await _stage_reached(pipeline.entered, task, f"its {gate} stage")
 
-    task.cancel()
-    await asyncio.sleep(0.01)
-    task.cancel()
-    await asyncio.sleep(0.01)
-    # The stage's thread cannot be interrupted: the run waits for it, transaction still open.
-    assert not task.done()
-    (data,) = engine.data_connections
-    assert data.outcome is None
-    assert engine.updates == []
+        task.cancel()
+        await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        # The stage's thread cannot be interrupted: the run waits for it, transaction still open.
+        assert not task.done()
+        (data,) = engine.data_connections
+        assert data.outcome is None
+        assert engine.updates == []
 
-    pipeline.release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+        pipeline.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await _run_result(task)
 
-    # The stage completed and its result was discarded; no later stage ran.
-    assert pipeline.finished == stages
-    assert set(pipeline.threads) == set(stages)
-    assert pipeline.upserts == []
-    assert (data.outcome, data.closed) == (ROLLED_BACK, True)
-    (update,) = engine.updates
-    assert (update.params["status"], update.params["error_message"]) == ("failed", "cancelled")
-    assert (update.params["rows_fetched"], update.params["rows_written"]) == (fetched, 0)
-    (record,) = _warnings_and_errors(caplog)
-    assert record.getMessage().endswith("(test_gated) failed: cancelled")
-    assert _other_tasks() == before
+        # The stage completed and its result was discarded; no later stage ran.
+        assert pipeline.finished == stages
+        assert set(pipeline.threads) == set(stages)
+        assert pipeline.upserts == []
+        assert (data.outcome, data.closed) == (ROLLED_BACK, True)
+        (update,) = engine.updates
+        assert (update.params["status"], update.params["error_message"]) == ("failed", "cancelled")
+        assert (update.params["rows_fetched"], update.params["rows_written"]) == (fetched, 0)
+        (record,) = _warnings_and_errors(caplog)
+        assert record.getMessage().endswith("(test_gated) failed: cancelled")
+        assert _other_tasks() == before
+    finally:
+        await _finish_run(task, engine, pipeline, before=before)
 
 
 async def test_cancellation_during_the_commit_lets_it_finish_and_keeps_the_committed_run(
     settings: TerminalSettings, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.INFO, logger=LOGGER)
+    before = _other_tasks()
     engine = _EngineDouble(hold_commit=True)
     pipeline = _QuotePipeline(settings, cells=["1.00", "2.00"])
     task = asyncio.create_task(_execute(pipeline, engine, _HttpDouble()))
-    await engine.commit_started.wait()
+    try:
+        await _stage_reached(engine.commit_started, task, "its commit")
 
-    task.cancel()
-    await asyncio.sleep(0)
-    task.cancel()
-    await asyncio.sleep(0)
-    assert not task.done()
-    assert engine.commit_release is not None
-    engine.commit_release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert engine.commit_release is not None
+        engine.commit_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await _run_result(task)
 
-    (data,) = engine.data_connections
-    assert data.outcome == COMMITTED
-    (update,) = engine.updates
-    assert (update.params["status"], update.params["error_message"]) == ("succeeded", None)
-    assert (update.params["rows_fetched"], update.params["rows_written"]) == (2, 2)
-    assert update.params["details"]["after_commit_error"] == "CancelledError"
-    (record,) = _warnings_and_errors(caplog)
-    run_id = engine.inserts[0].params["id"]
-    assert (record.levelno, record.getMessage()) == (
-        logging.WARNING,
-        f"ingestion run {run_id} (test_quotes) was interrupted after its data committed: cancelled",
-    )
+        (data,) = engine.data_connections
+        assert data.outcome == COMMITTED
+        (update,) = engine.updates
+        assert (update.params["status"], update.params["error_message"]) == ("succeeded", None)
+        assert (update.params["rows_fetched"], update.params["rows_written"]) == (2, 2)
+        assert update.params["details"]["after_commit_error"] == "CancelledError"
+        (record,) = _warnings_and_errors(caplog)
+        run_id = engine.inserts[0].params["id"]
+        assert (record.levelno, record.getMessage()) == (
+            logging.WARNING,
+            f"ingestion run {run_id} (test_quotes) was interrupted after its data committed: "
+            "cancelled",
+        )
+    finally:
+        await _finish_run(task, engine, pipeline, before=before)
 
 
 @pytest.mark.parametrize(
@@ -3646,25 +3754,29 @@ async def test_cancellation_during_the_commit_lets_it_finish_and_keeps_the_commi
 async def test_failed_commit_records_failed_with_nothing_written(
     settings: TerminalSettings, cancel: bool, message: str
 ) -> None:
+    before = _other_tasks()
     engine = _EngineDouble(fail_commit=True, hold_commit=cancel)
     pipeline = _QuotePipeline(settings, cells=["1.00", "2.00"])
     task = asyncio.create_task(_execute(pipeline, engine, _HttpDouble()))
-    if cancel:
-        await engine.commit_started.wait()
-        task.cancel()
-        await asyncio.sleep(0)
-        assert engine.commit_release is not None
-        engine.commit_release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-    else:
-        assert (await task).status is RunStatus.FAILED
+    try:
+        if cancel:
+            await _stage_reached(engine.commit_started, task, "its commit")
+            task.cancel()
+            await asyncio.sleep(0)
+            assert engine.commit_release is not None
+            engine.commit_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await _run_result(task)
+        else:
+            assert (await _run_result(task)).status is RunStatus.FAILED
 
-    (data,) = engine.data_connections
-    assert data.outcome == ROLLED_BACK
-    (update,) = engine.updates
-    assert (update.params["status"], update.params["error_message"]) == ("failed", message)
-    assert (update.params["rows_fetched"], update.params["rows_written"]) == (2, 0)
+        (data,) = engine.data_connections
+        assert data.outcome == ROLLED_BACK
+        (update,) = engine.updates
+        assert (update.params["status"], update.params["error_message"]) == ("failed", message)
+        assert (update.params["rows_fetched"], update.params["rows_written"]) == (2, 0)
+    finally:
+        await _finish_run(task, engine, pipeline, before=before)
 
 
 async def test_cancellation_during_the_final_update_still_records_the_true_status(
@@ -3675,30 +3787,33 @@ async def test_cancellation_during_the_final_update_still_records_the_true_statu
     engine = _EngineDouble(hold_update=True)
     pipeline = _QuotePipeline(settings, cells=["1.00", "abc", *(["2.00"] * 9)])
     task = asyncio.create_task(_execute(pipeline, engine, _HttpDouble()))
-    await engine.update_started.wait()
+    try:
+        await _stage_reached(engine.update_started, task, "its final update")
 
-    task.cancel()
-    await asyncio.sleep(0)
-    task.cancel()
-    await asyncio.sleep(0)
-    assert not task.done()
-    assert engine.update_release is not None
-    engine.update_release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert engine.update_release is not None
+        engine.update_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await _run_result(task)
 
-    (update,) = engine.updates
-    assert (update.params["status"], update.params["error_message"]) == ("partial", None)
-    assert (update.params["rows_written"], update.params["rows_rejected"]) == (10, 1)
-    # The update's own transaction committed: the row is not left running.
-    assert engine.connections[-1].kind == RUN_RECORD
-    assert engine.connections[-1].outcome == COMMITTED
-    assert _warnings_and_errors(caplog) == []
-    duration = update.params["details"]["duration_seconds"]
-    assert caplog.messages[-1].endswith(
-        f" status=partial fetched=11 written=10 rejected=1 duration={duration}s"
-    )
-    assert _other_tasks() == before
+        (update,) = engine.updates
+        assert (update.params["status"], update.params["error_message"]) == ("partial", None)
+        assert (update.params["rows_written"], update.params["rows_rejected"]) == (10, 1)
+        # The update's own transaction committed: the row is not left running.
+        assert engine.connections[-1].kind == RUN_RECORD
+        assert engine.connections[-1].outcome == COMMITTED
+        assert _warnings_and_errors(caplog) == []
+        duration = update.params["details"]["duration_seconds"]
+        assert caplog.messages[-1].endswith(
+            f" status=partial fetched=11 written=10 rejected=1 duration={duration}s"
+        )
+        assert _other_tasks() == before
+    finally:
+        await _finish_run(task, engine, pipeline, before=before)
 
 
 @pytest.mark.parametrize("fail_update", [False, True], ids=["recorded", "update-fails"])
@@ -3715,18 +3830,24 @@ async def test_repeated_cancellation_while_recording_a_cancelled_run_waits_for_t
         engine = _EngineDouble(hold_update=True, fail_run_updates=fail_update)
         pipeline = _BlockingPipeline(settings)
         task = asyncio.create_task(_execute(pipeline, engine, _HttpDouble()))
-        await pipeline.fetch_started.wait()
-        task.cancel()
-        await engine.update_started.wait()
-
-        for _ in range(3):
+        try:
+            await _stage_reached(pipeline.fetch_started, task, "its fetch")
             task.cancel()
-            await asyncio.sleep(0)
-        assert not task.done()
-        assert engine.update_release is not None
-        engine.update_release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+            await _stage_reached(engine.update_started, task, "its final update")
+
+            for _ in range(3):
+                task.cancel()
+                await asyncio.sleep(0)
+            assert not task.done()
+            assert engine.update_release is not None
+            engine.update_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await _run_result(task)
+            # Checked before the cleanup, which would wait for a task the run left behind.
+            assert _other_tasks() == before
+        finally:
+            await _finish_run(task, engine, pipeline, before=before)
+        # The cleanup is done and keeps no reference, so collecting the run frees its steps.
         del task
         gc.collect()
     finally:
@@ -3754,28 +3875,32 @@ async def test_repeated_cancellation_while_recording_a_cancelled_run_waits_for_t
 async def test_cancellation_while_the_running_row_is_inserted_still_finishes_the_row(
     settings: TerminalSettings,
 ) -> None:
+    before = _other_tasks()
     engine = _EngineDouble(hold_insert=True)
     pipeline = _QuotePipeline(settings, cells=["1.00"])
     task = asyncio.create_task(_execute(pipeline, engine, _HttpDouble()))
-    await engine.insert_started.wait()
+    try:
+        await _stage_reached(engine.insert_started, task, "its running insert")
 
-    task.cancel()
-    await asyncio.sleep(0)
-    task.cancel()
-    await asyncio.sleep(0)
-    assert not task.done()
-    assert engine.insert_release is not None
-    engine.insert_release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert engine.insert_release is not None
+        engine.insert_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await _run_result(task)
 
-    # No data transaction was started, and the committed running row was finished.
-    assert engine.data_connections == []
-    assert pipeline.contexts == []
-    (insert,) = engine.inserts
-    (update,) = engine.updates
-    assert update.params["id_1"] == insert.params["id"]
-    assert (update.params["status"], update.params["error_message"]) == ("failed", "cancelled")
+        # No data transaction was started, and the committed running row was finished.
+        assert engine.data_connections == []
+        assert pipeline.contexts == []
+        (insert,) = engine.inserts
+        (update,) = engine.updates
+        assert update.params["id_1"] == insert.params["id"]
+        assert (update.params["status"], update.params["error_message"]) == ("failed", "cancelled")
+    finally:
+        await _finish_run(task, engine, pipeline, before=before)
 
 
 @pytest.mark.parametrize(
@@ -3804,45 +3929,52 @@ async def test_cleanup_after_the_commit_keeps_the_committed_status_and_counts(
         return client
 
     monkeypatch.setattr(ingestion_http, "PoliteClient", open_client)
+    before = _other_tasks()
     engine = _EngineDouble()
     pipeline = _QuotePipeline(settings, cells=["abc", *(["1.00"] * 10)])
     task = asyncio.create_task(execute_pipeline(pipeline, cast(AsyncEngine, engine), trigger="cli"))
-    if close_error is None:
-        async with asyncio.timeout(5):
-            while not (clients and clients[0].closing.is_set()):
-                await asyncio.sleep(0)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        after_commit = "CancelledError"
-        logged = "cancelled"
-    else:
-        result = await task
-        assert (result.status, result.rows_written, result.error_message) == (
-            RunStatus.PARTIAL,
-            10,
-            None,
-        )
-        after_commit = logged = "RuntimeError"
+    try:
+        if close_error is None:
+            async with asyncio.timeout(5):
+                while not (clients and clients[0].closing.is_set()):
+                    if task.done():
+                        _run_ended_early(task, "closing its HTTP client")
+                    await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await _run_result(task)
+            after_commit = "CancelledError"
+            logged = "cancelled"
+        else:
+            result = await _run_result(task)
+            assert (result.status, result.rows_written, result.error_message) == (
+                RunStatus.PARTIAL,
+                10,
+                None,
+            )
+            after_commit = logged = "RuntimeError"
 
-    (client,) = clients
-    assert client.settings is settings
-    assert client.closing.is_set()
-    (data,) = engine.data_connections
-    assert data.outcome == COMMITTED
-    (update,) = engine.updates
-    assert (update.params["status"], update.params["error_message"]) == ("partial", None)
-    assert (update.params["rows_fetched"], update.params["rows_written"]) == (11, 10)
-    assert update.params["rows_rejected"] == 1
-    assert update.params["details"]["after_commit_error"] == after_commit
-    run_id = engine.inserts[0].params["id"]
-    (record,) = _warnings_and_errors(caplog)
-    assert (record.levelno, record.getMessage()) == (
-        logging.WARNING,
-        f"ingestion run {run_id} (test_quotes) was interrupted after its data committed: {logged}",
-    )
-    assert record.exc_info is None
-    assert "SECRET-CLOSE-MARKER" not in caplog.text
+        (client,) = clients
+        assert client.settings is settings
+        assert client.closing.is_set()
+        (data,) = engine.data_connections
+        assert data.outcome == COMMITTED
+        (update,) = engine.updates
+        assert (update.params["status"], update.params["error_message"]) == ("partial", None)
+        assert (update.params["rows_fetched"], update.params["rows_written"]) == (11, 10)
+        assert update.params["rows_rejected"] == 1
+        assert update.params["details"]["after_commit_error"] == after_commit
+        run_id = engine.inserts[0].params["id"]
+        (record,) = _warnings_and_errors(caplog)
+        assert (record.levelno, record.getMessage()) == (
+            logging.WARNING,
+            f"ingestion run {run_id} (test_quotes) was interrupted after its data committed: "
+            f"{logged}",
+        )
+        assert record.exc_info is None
+        assert "SECRET-CLOSE-MARKER" not in caplog.text
+    finally:
+        await _finish_run(task, engine, pipeline, before=before)
 
 
 @pytest.mark.parametrize(
@@ -3877,46 +4009,51 @@ async def test_cancellation_during_the_commit_is_reraised_when_cleanup_then_rais
             return await execute_pipeline(pipeline, cast(AsyncEngine, engine), trigger="cli")
 
     task = asyncio.create_task(run())
-    await engine.commit_started.wait()
-    if interrupt == "cancel":
-        task.cancel()
+    try:
+        await _stage_reached(engine.commit_started, task, "its commit")
+        if interrupt == "cancel":
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+        else:
+            (deadline,) = deadlines
+            deadline.reschedule(asyncio.get_running_loop().time())
+            async with asyncio.timeout(5):
+                while not deadline.expired():
+                    if task.done():
+                        _run_ended_early(task, "its deadline expired")
+                    await asyncio.sleep(0)
         await asyncio.sleep(0)
-        task.cancel()
-    else:
-        (deadline,) = deadlines
-        deadline.reschedule(asyncio.get_running_loop().time())
-        async with asyncio.timeout(5):
-            while not deadline.expired():
-                await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    # The commit is still held, so the run is waiting for it rather than abandoning it.
-    assert not task.done()
-    assert engine.commit_release is not None
-    engine.commit_release.set()
-    with pytest.raises(raised):
-        await task
+        # The commit is still held, so the run is waiting for it rather than abandoning it.
+        assert not task.done()
+        assert engine.commit_release is not None
+        engine.commit_release.set()
+        with pytest.raises(raised):
+            await _run_result(task)
 
-    assert task.cancelled() is (interrupt == "cancel")
-    (client,) = clients
-    assert client.closing.is_set()
-    (data,) = engine.data_connections
-    assert (data.outcome, data.closed) == (COMMITTED, True)
-    (update,) = engine.updates
-    assert (update.params["status"], update.params["error_message"]) == ("succeeded", None)
-    assert (update.params["rows_fetched"], update.params["rows_written"]) == (2, 2)
-    details = dict(update.params["details"])
-    _pop_duration(details)
-    assert details == {"after_commit_error": "RuntimeError"}
-    run_id = engine.inserts[0].params["id"]
-    (record,) = _warnings_and_errors(caplog)
-    assert (record.levelno, record.getMessage()) == (
-        logging.WARNING,
-        f"ingestion run {run_id} (test_quotes) was interrupted after its data committed: "
-        "RuntimeError",
-    )
-    assert all(entry.exc_info is None for entry in caplog.records)
-    assert "SECRET-CLOSE-MARKER" not in caplog.text
-    assert _other_tasks() == before
+        assert task.cancelled() is (interrupt == "cancel")
+        (client,) = clients
+        assert client.closing.is_set()
+        (data,) = engine.data_connections
+        assert (data.outcome, data.closed) == (COMMITTED, True)
+        (update,) = engine.updates
+        assert (update.params["status"], update.params["error_message"]) == ("succeeded", None)
+        assert (update.params["rows_fetched"], update.params["rows_written"]) == (2, 2)
+        details = dict(update.params["details"])
+        _pop_duration(details)
+        assert details == {"after_commit_error": "RuntimeError"}
+        run_id = engine.inserts[0].params["id"]
+        (record,) = _warnings_and_errors(caplog)
+        assert (record.levelno, record.getMessage()) == (
+            logging.WARNING,
+            f"ingestion run {run_id} (test_quotes) was interrupted after its data committed: "
+            "RuntimeError",
+        )
+        assert all(entry.exc_info is None for entry in caplog.records)
+        assert "SECRET-CLOSE-MARKER" not in caplog.text
+        assert _other_tasks() == before
+    finally:
+        await _finish_run(task, engine, pipeline, before=before)
 
 
 @pytest.mark.parametrize(
@@ -3942,51 +4079,51 @@ async def test_cancellation_before_the_commit_is_reraised_when_cleanup_then_rais
     clients = _open_closing_clients(monkeypatch, RuntimeError("close failed: SECRET-CLOSE-MARKER"))
     engine = _EngineDouble()
     pipeline: _QuotePipeline
+    reached: asyncio.Event
     if stage == "fetch":
         blocking = _BlockingPipeline(settings, cells=["1.00", "2.00"])
-        pipeline = blocking
-        task = asyncio.create_task(
-            execute_pipeline(pipeline, cast(AsyncEngine, engine), trigger="cli")
-        )
-        await blocking.fetch_started.wait()
-        task.cancel()
+        pipeline, reached = blocking, blocking.fetch_started
     else:
         gated = _GatedStagePipeline(settings, gate=stage, cells=["1.00", "2.00"])
-        pipeline = gated
-        task = asyncio.create_task(
-            execute_pipeline(pipeline, cast(AsyncEngine, engine), trigger="cli")
-        )
-        assert await asyncio.to_thread(gated.entered.wait, 10)
+        pipeline, reached = gated, gated.entered
+    task = asyncio.create_task(execute_pipeline(pipeline, cast(AsyncEngine, engine), trigger="cli"))
+    try:
+        await _stage_reached(reached, task, f"its {stage} stage")
         task.cancel()
-        await asyncio.sleep(0.01)
-        gated.release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+        if isinstance(pipeline, _GatedStagePipeline):
+            await asyncio.sleep(0.01)
+            pipeline.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await _run_result(task)
 
-    assert task.cancelled()
-    (client,) = clients
-    assert client.closing.is_set()
-    assert pipeline.upserts == []
-    (data,) = engine.data_connections
-    assert (data.outcome, data.closed) == (ROLLED_BACK, True)
-    (update,) = engine.updates
-    assert (update.params["status"], update.params["error_message"]) == ("failed", "cancelled")
-    assert (update.params["rows_fetched"], update.params["rows_written"]) == (fetched, 0)
-    details = dict(update.params["details"])
-    _pop_duration(details)
-    assert details == {"error_during_cancellation": "RuntimeError"}
-    run_id = engine.inserts[0].params["id"]
-    name = pipeline.run_name
-    assert [(record.levelno, record.getMessage()) for record in _warnings_and_errors(caplog)] == [
-        (
-            logging.WARNING,
-            f"ingestion run {run_id} ({name}) was cancelled; unwinding it raised RuntimeError",
-        ),
-        (logging.ERROR, f"ingestion run {run_id} ({name}) failed: cancelled"),
-    ]
-    assert all(entry.exc_info is None for entry in caplog.records)
-    assert "SECRET-CLOSE-MARKER" not in caplog.text
-    assert _other_tasks() == before
+        assert task.cancelled()
+        (client,) = clients
+        assert client.closing.is_set()
+        assert pipeline.upserts == []
+        (data,) = engine.data_connections
+        assert (data.outcome, data.closed) == (ROLLED_BACK, True)
+        (update,) = engine.updates
+        assert (update.params["status"], update.params["error_message"]) == ("failed", "cancelled")
+        assert (update.params["rows_fetched"], update.params["rows_written"]) == (fetched, 0)
+        details = dict(update.params["details"])
+        _pop_duration(details)
+        assert details == {"error_during_cancellation": "RuntimeError"}
+        run_id = engine.inserts[0].params["id"]
+        name = pipeline.run_name
+        assert [
+            (record.levelno, record.getMessage()) for record in _warnings_and_errors(caplog)
+        ] == [
+            (
+                logging.WARNING,
+                f"ingestion run {run_id} ({name}) was cancelled; unwinding it raised RuntimeError",
+            ),
+            (logging.ERROR, f"ingestion run {run_id} ({name}) failed: cancelled"),
+        ]
+        assert all(entry.exc_info is None for entry in caplog.records)
+        assert "SECRET-CLOSE-MARKER" not in caplog.text
+        assert _other_tasks() == before
+    finally:
+        await _finish_run(task, engine, pipeline, before=before)
 
 
 @pytest.mark.parametrize(
@@ -4015,25 +4152,28 @@ async def test_a_running_row_that_was_never_inserted_ends_the_call_cancelled(
     engine = _EngineDouble(hold_insert=cancel, insert_error=insert_error)
     pipeline = _QuotePipeline(settings, cells=["1.00"])
     task = asyncio.create_task(_execute(pipeline, engine, _HttpDouble()))
-    if cancel:
-        await engine.insert_started.wait()
-        task.cancel()
-        await asyncio.sleep(0)
-        assert not task.done()
-        assert engine.insert_release is not None
-        engine.insert_release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    try:
+        if cancel:
+            await _stage_reached(engine.insert_started, task, "its running insert")
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            assert engine.insert_release is not None
+            engine.insert_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await _run_result(task)
 
-    # The insert's own transaction rolled back; no data connection was opened.
-    (run_record,) = engine.connections
-    assert (run_record.kind, run_record.outcome) == (RUN_RECORD, ROLLED_BACK)
-    assert engine.updates == []
-    assert pipeline.contexts == []
-    assert [record.getMessage() for record in _warnings_and_errors(caplog)] == logged
-    assert all(entry.exc_info is None for entry in caplog.records)
-    assert "SECRET-INSERT-MARKER" not in caplog.text
-    assert _other_tasks() == before
+        # The insert's own transaction rolled back; no data connection was opened.
+        (run_record,) = engine.connections
+        assert (run_record.kind, run_record.outcome) == (RUN_RECORD, ROLLED_BACK)
+        assert engine.updates == []
+        assert pipeline.contexts == []
+        assert [record.getMessage() for record in _warnings_and_errors(caplog)] == logged
+        assert all(entry.exc_info is None for entry in caplog.records)
+        assert "SECRET-INSERT-MARKER" not in caplog.text
+        assert _other_tasks() == before
+    finally:
+        await _finish_run(task, engine, pipeline, before=before)
 
 
 def _raised_from(error: FetchFailed, cause: BaseException) -> FetchFailed:
@@ -5764,6 +5904,433 @@ def test_help_of_seed_is_the_seeders_own(capsys: pytest.CaptureFixture[str]) -> 
     assert out.startswith("usage: opennse-terminal seed [-h] [--database-url URL]\n")
     assert "TERMINAL_DATABASE_URL (or .env in the working directory)" in " ".join(out.split())
     assert 'README.md, section "Configuration"' not in " ".join(out.split())
+
+
+# --- ingest, import and scheduler dispatch --------------------------------------------------
+
+# The exit code of a recorded run by its final status, as the console script documents it.
+# Written out rather than read from cli.EXIT_CODES, so a changed mapping fails here; any other
+# status, running included, exits 1.
+_EXIT_CODE_BY_STATUS = MappingProxyType(
+    {
+        "succeeded": 0,
+        "partial": 0,
+        "no_new_data": 0,
+        "failed": 1,
+        "layout_changed": 3,
+        "blocked_by_robots": 4,
+        "ambiguous_session": 5,
+        "running": 1,
+    }
+)
+# The run order of ingest cbk.
+_CBK_RUN_ORDER = ("cbk_rates_csv", "cbk_inflation", "cbk_fx", "cbk_bonds", "cbk_reserves")
+_CLI_RUN_ID = uuid.UUID("6d1f0c4e-2b7a-4e59-9c3d-8a5b7e1f2c40")
+_SCHEDULER_MODULE = "opennse_terminal.ingestion.scheduler"
+# A database URL with the leak marker (_LEAK_MARKER, defined with the boundary tests below) as
+# its password, filled in when a test runs.
+_MARKED_URL_TEMPLATE = "postgresql+asyncpg://u:{marker}@127.0.0.1:1/x"
+
+
+@dataclass(frozen=True)
+class _PipelineCall:
+    """One ``registry.run_pipeline`` call, as the ``ingest`` handler made it."""
+
+    name: str
+    settings: TerminalSettings
+    trigger: RunTrigger
+    trade_date: date | None
+    limit: int | None
+    spacing: HostSpacing | None
+
+
+def _cli_run_result(pipeline: str, status: str) -> RunResult:
+    """A recorded run of ``pipeline`` ending ``status``: 7 rows fetched, 5 written, 2 rejected.
+
+    Its ``error_message`` carries the leak marker, which the outcome line must not repeat.
+    """
+    return RunResult(
+        run_id=_CLI_RUN_ID,
+        pipeline=pipeline,
+        status=RunStatus(status),
+        rows_fetched=7,
+        rows_written=5,
+        rows_rejected=2,
+        error_message=f"lost {_MARKED_DATABASE_URL}",
+        details={},
+    )
+
+
+def _outcome_line(label: str, pipeline: str, status: str, exit_code: int) -> str:
+    """The one INFO line the console script logs for a run returned by ``_cli_run_result``."""
+    return (
+        f"{label}: pipeline={pipeline} status={status} exit_code={exit_code} fetched=7 "
+        "written=5 rejected=2 run_id=6d1f0c4e-2b7a-4e59-9c3d-8a5b7e1f2c40"
+    )
+
+
+def _record_pipeline_runs(
+    monkeypatch: pytest.MonkeyPatch, outcomes: Mapping[str, str | type[Exception]]
+) -> list[_PipelineCall]:
+    """Replace ``registry.run_pipeline`` with a recorder, and return the calls it records.
+
+    A call returns ``_cli_run_result`` with the status ``outcomes`` gives its name, or raises the
+    exception type given instead, its text carrying the leak marker. No pipeline, engine or run
+    row is created. ``TERMINAL_DATABASE_URL`` is set to ``_UNREACHABLE_DATABASE_URL``.
+    """
+    calls: list[_PipelineCall] = []
+
+    async def run_pipeline(
+        name: str,
+        settings: TerminalSettings,
+        *,
+        trigger: RunTrigger,
+        trade_date: date | None = None,
+        limit: int | None = None,
+        spacing: HostSpacing | None = None,
+    ) -> RunResult:
+        calls.append(_PipelineCall(name, settings, trigger, trade_date, limit, spacing))
+        outcome = outcomes[name]
+        if isinstance(outcome, str):
+            return _cli_run_result(name, outcome)
+        raise outcome(f"the run row could not be written to {_MARKED_DATABASE_URL}")
+
+    monkeypatch.setenv("TERMINAL_DATABASE_URL", _UNREACHABLE_DATABASE_URL)
+    # _ingest looks run_pipeline up on the registry module when it runs, so it calls the fake.
+    monkeypatch.setattr(registry, "run_pipeline", run_pipeline)
+    return calls
+
+
+def _assert_no_leak(caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]) -> None:
+    """Neither a log line nor stdout or stderr carries the leak marker."""
+    captured = capsys.readouterr()
+    for output in (caplog.text, captured.out, captured.err):
+        assert _LEAK_MARKER not in output
+
+
+def test_cli_dispatch_scheduler_runs_run_forever_with_the_environment_settings(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``scheduler`` calls ``ingestion.scheduler.run_forever`` once, with ``TerminalSettings``
+    read from the environment, and exits 0 when it returns after a stop signal."""
+    calls: list[TerminalSettings | None] = []
+
+    def run_forever(settings: TerminalSettings | None = None) -> None:
+        calls.append(settings)
+
+    monkeypatch.setenv("TERMINAL_DATABASE_URL", _UNREACHABLE_DATABASE_URL)
+    # _cmd_scheduler imports run_forever when it runs, so it calls the fake.
+    monkeypatch.setattr(f"{_SCHEDULER_MODULE}.run_forever", run_forever)
+    caplog.set_level(logging.INFO)
+
+    assert cli.main(["scheduler"]) == 0
+
+    (settings,) = calls
+    assert isinstance(settings, TerminalSettings)
+    assert settings.database_url == _UNREACHABLE_DATABASE_URL
+    assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
+
+
+@pytest.mark.parametrize(
+    ("argv", "database_url", "error_type", "error_text", "exit_code", "runs", "error", "usage"),
+    [
+        pytest.param(
+            ["scheduler"],
+            _MARKED_URL_TEMPLATE,
+            RuntimeError,
+            "job store lost on " + _MARKED_URL_TEMPLATE,
+            1,
+            1,
+            re.escape("scheduler stopped on an error: RuntimeError"),
+            None,
+            id="error-named-by-type",
+        ),
+        pytest.param(
+            ["scheduler"],
+            _MARKED_URL_TEMPLATE,
+            OSError,
+            f"cannot reach 127.0.0.1:1\r\n{_FORGED_RECORD}",
+            1,
+            1,
+            re.escape(
+                f"scheduler stopped on an error: cannot reach 127.0.0.1:1\\r\\n{_FORGED_RECORD}"
+            ),
+            None,
+            id="os-error-text-escaped",
+        ),
+        pytest.param(
+            ["scheduler"],
+            "postgresql://u:{marker}@127.0.0.1:1/x",
+            None,
+            "",
+            1,
+            0,
+            r"invalid terminal settings: (?s:.*)database_url must use the asyncpg driver(?s:.*)",
+            None,
+            id="invalid-settings",
+        ),
+        pytest.param(
+            ["scheduler", "extra"],
+            _MARKED_URL_TEMPLATE,
+            None,
+            "",
+            2,
+            0,
+            None,
+            f"{cli.PROG}: error: unrecognized arguments: extra\n",
+            id="extra-argument",
+        ),
+    ],
+)
+def test_cli_dispatch_scheduler_failure_exits_non_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    database_url: str,
+    error_type: type[Exception] | None,
+    error_text: str,
+    exit_code: int,
+    runs: int,
+    error: str | None,
+    usage: str | None,
+) -> None:
+    """A scheduler that raises exits 1 after one ERROR line: an ``OSError`` with its text
+    escaped, anything else by its type only. Invalid settings exit 1 with one ERROR line and an
+    extra argument exits 2 through argparse, both before the scheduler is started. The database
+    password reaches no log line or stream.
+
+    ``database_url`` and ``error_text`` are templates whose ``{marker}`` is the leak marker;
+    ``error`` is the pattern the one ERROR line matches in full, ``usage`` the end of stderr.
+    """
+    calls: list[TerminalSettings | None] = []
+
+    def run_forever(settings: TerminalSettings | None = None) -> None:
+        calls.append(settings)
+        if error_type is not None:
+            raise error_type(error_text.format(marker=_LEAK_MARKER))
+
+    monkeypatch.setenv("TERMINAL_DATABASE_URL", database_url.format(marker=_LEAK_MARKER))
+    monkeypatch.setattr(f"{_SCHEDULER_MODULE}.run_forever", run_forever)
+    caplog.set_level(logging.INFO)
+
+    assert cli.main(argv) == exit_code
+
+    assert len(calls) == runs
+    errors = [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert [record.name for record in errors] == ([] if error is None else [_CLI_LOGGER])
+    if error is not None:
+        assert re.fullmatch(error, errors[0].getMessage()), errors[0].getMessage()
+        assert errors[0].exc_info is None
+    captured = capsys.readouterr()
+    if usage is None:
+        assert "error:" not in captured.err
+    else:
+        assert captured.err.endswith(usage)
+    for output in (caplog.text, captured.out, captured.err):
+        assert _LEAK_MARKER not in output
+        assert "Traceback" not in output
+
+
+@pytest.mark.parametrize(
+    ("argv", "label", "pipeline"),
+    [
+        pytest.param(["ingest", "cbk_fx"], "ingest cbk_fx", "cbk_fx", id="ingest"),
+        pytest.param(
+            ["import", "daily_prices", "{csv}"],
+            "import daily_prices",
+            "csv_import:daily_prices",
+            id="import",
+        ),
+    ],
+)
+@pytest.mark.parametrize("status", list(RunStatus), ids=str)
+def test_cli_dispatch_run_status_becomes_the_documented_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    status: RunStatus,
+    argv: list[str],
+    label: str,
+    pipeline: str,
+) -> None:
+    """A recorded run's status is the exit code of ``ingest NAME`` and ``import KIND PATH``
+    alike: succeeded, partial and no_new_data 0, failed 1, layout_changed 3, blocked_by_robots
+    4, ambiguous_session 5, and running 1. The run is logged as one INFO line with its counts and
+    run id, never its error message."""
+    exit_code = _EXIT_CODE_BY_STATUS[status]
+    csv_path = write_csv(tmp_path, "prices.csv", "ticker,trade_date,close_price,volume", [])
+    imports: list[tuple[str, str | Path, str | None, str | None, RunTrigger]] = []
+
+    async def import_file(
+        kind: str,
+        path: str | Path,
+        sheet: str | None = None,
+        *,
+        settings: TerminalSettings | None = None,
+        trigger: RunTrigger = "cli",
+    ) -> RunResult:
+        url = None if settings is None else settings.database_url
+        imports.append((kind, path, sheet, url, trigger))
+        return _cli_run_result(f"csv_import:{kind}", status)
+
+    runs = _record_pipeline_runs(monkeypatch, {"cbk_fx": status})
+    # _cmd_import imports import_file when it runs, so it calls the fake.
+    monkeypatch.setattr(tabular_import, "import_file", import_file)
+    caplog.set_level(logging.INFO, logger=_CLI_LOGGER)
+
+    assert cli.main([token.format(csv=csv_path) for token in argv]) == exit_code
+
+    if argv[0] == "ingest":
+        assert [(run.name, run.trigger) for run in runs] == [("cbk_fx", "cli")]
+        assert imports == []
+    else:
+        assert runs == []
+        assert imports == [("daily_prices", csv_path, None, _UNREACHABLE_DATABASE_URL, "cli")]
+    assert [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.name == _CLI_LOGGER
+    ] == [(logging.INFO, _outcome_line(label, pipeline, status, exit_code))]
+    _assert_no_leak(caplog, capsys)
+
+
+@pytest.mark.parametrize(
+    ("runs", "exit_code", "summary"),
+    [
+        pytest.param(
+            [
+                ("succeeded", 0),
+                ("partial", 0),
+                ("no_new_data", 0),
+                ("succeeded", 0),
+                ("partial", 0),
+            ],
+            0,
+            "ingest cbk: exit_code=0 (cbk_rates_csv=0, cbk_inflation=0, cbk_fx=0, cbk_bonds=0, "
+            "cbk_reserves=0)",
+            id="every-run-exits-0",
+        ),
+        pytest.param(
+            [
+                ("succeeded", 0),
+                ("layout_changed", 3),
+                ("failed", 1),
+                ("blocked_by_robots", 4),
+                ("succeeded", 0),
+            ],
+            3,
+            "ingest cbk: exit_code=3 (cbk_rates_csv=0, cbk_inflation=3, cbk_fx=1, cbk_bonds=4, "
+            "cbk_reserves=0)",
+            id="first-non-zero-neither-last-nor-largest",
+        ),
+        pytest.param(
+            [
+                ("succeeded", 0),
+                ("succeeded", 0),
+                ("no_new_data", 0),
+                ("succeeded", 0),
+                ("blocked_by_robots", 4),
+            ],
+            4,
+            "ingest cbk: exit_code=4 (cbk_rates_csv=0, cbk_inflation=0, cbk_fx=0, cbk_bonds=0, "
+            "cbk_reserves=4)",
+            id="only-the-last-run-fails",
+        ),
+        pytest.param(
+            [
+                ("succeeded", 0),
+                (RuntimeError, 1),
+                ("layout_changed", 3),
+                ("succeeded", 0),
+                ("succeeded", 0),
+            ],
+            1,
+            "ingest cbk: exit_code=1 (cbk_rates_csv=0, cbk_inflation=1, cbk_fx=3, cbk_bonds=0, "
+            "cbk_reserves=0)",
+            id="a-raising-run-counts-1-and-the-rest-still-run",
+        ),
+    ],
+)
+def test_cli_dispatch_ingest_cbk_runs_five_pipelines_and_exits_with_the_first_non_zero_code(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    runs: list[tuple[str | type[Exception], int]],
+    exit_code: int,
+    summary: str,
+) -> None:
+    """``ingest cbk`` makes one ``run_pipeline`` call per CBK pipeline, in the order
+    cbk_rates_csv, cbk_inflation, cbk_fx, cbk_bonds, cbk_reserves, each triggered ``cli`` with no
+    trade date or limit, the environment's settings and one ``HostSpacing`` shared by all five.
+
+    ``runs`` gives each run's status, or the exception type its call raises, with the exit code
+    that run counts. Each run logs its outcome line, a raising run one ERROR line by type, and the
+    sequence always runs to the end; the command then logs the summary and exits with the code of
+    the first run that did not exit 0, or 0.
+    """
+    outcomes = dict(zip(_CBK_RUN_ORDER, (outcome for outcome, _code in runs), strict=True))
+    calls = _record_pipeline_runs(monkeypatch, outcomes)
+    caplog.set_level(logging.INFO, logger=_CLI_LOGGER)
+
+    assert cli.main(["ingest", "cbk"]) == exit_code
+
+    assert [call.name for call in calls] == list(_CBK_RUN_ORDER)
+    options = [(call.trigger, call.trade_date, call.limit) for call in calls]
+    assert options == [("cli", None, None)] * 5
+    assert [call.settings.database_url for call in calls] == [_UNREACHABLE_DATABASE_URL] * 5
+    spacing = calls[0].spacing
+    assert isinstance(spacing, HostSpacing)
+    assert all(call.spacing is spacing for call in calls)
+    expected: list[tuple[int, str]] = []
+    for name, (outcome, code) in zip(_CBK_RUN_ORDER, runs, strict=True):
+        if isinstance(outcome, str):
+            expected.append((logging.INFO, _outcome_line(f"ingest {name}", name, outcome, code)))
+        else:
+            line = f"ingest {name}: the run could not be recorded: {outcome.__name__}"
+            expected.append((logging.ERROR, line))
+    expected.append((logging.INFO, summary))
+    assert [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.name == _CLI_LOGGER
+    ] == expected
+    _assert_no_leak(caplog, capsys)
+
+
+@pytest.mark.parametrize(
+    ("argv", "trade_date", "limit"),
+    [
+        pytest.param(
+            ["ingest", "nse_market_statistics", "--trade-date", "2026-10-27"],
+            date(2026, 10, 27),
+            None,
+            id="trade-date",
+        ),
+        pytest.param(["ingest", "cbk_reserves", "--limit", "5"], None, 5, id="limit"),
+        pytest.param(["ingest", "cbk_fx"], None, None, id="no-options"),
+    ],
+)
+def test_cli_dispatch_ingest_forwards_its_options_to_one_run(
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    trade_date: date | None,
+    limit: int | None,
+) -> None:
+    """``ingest NAME`` makes one ``run_pipeline`` call for NAME, triggered ``cli``, with
+    ``--trade-date`` as a ``date`` and ``--limit`` as an ``int``, each ``None`` when not given,
+    the environment's settings and a ``HostSpacing``; its succeeded run exits 0."""
+    name = argv[1]
+    calls = _record_pipeline_runs(monkeypatch, {name: "succeeded"})
+
+    assert cli.main(argv) == 0
+
+    (call,) = calls
+    assert (call.name, call.trigger) == (name, "cli")
+    assert (call.trade_date, call.limit) == (trade_date, limit)
+    assert call.settings.database_url == _UNREACHABLE_DATABASE_URL
+    assert isinstance(call.spacing, HostSpacing)
 
 
 # --- import path check ----------------------------------------------------------------------

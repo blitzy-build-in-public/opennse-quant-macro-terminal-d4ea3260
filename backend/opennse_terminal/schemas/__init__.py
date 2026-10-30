@@ -10,6 +10,7 @@ like every other module in the package.
 from opennse_terminal.schemas.common import (
     ERROR_CODES,
     FLAG_CODES,
+    CanonicalDecimalText,
     CoverageMeta,
     ErrorCode,
     ErrorDetail,
@@ -177,6 +178,7 @@ __all__ = [
     "BandStats",
     "BandsStatus",
     "Candidate",
+    "CanonicalDecimalText",
     "ComparablesResult",
     "CoverageMeta",
     "CycleMarker",

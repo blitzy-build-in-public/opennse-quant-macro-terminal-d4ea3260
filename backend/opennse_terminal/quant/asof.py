@@ -3,7 +3,9 @@
 Every quant module takes these plain records rather than ORM rows, so formulas stay free of I/O and
 are testable with literals. Units follow the database columns they mirror:
 
-* ``*_kes`` fields are whole Kenyan shillings (KES, the default currency), never thousands;
+* ``*_kes`` fields are whole Kenyan shillings (KES, the default currency), never thousands; a
+  non-KES ticker's :class:`PriceRow` close, turnover and foreign net flow are in its listing
+  currency, never converted;
 * ``*_pct`` fields are percentage points, so ``Decimal("6.80")`` means 6.80%;
 * volumes are integer share counts.
 
@@ -68,11 +70,14 @@ class PriceRow:
     Attributes:
         ticker: Exchange ticker, for example ``"SCOM"``.
         trade_date: Session date in Africa/Nairobi.
-        close_price: Closing price in KES per share.
+        close_price: Closing price per share, in the ticker's listing currency (KES by default),
+            never converted.
         volume: Shares traded.
-        turnover_kes: Value traded in KES.
-        foreign_net_flow_kes: Foreign investors' net purchases in KES (positive means net
-            buying), or ``None`` where the session has no flow data.
+        turnover_kes: Value traded, in the ticker's listing currency (KES by default), never
+            converted.
+        foreign_net_flow_kes: Foreign investors' net purchases (positive means net buying), in
+            the ticker's listing currency (KES by default), never converted, or ``None`` where
+            the session has no flow data.
     """
 
     ticker: str

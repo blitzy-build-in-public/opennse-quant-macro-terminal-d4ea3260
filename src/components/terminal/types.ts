@@ -70,7 +70,11 @@ export interface FastApiValidationItem {
   loc: (string | number)[];
   /** Human-readable message. */
   msg: string;
-  /** The rejected input value, when FastAPI includes it. */
+  /**
+   * The rejected value; for a field missing from a supplied object, the containing object as
+   * sent, for example `{"tickers": []}` for a watchlist body without `name`. Null when a whole
+   * parameter or the whole body is absent.
+   */
   input?: unknown;
 }
 
@@ -126,9 +130,12 @@ export type TenorLabel = "91D" | "182D" | "364D" | "2Y" | "5Y" | "10Y" | "15Y" |
 /** Instrument behind a yield-curve point: a CBK Treasury bill or an FXD Treasury bond. */
 export type Instrument = "tbill" | "bond";
 
-/** One month-end row of the policy, interbank and T-bill rate history, in percentage points. */
+/** One stored row of the policy, interbank and T-bill rate history, in percentage points. */
 export interface RatesPoint {
-  /** Month-end of the reference month. */
+  /**
+   * Date the observation is stored under, unchanged: a month-end for CBK and seeded rates, the
+   * row's own date (possibly mid-month) for a CSV or Excel import.
+   */
   observation_date: string;
   /** Central Bank Rate (%). */
   cbr_rate_pct: DecimalString | null;
@@ -250,11 +257,20 @@ export interface ScreenerFilters {
   max_ev_ebitda?: DecimalString;
   /** Minimum dividend yield in percentage points (`"5.00"` means 5%), inclusive. */
   min_dividend_yield?: DecimalString;
-  /** Minimum rolling volume Z-score (standard deviations), inclusive. */
+  /**
+   * Minimum rolling volume Z-score (standard deviations), inclusive, compared with the 2 dp
+   * `volume_z` shown; the anomaly flags compare the unrounded score instead.
+   */
   min_volume_z?: DecimalString;
-  /** Keep only rows with a positive volume or turnover spike at the threshold. Default false. */
+  /**
+   * Keep only rows with `is_volume_anomaly` or `is_turnover_anomaly`: an unrounded Z-score at or
+   * above the threshold, positive side only. Default false.
+   */
   anomalies_only?: boolean;
-  /** Spike threshold in standard deviations, 0.5 to 10. Default `"2.0"`. */
+  /**
+   * Spike threshold in standard deviations, 0.5 to 10: an unrounded Z-score at or above it is an
+   * anomaly. Default `"2.0"`.
+   */
   anomaly_threshold?: DecimalString;
   /** Rolling Z-score window N in the ticker's own prior rows, 5 to 250. Default 20. */
   z_window?: number;
@@ -278,11 +294,17 @@ export interface ScreenerRow {
   company_name: string;
   /** Sector name as stored, for example `Banking`. */
   sector: string;
-  /** ISO 4217 code of the equity's prices and fundamentals; KES by default. */
+  /**
+   * ISO 4217 code of the equity's listing currency, KES by default; `close_price` and
+   * `turnover_kes` are in it, never converted. The computed metrics are KES-only and flag
+   * `currency_mismatch` otherwise: a non-KES equity has a null `market_cap_kes`, and a non-KES
+   * equity or non-KES fundamentals give null `eps_kes`, `pe`, `pb`, `ev_ebitda`,
+   * `dividend_yield_pct` and `fundamentals_period_end`.
+   */
   currency: string;
   /** Date of the latest close on or before `as_of`. */
   trade_date: string;
-  /** Closing price on `trade_date`, KES per share. */
+  /** Closing price per share on `trade_date`, in `currency` (KES by default), never converted. */
   close_price: DecimalString;
   /** Change from the previous close, %; null without one (`change_pct:no_previous_close`). */
   change_pct: DecimalString | null;
@@ -300,15 +322,22 @@ export interface ScreenerRow {
   dividend_yield_pct: DecimalString | null;
   /** Shares traded on `trade_date`. */
   volume: number;
-  /** Value traded on `trade_date`, KES. */
+  /** Value traded on `trade_date`, in `currency` (KES by default) as stored, never converted. */
   turnover_kes: DecimalString;
   /** Rolling volume Z-score on `trade_date` (standard deviations). */
   volume_z: DecimalString | null;
   /** Rolling turnover Z-score on `trade_date` (standard deviations). */
   turnover_z: DecimalString | null;
-  /** True when `volume_z` is at or above the threshold (positive side only). */
+  /**
+   * True when the unrounded volume Z-score is at or above the threshold (positive side only).
+   * Comparing the 2 dp `volume_z` instead can differ: raw 1.996 shows `"2.00"` yet is not an
+   * anomaly at threshold 2.
+   */
   is_volume_anomaly: boolean;
-  /** True when `turnover_z` is at or above the threshold (positive side only). */
+  /**
+   * True when the unrounded turnover Z-score is at or above the threshold (positive side only);
+   * comparing the 2 dp `turnover_z` instead can differ, as for `is_volume_anomaly`.
+   */
   is_turnover_anomaly: boolean;
   /** Free float as a percentage of shares outstanding. */
   free_float_pct: DecimalString | null;
@@ -362,7 +391,11 @@ export interface ScreenerResponse {
   sector_aggregates: SectorAggregate[];
 }
 
-/** Period boundaries of the sector heatmap: month-ends or Fridays. */
+/**
+ * Period boundaries of the sector heatmap: the last market session on or before each month-end
+ * or each Friday, with `as_of` replacing a month-end or Friday after it. The latest period is
+ * thus clamped to `as_of` and can be month-to-date or week-to-date.
+ */
 export type HeatmapInterval = "month" | "week";
 
 /** Capitalization-weighted return of one sector, or of the market, over one period. */
@@ -387,7 +420,13 @@ export interface SectorHeatmapRow {
 
 /** Body of `GET /market/sector-heatmap`. */
 export interface SectorHeatmapResponse {
-  /** Last period boundary. */
+  /**
+   * Cutoff of the latest period: the requested `as_of`, else the latest stored trade date, else
+   * the current date in the configured timezone (`TERMINAL_TIMEZONE`, Africa/Nairobi by default)
+   * when no price exists (with empty lists). It is not itself a boundary: `period_ends` holds
+   * observed market sessions, so an `as_of` that is not one (a weekend, a holiday, a date past
+   * the data) differs from the last `period_ends` entry.
+   */
   as_of: string;
   /** Period length. */
   interval: HeatmapInterval;
@@ -460,7 +499,12 @@ export interface ValuationBandsResponse {
   status: BandsStatus;
   /** Reason codes for null or qualified values. */
   flags: string[];
-  /** The multiple (×) on the last market session of each ISO week, ascending. */
+  /**
+   * Weekly as-of transport sample of the multiple (×), ascending: one point per ISO week with a
+   * non-null daily value, dated on the week's last market session on or before `as_of` and
+   * carrying the week's latest non-null daily value, which may come from an earlier session than
+   * that date. Weeks without a value are omitted; `stats` uses the daily values.
+   */
   series: SeriesPoint[];
   /** Band statistics; null for every status other than `ok`. */
   stats: BandStats | null;
@@ -469,7 +513,7 @@ export interface ValuationBandsResponse {
 /** Metrics the anomaly feed scans (query value); `both` scans volume and turnover. */
 export type AnomalyMetric = "volume" | "turnover" | "both";
 
-/** One positive volume or turnover spike: a Z-score at or above the threshold. */
+/** One positive volume or turnover spike: an unrounded Z-score at or above the threshold. */
 export interface AnomalyItem {
   /** NSE ticker symbol. */
   ticker: string;
@@ -477,11 +521,15 @@ export interface AnomalyItem {
   trade_date: string;
   /** The metric that spiked. */
   metric: "volume" | "turnover";
-  /** The metric on `trade_date`: shares for volume, KES for turnover. */
+  /**
+   * The metric on `trade_date`: shares for volume, or for turnover the value traded in the
+   * equity's listing currency (KES by default); a non-KES equity's turnover is scored and
+   * returned as stored, never converted to KES.
+   */
   value: DecimalString;
-  /** Mean of the prior window, in the metric's unit. */
+  /** Mean of the prior window, in `value`'s unit (shares, or the listing currency for turnover). */
   rolling_mean: DecimalString;
-  /** Sample standard deviation of the prior window, in the metric's unit. */
+  /** Sample standard deviation of the prior window, in `value`'s unit. */
   rolling_stdev: DecimalString;
   /** Z-score of `value` against the window (standard deviations). */
   z_score: DecimalString;
@@ -495,7 +543,7 @@ export interface AnomaliesResponse {
   window: number;
   /** Spike threshold used, in standard deviations. */
   threshold: DecimalString;
-  /** Spikes with z ≥ threshold. */
+  /** Spikes whose unrounded Z-score is ≥ threshold. */
   items: AnomalyItem[];
 }
 
@@ -968,7 +1016,11 @@ export interface DerivationEntry {
   value: DecimalString;
 }
 
-/** One conflicting match of an `ambiguous` item; at most five are returned per item. */
+/**
+ * One candidate of an `ambiguous` item: the token selected on one of its matched lines, or one of
+ * the value tokens offered by a matched line whose column evidence selected no single readable
+ * token. At most five are returned per item.
+ */
 export interface Candidate {
   /** Statement label of the matching line, as printed. */
   label: string;
@@ -976,7 +1028,12 @@ export interface Candidate {
   page_number: number;
   /** The numeric token exactly as printed in the PDF text layer, for example `"(1,234)"`. */
   raw_value: string;
-  /** The token after sign handling and scale normalization; null when it is not a number. */
+  /**
+   * The token after sign handling and scale normalization; null when it is not a well-formed
+   * number or its scaled amount is not a valid value for the item: a monetary amount whose
+   * magnitude reaches 10^22 once rounded to 2 places (beyond the NUMERIC(24,2) fundamentals
+   * columns), or a share count that is fractional, negative or above 10^12.
+   */
   value: DecimalString | null;
 }
 
@@ -993,7 +1050,10 @@ export interface ExtractedItem {
   /**
    * Value after scale normalization: whole units of the filing's currency for monetary items, a
    * share count for `shares_outstanding`. For `ambiguous`, the first match on the primary
-   * statement page, null when that match has no single readable token; null for `not_found`.
+   * statement page (else the first match) when equal-priority matches conflict, but null when no
+   * valid amount could be selected or derived: column evidence selected no single readable token,
+   * the amount is not a valid value for the item (see {@link Candidate}), or an EBITDA derivation
+   * has an ambiguous part or a sum beyond the NUMERIC(24,2) range. Null for `not_found`.
    */
   value: DecimalString | null;
   /**
@@ -1017,7 +1077,7 @@ export interface ExtractedItem {
   matched_label: string | null;
   /** Component lines summed into a `derived` value; empty for other statuses. */
   derivation: DerivationEntry[];
-  /** Up to five conflicting matches of an `ambiguous` item; empty otherwise. */
+  /** Up to five candidates of an `ambiguous` item (see {@link Candidate}); empty otherwise. */
   candidates: Candidate[];
 }
 
@@ -1088,7 +1148,13 @@ export interface Watchlist {
   tickers: string[];
   /** Creation timestamp (ISO 8601 with UTC offset). */
   created_at: string;
-  /** Timestamp of the last ticker addition or removal (ISO 8601 with UTC offset). */
+  /**
+   * Creation time, or the time of the latest tracked change (ISO 8601 with UTC offset): an
+   * update of the watchlist row through the ORM, or a ticker actually added or removed by `PUT`
+   * or `DELETE /watchlists/{watchlist_id}/items/{ticker}` (an idempotent no-op is not one). Item
+   * rows changed directly in the database, such as by the cascade when an equity's ticker is
+   * renamed or the equity is deleted, change `tickers` without advancing it.
+   */
   updated_at: string;
 }
 

@@ -112,7 +112,11 @@ class Watchlist(TerminalResponseModel):
     )
     updated_at: dt.datetime = Field(
         description=(
-            "When the watchlist or its tickers last changed (ISO 8601 timestamp with UTC "
-            "offset); advanced only by a real item addition or removal."
+            "Creation time, or the time of the latest tracked change (ISO 8601 timestamp with UTC "
+            "offset). Tracked changes are an update of the watchlist row through SQLAlchemy (the "
+            "column's onupdate) and a ticker actually added or removed by PUT or DELETE "
+            "/watchlists/{watchlist_id}/items/{ticker}; an idempotent no-op is not one. Item rows "
+            "changed directly in the database, such as by the cascade when an equity's ticker is "
+            "renamed or the equity is deleted, change tickers without advancing it."
         ),
     )

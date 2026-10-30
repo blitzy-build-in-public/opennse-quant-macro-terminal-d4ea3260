@@ -20,7 +20,8 @@ import type {
 /** Props of {@link AnomalyFeed}. */
 export interface AnomalyFeedProps extends TerminalWidgetProps {
   /**
-   * Metric to scan: `"volume"` (shares), `"turnover"` (KES) or `"both"`. Default `"both"`.
+   * Metric to scan: `"volume"` (shares), `"turnover"` (value traded, in the equity's listing
+   * currency, KES by default) or `"both"`. Default `"both"`.
    */
   metric?: AnomalyMetric;
   /**
@@ -122,9 +123,10 @@ const METRIC_BADGES: Record<AnomalyItem["metric"], { label: string; className: s
 };
 
 /**
- * An amount in the spiking metric's unit: a share count for volume, KES for turnover. The `z`
- * kind has no unit affixes, so with `unit: false` it yields the exact grouped digits of the count
- * (a 2 dp window mean keeps its fraction).
+ * An amount in the spiking metric's unit: a share count for volume, or for turnover the value
+ * traded in the equity's listing currency (KES by default). The `z` kind has no unit affixes, so
+ * with `unit: false` it yields the exact grouped digits of the count (a 2 dp window mean keeps
+ * its fraction).
  */
 function formatAmount(value: DecimalString, metric: AnomalyItem["metric"]): string {
   return metric === "volume"

@@ -25,8 +25,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
+from itertools import pairwise
 from typing import Any, Protocol
 
+import httpx
 import pytest
 import respx
 from sqlalchemy import select
@@ -132,6 +134,20 @@ class FakeSleep:
         await asyncio.sleep(0)
 
 
+Responder = Callable[[httpx.Request], httpx.Response]
+
+
+def logged(clock: FakeClock, log: list[tuple[float, str]], respond: Responder) -> Responder:
+    """``respond``, first appending ``(fake time, URL)`` to ``log`` as each request reaches the
+    mock, so request starts are measured on the fake timeline."""
+
+    def side_effect(request: httpx.Request) -> httpx.Response:
+        log.append((clock(), str(request.url)))
+        return respond(request)
+
+    return side_effect
+
+
 class SeededDatabase(Protocol):
     """The parts of the root conftest's ``DatabaseHandle`` these tests use."""
 
@@ -149,6 +165,8 @@ class Served:
     result: RunResult
     robots_requests: int
     page_requests: int
+    # Every request in the order it reached the mock, as (fake time at its start, URL).
+    requests: tuple[tuple[float, str], ...]
     delays: tuple[float, ...]
 
 
@@ -161,12 +179,18 @@ class MacroRow:
 
 
 async def run(handle: SeededDatabase, html: str) -> Served:
-    """Run ``cbk_inflation`` once, end to end, with respx serving ``html`` at its real URL."""
+    """Run ``cbk_inflation`` once, end to end, with respx serving ``html`` at its real URL and
+    logging the fake time at which each request starts."""
     clock = FakeClock()
     sleep = FakeSleep(clock)
+    log: list[tuple[float, str]] = []
     with respx.mock(assert_all_called=False, assert_all_mocked=True) as router:
-        robots = router.get(CBK_ROBOTS_URL).respond(200, text=ALLOW_ALL)
-        page = router.get(INFLATION_URL).respond(200, html=html)
+        robots = router.get(CBK_ROBOTS_URL).mock(
+            side_effect=logged(clock, log, lambda _request: httpx.Response(200, text=ALLOW_ALL))
+        )
+        page = router.get(INFLATION_URL).mock(
+            side_effect=logged(clock, log, lambda _request: httpx.Response(200, html=html))
+        )
         async with PoliteClient(handle.settings, sleep=sleep, clock=clock) as client:
             result = await execute_pipeline(
                 CbkInflationPipeline(handle.settings), handle.engine, trigger="cli", http=client
@@ -175,6 +199,7 @@ async def run(handle: SeededDatabase, html: str) -> Served:
         result=result,
         robots_requests=robots.call_count,
         page_requests=page.call_count,
+        requests=tuple(log),
         delays=tuple(sleep.delays),
     )
 
@@ -450,11 +475,19 @@ def test_parse_raises_layout_changed_without_the_table() -> None:
 
 
 def assert_one_polite_request(served: Served) -> None:
-    """The run read ``robots.txt`` once, then requested the page once after the per-host
-    spacing, which the fake sleep absorbed."""
+    """The run read ``robots.txt`` once, then requested the page once, and each request to the
+    CBK host started at least ``SPACING_SECONDS`` after the one before it on the fake clock.
+
+    The mocked site answers in no fake time, so the client's single spacing wait, which the fake
+    sleep absorbed, is the whole interval: exactly ``SPACING_SECONDS``, putting the page's start
+    exactly that far after the start of ``robots.txt``.
+    """
     assert (served.robots_requests, served.page_requests) == (1, 1)
-    assert served.delays
-    assert all(0 < delay <= SPACING_SECONDS for delay in served.delays)
+    assert [url for _, url in served.requests] == [CBK_ROBOTS_URL, INFLATION_URL]
+    starts = [at for at, _ in served.requests]
+    assert all(later - earlier >= SPACING_SECONDS for earlier, later in pairwise(starts))
+    assert served.delays == (SPACING_SECONDS,)
+    assert starts[1] - starts[0] == SPACING_SECONDS
 
 
 async def test_layout_change_ends_the_run_without_writing(
@@ -554,6 +587,7 @@ async def test_one_shifted_row_is_rejected_and_its_month_keeps_the_seeded_value(
     assert result.details["rejected"] == [
         {"index": 1, "reason": "long_row", "row": SHIFTED_ANCHOR_CELLS}
     ]
+    assert_one_polite_request(served)
     recorded = await run_row(engine, result.run_id)
     assert (recorded.status, recorded.rows_rejected) == ("partial", 1)
 
@@ -648,6 +682,7 @@ async def test_rerun_leaves_every_value_and_its_provenance_identical(
     engine = seeded_database.engine
     first = await run(seeded_database, page)
     assert first.result.status is RunStatus.SUCCEEDED
+    assert_one_polite_request(first)
     once = await macro_snapshot(engine)
 
     second = await run(seeded_database, page)
@@ -655,6 +690,9 @@ async def test_rerun_leaves_every_value_and_its_provenance_identical(
     assert second.result.status is RunStatus.SUCCEEDED
     assert second.result.rows_rejected == 0
     assert second.result.rows_fetched == first.result.rows_fetched
+    # The re-run builds its own client and fake clock, so it reads robots.txt again and is spaced
+    # on its own timeline.
+    assert_one_polite_request(second)
     assert await macro_snapshot(engine) == once
     async with AsyncSession(engine) as session:
         runs = (

@@ -24,7 +24,7 @@ from typing import Final, Literal
 
 from pydantic import Field
 
-from opennse_terminal.config import DEFAULT_CURRENCY
+from opennse_terminal.config import DEFAULT_CURRENCY, MAX_SHARE_COUNT
 from opennse_terminal.schemas.common import TerminalResponseModel
 
 __all__ = [
@@ -115,7 +115,9 @@ class DerivationEntry(TerminalResponseModel):
 
 
 class Candidate(TerminalResponseModel):
-    """One conflicting match of an ``ambiguous`` item; at most five are returned per item."""
+    """One candidate of an ``ambiguous`` item: the token selected on one of its matched lines,
+    or one of the value tokens offered by a matched line whose column evidence selected no
+    single readable token. At most five are returned per item."""
 
     label: str = Field(description="Statement label of the matching line, as printed.")
     page_number: int = Field(description="1-based PDF page of the matching line.")
@@ -128,7 +130,10 @@ class Candidate(TerminalResponseModel):
     value: Decimal | None = Field(
         description=(
             "The token after sign handling and scale normalization, as a decimal string; "
-            "null when it could not be read as a number."
+            "null when the token is not a well-formed number or its scaled amount is not a valid "
+            "value for the item: a monetary amount whose magnitude reaches 10^22 once rounded to "
+            "2 places (beyond the NUMERIC(24,2) fundamentals columns), or a share count that is "
+            f"fractional, negative or above {MAX_SHARE_COUNT:,}."
         ),
     )
 
@@ -151,7 +156,11 @@ class ExtractedItem(TerminalResponseModel):
         description=(
             "Value after scale normalization as a decimal string: whole units of the filing's "
             "currency for monetary items, a share count for shares_outstanding. For ambiguous, "
-            "the first match on the primary statement page; null for not_found."
+            "the first match on the primary statement page (else the first match) when "
+            "equal-priority matches conflict, but null when no valid amount could be selected "
+            "or derived: column evidence selected no single readable token, the amount is not "
+            "a valid value for the item (see Candidate.value), or an EBITDA derivation has an "
+            "ambiguous part or a sum beyond the NUMERIC(24,2) range. Null for not_found."
         ),
     )
     unit: ItemUnit = Field(
@@ -184,7 +193,7 @@ class ExtractedItem(TerminalResponseModel):
     )
     candidates: list[Candidate] = Field(
         default_factory=list,
-        description="Up to five conflicting matches of an ambiguous item; empty otherwise.",
+        description="Up to five candidates of an ambiguous item (see Candidate); empty otherwise.",
     )
 
 

@@ -5,7 +5,9 @@ Every request goes through ``httpx.MockTransport`` backed by a respx router crea
 Spacing and backoff run on a fake monotonic clock that only the fake sleep advances, so no test
 really waits. Expected values are literals from the politeness contract (the user agent, 2.0 s
 per-host spacing, 3 retries, 2^n s plus up to 1 s of jitter capped at 60 s, 5 redirects and the
-response size cap), compared with explicit bounds rather than float equality.
+response size cap), compared with explicit bounds rather than float equality. The exception is
+backoff with its jitter pinned to one end of its range: every such wait, the 60 s cap included,
+is a whole number of seconds, so it is compared exactly.
 """
 
 import asyncio
@@ -94,6 +96,18 @@ class FakeSleep:
     def reset(self) -> None:
         """Forget the waits recorded so far, so a test can isolate the ones that follow."""
         self.delays.clear()
+
+
+class PinnedJitter:
+    """Stands in for the ``random`` module of ``opennse_terminal.ingestion.http`` to fix the
+    backoff jitter: every ``uniform(low, high)`` draw lands ``fraction`` of the way from ``low``
+    to ``high``, so 0.0 pins the lower end of the range and 1.0 the upper."""
+
+    def __init__(self, fraction: float) -> None:
+        self.fraction = fraction
+
+    def uniform(self, low: float, high: float) -> float:
+        return low + self.fraction * (high - low)
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,11 +199,9 @@ def assert_spaced(starts: list[float], interval: float = 2.0) -> None:
 
 
 def assert_backoff(delays: list[float]) -> None:
-    """Waits before retries 1, 2 and 3: 2^n s plus up to 1 s of jitter."""
-    bounds = [(2.0, 3.0), (4.0, 5.0), (8.0, 9.0)]
-    assert len(delays) <= len(bounds)
-    for delay, (low, high) in zip(delays, bounds, strict=False):
-        assert low <= delay <= high
+    """Waits before retries 1, 2, 3 and on: 2^n s plus up to 1 s of jitter, capped at 60 s."""
+    for attempt, delay in enumerate(delays, start=1):
+        assert min(60.0, 2.0**attempt) <= delay <= min(60.0, 2.0**attempt + 1.0)
 
 
 def warnings_logged(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -636,6 +648,78 @@ async def test_configured_retry_count_bounds_the_attempts(
 
     assert caught.value.reason == "http_503"
     assert page.call_count == calls
+
+
+@pytest.mark.parametrize(
+    ("attempt", "jitter", "retry_after", "expected"),
+    [
+        pytest.param(5, 0.0, None, 32.0, id="attempt-5-least-jitter-under-the-cap"),
+        pytest.param(5, 1.0, None, 33.0, id="attempt-5-most-jitter-under-the-cap"),
+        pytest.param(6, 0.0, None, 60.0, id="attempt-6-least-jitter-capped"),
+        pytest.param(6, 1.0, None, 60.0, id="attempt-6-most-jitter-capped"),
+        pytest.param(7, 0.0, None, 60.0, id="attempt-7-least-jitter-capped"),
+        pytest.param(7, 1.0, None, 60.0, id="attempt-7-most-jitter-capped"),
+        pytest.param(10, 0.0, None, 60.0, id="attempt-10-least-jitter-capped"),
+        pytest.param(10, 1.0, None, 60.0, id="attempt-10-most-jitter-capped"),
+        pytest.param(6, 1.0, 120.0, 60.0, id="retry-after-over-the-cap"),
+        pytest.param(6, 1.0, 0.0, 0.0, id="retry-after-zero-replaces-the-backoff"),
+    ],
+)
+def test_backoff_is_2_to_the_attempt_plus_jitter_capped_at_60_s(
+    attempt: int,
+    jitter: float,
+    retry_after: float | None,
+    expected: float,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(polite_http, "random", PinnedJitter(jitter))
+
+    assert polite_http._backoff_seconds(attempt, retry_after) == expected
+
+
+@pytest.mark.parametrize(
+    ("jitter", "waits"),
+    [
+        pytest.param(0.0, [2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0], id="least-jitter"),
+        pytest.param(1.0, [3.0, 5.0, 9.0, 17.0, 33.0, 60.0, 60.0], id="most-jitter"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        pytest.param(httpx.Response(503), "http_503", id="503"),
+        pytest.param(httpx.ConnectTimeout, "ConnectTimeout after 8 attempts", id="connect-timeout"),
+    ],
+)
+async def test_backoff_from_the_sixth_retry_on_waits_the_60_s_cap(
+    failure: httpx.Response | type[httpx.TransportError],
+    reason: str,
+    jitter: float,
+    waits: list[float],
+    network: FakeNetwork,
+    make_client: ClientFactory,
+    clock: FakeClock,
+    sleep: FakeSleep,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(polite_http, "random", PinnedJitter(jitter))
+    network.robots(CBK)
+    # 7 retries make 8 attempts; uncapped, the waits after attempts 6 and 7 would pass 60 s.
+    page = network.router.get(INFLATION_URL).mock(side_effect=[failure] * 8)
+    # Default 2.0 s spacing: with robots.txt read and its spacing long past, every wait that
+    # follows is a backoff, none of which is shorter than the spacing.
+    async with make_client(scraper_max_retries=7) as http:
+        await http.ensure_allowed(INFLATION_URL)
+        clock.advance(10.0)
+        sleep.reset()
+        with pytest.raises(FetchFailed) as caught:
+            await http.fetch(INFLATION_URL)
+
+    assert caught.value.reason == reason
+    assert page.call_count == 8
+    assert sleep.delays == waits
+    starts = network.starts(INFLATION_URL)
+    assert [later - earlier for earlier, later in pairwise(starts)] == waits
 
 
 @pytest.mark.parametrize(

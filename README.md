@@ -211,9 +211,13 @@ docker/                  postgres-init.sql (creates opennse_test)
 - Values are rounded once, at the response boundary, with `ROUND_HALF_UP`: 2 decimal places for
   KES, prices, ratios, percentages and Z-scores, 6 for discount factors.
 - JSON carries decimals as strings, already rounded (`"offer_price_kes": "7.50"`). Requests accept a
-  string or a number. The widgets format the string itself and convert to a number only for chart
+  number or a string of plain ASCII decimal text (`"7.50"`, `"-3"`, `".5"`, `"7.5e0"`); a string
+  with whitespace, `_` separators or non-ASCII digits is refused with the standard 422 entry
+  `decimal_parsing`. The widgets format the string itself and convert to a number only for chart
   coordinates.
 - Share counts and volumes are JSON integers of at most 10^12, so they stay exact in JavaScript.
+  Request share counts and `forecast_years` accept only a JSON integer: a boolean, string or float
+  is the standard 422 entry `int_type`.
 - An undefined metric is `null` with reason codes in `flags` (for example `pe_negative_earnings`,
   `ev_not_meaningful_for_banks`), never zero.
 - Units: `*_pct` columns are percentage points (`6.80` means 6.80%), `*_kes` columns are whole KES,

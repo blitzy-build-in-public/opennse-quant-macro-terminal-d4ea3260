@@ -1440,6 +1440,8 @@ QUICKMART: dict[str, object] = {
 }
 
 FINITE_NUMBER_MSG = "Input should be a finite number"
+INT_TYPE_MSG = "Input should be a valid integer"
+DECIMAL_PARSING_MSG = "Input should be a valid decimal"
 STRING_TYPE_MSG = "Input should be a valid string"
 JSON_NESTING_ERROR = "JSON nesting exceeds the 200-level limit"
 LONE_SURROGATE_ERROR = "JSON text contains an unpaired UTF-16 surrogate"
@@ -1543,13 +1545,14 @@ async def post_raw(client: httpx.AsyncClient, path: str, body: bytes) -> httpx.R
             },
             id="extra_member_NaN",
         ),
+        # Share counts are strict integers, so a NaN is refused as a non-integer, not as NaN.
         pytest.param(
             IPO,
             quickmart_raw(shares_outstanding="NaN"),
             {
-                "type": "finite_number",
+                "type": "int_type",
                 "loc": ["body", "shares_outstanding"],
-                "msg": FINITE_NUMBER_MSG,
+                "msg": INT_TYPE_MSG,
                 "input": "NaN",
             },
             id="shares_outstanding_NaN",
@@ -1676,6 +1679,158 @@ def test_custom_error_type_survives_non_finite_rendering() -> None:
         },
         {"type": "finite_number", "loc": ["amount"], "msg": FINITE_NUMBER_MSG, "input": "NaN"},
     ]
+
+
+# ---------------------------------------------------------------------------------------------
+# Canonical numbers: share counts are JSON integers, decimal strings are ASCII decimal text
+# ---------------------------------------------------------------------------------------------
+
+# Messages of the standard 422 entries that carry no context.
+CONTEXT_FREE_MESSAGES: Final[dict[str, str]] = {
+    "int_type": INT_TYPE_MSG,
+    "decimal_parsing": DECIMAL_PARSING_MSG,
+    "finite_number": FINITE_NUMBER_MSG,
+}
+
+
+@pytest.mark.parametrize("prefix", BOTH_PREFIXES)
+@pytest.mark.parametrize(
+    ("member", "raw", "loc", "error_type", "rejected"),
+    [
+        pytest.param("shares_offered", "true", [], "int_type", True, id="shares_offered_true"),
+        pytest.param("shares_offered", "false", [], "int_type", False, id="shares_offered_false"),
+        pytest.param(
+            "shares_offered",
+            '"5_0000_0000"',
+            [],
+            "int_type",
+            "5_0000_0000",
+            id="shares_offered_underscored_string",
+        ),
+        pytest.param(
+            "shares_outstanding",
+            '"1000000000"',
+            [],
+            "int_type",
+            "1000000000",
+            id="shares_outstanding_digit_string",
+        ),
+        pytest.param("forecast_years", '"5"', [], "int_type", "5", id="forecast_years_string"),
+        pytest.param("forecast_years", "5.0", [], "int_type", 5.0, id="forecast_years_float"),
+        pytest.param(
+            "offer_price_kes",
+            '"\\u0667.\\u0665\\u0660"',
+            [],
+            "decimal_parsing",
+            "\u0667.\u0665\u0660",
+            id="offer_price_kes_arabic_indic_digits",
+        ),
+        pytest.param(
+            "offer_price_kes",
+            '"\\uff17.\\uff15\\uff10"',
+            [],
+            "decimal_parsing",
+            "\uff17.\uff15\uff10",
+            id="offer_price_kes_full_width_digits",
+        ),
+        pytest.param(
+            "offer_price_kes",
+            '" 7.50\\n"',
+            [],
+            "decimal_parsing",
+            " 7.50\n",
+            id="offer_price_kes_whitespace_padded",
+        ),
+        pytest.param(
+            "offer_price_kes",
+            '"7_50"',
+            [],
+            "decimal_parsing",
+            "7_50",
+            id="offer_price_kes_underscore",
+        ),
+        pytest.param(
+            "sensitivity_wacc_pct",
+            '["16", "\\u0661\\u0668"]',
+            [1],
+            "decimal_parsing",
+            "\u0661\u0668",
+            id="wacc_axis_element_arabic_indic_digits",
+        ),
+        # ASCII spellings of NaN and Infinity keep the decimal validator's own finite_number.
+        pytest.param(
+            "offer_price_kes",
+            '"-Infinity"',
+            [],
+            "finite_number",
+            "-Infinity",
+            id="offer_price_kes_infinity_string",
+        ),
+        pytest.param(
+            "offer_price_kes",
+            '"sNaN"',
+            [],
+            "finite_number",
+            "sNaN",
+            id="offer_price_kes_snan_string",
+        ),
+    ],
+)
+async def test_non_canonical_number_returns_standard_422(
+    body_client: httpx.AsyncClient,
+    prefix: str,
+    member: str,
+    raw: str,
+    loc: list[int],
+    error_type: str,
+    rejected: object,
+) -> None:
+    """A JSON boolean, string or float is not a share count or forecast horizon, and a decimal
+    string with non-ASCII digits, whitespace or ``_`` separators is not a decimal."""
+    response = await post_raw(body_client, prefix + IPO, quickmart_raw(**{member: raw}))
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": [
+            {
+                "type": error_type,
+                "loc": ["body", member, *loc],
+                "msg": CONTEXT_FREE_MESSAGES[error_type],
+                "input": rejected,
+            }
+        ]
+    }
+
+
+@pytest.mark.parametrize("prefix", BOTH_PREFIXES)
+@pytest.mark.parametrize(
+    ("member", "raw"),
+    [
+        pytest.param("offer_price_kes", '"7.5"', id="fewer_fraction_digits"),
+        pytest.param("offer_price_kes", '"+7.50"', id="explicit_plus"),
+        pytest.param("offer_price_kes", '"7.5e0"', id="exponent"),
+        pytest.param("offer_price_kes", '"75E-1"', id="upper_case_exponent"),
+        pytest.param("offer_price_kes", "7.5", id="json_number"),
+        pytest.param("dcf_weight_pct", '"50."', id="trailing_point"),
+        pytest.param("margin_expansion_pct", '".5"', id="leading_point"),
+        pytest.param("net_debt_kes", "4000000000", id="json_integer"),
+        pytest.param(
+            "sensitivity_wacc_pct", '["16", 17, 18.0, "1.9e1", "+20."]', id="wacc_axis_mixed_forms"
+        ),
+    ],
+)
+async def test_canonical_spellings_value_like_the_preset(
+    body_client: httpx.AsyncClient, prefix: str, member: str, raw: str
+) -> None:
+    """Every canonical spelling of a preset value, as a JSON number or ASCII decimal text,
+    including the ``"12."`` and ``".5"`` forms the sandbox may send, values exactly like the
+    preset itself."""
+    preset = await post_raw(body_client, prefix + IPO, quickmart_raw())
+    response = await post_raw(body_client, prefix + IPO, quickmart_raw(**{member: raw}))
+
+    assert preset.status_code == response.status_code == 200
+    assert response.json()["blended_fair_value_per_share_kes"] == "6.82"
+    assert response.json() == preset.json()
 
 
 # ---------------------------------------------------------------------------------------------

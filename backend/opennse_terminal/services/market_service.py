@@ -13,9 +13,13 @@ has in ``terminal_daily_prices``, never a holiday list. Each endpoint issues a c
 statements, whatever the number of tickers or days, and price history is read as Core column
 rows rather than ORM entities.
 
-Units: KES amounts are whole shillings, prices are KES per share, multiples are ratios (x),
-yields, returns and changes are percentage points, volumes are shares and Z-scores are standard
-deviations. Only KES values are aggregated; the quant layer refuses anything else with
+Units: KES amounts are whole shillings, multiples are ratios (x), yields, returns and changes are
+percentage points, volumes are shares and Z-scores are standard deviations. Closes (per share)
+and turnover are in the equity's listing currency (``currency``, KES by default), read and
+returned as stored and never converted, so the screener and the anomaly feed carry a non-KES
+equity's close and turnover in its own currency. Market cap, EPS, P/E, P/B, EV/EBITDA, dividend
+yield and their sector aggregates are computed in KES only: the quant layer refuses a non-KES
+equity outright, and a KES equity's fundamentals not in KES (its market cap stands), both with
 ``currency_mismatch``.
 
 Business-rule errors are coded ``HTTPException`` bodies ``{code, message, field}`` (see
@@ -346,9 +350,10 @@ async def load_price_rows(
 ) -> dict[str, list[PriceRow]]:
     """Return price history per ticker, each list ascending by ``trade_date``, in one statement.
 
-    Only the columns the quant records need are read (ticker, trade date, close in KES per share,
-    volume in shares, turnover and foreign net flow in KES), served by the ``(ticker,
-    trade_date)`` unique index. Sessions a ticker did not trade have no row and are not filled.
+    Only the columns the quant records need are read: ticker, trade date, volume in shares, and
+    the close per share, turnover and foreign net flow in the equity's listing currency (KES by
+    default) as stored, never converted. The read is served by the ``(ticker, trade_date)``
+    unique index. Sessions a ticker did not trade have no row and are not filled.
 
     Args:
         session: An async session on the terminal database; it is only read.
@@ -645,11 +650,15 @@ async def get_screener(
     """Build ``GET /market/screener``: every equity valued as of ``as_of``, filtered and sorted.
 
     Per row (as of ``as_of``, default the latest stored ``trade_date``): the latest close on or
-    before ``as_of`` (KES per share) and its change from the previous close (%); market cap
-    (KES); EPS (KES per share); P/E, P/B and EV/EBITDA (x); dividend yield (%); volume (shares)
-    and turnover (KES) of that session; and the rolling ``z_window`` volume and turnover
-    Z-scores of that session against the ticker's own prior rows. Fundamentals are the fiscal
-    year available ``settings.fundamentals_lag_days`` after period end. Banking equities have a
+    before ``as_of`` (per share) and its change from the previous close (%); market cap (KES);
+    EPS (KES per share); P/E, P/B and EV/EBITDA (x); dividend yield (%); volume (shares) and
+    turnover of that session; and the rolling ``z_window`` volume and turnover Z-scores of that
+    session against the ticker's own prior rows. The close and turnover are in the equity's
+    ``currency`` (KES by default), as stored and never converted. Market cap, EPS, the multiples
+    and dividend yield are KES-only: a non-KES equity has them all null with
+    ``currency_mismatch``, and a KES equity whose fundamentals are not in KES has all but the
+    market cap null with it. Fundamentals are the fiscal year available
+    ``settings.fundamentals_lag_days`` after period end. Banking equities have a
     null EV/EBITDA with ``ev_not_meaningful_for_banks``. A null change carries its reason
     prefixed ``change_pct:``, as in ``change_pct:no_previous_close`` on a counter's first
     session, and Z-score reasons are prefixed ``volume_z:`` or ``turnover_z:``. A row is an
@@ -1116,7 +1125,8 @@ def _anomaly_item(
         ticker=ticker,
         trade_date=point.trade_date,
         metric=metric,
-        # A volume is an integral Decimal of shares and stays exact; turnover is KES at 2 dp.
+        # A volume is an integral Decimal of shares and stays exact; turnover is at 2 dp in the
+        # equity's listing currency (KES by default), as stored and never converted.
         value=point.value if metric == "volume" else quantize_out(point.value, "money"),
         rolling_mean=quantize_out(point.rolling_mean, "money"),
         rolling_stdev=quantize_out(point.rolling_stdev, "money"),
@@ -1142,12 +1152,14 @@ async def get_anomalies(
     the ``2 x window`` market sessions before it (sessions without a row are skipped, never
     zero-filled), and kept when its unrounded Z-score is at or above ``threshold``. Negative
     Z-scores are never anomalies. ``value``, ``rolling_mean`` and ``rolling_stdev`` are in the
-    metric's unit (shares for volume, KES for turnover); the mean and deviation are at 2 dp and
-    ``z_score`` is in standard deviations at 2 dp.
+    metric's unit (shares for volume; for turnover, the equity's listing currency, KES by
+    default, as stored and never converted); the mean and deviation are at 2 dp and ``z_score``
+    is in standard deviations at 2 dp.
 
-    Candidates are every equity, or ``ticker``, or the equities of ``sector``; with both, the
-    ticker only if it belongs to the sector. Items sort by ``trade_date`` descending, then
-    ``z_score`` descending, then ticker. An empty price table gives no items.
+    Candidates are every equity whatever its currency, or ``ticker``, or the equities of
+    ``sector``; with both, the ticker only if it belongs to the sector. Items sort by
+    ``trade_date`` descending, then ``z_score`` descending, then ticker. An empty price table
+    gives no items.
 
     Errors: 404 ``unknown_ticker`` or ``unknown_sector``.
     """

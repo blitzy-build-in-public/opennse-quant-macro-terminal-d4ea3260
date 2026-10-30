@@ -37,9 +37,11 @@ class TerminalDailyPrice(TerminalBase):
     Key: ``(ticker, trade_date)`` is unique and is the conflict target of every upsert.
     ``trade_date`` is the session date in Africa/Nairobi.
 
-    Units: ``open_price``, ``high_price``, ``low_price`` and ``close_price`` are KES per share;
-    ``turnover_kes`` and ``foreign_net_flow_kes`` are whole KES (never thousands); ``volume`` is
-    shares, bounded to 0..10^12 (``MAX_SHARE_COUNT``) so it stays an exact JavaScript integer.
+    Units: ``open_price``, ``high_price``, ``low_price`` and ``close_price`` are per share, and
+    ``turnover_kes`` and ``foreign_net_flow_kes`` whole units (never thousands), all in the
+    counter's listing currency (``terminal_equities.currency``, KES by default) as written and
+    never converted; the ``_kes`` names state that default. ``volume`` is shares, bounded to
+    0..10^12 (``MAX_SHARE_COUNT``) so it stays an exact JavaScript integer.
     Open, high and low are nullable because the public NSE market-statistics page publishes only
     the last traded price. ``turnover_estimated`` is true when turnover was derived as
     volume x close (the NSE pipeline, and CSV rows without a turnover cell).

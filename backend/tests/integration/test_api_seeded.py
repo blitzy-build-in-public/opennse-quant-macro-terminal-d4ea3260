@@ -382,6 +382,39 @@ async def test_screener_sector_with_nul_is_the_standard_422(
     ]
 
 
+@pytest.mark.parametrize(
+    ("path", "parameter", "value"),
+    [
+        pytest.param("/market/screener", "min_pe", "\u0665", id="screener-min_pe-arabic-indic"),
+        pytest.param("/market/screener", "max_pb", "\uff12", id="screener-max_pb-full-width"),
+        pytest.param("/market/screener", "min_dividend_yield", " 5", id="screener-dy-padded"),
+        pytest.param("/market/screener", "min_volume_z", "1_0", id="screener-volume_z-underscore"),
+        pytest.param(
+            "/market/screener", "anomaly_threshold", "\u0663", id="screener-threshold-arabic-indic"
+        ),
+        pytest.param("/market/anomalies", "threshold", "\u0663", id="anomalies-threshold"),
+    ],
+)
+async def test_non_canonical_decimal_query_is_the_standard_422(
+    client: httpx.AsyncClient, path: str, parameter: str, value: str
+) -> None:
+    """A decimal query parameter must be ASCII decimal text: non-ASCII digits, whitespace and
+    ``_`` separators, which ``Decimal()`` alone would read, are FastAPI's ``decimal_parsing``."""
+    response = await client.get(f"{BASE}{path}", params={parameter: value})
+
+    assert response.status_code == 422, response.text
+    assert response.json() == {
+        "detail": [
+            {
+                "type": "decimal_parsing",
+                "loc": ["query", parameter],
+                "msg": "Input should be a valid decimal",
+                "input": value,
+            }
+        ]
+    }
+
+
 async def test_sector_heatmap_covers_four_sectors_over_twelve_month_ends(
     client: httpx.AsyncClient,
 ) -> None:

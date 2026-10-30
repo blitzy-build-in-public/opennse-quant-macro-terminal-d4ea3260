@@ -27,7 +27,9 @@ import type {
 export interface SectorRotationHeatmapProps extends TerminalWidgetProps {
   /**
    * Period boundaries: the last market session on or before each month-end (`"month"`) or each
-   * Friday (`"week"`). Default `"month"`.
+   * Friday (`"week"`), with the response's `as_of` replacing a month-end or Friday after it. The
+   * latest period is thus clamped to `as_of` and can be month-to-date or week-to-date. Default
+   * `"month"`.
    */
   interval?: HeatmapInterval;
   /**

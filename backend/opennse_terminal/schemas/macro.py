@@ -127,11 +127,15 @@ class IndicatorSnapshot(TerminalResponseModel):
 
 
 class RatesPoint(TerminalResponseModel):
-    """One month-end row of the policy, interbank and T-bill rate history, in percentage
-    points."""
+    """One stored row of the policy, interbank and T-bill rate history, in percentage points."""
 
     observation_date: dt.date = Field(
-        description="Observation date (YYYY-MM-DD), the month-end of the reference month.",
+        description=(
+            "Date (YYYY-MM-DD) the observation is stored under, returned unchanged with no "
+            "monthly resampling. CBK monthly rates and the seeded history are dated at the "
+            "month-end of their reference month; a CSV or Excel import keeps each row's own "
+            "date, which can fall mid-month."
+        ),
     )
     cbr_rate_pct: Decimal | None = Field(
         description="Central Bank Rate (%); null when not published for the date.",

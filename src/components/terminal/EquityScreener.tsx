@@ -392,8 +392,11 @@ function sameTickers(left: readonly string[], right: readonly string[]): boolean
 
 /**
  * The content of a caller's watchlists as one string, the same for the same lists in any order:
- * each list's id, name and `updated_at`, which the server advances on every ticker addition or
- * removal. Each entry is JSON-encoded, so no name can merge two entries. `null` without lists.
+ * each list's id, name and `updated_at`, which the server advances on an ORM update of the list
+ * and on a ticker actually added or removed through the API. A database cascade (an equity's
+ * ticker renamed or the equity deleted) changes `tickers` without advancing it, so such a change
+ * alone does not alter the signature. Each entry is JSON-encoded, so no name can merge two
+ * entries. `null` without lists.
  */
 function watchlistsSignature(lists: readonly Watchlist[] | undefined): string | null {
   if (lists === undefined) {

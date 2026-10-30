@@ -6,10 +6,12 @@
 The request's 18 assumption fields carry the same names as ``quant.dcf.DcfAssumptions``, to
 which ``services/ipo_service.py`` converts the request one-to-one. Rates are percentage points
 (``"18.00"`` means 18%), ``*_kes`` amounts are whole Kenyan shillings and share counts are
-integers. Requests accept each decimal as a JSON number or string; the frontend sends
-fixed-decimal strings. Responses serialize every ``Decimal`` as a JSON string, already quantized
-by the service: KES and per-share KES to 2 dp, percentages and multiples to 2 dp, discount factors
-to 6 dp.
+integers. Requests accept each decimal as a JSON number or as a string of canonical ASCII decimal
+text such as ``"7.50"`` (``schemas.common.CanonicalDecimalText``); the frontend sends
+fixed-decimal strings. The share counts and ``forecast_years`` accept only a JSON integer: a
+boolean, string or float is FastAPI's standard 422 entry ``int_type``. Responses serialize every
+``Decimal`` as a JSON string, already quantized by the service: KES and per-share KES to 2 dp,
+percentages and multiples to 2 dp, discount factors to 6 dp.
 
 Only single-field bounds are declared here, so their failures use FastAPI's standard 422 list.
 Rules that relate fields are checked by ``quant.dcf.assumption_violations`` and raised by the
@@ -30,6 +32,7 @@ from pydantic import ConfigDict, Field
 
 from opennse_terminal.config import DEFAULT_CURRENCY, MAX_SHARE_COUNT
 from opennse_terminal.schemas.common import (
+    CanonicalDecimalText,
     PositiveShareCount,
     RequestDecimal,
     ShareCount,
@@ -67,12 +70,26 @@ _MAX_PRIMARY_PROCEEDS_KES: Final = _MAX_OFFER_PRICE_KES * MAX_SHARE_COUNT
 _MAX_SENSITIVITY_AXIS: Final = 9
 
 # Axis elements reuse the scalar ranges of wacc_pct and ebitda_margin_pct. Without them a WACC
-# element such as -100 would make the discount base (1 + WACC)^t zero.
-WaccAxisValue = Annotated[RequestDecimal, Field(ge=_MIN_WACC_PCT, le=_MAX_WACC_PCT)]
+# element such as -100 would make the discount base (1 + WACC)^t zero. Each restates the
+# RequestDecimal limits with its bounds ahead of CanonicalDecimalText: a bound added after that
+# validator, as Annotated[RequestDecimal, Field(...)] would add it, is checked separately, with
+# a different message and no JSON-schema minimum or maximum.
+WaccAxisValue = Annotated[
+    Decimal,
+    Field(max_digits=28, allow_inf_nan=False, ge=_MIN_WACC_PCT, le=_MAX_WACC_PCT),
+    CanonicalDecimalText,
+]
 """One sensitivity-matrix row: a WACC in %, 8.00 to 30.00."""
 
 MarginAxisValue = Annotated[
-    RequestDecimal, Field(ge=_MIN_EBITDA_MARGIN_PCT, le=_MAX_EBITDA_MARGIN_PCT)
+    Decimal,
+    Field(
+        max_digits=28,
+        allow_inf_nan=False,
+        ge=_MIN_EBITDA_MARGIN_PCT,
+        le=_MAX_EBITDA_MARGIN_PCT,
+    ),
+    CanonicalDecimalText,
 ]
 """One sensitivity-matrix column: a base EBITDA margin in %, 0.50 to 15.00."""
 
@@ -202,6 +219,7 @@ class IpoValuationRequest(TerminalRequestModel):
     forecast_years: int = Field(
         ge=3,
         le=10,
+        strict=True,
         description="Explicit forecast horizon N, whole years, 3 to 10.",
     )
     base_revenue_kes: RequestDecimal = Field(

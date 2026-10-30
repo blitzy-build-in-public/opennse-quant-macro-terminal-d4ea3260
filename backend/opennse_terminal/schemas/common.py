@@ -18,29 +18,33 @@ FastAPI, SQLAlchemy, the models or the services. It holds:
 Pydantic serializes every ``Decimal`` as a JSON string and keeps its exponent, so
 ``Decimal("7.50")`` becomes ``"7.50"``. Services quantize each value once, with
 ``quant.numeric.quantize_out``, before building a response model; this module adds no custom
-serializer. Requests accept a ``Decimal`` as a JSON number or string.
+serializer. Requests accept a ``Decimal`` as a JSON number or as a string of canonical ASCII
+decimal text (:data:`CanonicalDecimalText`), and a share count only as a JSON integer.
 """
 
 import datetime as dt
 import math
+import re
 from decimal import Decimal
 from typing import Annotated, Any, Final, Literal, Self, get_args
 
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     ModelWrapValidatorHandler,
     ValidationError,
     model_validator,
 )
-from pydantic_core import InitErrorDetails, PydanticCustomError
+from pydantic_core import InitErrorDetails, PydanticCustomError, PydanticKnownError
 
 from opennse_terminal.config import MAX_SHARE_COUNT
 
 __all__ = [
     "ERROR_CODES",
     "FLAG_CODES",
+    "CanonicalDecimalText",
     "CoverageMeta",
     "ErrorCode",
     "ErrorDetail",
@@ -219,6 +223,7 @@ ErrorCode = Literal[
     "commit_requires_kes",
     "currency_conflict",
     "ingest_busy",
+    "internal_error",
     "watchlist_name_taken",
 ]
 """Every stable snake_case code a terminal endpoint raises in a coded error body."""
@@ -240,8 +245,9 @@ class ErrorDetail(TerminalResponseModel):
     # Typed str rather than ErrorCode: quant.numeric.Violation.code, raised as-is, is a plain str.
     code: str = Field(
         description=(
-            "Stable snake_case error code, one of the documented ErrorCode values, "
-            "for example primary_exceeds_offer_size."
+            "Stable snake_case error code from the terminal's closed catalog, for example "
+            "primary_exceeds_offer_size. Each operation names the codes it can return in its "
+            "description or in the descriptions of its error responses."
         ),
     )
     message: str = Field(description="Human-readable explanation of the error.")
@@ -268,22 +274,31 @@ class ErrorResponse(TerminalResponseModel):
 class ValidationErrorItem(TerminalResponseModel):
     """One entry of FastAPI's standard 422 ``detail`` list: a single-field validation failure.
 
-    OpenAPI documentation only; FastAPI builds each entry from a Pydantic error, without its
-    documentation URL, and the entry carries no stable terminal code. Named apart from FastAPI's
-    own ``ValidationError`` component, which the same OpenAPI document may also hold.
+    OpenAPI documentation only. FastAPI builds each entry from a Pydantic error, without its
+    documentation URL, except the ``json_invalid`` entry of an undecodable JSON body, which it
+    writes itself. No entry carries a stable terminal code. Named apart from FastAPI's own
+    ``ValidationError`` component, which the same OpenAPI document may also hold.
     """
 
     loc: list[str | int] = Field(
         description=(
             "Location of the failing value: its source (query, path, body), then its name and "
-            'any nested key or list index, for example ["query", "min_pe"].'
+            'any nested key or list index, for example ["query", "min_pe"]. A body that is '
+            'missing or not an object is located at ["body"] alone, and an undecodable JSON body '
+            'at ["body", <character position where decoding failed>].'
         ),
     )
     msg: str = Field(description="Human-readable explanation of the failure.")
     type: str = Field(description="Pydantic error type, for example less_than_equal or missing.")
     input: Any = Field(
         default=None,
-        description="The rejected input value; null when the value is missing altogether.",
+        description=(
+            "The rejected value itself; a NaN or infinite number appears as the string NaN, "
+            "Infinity or -Infinity. For a field missing from a supplied object, the containing "
+            'object as sent, for example {"tickers": []} for a watchlist body without name. '
+            "Null when a whole parameter, such as the PDF file field, or the whole body is "
+            "absent; {} for an undecodable JSON body."
+        ),
     )
     ctx: dict[str, Any] = Field(
         default_factory=dict,
@@ -388,29 +403,75 @@ FLAG_CODES: Final[frozenset[str]] = frozenset(get_args(Flag))
 # Decimal literals or ints, never floats. Response fields use plain Decimal, Decimal | None and
 # int: their values arrive already quantized by the services.
 
-RequestDecimal = Annotated[Decimal, Field(max_digits=28, allow_inf_nan=False)]
-"""Base of every request decimal: at most 28 significant digits, the precision of the default
-``decimal`` context, and finite (NaN and +/-Infinity are rejected). Accepts a JSON number or a
-string; the frontend always sends strings."""
+_CANONICAL_DECIMAL_PATTERN: Final = re.compile(
+    r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+)
+"""Canonical decimal text: ASCII digits with an optional sign, decimal point and exponent, and
+nothing else. ``"12."`` and ``".5"``, which the frontend's ``parseScaled`` accepts, match."""
 
-Kes = Annotated[Decimal, Field(max_digits=28, allow_inf_nan=False)]
+_NON_FINITE_DECIMAL_PATTERN: Final = re.compile(
+    r"[+-]?(?:s?nan[0-9]*|inf(?:inity)?)", re.ASCII | re.IGNORECASE
+)
+"""The ASCII spellings of NaN and +/-Infinity that ``Decimal()`` reads, in any letter case."""
+
+
+def _require_canonical_decimal_text(value: object) -> object:
+    """Pass ``value`` on to the decimal validator unless it is a non-canonical decimal string.
+
+    ``Decimal()`` on its own also reads surrounding whitespace, ``_`` digit separators and every
+    Unicode decimal digit, so ``" 7.50\\n"``, ``"7_50"`` and the Arabic-Indic
+    ``"\\u0667.\\u0665\\u0660"`` would validate as 7.50. A string passes only when it is canonical
+    decimal text, or an ASCII spelling of NaN or Infinity, which the decimal validator refuses as
+    ``finite_number``. Any other string is refused as ``decimal_parsing``, the decimal validator's
+    own error for text it cannot read. Numbers, ``Decimal`` values and every other type pass
+    unchanged, so the decimal validator converts or refuses them as before: a JSON boolean, for
+    example, is ``decimal_type``.
+    """
+    if (
+        isinstance(value, str)
+        and _CANONICAL_DECIMAL_PATTERN.fullmatch(value) is None
+        and _NON_FINITE_DECIMAL_PATTERN.fullmatch(value) is None
+    ):
+        raise PydanticKnownError("decimal_parsing")
+    return value
+
+
+CanonicalDecimalText: Final = BeforeValidator(_require_canonical_decimal_text)
+"""The last metadata of every request decimal alias: a string must be canonical decimal text.
+
+It refuses a non-canonical string (whitespace, ``_`` separators, non-ASCII digits) with FastAPI's
+standard 422 entry ``decimal_parsing``, before the decimal validator reads it. It goes after
+every bound of an alias, because Pydantic applies a bound placed after a validator as a separate
+check, with a different message and no JSON-schema keyword. A field's own ``Field(...)`` bounds
+are merged ahead of it and need no care."""
+
+RequestDecimal = Annotated[Decimal, Field(max_digits=28, allow_inf_nan=False), CanonicalDecimalText]
+"""Base of every request decimal: at most 28 significant digits, the precision of the default
+``decimal`` context, and finite (NaN and +/-Infinity are rejected). Accepts a JSON number, or a
+string of canonical ASCII decimal text such as ``"7.50"``, ``"-3"``, ``"12."``, ``".5"`` or
+``"7.5e0"`` (:data:`CanonicalDecimalText`); the frontend always sends strings."""
+
+Kes = Annotated[Decimal, Field(max_digits=28, allow_inf_nan=False), CanonicalDecimalText]
 """An amount in whole Kenyan shillings (KES, not thousands), of either sign."""
 
-NonNegativeKes = Annotated[Decimal, Field(max_digits=28, allow_inf_nan=False, ge=0)]
+NonNegativeKes = Annotated[
+    Decimal, Field(max_digits=28, allow_inf_nan=False, ge=0), CanonicalDecimalText
+]
 """An amount in whole Kenyan shillings (KES), zero or greater."""
 
-Pct = Annotated[Decimal, Field(max_digits=28, allow_inf_nan=False)]
+Pct = Annotated[Decimal, Field(max_digits=28, allow_inf_nan=False), CanonicalDecimalText]
 """A percentage in percentage points: ``6.80`` means 6.80%."""
 
-Ratio = Annotated[Decimal, Field(max_digits=28, allow_inf_nan=False)]
+Ratio = Annotated[Decimal, Field(max_digits=28, allow_inf_nan=False), CanonicalDecimalText]
 """A dimensionless multiple (x), such as P/E or EV/EBITDA."""
 
-ShareCount = Annotated[int, Field(ge=0, le=MAX_SHARE_COUNT)]
+ShareCount = Annotated[int, Field(ge=0, le=MAX_SHARE_COUNT, strict=True)]
 """A share count or traded volume in shares, 0 to 10^12, so the JSON integer is exact in
-JavaScript."""
+JavaScript. Strict: only a JSON integer is accepted; a boolean, string or float, even ``5.0``,
+is FastAPI's standard 422 entry ``int_type``."""
 
-PositiveShareCount = Annotated[int, Field(ge=1, le=MAX_SHARE_COUNT)]
-"""A share count in shares, 1 to 10^12."""
+PositiveShareCount = Annotated[int, Field(ge=1, le=MAX_SHARE_COUNT, strict=True)]
+"""A share count in shares, 1 to 10^12. Strict, like :data:`ShareCount`: JSON integers only."""
 
 # PostgreSQL text cannot hold a NUL character, so a ticker or sector carrying one is refused as a
 # single-field 422 here rather than failing as a 500 when the service queries it.

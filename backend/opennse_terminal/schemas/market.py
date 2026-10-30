@@ -15,8 +15,8 @@ than by a Pydantic validator: ``min_exceeds_max`` (``field`` is the ``min_*`` pa
 ``exactly_one_subject``, ``conflicting_subjects`` and ``start_after_end``.
 
 The ``as_of`` field of a response is never null. Services echo the request's ``as_of``, else the
-latest stored ``trade_date``, else (no price row exists at all) the current Africa/Nairobi date,
-and then return empty lists.
+latest stored ``trade_date``, else (no price row exists at all) the current date in the configured
+timezone (``TERMINAL_TIMEZONE``, Africa/Nairobi by default), and then return empty lists.
 """
 
 import datetime as dt
@@ -166,9 +166,12 @@ class ScreenerParams(TerminalRequestModel):
     parameter in OpenAPI and an unknown parameter is FastAPI's standard 422 ``extra_forbidden``.
 
     Filtering: a row whose metric is null fails every filter on that metric. ``anomalies_only``
-    keeps rows where ``is_volume_anomaly`` or ``is_turnover_anomaly`` is true, which means a
-    Z-score at or above ``anomaly_threshold`` on the positive side only. A ``min_*`` above its
-    ``max_*`` is the service's coded 422 ``min_exceeds_max``, not a validation error here.
+    keeps rows where ``is_volume_anomaly`` or ``is_turnover_anomaly`` is true, which means an
+    unrounded Z-score at or above ``anomaly_threshold`` on the positive side only. The metric
+    filters, ``min_volume_z`` included, and ``sort`` compare the 2 dp values the rows show, so
+    ``min_volume_z=2`` keeps a row whose ``volume_z`` shows 2.00 from a raw 1.996, which
+    ``anomalies_only`` at threshold 2 drops. A ``min_*`` above its ``max_*`` is the service's
+    coded 422 ``min_exceeds_max``, not a validation error here.
     """
 
     sector: SectorName | None = Field(
@@ -195,17 +198,26 @@ class ScreenerParams(TerminalRequestModel):
     )
     min_volume_z: RequestDecimal | None = Field(
         default=None,
-        description="Minimum rolling volume Z-score (standard deviations), inclusive.",
+        description=(
+            "Minimum rolling volume Z-score (standard deviations), inclusive, compared with the "
+            "2 dp volume_z shown; the anomaly flags compare the unrounded score instead."
+        ),
     )
     anomalies_only: bool = Field(
         default=False,
-        description="Keep only rows with a positive volume or turnover spike at the threshold.",
+        description=(
+            "Keep only rows with is_volume_anomaly or is_turnover_anomaly: an unrounded Z-score "
+            "at or above the threshold, positive side only."
+        ),
     )
     anomaly_threshold: RequestDecimal = Field(
         default=DEFAULT_THRESHOLD,
         ge=THRESHOLD_MIN,
         le=THRESHOLD_MAX,
-        description="Spike threshold in standard deviations: z >= threshold is an anomaly.",
+        description=(
+            "Spike threshold in standard deviations: an unrounded Z-score >= threshold is an "
+            "anomaly."
+        ),
     )
     z_window: int = Field(
         default=DEFAULT_Z_WINDOW,
@@ -228,10 +240,18 @@ class ScreenerRow(TerminalResponseModel):
     company_name: str = Field(description="Registered company name.")
     sector: str = Field(description="Sector name as stored, for example Banking.")
     currency: str = Field(
-        description="ISO 4217 code of the equity's prices and fundamentals; KES by default.",
+        description=(
+            "ISO 4217 code of the equity's listing currency, KES by default; close_price and "
+            "turnover_kes are in it, never converted. The computed metrics are KES-only and "
+            "flag currency_mismatch otherwise: a non-KES equity has a null market_cap_kes, and "
+            "a non-KES equity or non-KES fundamentals give null eps_kes, pe, pb, ev_ebitda, "
+            "dividend_yield_pct and fundamentals_period_end."
+        ),
     )
     trade_date: dt.date = Field(description="Date of the latest close on or before as_of.")
-    close_price: Decimal = Field(description="Closing price on trade_date, in KES per share.")
+    close_price: Decimal = Field(
+        description="Closing price per share on trade_date, in currency (KES by default).",
+    )
     change_pct: Decimal | None = Field(
         description=(
             "Change from the previous close, in percent; null without a previous close, with "
@@ -254,7 +274,12 @@ class ScreenerRow(TerminalResponseModel):
         description="Dividend per share over close, in percent.",
     )
     volume: int = Field(description="Shares traded on trade_date.")
-    turnover_kes: Decimal = Field(description="Value traded on trade_date, in KES.")
+    turnover_kes: Decimal = Field(
+        description=(
+            "Value traded on trade_date, in currency (KES by default): a non-KES equity's "
+            "turnover is returned as stored, not converted to KES."
+        ),
+    )
     volume_z: Decimal | None = Field(
         description="Rolling volume Z-score on trade_date (standard deviations).",
     )
@@ -262,10 +287,18 @@ class ScreenerRow(TerminalResponseModel):
         description="Rolling turnover Z-score on trade_date (standard deviations).",
     )
     is_volume_anomaly: bool = Field(
-        description="True when volume_z is at or above the threshold (positive side only).",
+        description=(
+            "True when the unrounded volume Z-score is at or above the threshold (positive side "
+            "only). Comparing the 2 dp volume_z instead can give a different answer: raw 1.996 "
+            "shows 2.00 yet is not an anomaly at threshold 2."
+        ),
     )
     is_turnover_anomaly: bool = Field(
-        description="True when turnover_z is at or above the threshold (positive side only).",
+        description=(
+            "True when the unrounded turnover Z-score is at or above the threshold (positive "
+            "side only); comparing the 2 dp turnover_z instead can give a different answer, as "
+            "for is_volume_anomaly."
+        ),
     )
     free_float_pct: Decimal | None = Field(
         description="Free float as a percentage of shares outstanding.",
@@ -338,7 +371,8 @@ class ScreenerResponse(TerminalResponseModel):
     as_of: dt.date = Field(
         description=(
             "Valuation date: the requested as_of, else the latest stored trade_date, else the "
-            "current Africa/Nairobi date when no price exists (with empty lists)."
+            "current date in the configured timezone (TERMINAL_TIMEZONE, Africa/Nairobi by "
+            "default) when no price exists (with empty lists)."
         ),
     )
     z_window: int = Field(description="Rolling Z-score window N used, in the ticker's own rows.")
@@ -369,7 +403,8 @@ class SectorHeatmapParams(TerminalRequestModel):
         default="month",
         description=(
             "Period boundaries: the last market session on or before each month-end (month) or "
-            "each Friday (week)."
+            "each Friday (week), with as_of replacing a month-end or Friday after it. The latest "
+            "period is thus clamped to as_of and can be month-to-date or week-to-date."
         ),
     )
     periods: int = Field(
@@ -380,7 +415,9 @@ class SectorHeatmapParams(TerminalRequestModel):
     )
     as_of: dt.date | None = Field(
         default=None,
-        description="Valuation date (YYYY-MM-DD); defaults to the latest stored trade_date.",
+        description=(
+            "Cutoff of the latest period (YYYY-MM-DD); defaults to the latest stored trade_date."
+        ),
     )
 
 
@@ -447,8 +484,12 @@ class SectorHeatmapResponse(TerminalResponseModel):
 
     as_of: dt.date = Field(
         description=(
-            "Last period boundary: the requested as_of, else the latest stored trade_date, else "
-            "the current Africa/Nairobi date when no price exists (with empty lists)."
+            "Cutoff of the latest period, echoed as resolved: the requested as_of, else the latest "
+            "stored trade_date, else the current date in the configured timezone "
+            "(TERMINAL_TIMEZONE, Africa/Nairobi by default) when no price exists (with empty "
+            "lists). It is not itself a boundary: period_ends holds observed market sessions, so "
+            "an as_of that is not one (a weekend, a holiday, a date past the data) differs from "
+            "period_ends[-1]."
         ),
     )
     interval: HeatmapInterval = Field(description="Period length: month or week.")
@@ -491,7 +532,8 @@ class ValuationBandsResponse(TerminalResponseModel):
     as_of: dt.date = Field(
         description=(
             "End of the lookback: the requested as_of, else the latest stored trade_date, else "
-            "the current Africa/Nairobi date when no price exists (with an empty series)."
+            "the current date in the configured timezone (TERMINAL_TIMEZONE, Africa/Nairobi by "
+            "default) when no price exists (with an empty series)."
         ),
     )
     coverage: CoverageMeta = Field(
@@ -509,8 +551,11 @@ class ValuationBandsResponse(TerminalResponseModel):
     )
     series: list[SeriesPoint] = Field(
         description=(
-            "The multiple (x) on the last market session of each ISO week, ascending; the "
-            "statistics use the daily values."
+            "Weekly as-of transport sample of the multiple (x), ascending: one point per ISO week "
+            "with a non-null daily value, dated on the week's last market session on or before "
+            "as_of and carrying the week's latest non-null daily value, which may come from an "
+            "earlier session than that date. Weeks without a value are omitted; the statistics "
+            "use the daily values."
         ),
     )
     stats: BandStats | None = Field(
@@ -546,7 +591,9 @@ class AnomaliesParams(TerminalRequestModel):
         default=DEFAULT_THRESHOLD,
         ge=THRESHOLD_MIN,
         le=THRESHOLD_MAX,
-        description="Spike threshold in standard deviations: z >= threshold is a spike.",
+        description=(
+            "Spike threshold in standard deviations: an unrounded Z-score >= threshold is a spike."
+        ),
     )
     lookback_sessions: int = Field(
         default=DEFAULT_LOOKBACK_SESSIONS,
@@ -603,21 +650,34 @@ class FlowsParams(TerminalRequestModel):
 
 
 class AnomalyItem(TerminalResponseModel):
-    """One positive volume or turnover spike: a Z-score at or above the threshold."""
+    """One positive volume or turnover spike: an unrounded Z-score at or above the threshold."""
 
     ticker: str = Field(description="NSE ticker symbol, for example SCOM.")
     trade_date: dt.date = Field(description="Session of the spike.")
     metric: Literal["volume", "turnover"] = Field(description="The metric that spiked.")
     value: Decimal = Field(
-        description="The metric on trade_date: shares for volume, KES for turnover.",
+        description=(
+            "The metric on trade_date: shares for volume, or for turnover the value traded in the "
+            "equity's listing currency (KES by default); a non-KES equity's turnover is scored "
+            "and returned as stored, not converted to KES."
+        ),
     )
     rolling_mean: Decimal = Field(
-        description="Mean of the prior window, in the metric's unit (shares or KES).",
+        description=(
+            "Mean of the prior window, in value's unit (shares, or the listing currency for "
+            "turnover)."
+        ),
     )
     rolling_stdev: Decimal = Field(
-        description="Sample standard deviation of the prior window, in the metric's unit.",
+        description="Sample standard deviation of the prior window, in value's unit.",
     )
-    z_score: Decimal = Field(description="Z-score of value against the window, in std devs.")
+    z_score: Decimal = Field(
+        description=(
+            "Z-score of value against the window, in std devs, at 2 dp. Membership tests the "
+            "unrounded score, so with a threshold of more than 2 dp the value shown can be "
+            "below it."
+        ),
+    )
     observations_used: int = Field(
         description="Prior rows of the ticker in the window; missing sessions are skipped.",
     )
@@ -630,7 +690,8 @@ class AnomaliesResponse(TerminalResponseModel):
     threshold: Decimal = Field(description="Spike threshold used, in standard deviations.")
     items: list[AnomalyItem] = Field(
         description=(
-            "Spikes with z >= threshold, sorted by trade_date descending, then z_score descending."
+            "Spikes whose unrounded Z-score is >= threshold, sorted by trade_date descending, "
+            "then z_score descending."
         ),
     )
 
@@ -685,8 +746,9 @@ class FlowsResponse(TerminalResponseModel):
     )
     as_of: dt.date = Field(
         description=(
-            "The requested as_of, else the latest stored trade_date, else the current "
-            "Africa/Nairobi date when no price exists (with an empty series)."
+            "The requested as_of, else the latest stored trade_date, else the current date in "
+            "the configured timezone (TERMINAL_TIMEZONE, Africa/Nairobi by default) when no "
+            "price exists (with an empty series)."
         ),
     )
     start: dt.date = Field(description="First date of the range; defaults to end minus 365 days.")
