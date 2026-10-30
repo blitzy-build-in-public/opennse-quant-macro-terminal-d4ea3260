@@ -17,7 +17,7 @@ import type { TooltipContentProps } from "recharts";
 import { AXIS_TICK, CHART_COLORS } from "./lib/chartTheme";
 import { formatDate, formatDecimal, formatMonth, toChartNumber } from "./lib/format";
 import { useTerminalQuery } from "./lib/useTerminalQuery";
-import { WidgetFrame } from "./shared/WidgetFrame";
+import { PartialCoverageNote, WidgetFrame } from "./shared/WidgetFrame";
 import type { DecimalString, MacroOverviewResponse, TerminalWidgetProps } from "./types";
 
 /** Props of {@link InflationTrajectoryChart}. */
@@ -114,7 +114,6 @@ const LEGEND_ITEM_CLASS = "flex items-center gap-2";
 // colours, so the keys also opt out of colour forcing: they are the only link from a series name
 // to its line.
 const SWATCH_CLASS = "h-2 w-4 shrink-0 forced-color-adjust-none";
-const PARTIAL_COVERAGE_CLASS = "mt-2 mb-0 text-xs text-amber-300";
 // The loading skeleton's heights are the loaded chart and legend, measured on the standalone page
 // with the seeded data at each viewport width where they reflow, so the card keeps its height
 // when the data arrives.
@@ -333,13 +332,6 @@ function InflationTooltip({ active, payload }: TooltipContentProps): ReactNode {
   );
 }
 
-/** Text of the partial-coverage note; a window without any observation has no start date. */
-function partialCoverageText(coverageStart: string | null): string {
-  return coverageStart === null
-    ? "Partial coverage: no observations in the requested window"
-    : `Partial coverage from ${formatDate(coverageStart)}`;
-}
-
 /**
  * 12-month inflation against the Central Bank Rate over the last `historyMonths` month-ends,
  * with CBK's 2.5–7.5% target band shaded behind both lines (`GET /macro/overview`).
@@ -529,9 +521,11 @@ export function InflationTrajectoryChart(props: InflationTrajectoryChartProps): 
         ) : null}
       </ul>
       {coverage?.is_partial_coverage ? (
-        <p data-testid="inflation-partial-coverage" className={PARTIAL_COVERAGE_CLASS}>
-          {partialCoverageText(coverage.coverage_start)}
-        </p>
+        <PartialCoverageNote
+          testId="inflation-partial-coverage"
+          coverageStart={coverage.coverage_start}
+          className="mt-2 mb-0"
+        />
       ) : null}
     </WidgetFrame>
   );

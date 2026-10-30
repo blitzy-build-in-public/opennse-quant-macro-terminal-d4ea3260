@@ -3,6 +3,7 @@
 import type { ReactElement, ReactNode } from "react";
 
 import type { TerminalApiError } from "../lib/apiClient";
+import { formatDate } from "../lib/format";
 import type { WidgetState } from "../types";
 import { SECONDARY_BUTTON_CLASS } from "./controlStyles";
 
@@ -91,6 +92,23 @@ export interface FieldErrorTextProps {
   id?: string;
 }
 
+/** Props of {@link PartialCoverageNote}. */
+export interface PartialCoverageNoteProps {
+  /** The note's `data-testid`, for example `"inflation-partial-coverage"`. */
+  testId: string;
+  /**
+   * `CoverageMeta.coverage_start` of the response: the first date in the requested window that
+   * has a value, or `null` when the window has none.
+   */
+  coverageStart: string | null;
+  /**
+   * Spacing classes the calling widget appends for the note's placement, such as `"mt-2 mb-0"`.
+   * Every class must be complete and written literally in the caller's source, so Tailwind's
+   * scanner and a host's `@source` or `content` glob find it.
+   */
+  className?: string;
+}
+
 // Every class below is a complete static string, never assembled from fragments, so Tailwind's
 // source scan and a host's `@source` directive or `content` glob find each one. The root sets its
 // own surface and font family, so the widget never depends on a host's body styles or fonts. The
@@ -121,6 +139,9 @@ const RETRY_CLASS = `${SECONDARY_BUTTON_CLASS} mt-3`;
 // `min-w-0` lets charts and tables shrink inside a host's grid or flex layout.
 const READY_CLASS = "min-w-0";
 const FIELD_ERROR_CLASS = "mt-1 text-xs text-rose-400";
+// The one look of the partial-coverage note in every widget: amber, the widgets' colour for
+// partial and caution states, rather than the slate of their neutral meta text.
+const PARTIAL_COVERAGE_NOTE_CLASS = "text-xs text-amber-300";
 
 const ERROR_FALLBACK_MESSAGE = "Something went wrong";
 
@@ -273,6 +294,27 @@ export function FieldErrorText({ field, message, id }: FieldErrorTextProps): Rea
   return (
     <p id={id} data-testid={"field-error-" + field} role="alert" className={FIELD_ERROR_CLASS}>
       {message}
+    </p>
+  );
+}
+
+/**
+ * Inline note of a response whose `coverage.is_partial_coverage` is true, rendered by each widget
+ * that plots a requested history window, so the note reads and looks the same in all of them:
+ * "Partial coverage from <coverage_start>", or, when the window has no observation at all,
+ * "Partial coverage: no observations in the requested window". The caller renders it only when
+ * the coverage is partial.
+ */
+export function PartialCoverageNote({
+  testId,
+  coverageStart,
+  className,
+}: PartialCoverageNoteProps): ReactElement {
+  return (
+    <p data-testid={testId} className={joinClasses(PARTIAL_COVERAGE_NOTE_CLASS, className)}>
+      {coverageStart === null
+        ? "Partial coverage: no observations in the requested window"
+        : `Partial coverage from ${formatDate(coverageStart)}`}
     </p>
   );
 }

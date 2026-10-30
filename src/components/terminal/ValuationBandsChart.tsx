@@ -24,7 +24,7 @@ import {
   toChartNumber,
 } from "./lib/format";
 import { useTerminalQuery } from "./lib/useTerminalQuery";
-import { WidgetFrame } from "./shared/WidgetFrame";
+import { PartialCoverageNote, WidgetFrame } from "./shared/WidgetFrame";
 import { KPI_LABEL_CLASS, KPI_TILE_CLASS, KPI_VALUE_CLASS } from "./shared/headingAndTileClasses";
 import type {
   BandMetric,
@@ -97,7 +97,6 @@ const SKELETON_HEIGHT_CLASS =
 const META_CLASS = "text-xs text-slate-400";
 const UPDATING_CLASS = "text-sky-300";
 const STATUS_NOTE_CLASS = "text-xs text-amber-300";
-const PARTIAL_NOTE_CLASS = "text-xs text-slate-400";
 // Recharts' accessibility layer renders the chart as `<svg class="recharts-surface" tabindex="0">`,
 // which the keyboard reaches and navigates with the arrow keys. Recharts 3 also renders its z-index
 // layers as `<g tabindex="-1">`: Tab never reaches them, but a mouse click on plotted data focuses
@@ -600,9 +599,10 @@ function BandsBody({
         </p>
       ) : null}
       {coverage.is_partial_coverage ? (
-        <p className={PARTIAL_NOTE_CLASS} data-testid="bands-partial-coverage">
-          Partial coverage from {formatDate(coverage.coverage_start)}
-        </p>
+        <PartialCoverageNote
+          testId="bands-partial-coverage"
+          coverageStart={coverage.coverage_start}
+        />
       ) : null}
       {rows.length > 0 ? (
         <div className={CHART_CLASS} data-testid="bands-chart">
