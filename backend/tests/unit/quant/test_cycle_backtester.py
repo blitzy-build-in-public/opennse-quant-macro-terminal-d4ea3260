@@ -332,13 +332,32 @@ def test_add_months_clamps_to_the_target_months_last_day(
     assert add_months(start, months) == expected
 
 
-def test_days_and_months_together_are_a_conflicting_window_violation() -> None:
-    """``pre_days=180`` with ``pre_months=12`` mixes the two forms: a coded violation, not a
-    window, reported against ``pre_months``."""
-    result = resolve_window(date(2027, 8, 10), pre_days=180, pre_months=12)
+@pytest.mark.parametrize(
+    ("fields", "field"),
+    [
+        pytest.param({"pre_days": 180, "pre_months": 12}, "pre_months", id="pre_days-pre_months"),
+        pytest.param({"pre_months": 12, "post_days": 30}, "pre_months", id="pre_months-post_days"),
+        pytest.param(
+            {"post_days": 30, "post_months": 3}, "post_months", id="post_days-post_months"
+        ),
+        pytest.param({"pre_days": 30, "post_months": 3}, "post_months", id="pre_days-post_months"),
+        pytest.param(
+            {"pre_days": 180, "post_days": 180, "pre_months": 12, "post_months": 12},
+            "pre_months",
+            id="all-four",
+        ),
+    ],
+)
+def test_days_and_months_together_are_a_conflicting_window_violation(
+    fields: dict[str, int], field: str
+) -> None:
+    """A day field with a month field mixes the two forms: a coded violation, not a window,
+    reported against a month field the caller supplied, ``pre_months`` when it is set and
+    ``post_months`` otherwise."""
+    result = resolve_window(date(2027, 8, 10), **fields)
     assert isinstance(result, Violation)
     assert result.code == "conflicting_window_units"
-    assert result.field == "pre_months"
+    assert result.field == field
     assert result.message
 
 

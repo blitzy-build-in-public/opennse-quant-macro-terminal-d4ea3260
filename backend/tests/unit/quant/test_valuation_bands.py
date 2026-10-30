@@ -242,6 +242,26 @@ def test_all_null_series_reports_the_metric_status(metric: BandMetric, status: s
     assert result.is_partial_coverage is True
 
 
+@pytest.mark.parametrize("metric", ["pe", "pb"])
+def test_empty_daily_series_is_insufficient_history(metric: BandMetric) -> None:
+    """A lookback without any market session with a close: ``daily`` and ``sessions`` are empty.
+
+    0 observations is fewer than 60, so both metrics report ``insufficient_history`` as the status
+    and only flag, never the all-null ``no_positive_*`` status: no day exists on which the multiple
+    could be undefined. There are no statistics, an empty series, no coverage start and therefore
+    partial coverage, with the requested start echoed.
+    """
+    result = valuation_bands([], requested_start=FIRST_SESSION, sessions=[], metric=metric)
+
+    assert result.status == "insufficient_history"
+    assert result.flags == ["insufficient_history"]
+    assert result.stats is None
+    assert result.series == []
+    assert result.requested_start == FIRST_SESSION
+    assert result.coverage_start is None
+    assert result.is_partial_coverage is True
+
+
 def test_zero_standard_deviation_puts_every_band_on_the_mean() -> None:
     """60 identical values of 7.5: the sample sd is 0, so all four bands equal the mean 7.5.
 

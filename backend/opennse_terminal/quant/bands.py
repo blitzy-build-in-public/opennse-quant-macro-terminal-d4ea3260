@@ -135,9 +135,12 @@ def valuation_bands(
     Units: every statistic is a multiple (×) except ``current_percentile`` (%). Nothing is rounded.
 
     Status: ``"ok"`` needs at least :data:`MIN_BAND_OBSERVATIONS` (60) values. Fewer gives
-    ``"insufficient_history"`` with ``stats`` ``None`` and the weekly series still returned. No
-    value at all gives ``"no_positive_earnings"`` for ``"pe"`` or ``"no_positive_equity"`` for
-    ``"pb"``, with an empty series. ``flags`` is ``[status]`` for every status but ``"ok"``.
+    ``"insufficient_history"`` with ``stats`` ``None`` and the weekly series still returned; this
+    includes an empty ``daily``, a lookback without any market session with a close, which has 0
+    observations and an empty series. When ``daily`` has at least one session but every value is
+    ``None``, the multiple is undefined throughout the lookback and the status is
+    ``"no_positive_earnings"`` for ``"pe"`` or ``"no_positive_equity"`` for ``"pb"``, with an empty
+    series. ``flags`` is ``[status]`` for every status but ``"ok"``.
 
     Coverage: ``coverage_start`` is the date of the first value, and ``is_partial_coverage`` is
     true when there is none or it falls more than :data:`PARTIAL_COVERAGE_DAYS` (7) calendar days
@@ -187,7 +190,7 @@ def valuation_bands(
 
     stats: BandStatsResult | None = None
     status: BandsStatus
-    if not observed:
+    if daily and not observed:
         status = empty_status
     elif len(observed) < MIN_BAND_OBSERVATIONS:
         status = "insufficient_history"

@@ -21,7 +21,7 @@ from typing import Annotated, Final
 
 from pydantic import Field, StringConstraints
 
-from opennse_terminal.schemas.common import TerminalRequestModel, TerminalResponseModel, Ticker
+from opennse_terminal.schemas.common import TerminalRequestModel, TerminalResponseModel
 
 __all__ = [
     "MAX_WATCHLIST_NAME_LENGTH",
@@ -40,13 +40,36 @@ MAX_WATCHLIST_TICKERS: Final = 100
 # single-field 422 here rather than failing as a 500 when the service queries it.
 _NO_NUL_PATTERN: Final = r"^[^\x00]*$"
 
+# Longest ticker, matching terminal_equities.ticker (VARCHAR(16)).
+_MAX_TICKER_LENGTH: Final = 16
+
+# A ticker refuses NUL for the same reason as the name, and also U+001C-U+001F. The service trims
+# tickers with str.strip(), which treats those four separators as whitespace, while Pydantic's
+# strip_whitespace does not, so a ticker made of them would pass the length check below and reach
+# the service empty. No ticker contains them, so they are refused with the standard 422 as well.
+_TICKER_PATTERN: Final = r"^[^\x00\x1c-\x1f]*$"
+
+# Whitespace is stripped before the length check, as for the name, so a blank ticker fails
+# min_length=1 with the standard 422 rather than reaching the service as an empty ticker.
+_WatchlistTicker = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=_MAX_TICKER_LENGTH,
+        pattern=_TICKER_PATTERN,
+    ),
+]
+
 
 class WatchlistCreate(TerminalRequestModel):
     """Body of ``POST /watchlists``.
 
-    Ticker elements are bounded to 1-16 characters here, and a NUL character in the name or a
-    ticker is FastAPI's standard 422. The service normalizes tickers to upper case, removes
-    duplicates and answers an unknown ticker with the coded 422 ``unknown_ticker``.
+    Ticker elements are bounded to 1-16 characters here after surrounding whitespace is removed,
+    so a blank ticker, like a blank name, is FastAPI's standard 422. So is a NUL character in the
+    name or a ticker, and a U+001C-U+001F separator in a ticker. The service normalizes tickers to
+    upper case, removes duplicates and answers an unknown ticker with the coded 422
+    ``unknown_ticker``.
     """
 
     # Whitespace is stripped before the length check, so a blank name fails min_length=1 with
@@ -65,12 +88,13 @@ class WatchlistCreate(TerminalRequestModel):
             "NUL character; unique per owner."
         ),
     )
-    tickers: list[Ticker] = Field(
+    tickers: list[_WatchlistTicker] = Field(
         default_factory=list,
         max_length=MAX_WATCHLIST_TICKERS,
         description=(
-            "Initial NSE tickers such as SCOM, at most 100; each must exist in terminal_equities. "
-            "Omitted means an empty watchlist."
+            "Initial NSE tickers such as SCOM, at most 100, each 1-16 characters after surrounding "
+            "whitespace is removed, with no NUL or U+001C-U+001F character; each must exist in "
+            "terminal_equities. Omitted means an empty watchlist."
         ),
     )
 

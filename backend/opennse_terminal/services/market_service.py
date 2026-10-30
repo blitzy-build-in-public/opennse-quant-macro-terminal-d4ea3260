@@ -1013,8 +1013,11 @@ async def get_valuation_bands(
     (mean, sample deviation, mean +/- 1 and 2 deviations, min, quartiles, max, current, all x;
     ``current_percentile`` in %) need at least 60 values and are present only when ``status``
     is ``ok``; ``series`` is the weekly transport sample. ``flags`` adds ``currency_mismatch``
-    when a value or member was refused for a non-KES currency. With no price row at all,
-    ``as_of`` is today's date in ``settings.timezone`` and the series is empty.
+    when a value or member was refused for a non-KES currency. A lookback without any session
+    with a close for the subject has 0 observations: ``status`` is ``insufficient_history``,
+    with an empty series and no ``coverage_start``; ``no_positive_earnings`` (pe) and
+    ``no_positive_equity`` (pb) are reserved for a lookback whose sessions are all undefined.
+    With no price row at all, ``as_of`` is today's date in ``settings.timezone``.
 
     Errors: 422 ``exactly_one_subject`` unless exactly one of ``ticker`` and ``sector`` is given;
     404 ``unknown_ticker`` or ``unknown_sector``.

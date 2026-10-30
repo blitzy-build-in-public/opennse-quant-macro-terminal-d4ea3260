@@ -408,8 +408,9 @@ class ValuationBandsResponse(TerminalResponseModel):
     )
     status: BandsStatus = Field(
         description=(
-            "ok, or insufficient_history (under 60 observations), no_positive_earnings (pe) or "
-            "no_positive_equity (pb) when every day is null."
+            "ok, or insufficient_history (under 60 observations, including a lookback with no "
+            "session with a close), no_positive_earnings (pe) or no_positive_equity (pb) when "
+            "the lookback has sessions and every day is null."
         ),
     )
     flags: list[str] = Field(

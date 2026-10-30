@@ -2201,7 +2201,12 @@ async def test_empty_price_table_gives_empty_results_as_of_today(
     assert heatmap.as_of in today
     assert (heatmap.period_ends, heatmap.market, heatmap.sectors) == ([], [], [])
     assert bands.as_of in today
-    assert (bands.status, bands.series, bands.stats) == ("no_positive_earnings", [], None)
+    assert (bands.status, bands.flags, bands.series, bands.stats) == (
+        "insufficient_history",
+        ["insufficient_history"],
+        [],
+        None,
+    )
     assert bands.coverage.coverage_start is None
     assert anomalies.items == []
     assert flows.as_of in today

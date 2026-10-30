@@ -99,14 +99,21 @@ def field(response: httpx.Response) -> str | None:
     return None if value is None else str(value)
 
 
-def assert_validation_list(response: httpx.Response, *offending: str | int) -> None:
+def assert_validation_list(
+    response: httpx.Response, *offending: str | int, error_type: str | None = None
+) -> None:
     """Assert FastAPI's standard 422 body: a ``detail`` list with an entry whose ``loc`` ends
-    with ``offending``, for example ``"watchlist_id"`` or ``"body", "tickers", 0``."""
+    with ``offending``, for example ``"watchlist_id"`` or ``"body", "tickers", 0``, and whose
+    ``type`` is ``error_type`` when one is given, for example ``"string_too_short"``."""
     assert response.status_code == 422, response.text
     detail = response.json()["detail"]
     assert isinstance(detail, list), f"expected the standard validation list, got {detail!r}"
     suffix = list(offending)
-    assert any(entry["loc"][-len(suffix) :] == suffix for entry in detail), detail
+    assert any(
+        entry["loc"][-len(suffix) :] == suffix
+        and (error_type is None or entry["type"] == error_type)
+        for entry in detail
+    ), detail
 
 
 async def names(client: httpx.AsyncClient) -> list[str]:
@@ -247,17 +254,54 @@ async def test_create_rejects_unknown_ticker(
 
 
 @pytest.mark.parametrize(
-    ("body", "offending"),
+    ("body", "offending", "error_type"),
     [
-        pytest.param({"name": "x" * 101}, ("body", "name"), id="name-too-long"),
-        pytest.param({"name": ""}, ("body", "name"), id="name-empty"),
+        pytest.param({"name": "x" * 101}, ("body", "name"), "string_too_long", id="name-too-long"),
+        pytest.param({"name": ""}, ("body", "name"), "string_too_short", id="name-empty"),
         pytest.param(
-            {"name": "x", "owner_key": "y"}, ("body", "owner_key"), id="extra-key-forbidden"
+            {"name": "x", "owner_key": "y"},
+            ("body", "owner_key"),
+            "extra_forbidden",
+            id="extra-key-forbidden",
         ),
-        pytest.param({"name": "bad\x00name"}, ("body", "name"), id="name-nul"),
-        pytest.param({"name": "A\x00B"}, ("body", "name"), id="name-nul-between-letters"),
         pytest.param(
-            {"name": "Bad", "tickers": ["SCOM\x00"]}, ("body", "tickers", 0), id="ticker-nul"
+            {"name": "bad\x00name"}, ("body", "name"), "string_pattern_mismatch", id="name-nul"
+        ),
+        pytest.param(
+            {"name": "A\x00B"},
+            ("body", "name"),
+            "string_pattern_mismatch",
+            id="name-nul-between-letters",
+        ),
+        pytest.param(
+            {"name": "Bad", "tickers": ["SCOM\x00"]},
+            ("body", "tickers", 0),
+            "string_pattern_mismatch",
+            id="ticker-nul",
+        ),
+        pytest.param(
+            {"name": "Bad", "tickers": [""]},
+            ("body", "tickers", 0),
+            "string_too_short",
+            id="ticker-empty",
+        ),
+        pytest.param(
+            {"name": "Bad", "tickers": ["   "]},
+            ("body", "tickers", 0),
+            "string_too_short",
+            id="ticker-whitespace-only",
+        ),
+        pytest.param(
+            {"name": "Bad", "tickers": ["S" * 17]},
+            ("body", "tickers", 0),
+            "string_too_long",
+            id="ticker-too-long",
+        ),
+        pytest.param(
+            {"name": "Bad", "tickers": ["SCOM", "\x1c\x1f"]},
+            ("body", "tickers", 1),
+            "string_pattern_mismatch",
+            id="ticker-information-separators",
         ),
     ],
 )
@@ -266,17 +310,21 @@ async def test_field_bounds_use_standard_validation_list(
     db_session: AsyncSession,
     body: dict[str, Any],
     offending: tuple[str | int, ...],
+    error_type: str,
 ) -> None:
     """Single-field failures get FastAPI's standard 422 list, with no stable code and no write.
 
     The extra-key case also shows that a body can never choose the owner. PostgreSQL text cannot
-    hold a NUL character, so the NUL cases show validation refusing one before any query.
+    hold a NUL character, so the NUL cases show validation refusing one before any query. A
+    ticker is stripped before its length check, so a blank one is too short rather than an
+    unknown ticker. The U+001C-U+001F separators are whitespace to ``str.strip`` but not to that
+    check, so a ticker made of them is refused as well rather than reaching the service empty.
     """
     before = await watchlist_count(db_session)
 
     response = await client.post(f"{BASE}/watchlists", json=body)
 
-    assert_validation_list(response, *offending)
+    assert_validation_list(response, *offending, error_type=error_type)
     assert await watchlist_count(db_session) == before
     assert await names(client) == [SEEDED_WATCHLIST]
 

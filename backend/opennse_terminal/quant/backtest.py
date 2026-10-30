@@ -200,8 +200,9 @@ def resolve_window(
         The window, or one of two :class:`Violation` records, which the route raises as a coded
         422; they are returned values because each rule spans several fields:
 
-        * ``conflicting_window_units`` (reported against ``pre_months``) when a day field and a
-          month field are both supplied;
+        * ``conflicting_window_units`` when a day field and a month field are both supplied,
+          reported against the month field the caller supplied: ``pre_months`` when it is set,
+          otherwise ``post_months``;
         * ``window_out_of_range`` (reported against ``event_dates``) when ``window_start`` or
           ``window_end`` would fall outside the dates ``date`` represents, 0001-01-01 to
           9999-12-31, for example the default 180 days before 0001-01-01.
@@ -215,7 +216,7 @@ def resolve_window(
     if days_given and months_given:
         return Violation(
             code="conflicting_window_units",
-            field="pre_months",
+            field="pre_months" if pre_months is not None else "post_months",
             message=(
                 "Give the window either in days (pre_days, post_days) or in months "
                 "(pre_months, post_months), not both."
