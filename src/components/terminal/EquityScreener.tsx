@@ -516,9 +516,13 @@ const SUMMARY_SECTOR_TEXT_CLASS =
 // moving the selection shifts nothing. Every text colour in the row stays at least 5.1:1 on the
 // tint (rose-400, the lowest), and the ticker button keeps its own hover and pressed states. The
 // cell keeps the resting row header's weight, colour and inline-end divider.
+// Forced-colors mode paints every background, the tint and the bar's included, in the system
+// Canvas colour, so there the bar alone marks the row: it opts out of the adjustment
+// (`forced-color-adjust: none`), takes the system Highlight colour and widens to 4px, which still
+// fits inside the cell's 8px start padding, clear of the ticker text.
 const SELECTED_ROW_CLASS = "bg-slate-800";
 const ROW_HEADER_SELECTED_CLASS =
-  "sticky start-0 z-10 whitespace-nowrap bg-slate-800 px-2 py-1.5 text-start font-medium text-slate-200 before:absolute before:inset-y-0 before:start-0 before:w-0.5 before:bg-sky-400 before:content-[''] after:pointer-events-none after:absolute after:inset-y-0 after:end-0 after:w-px after:bg-slate-700";
+  "sticky start-0 z-10 whitespace-nowrap bg-slate-800 px-2 py-1.5 text-start font-medium text-slate-200 before:absolute before:inset-y-0 before:start-0 before:w-0.5 before:bg-sky-400 before:content-[''] forced-colors:before:w-1 forced-colors:before:bg-[color:Highlight] forced-colors:before:forced-color-adjust-none after:pointer-events-none after:absolute after:inset-y-0 after:end-0 after:w-px after:bg-slate-700";
 // The ticker button is the shared 24px monospace ticker button that AnomalyFeed also uses, at the
 // same size and weight; on the selected row its hover and pressed backgrounds step one shade
 // past the row's slate-800 tint. Its -mx-1 only offsets its 4px inline padding, so the ticker

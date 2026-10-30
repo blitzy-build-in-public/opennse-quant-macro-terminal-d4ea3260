@@ -73,16 +73,27 @@ const CORNER_HEADER_CLASS =
 const ROW_HEADER_CLASS =
   "sticky start-0 z-10 whitespace-nowrap bg-slate-900 px-2 py-1.5 text-start align-top font-medium text-slate-200 after:pointer-events-none after:absolute after:inset-y-0 after:end-0 after:w-px after:bg-slate-700";
 const CELL_CLASS = "border border-slate-900 px-2 py-1.5 text-end align-top";
-const TONE_AT_OR_ABOVE_OFFER = "bg-emerald-900/60 text-emerald-100";
-const TONE_BELOW_OFFER = "bg-rose-900/60 text-rose-100";
-const TONE_NOT_COMPARABLE = "bg-slate-800 text-slate-400";
+// The tones are what the legend below the table explains, so every cell keeps its colours under
+// forced colours (`forced-color-adjust-none`); forcing would paint every cell the one Canvas
+// colour, leaving at-or-above and below the offer alike and the legend untrue. The translucent
+// tones are made opaque there, because over a light Canvas they would pale and their light text
+// would lose contrast. Forced colours drop box shadows only where colours are forced, so the
+// opted-out cells also keep the selected cell's sky ring, which stands out against all three
+// tones whatever the user's palette.
+const TONE_AT_OR_ABOVE_OFFER =
+  "bg-emerald-900/60 text-emerald-100 forced-color-adjust-none forced-colors:bg-emerald-900";
+const TONE_BELOW_OFFER =
+  "bg-rose-900/60 text-rose-100 forced-color-adjust-none forced-colors:bg-rose-900";
+const TONE_NOT_COMPARABLE = "bg-slate-800 text-slate-400 forced-color-adjust-none";
 const SELECTED_CLASS = "ring-2 ring-inset ring-sky-400";
 // A cell with an explanation positions its keyboard tooltip.
 const EXPLAINED_CELL_CLASS = "relative";
 // The explanation trigger looks like the plain cell content, even in a host without a CSS reset,
-// and shows a slate-100 focus ring distinct from the selected cell's sky ring. The transparent
-// outline (written out, since `outline-none` differs between Tailwind 3 and 4) keeps a focus
-// indicator in forced-colors mode, where box-shadow rings are not drawn. Hover underlines the
+// and shows a slate-100 focus ring distinct from the selected cell's sky ring. Under forced colours
+// the cell tones opt out of forcing, which the trigger inherits, so the ring is still drawn. The
+// transparent outline (written out, since `outline-none` differs between Tailwind 3 and 4) keeps a
+// focus indicator wherever the cell's colours are forced after all, as with a host Tailwind that
+// lacks the forced-colours utilities, since forcing drops box-shadow rings. Hover underlines the
 // value (dotted), pressing dims it and a disabled trigger fades with a not-allowed cursor; none of
 // these touches the cell's comparison colours.
 const EXPLANATION_TRIGGER_CLASS =

@@ -317,13 +317,19 @@ const SKELETON_HEIGHT_CLASS =
   "h-[205.34375rem] min-[323px]:h-[204.09375rem] min-[353px]:h-[202.84375rem] min-[363px]:h-[201.84375rem] min-[429px]:h-[200.59375rem] min-[430px]:h-[181.59375rem] min-[435px]:h-[180.59375rem] min-[437px]:h-[179.59375rem] min-[439px]:h-[178.34375rem] min-[462px]:h-[162.09375rem] min-[489px]:h-[156.84375rem] min-[524px]:h-[155.59375rem] min-[595px]:h-[154.34375rem] min-[618px]:h-[150.21875rem] min-[660px]:h-[149.21875rem] min-[666px]:h-[141.96875rem] min-[707px]:h-[138.46875rem] min-[739px]:h-[137.21875rem] min-[806px]:h-[131.84375rem] min-[922px]:h-[89.59375rem] min-[932px]:h-[88.34375rem] min-[1003px]:h-[87.09375rem] min-[1075px]:h-[79.84375rem] min-[1116px]:h-[76.34375rem] min-[1147px]:h-[75.09375rem]";
 const PENDING_OUTPUT_CLASS =
   "h-[85.96875rem] rounded bg-slate-800 motion-safe:animate-pulse min-[435px]:h-[84.96875rem] min-[437px]:h-[83.96875rem] min-[462px]:h-[67.71875rem] min-[489px]:h-[62.46875rem] min-[666px]:h-[55.21875rem] min-[707px]:h-[51.71875rem] min-[922px]:h-[62.46875rem] min-[1075px]:h-[55.21875rem] min-[1116px]:h-[51.71875rem]";
-// Keyboard focus on the chart's `<svg tabindex="0">` gets the controls' sky outline. A mouse click
-// focuses the svg or one of Recharts' internal layers (tabindex -1) without :focus-visible, and
-// that focus draws no ring. When Tab scrolls the chart into view, the svg's scroll-my-2 keeps the
-// whole ring (2px wide at a 2px offset) inside the viewport, with room to spare even when a host's
-// root font size makes the rem-based margin smaller than 8px.
+// Recharts' accessibility layer renders the chart as `<svg class="recharts-surface" tabindex="0">`,
+// which the keyboard reaches and navigates with the arrow keys, and renders its z-index layers as
+// `<g tabindex="-1">`: Tab never reaches them, but a mouse click on a bar focuses one, and a click
+// on bare plot area focuses the surface. A key pressed after the click, such as an arrow key or the
+// Escape that dismisses the tooltip, makes that element :focus-visible. So the layers' outline and
+// any pointer-focus outline are hidden, and the controls' sky-400 ring is drawn on the surface
+// whenever it or a descendant is :focus-visible: it appears for keyboard use and not for a mouse
+// click. The solid style is explicit because Tailwind 3's `outline-2` sets only the width. When Tab
+// scrolls the chart into view, the svg's scroll-my-2 keeps the whole ring (2px wide at a 2px
+// offset) inside the viewport, with room to spare even when a host's root font size makes the
+// rem-based margin smaller than 8px.
 const FAIR_VALUE_CHART_CLASS =
-  "mt-2 h-56 w-full [&_*:focus:not(:focus-visible)]:outline-none [&_svg]:scroll-my-2 [&_svg:focus-visible]:outline-2 [&_svg:focus-visible]:outline-offset-2 [&_svg:focus-visible]:outline-sky-400";
+  "mt-2 h-56 w-full [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none [&_svg]:scroll-my-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:[outline-style:solid] [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-offset-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-sky-400";
 // The chart tooltip mirrors TOOLTIP_CONTENT_STYLE (slate-900 surface, slate-700 border, slate-300
 // text, 12px) with utility classes: the widget renders this content itself, in place of the
 // Recharts default content that takes `contentStyle`.
@@ -620,7 +626,7 @@ function FairValueTooltipContent({ active, payload }: TooltipContentProps): Reac
     <div className={TOOLTIP_CLASS}>
       <p className={TOOLTIP_TITLE_CLASS}>{entry.method}</p>
       <p className={TOOLTIP_ROW_CLASS}>
-        Fair value :{" "}
+        Fair value:{" "}
         <span className={TOOLTIP_VALUE_CLASS}>{formatDecimal(entry.raw, "per_share")}</span>
       </p>
     </div>
@@ -737,6 +743,18 @@ function renderMethodTick(props: XAxisTickContentProps): ReactElement {
   return <MethodAxisTick {...props} />;
 }
 
+// In forced-colors mode browsers keep an SVG's own colours, so the amber offer line and its label,
+// chosen for the slate-900 surface, would fade on a light Canvas (about 1.7:1 on white). Under
+// forced colours only, both are drawn in CanvasText, the line still dashed and drawn 2px wide,
+// because the grid keeps its own dark dashed stroke and a 1px offer line would read as one more
+// grid line. The `ReferenceLine` class lands on the layer holding the line, while Recharts draws
+// the label in a layer of its own, so the label takes its own class. Recharts 3.10.1 replaces its
+// `recharts-label` class with a label's `className` instead of adding to it, so the library class
+// is repeated to keep the label matching `.recharts-label` selectors.
+const OFFER_LINE_CLASS =
+  "forced-colors:[&_.recharts-reference-line-line]:[stroke:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-2";
+const OFFER_LABEL_CLASS = "recharts-label forced-colors:[fill:CanvasText]";
+
 function FairValueChart({ response }: { response: IpoValuationResponse }): ReactElement {
   const offer = response.offer_price_kes;
   const bars = [
@@ -786,12 +804,14 @@ function FairValueChart({ response }: { response: IpoValuationResponse }): React
             {offerY === null ? null : (
               <ReferenceLine
                 y={offerY}
+                className={OFFER_LINE_CLASS}
                 stroke={CHART_COLORS.warning}
                 strokeDasharray="4 3"
                 ifOverflow="extendDomain"
                 label={{
                   value: `Offer ${offerText}`,
                   position: "right",
+                  className: OFFER_LABEL_CLASS,
                   fill: CHART_COLORS.warning,
                   fontSize: 11,
                 }}

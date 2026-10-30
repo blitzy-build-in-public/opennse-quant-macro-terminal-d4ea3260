@@ -426,10 +426,14 @@ const SKELETON_HEIGHT_CLASS =
   "h-[74.625rem] min-[329px]:h-[73.625rem] min-[353px]:h-[72.375rem] min-[358px]:h-[71.375rem] min-[407px]:h-[70.125rem] min-[443px]:h-[68.625rem] min-[449px]:h-[67.625rem] min-[475px]:h-[66.125rem] min-[511px]:h-[65.125rem] min-[556px]:h-[63.875rem] min-[632px]:h-[62.625rem] min-[863px]:h-[61.375rem] min-[1093px]:h-[60.125rem]";
 const SECTION_CLASS = "m-0 flex min-w-0 flex-col gap-2";
 const SECTION_HEADER_CLASS = "flex flex-wrap items-baseline justify-between gap-2";
-// Recharts 3 makes each chart's `<svg class="recharts-surface">` a tabindex 0 application, so it
-// gets the same keyboard focus ring as the other controls. Its `<g tabindex="-1">` layers are
-// never keyboard-reachable but a mouse click can focus them, so neither they nor a mouse-focused
-// surface draws an outline.
+// Recharts 3 makes each chart's `<svg class="recharts-surface">` a tabindex 0 application, which
+// the keyboard reaches and navigates with the arrow keys, and renders its z-index layers as
+// `<g tabindex="-1">`: Tab never reaches them, but a mouse click on plotted data focuses one, and
+// a click on bare plot area focuses the surface. A key pressed after the click, such as an arrow
+// key or the Escape that dismisses the tooltip, makes that element :focus-visible. So the layers'
+// outline and any pointer-focus outline are hidden, and the controls' sky-400 ring is drawn on the
+// surface whenever it or a descendant is :focus-visible: it appears for keyboard use and not for a
+// mouse click. The solid style is explicit because Tailwind 3's `outline-2` sets only the width.
 // Forced-colours mode does not repaint the `fill` and `stroke` attributes Recharts writes, so they
 // would keep their slate and palette colours on the system `Canvas`. Under `forced-colors: active`
 // every SVG `<text>` (tick values, axis labels, the "Event" label) is filled with `CanvasText`;
@@ -444,17 +448,17 @@ const SECTION_HEADER_CLASS = "flex flex-wrap items-baseline justify-between gap-
 // has no `@container` utility without a plugin, so its floating tooltip can be capped at the
 // plot's width (see `TOOLTIP_CLASS`). Its `w-full` and `h-*` sizes are unchanged by it.
 const MAIN_CHART_CLASS =
-  "[container-type:inline-size] h-80 w-full [&_.recharts-surface:focus-visible]:outline-2 [&_.recharts-surface:focus-visible]:outline-offset-2 [&_.recharts-surface:focus-visible]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none forced-colors:[&_text]:fill-[CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:stroke-[color:GrayText] forced-colors:[&_.recharts-line-curve]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_g[data-testid^='marker-']]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_g[data-marker-connectors]]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
+  "[container-type:inline-size] h-80 w-full [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:[outline-style:solid] [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-offset-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none forced-colors:[&_text]:fill-[CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:stroke-[color:GrayText] forced-colors:[&_.recharts-line-curve]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_g[data-testid^='marker-']]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_g[data-marker-connectors]]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
 const OVERLAY_CHART_CLASS =
-  "[container-type:inline-size] h-48 w-full [&_.recharts-surface:focus-visible]:outline-2 [&_.recharts-surface:focus-visible]:outline-offset-2 [&_.recharts-surface:focus-visible]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none forced-colors:[&_text]:fill-[CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:stroke-[color:GrayText] forced-colors:[&_.recharts-line-curve]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_.recharts-active-dot]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
+  "[container-type:inline-size] h-48 w-full [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:[outline-style:solid] [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-offset-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none forced-colors:[&_text]:fill-[CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:stroke-[color:GrayText] forced-colors:[&_.recharts-line-curve]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_.recharts-active-dot]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
 // On a body narrower than the chart's minimum width, each chart wrapper scrolls horizontally
 // and, like the summary table's wrapper, is focusable for keyboard scrolling. Its overflow clips
 // whatever is drawn outside it, so the surface's focus ring is drawn inset there. The
 // forced-colours rules are those of the non-scrolling classes.
 const MAIN_CHART_SCROLL_CLASS =
-  "h-80 w-full overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 [&_.recharts-surface:focus-visible]:outline-2 [&_.recharts-surface:focus-visible]:-outline-offset-2 [&_.recharts-surface:focus-visible]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none forced-colors:[&_text]:fill-[CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:stroke-[color:GrayText] forced-colors:[&_.recharts-line-curve]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_g[data-testid^='marker-']]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_g[data-marker-connectors]]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
+  "h-80 w-full overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:[outline-style:solid] [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:-outline-offset-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none forced-colors:[&_text]:fill-[CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:stroke-[color:GrayText] forced-colors:[&_.recharts-line-curve]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_g[data-testid^='marker-']]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_g[data-marker-connectors]]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
 const OVERLAY_CHART_SCROLL_CLASS =
-  "h-48 w-full overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 [&_.recharts-surface:focus-visible]:outline-2 [&_.recharts-surface:focus-visible]:-outline-offset-2 [&_.recharts-surface:focus-visible]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none forced-colors:[&_text]:fill-[CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:stroke-[color:GrayText] forced-colors:[&_.recharts-line-curve]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_.recharts-active-dot]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
+  "h-48 w-full overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:[outline-style:solid] [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:-outline-offset-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none forced-colors:[&_text]:fill-[CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:stroke-[color:GrayText] forced-colors:[&_.recharts-line-curve]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_.recharts-active-dot]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
 const LEGEND_CLASS = "m-0 flex list-none flex-wrap gap-x-4 gap-y-1 p-0 text-xs text-slate-300";
 const LEGEND_ITEM_CLASS = "inline-flex items-center gap-1.5";
 // Line and marker swatches get the plotted shapes' forced-colours `CanvasText` casing.
@@ -635,9 +639,12 @@ function isIndexMetric(metric: Metric): metric is IndexMetric {
   return metric !== "cumulative_foreign_net_kes";
 }
 
-/** The palette colour of the cycle at `index`, by its position in the response. */
-function seriesColor(index: number): string {
-  return SERIES_PALETTE[index % SERIES_PALETTE.length] ?? CHART_COLORS.accent;
+/**
+ * The colour of palette slot `slot`, a cycle's slot from {@link assignColorSlots}. A slot past the
+ * palette's end wraps around; a negative one, which no cycle holds, takes the fallback accent.
+ */
+function seriesColor(slot: number): string {
+  return SERIES_PALETTE[slot % SERIES_PALETTE.length] ?? CHART_COLORS.accent;
 }
 
 /** How many leading {@link SERIES_PALETTE} entries are its 400 shades, drawn at the base width. */
@@ -648,15 +655,80 @@ const DARK_TONE_SERIES_STROKE_WIDTH = 3;
 const PROJECTION_STROKE_INSET = 0.5;
 
 /**
- * The observed-line `strokeWidth` of the cycle at `index`, by its position in the response: 2px
- * for the cycles in the palette's 400 shades, 3px for the fifth to eighth cycles in its 600
- * shades, so those differ from the first four in weight as well as tone while every observed
- * line stays solid.
+ * The observed-line `strokeWidth` of a cycle in palette slot `slot`, its slot from
+ * {@link assignColorSlots}: 2px for the slots of the palette's 400 shades, 3px for the fifth to
+ * eighth slots in its 600 shades, so those cycles differ from the first four in weight as well as
+ * tone while every observed line stays solid. The width follows the slot, so it stays with the
+ * cycle's colour.
  */
-function seriesStrokeWidth(index: number): number {
-  return index % SERIES_PALETTE.length < BASE_TONE_SERIES
+function seriesStrokeWidth(slot: number): number {
+  return slot % SERIES_PALETTE.length < BASE_TONE_SERIES
     ? BASE_SERIES_STROKE_WIDTH
     : DARK_TONE_SERIES_STROKE_WIDTH;
+}
+
+/**
+ * The {@link SERIES_PALETTE} slot of each of `cycles`, by event date. The slot sets the cycle's
+ * colour ({@link seriesColor}) and stroke width ({@link seriesStrokeWidth}) on the main chart, in
+ * the overlay's swatch and in the summary table, so each cycle keeps both while events are
+ * removed and added.
+ *
+ * In response order, each cycle first keeps its `recorded` slot when that is a palette slot no
+ * earlier cycle has kept. Every other cycle then takes, in response order, the lowest slot no
+ * cycle holds, or its position modulo the palette length once every slot is held, as when the
+ * stored events outnumber the palette. With nothing recorded the slots are the positions, so a
+ * first render colours the cycles in response order.
+ *
+ * @param cycles The response's cycles, in response order, each with a distinct event date.
+ * @param recorded Slots by event date, as {@link withColorSlots} last recorded them.
+ * @returns The slot of every one of `cycles`, by event date.
+ */
+function assignColorSlots(
+  cycles: readonly CycleResult[],
+  recorded: Readonly<Record<string, number>>,
+): Readonly<Record<string, number>> {
+  // At least one slot, so the modulo below is defined; an empty palette draws the accent colour.
+  const slotCount = Math.max(SERIES_PALETTE.length, 1);
+  const slots: Record<string, number> = {};
+  const held = new Set<number>();
+  for (const cycle of cycles) {
+    const slot = recorded[cycle.event_date];
+    if (slot === undefined || slot < 0 || slot >= slotCount || held.has(slot)) continue;
+    slots[cycle.event_date] = slot;
+    held.add(slot);
+  }
+  let lowestFree = 0;
+  cycles.forEach((cycle, index) => {
+    if (slots[cycle.event_date] !== undefined) return;
+    // Every held slot is below `slotCount`, so the scan stops there at the latest.
+    while (held.has(lowestFree)) lowestFree += 1;
+    const slot = lowestFree < slotCount ? lowestFree : index % slotCount;
+    slots[cycle.event_date] = slot;
+    held.add(slot);
+  });
+  return slots;
+}
+
+/**
+ * `recorded` updated with `current`, the slots {@link assignColorSlots} gave the cycles now
+ * shown: each shown cycle's slot replaces its date's record, and a recorded date no longer shown
+ * keeps its slot while no shown cycle holds it, so a date removed and then added back regains its
+ * colour when that is still free. `recorded` itself when that changes nothing.
+ */
+function withColorSlots(
+  recorded: Readonly<Record<string, number>>,
+  current: Readonly<Record<string, number>>,
+): Readonly<Record<string, number>> {
+  const held = new Set(Object.values(current));
+  const merged: Record<string, number> = { ...current };
+  for (const [date, slot] of Object.entries(recorded)) {
+    if (current[date] === undefined && !held.has(slot)) merged[date] = slot;
+  }
+  const dates = Object.keys(merged);
+  const unchanged =
+    dates.length === Object.keys(recorded).length &&
+    dates.every((date) => recorded[date] === merged[date]);
+  return unchanged ? recorded : merged;
 }
 
 /** Whether `iso` is `YYYY-MM-DD` naming a real Gregorian calendar day, checked on its digits. */
@@ -872,18 +944,46 @@ function formatIndexAxisTick(value: unknown): string {
 }
 
 /**
- * The row at or before offset `x`: the latest row with `row.x <= x`, or undefined when `x` lies
- * outside the rows' range. A cycle has no session on most days, so a hovered day is paired with
- * each line's own last session on or before it.
+ * The row at or before offset `x` on a line that covers days up to `limit`: the latest row with
+ * `row.x <= x`, or undefined when `x` is after `limit`, when `limit` is null (the line covers no
+ * day), or when `x` is before every row. A cycle has no session on most days, so a hovered day is
+ * paired with each line's own last session on or before it, which on the days after a line's last
+ * row and up to `limit` is that last row.
+ *
+ * @param limit The last offset the line covers: {@link observedOffsetLimit} for a cycle's
+ *   sessions, which reaches past the last session to the end of the days its window has data
+ *   for; the last row's offset for a projection, which has a row on every offset it covers.
  */
-function rowAtOrBefore<R extends { x: number }>(rows: readonly R[], x: number): R | undefined {
+function rowAtOrBefore<R extends { x: number }>(
+  rows: readonly R[],
+  x: number,
+  limit: number | null,
+): R | undefined {
+  if (limit === null || x > limit) return undefined;
   let found: R | undefined;
-  let maxX = Number.NEGATIVE_INFINITY;
   for (const row of rows) {
-    if (row.x > maxX) maxX = row.x;
     if (row.x <= x && (found === undefined || row.x > found.x)) found = row;
   }
-  return x > maxX ? undefined : found;
+  return found;
+}
+
+/**
+ * The last day a cycle's sessions cover, in calendar days from its `event_date`: its
+ * `window_end`, or the response's `dataAvailableThrough` when the data ends earlier, since its
+ * sessions stop at whichever comes first. For example a ±180-day window ending on a Saturday
+ * covers +180 with its Friday session at +179, while a partial window covers only up to the day
+ * of the latest data. Null when no data is loaded (`dataAvailableThrough` is null) or a date is
+ * not a calendar date, so the cycle covers no day.
+ */
+function observedOffsetLimit(
+  cycle: CycleResult,
+  dataAvailableThrough: string | null,
+): number | null {
+  if (dataAvailableThrough === null) return null;
+  // Four-digit ISO dates order correctly as strings.
+  const coveredThrough =
+    cycle.window_end < dataAvailableThrough ? cycle.window_end : dataAvailableThrough;
+  return calendarDaysBetween(cycle.event_date, coveredThrough);
 }
 
 /** The hovered offset Recharts reports as the tooltip `label`, as a number. */
@@ -1062,16 +1162,22 @@ function describeUpdateStatus(
 }
 
 /**
- * The lines and markers of the main chart for `metric`. Coordinates come from `toChartNumber`;
+ * The lines and markers of the main chart for `metric`, each cycle in the colour and stroke width
+ * of its slot in `slots` (see {@link assignColorSlots}). Coordinates come from `toChartNumber`;
  * every row keeps its raw point, whose decimal strings the tooltip formats for display.
  */
-function buildChartModel(cycles: readonly CycleResult[], metric: Metric): ChartModel {
+function buildChartModel(
+  cycles: readonly CycleResult[],
+  metric: Metric,
+  slots: Readonly<Record<string, number>>,
+): ChartModel {
   const series: ChartSeries[] = [];
   const markers: MarkerSpec[] = [];
   cycles.forEach((cycle, index) => {
     const key = `${index}-${cycle.event_date}`;
-    const color = seriesColor(index);
-    const strokeWidth = seriesStrokeWidth(index);
+    const slot = slots[cycle.event_date] ?? index;
+    const color = seriesColor(slot);
+    const strokeWidth = seriesStrokeWidth(slot);
     const observed = cycle.points.map(
       (point): ObservedRow => ({
         kind: "observed",
@@ -1521,6 +1627,11 @@ interface CycleChartTooltipProps {
   metric: Metric;
   /** The marker whose glyph is under the pointer, or null when the pointer is on none. */
   hoveredMarker: MarkerSpec | null;
+  /**
+   * The response's `data_available_through`, which with each cycle's `window_end` bounds the days
+   * its sessions cover (see {@link observedOffsetLimit}); null when no data is loaded.
+   */
+  dataAvailableThrough: string | null;
   /** The panel's and its rows' classes, by where it is drawn (see `tooltipClasses`). */
   classes: TooltipClasses;
 }
@@ -1547,13 +1658,17 @@ type CycleTooltipEntry =
     };
 
 /**
- * Main-chart tooltip: for the hovered day, each cycle's own session at or before it and each
- * drawn projection's value at or before it. Rows are resolved from the series rather than from
- * Recharts' payload, which is null on every day that is not a session of the line. Both charts
- * snap to the same {@link GridRow} day and resolve it with `rowAtOrBefore`, so a given x shows
- * the same session of a cycle in both tooltips. When a cycle's session is its valuation floor or
- * volume exhaustion, a row beneath it names the marker with its glyph and selecting value
- * ("Valuation floor · P/E 10.55×").
+ * Main-chart tooltip: for the hovered day, each cycle's own last session at or before it and each
+ * drawn projection's value at or before it. A cycle has a row from its first session through the
+ * last day its sessions cover, its `window_end` or `dataAvailableThrough` if earlier (see
+ * {@link observedOffsetLimit}), so a window that ends on a weekend still shows its last session on
+ * its closing days, while a partial cycle has none after its latest data. A projection has a row
+ * from its first through its last projected offset. Rows are resolved from the series rather than
+ * from Recharts' payload, which is null on every day that is not a session of the line. Both
+ * charts snap to the same {@link GridRow} day and resolve it with `rowAtOrBefore` under the same
+ * bound, so a given x shows the same session of a cycle in both tooltips. When a cycle's session
+ * is its valuation floor or volume exhaustion, a row beneath it names the marker with its glyph
+ * and selecting value ("Valuation floor · P/E 10.55×").
  *
  * A marker glyph spans several days, so the hovered offset, taken from the pointer's x, is often
  * not the marked session. While the pointer is on a glyph, `hoveredMarker` is that marker, and a
@@ -1567,6 +1682,7 @@ function CycleChartTooltip({
   series,
   metric,
   hoveredMarker,
+  dataAvailableThrough,
   classes,
 }: CycleChartTooltipProps): ReactElement | null {
   const x = tooltipOffset(label);
@@ -1574,7 +1690,8 @@ function CycleChartTooltip({
 
   const entries: CycleTooltipEntry[] = [];
   for (const item of series) {
-    const observed = rowAtOrBefore(item.observed, x);
+    const observedLimit = observedOffsetLimit(item.cycle, dataAvailableThrough);
+    const observed = rowAtOrBefore(item.observed, x, observedLimit);
     if (observed !== undefined) {
       entries.push({
         type: "line",
@@ -1604,7 +1721,9 @@ function CycleChartTooltip({
       }
     }
     if (item.projection !== null) {
-      const projected = rowAtOrBefore(item.projection, x);
+      // A projection has a row on every offset it covers, so it covers up to its last row.
+      const projectedLimit = offsetRange(item.projection)?.[1] ?? null;
+      const projected = rowAtOrBefore(item.projection, x, projectedLimit);
       if (projected !== undefined) {
         entries.push({
           type: "line",
@@ -1701,21 +1820,36 @@ function CycleChartTooltip({
 interface OverlayTooltipProps {
   active?: boolean;
   label?: string | number;
+  /** The sessions of `cycle`, the cycle the overlay shows. */
   rows: readonly OverlayRow[];
+  /** The cycle the overlay shows, whose `event_date` and `window_end` bound its rows' days. */
+  cycle: CycleResult;
+  /**
+   * The response's `data_available_through`, which with the cycle's `window_end` bounds the days
+   * its sessions cover (see {@link observedOffsetLimit}); null when no data is loaded.
+   */
+  dataAvailableThrough: string | null;
   /** The panel's and its rows' classes, by where it is drawn (see `tooltipClasses`). */
   classes: TooltipClasses;
 }
 
-/** Overlay-chart tooltip: the session at or before the hovered offset, in percentage points. */
+/**
+ * Overlay-chart tooltip, in percentage points: the cycle's last session at or before the hovered
+ * offset, from its first session through the last day its sessions cover, its `window_end` or
+ * `dataAvailableThrough` if earlier (see {@link observedOffsetLimit}). That is the bound the main
+ * chart's tooltip applies to the cycle, so both name the same session for a given day.
+ */
 function OverlayTooltip({
   active,
   label,
   rows,
+  cycle,
+  dataAvailableThrough,
   classes,
 }: OverlayTooltipProps): ReactElement | null {
   const x = tooltipOffset(label);
   if (active !== true || x === null) return null;
-  const row = rowAtOrBefore(rows, x);
+  const row = rowAtOrBefore(rows, x, observedOffsetLimit(cycle, dataAvailableThrough));
   if (row === undefined) return null;
   return (
     <div className={classes.panel}>
@@ -2008,6 +2142,10 @@ export function CycleBacktester({
   // The label of every event date a response has named, by date, recorded whenever the events
   // change, so a re-added stored date keeps its label while the new result loads.
   const [knownLabels, setKnownLabels] = useState<Readonly<Record<string, string>>>({});
+  // The palette slot of every event date shown, by date, with earlier dates whose slot is still
+  // free (see withColorSlots), recorded whenever the events change, so every cycle still shown
+  // keeps its colour and stroke width in the new result.
+  const [colorSlots, setColorSlots] = useState<Readonly<Record<string, number>>>({});
   const removeButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const dateInputRef = useRef<HTMLInputElement>(null);
   const pendingChipFocus = useRef<ChipFocusTarget | null>(null);
@@ -2060,7 +2198,15 @@ export function CycleBacktester({
   // An earlier payload's stored cycles are gone once the API reports none, so no chip shows them.
   const cycles = noEvents ? undefined : data?.cycles;
   const chips = eventDates ?? cycles?.map((cycle) => cycle.event_date) ?? [];
-  const chartModel = useMemo(() => buildChartModel(cycles ?? [], metric), [cycles, metric]);
+  // Every shown cycle's palette slot, by event date, shared by both charts and the summary table.
+  const cycleSlots = useMemo(
+    () => assignColorSlots(cycles ?? [], colorSlots),
+    [cycles, colorSlots],
+  );
+  const chartModel = useMemo(
+    () => buildChartModel(cycles ?? [], metric, cycleSlots),
+    [cycles, metric, cycleSlots],
+  );
   // A key the current chart no longer draws names no marker, so it is never shown.
   const hoveredMarker =
     hoveredMarkerKey === null
@@ -2068,14 +2214,17 @@ export function CycleBacktester({
       : (chartModel.markers.find((spec) => spec.key === hoveredMarkerKey) ?? null);
 
   // The overlay shows the chosen cycle while it still has points, otherwise the first that does.
-  // Its swatch takes the cycle's colour by its position among all cycles, as on the main chart,
-  // not among the candidates.
+  // Its swatch takes the colour of the cycle's palette slot, as on the main chart; the slot is -1,
+  // outside the palette, when no cycle is selected and so no swatch is drawn.
   const overlay = useMemo(() => {
     const allCycles = cycles ?? [];
     const candidates = allCycles.filter((cycle) => cycle.points.length > 0);
     const selected =
       candidates.find((cycle) => cycle.event_date === overlayEventDate) ?? candidates[0];
-    const selectedIndex = selected === undefined ? -1 : allCycles.indexOf(selected);
+    const selectedSlot =
+      selected === undefined
+        ? -1
+        : (cycleSlots[selected.event_date] ?? allCycles.indexOf(selected));
     const rows = (selected?.points ?? []).map(
       (point): OverlayRow => ({
         x: point.offset_days,
@@ -2089,11 +2238,11 @@ export function CycleBacktester({
       OVERLAY_SERIES.some((series) => row[series.field] !== null),
     );
     const yAxis = hasCoordinate ? AUTO_VALUE_AXIS : emptyValueAxis(0);
-    return { candidates, selected, selectedIndex, rows, yAxis };
-  }, [cycles, overlayEventDate]);
+    return { candidates, selected, selectedSlot, rows, yAxis };
+  }, [cycles, cycleSlots, overlayEventDate]);
   const overlayCandidates = overlay.candidates;
   const overlayCycle = overlay.selected;
-  const overlayCycleIndex = overlay.selectedIndex;
+  const overlayCycleSlot = overlay.selectedSlot;
   const overlayRows = overlay.rows;
   const overlayYAxis = overlay.yAxis;
 
@@ -2175,6 +2324,7 @@ export function CycleBacktester({
     }
     setEventDates(remaining);
     setKnownLabels(withCycleLabels(knownLabels, cycles));
+    setColorSlots(withColorSlots(colorSlots, cycleSlots));
     setChipError(null);
     setHoveredMarkerKey(null);
     // A removed date no longer blocks the refused switch, so re-adding it never revives the
@@ -2223,6 +2373,7 @@ export function CycleBacktester({
     // ISO dates order correctly as strings.
     setEventDates([...chips, candidate].sort());
     setKnownLabels(withCycleLabels(knownLabels, cycles));
+    setColorSlots(withColorSlots(colorSlots, cycleSlots));
     setCustomDate("");
     setChipError(null);
     setHoveredMarkerKey(null);
@@ -2583,6 +2734,7 @@ export function CycleBacktester({
                       series={chartModel.series}
                       metric={metric}
                       hoveredMarker={hoveredMarker}
+                      dataAvailableThrough={data?.data_available_through ?? null}
                       classes={mainTooltipClasses}
                     />
                   )}
@@ -2740,8 +2892,8 @@ export function CycleBacktester({
             <span className={SELECT_LABEL_CLASS}>
               <label htmlFor={overlaySelectId}>Overlay cycle</label>
               <LineSwatch
-                color={seriesColor(overlayCycleIndex)}
-                width={seriesStrokeWidth(overlayCycleIndex)}
+                color={seriesColor(overlayCycleSlot)}
+                width={seriesStrokeWidth(overlayCycleSlot)}
               />
               <select
                 id={overlaySelectId}
@@ -2820,6 +2972,8 @@ export function CycleBacktester({
                         active={props.active}
                         label={props.label}
                         rows={overlayRows}
+                        cycle={overlayCycle}
+                        dataAvailableThrough={data?.data_available_through ?? null}
                         classes={overlayTooltipClasses}
                       />
                     )}
@@ -2935,7 +3089,10 @@ export function CycleBacktester({
                   <th scope="row" className={TH_ROW_CLASS}>
                     <span className={CYCLE_CELL_CLASS}>
                       <span className={CYCLE_SWATCH_SLOT_CLASS}>
-                        <LineSwatch color={seriesColor(index)} width={seriesStrokeWidth(index)} />
+                        <LineSwatch
+                          color={seriesColor(cycleSlots[cycle.event_date] ?? index)}
+                          width={seriesStrokeWidth(cycleSlots[cycle.event_date] ?? index)}
+                        />
                       </span>
                       <span>
                         <span className={CYCLE_LABEL_CLASS}>{displayLabel(cycle.label)}</span>

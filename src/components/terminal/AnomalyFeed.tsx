@@ -75,10 +75,16 @@ const LIST_CLASS = "m-0 list-none p-0";
 // a selected row turns it sky-400 (about 6.7:1 on its tint) and tints itself slate-800, so it is
 // marked beyond the tint alone and moving the selection shifts nothing. Every text colour in the
 // row stays at least 5.5:1 on the tint (slate-400, the lowest).
+// Forced-colors mode paints the tint in the system Canvas colour and every non-system border
+// colour, transparent included, in CanvasText, which would give every row the same start border.
+// System colours are kept there, so each row's start border is set to one: Canvas, invisible on
+// the surface, for a row that is not selected, and Highlight for a selected one. Both widen to the
+// same 4px, so the selection reads as a bar like the screener's selected row and moving it still
+// shifts nothing.
 const ITEM_CLASS =
-  "flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-s-2 border-slate-800 border-s-transparent py-1 last:border-b-0";
+  "flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-s-2 border-slate-800 border-s-transparent forced-colors:border-s-4 forced-colors:border-s-[color:Canvas] py-1 last:border-b-0";
 const ITEM_SELECTED_CLASS =
-  "flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-s-2 border-slate-800 border-s-sky-400 bg-slate-800 py-1 last:border-b-0";
+  "flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-s-2 border-slate-800 border-s-sky-400 forced-colors:border-s-4 forced-colors:border-s-[color:Highlight] bg-slate-800 py-1 last:border-b-0";
 const ITEM_LEAD_CLASS = "flex min-w-0 items-center gap-2";
 const ITEM_FIGURES_CLASS = "ms-auto flex items-center gap-3 text-end tabular-nums";
 // The button is the shared compact ticker button of `shared/controlStyles`, the same 24px, 12px

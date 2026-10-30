@@ -801,6 +801,39 @@ test.describe("Election and cycle backtesting (/cycles)", () => {
     return withAttributes(backtester, "cycle-event-chip", { "data-event-date": eventDate });
   }
 
+  /**
+   * The `stroke` and `stroke-width` of every part drawn in `eventDate`'s cycle colour, by part: its
+   * legend and summary swatches, its observed and projection lines, the projection's legend
+   * swatch and its marker glyphs. A part the cycle does not draw is left out.
+   */
+  async function cycleStrokes(
+    backtester: Locator,
+    eventDate: string,
+  ): Promise<Record<string, string>> {
+    const ofCycle = (testId: string): Locator =>
+      withAttributes(backtester, testId, { "data-event-date": eventDate });
+    const mainChart = backtester.getByTestId("cycle-main-chart");
+    const parts: Record<string, Locator> = {
+      legend: ofCycle("cycle-legend-item").locator("svg line"),
+      summary: ofCycle("cycle-summary-row").locator("th svg line"),
+      observed: cycleLine(mainChart, eventDate, "observed"),
+      projection: cycleLine(mainChart, eventDate, "projection"),
+      projectionLegend: ofCycle("cycle-projection-legend").locator("svg line"),
+      valuationFloor: ofCycle("marker-valuation-floor").locator("[stroke]"),
+      volumeExhaustion: ofCycle("marker-volume-exhaustion").locator("[stroke]"),
+    };
+    const strokes: Record<string, string> = {};
+    for (const [part, locator] of Object.entries(parts)) {
+      const values = await locator.evaluateAll((elements) =>
+        elements.map(
+          (element) => `${element.getAttribute("stroke")} ${element.getAttribute("stroke-width")}`,
+        ),
+      );
+      if (values.length > 0) strokes[part] = values.join(", ");
+    }
+    return strokes;
+  }
+
   /** An ISO date as the widgets display it: `4 Mar 2013`. */
   function displayedDate(iso: string): string {
     const [year = "", month = "", day = ""] = iso.split("-");
@@ -848,22 +881,57 @@ test.describe("Election and cycle backtesting (/cycles)", () => {
   }
 
   /**
-   * The last of `rows` at or before `day`, or undefined when `day` is past every row: the session
-   * or projected offset a tooltip pairs with a hovered day.
+   * The last of `rows` at or before `day` on a line that covers days up to `limit`, or undefined
+   * when `day` is past `limit`, when `limit` is null or when `day` is before every row: the session
+   * or projected offset a tooltip pairs with a hovered day. `limit` is {@link observedLimit} for a
+   * cycle's sessions and {@link lastOffset} for a projection.
    */
   function lastAtOrBefore<R extends { offset_days: number }>(
     rows: readonly R[],
     day: number,
+    limit: number | null,
   ): R | undefined {
+    if (limit === null || day > limit) return undefined;
     let found: R | undefined;
-    let latest = Number.NEGATIVE_INFINITY;
     for (const row of rows) {
-      latest = Math.max(latest, row.offset_days);
       if (row.offset_days <= day && (found === undefined || row.offset_days > found.offset_days)) {
         found = row;
       }
     }
-    return day > latest ? undefined : found;
+    return found;
+  }
+
+  /** The latest offset of `rows`, or null when there are none. */
+  function lastOffset(rows: ReadonlyArray<{ offset_days: number }>): number | null {
+    return rows.reduce<number | null>(
+      (latest, row) => (latest === null || row.offset_days > latest ? row.offset_days : latest),
+      null,
+    );
+  }
+
+  /**
+   * Calendar days from ISO date `from` to `to`, negative when `to` is earlier. A date-only ISO
+   * string parses as UTC midnight, so every day is exactly 86,400,000 ms long.
+   */
+  function calendarDaysBetween(from: string, to: string): number {
+    const start = Date.parse(from);
+    const end = Date.parse(to);
+    if (Number.isNaN(start) || Number.isNaN(end)) {
+      throw new Error(`Not ISO dates: ${JSON.stringify(from)}, ${JSON.stringify(to)}`);
+    }
+    return (end - start) / 86_400_000;
+  }
+
+  /**
+   * The last day `cycle`'s sessions cover, in calendar days from its event: its `window_end`, or
+   * `body.data_available_through` when the data ends earlier; null when no data is loaded. A
+   * tooltip pairs every day up to it with the cycle's last session on or before that day.
+   */
+  function observedLimit(body: BacktestResponse, cycle: CycleResult): number | null {
+    const through = body.data_available_through;
+    if (through === null) return null;
+    const coveredThrough = cycle.window_end < through ? cycle.window_end : through;
+    return calendarDaysBetween(cycle.event_date, coveredThrough);
   }
 
   /** Points at the middle of `chart`'s event line, which opens its tooltip at about day 0. */
@@ -879,11 +947,55 @@ test.describe("Election and cycle backtesting (/cycles)", () => {
   }
 
   /**
+   * Points at `day` on `chart`'s offset axis, level with the middle of its event line, so its
+   * tooltip opens on that day. The day's x comes from the axis's own scale: the offset axis is
+   * linear, so x is interpolated between its first and last rendered tick labels, each centred on
+   * its offset. Chrome reports a mouse event's position in whole pixels, truncating a fractional
+   * one, so the pointer is placed on the nearest whole pixel instead: with at least 1 px per day
+   * that stays within half a day of `day`, where the tooltip snaps to it.
+   */
+  async function hoverDay(page: Page, chart: Locator, day: number): Promise<void> {
+    await chart.scrollIntoViewIfNeeded();
+    const tickLabels = chart.locator(
+      ".recharts-xAxis-tick-labels .recharts-cartesian-axis-tick-value",
+    );
+    await expect.poll(() => tickLabels.count()).toBeGreaterThanOrEqual(2);
+    const ticks = await tickLabels.evaluateAll((elements) =>
+      elements.map((element) => {
+        const matrix = element instanceof SVGGraphicsElement ? element.getScreenCTM() : null;
+        const anchor = new DOMPoint(
+          Number(element.getAttribute("x")),
+          Number(element.getAttribute("y")),
+        );
+        return {
+          text: (element.textContent ?? "").trim(),
+          x: matrix === null ? Number.NaN : anchor.matrixTransform(matrix).x,
+        };
+      }),
+    );
+    const first = ticks[0];
+    const last = ticks[ticks.length - 1];
+    if (first === undefined || last === undefined) throw new Error("The offset axis has no tick");
+    const firstDay = parseDisplayedOffset(first.text);
+    const pxPerDay = (last.x - first.x) / (parseDisplayedOffset(last.text) - firstDay);
+    expect(pxPerDay, "client px per day of the offset axis").toBeGreaterThanOrEqual(1);
+    const y = await chart.locator(".recharts-reference-line-line").evaluate((element) => {
+      const box = element.getBoundingClientRect();
+      return box.top + box.height / 2;
+    });
+    // From outside the chart, so the pointer enters it afresh.
+    await page.mouse.move(0, 0);
+    const x = Math.round(first.x + (day - firstDay) * pxPerDay);
+    await page.mouse.move(x, Math.round(y), { steps: 4 });
+  }
+
+  /**
    * Hovers the main chart's event line and checks its tooltip against `body`: each cycle's row
    * names its last session on or before the hovered day and shows that session's `metric` value,
    * each projection's row its value at the last projected offset on or before that day, both as
-   * `formatDecimal` displays them. A line with nothing on or before that day, or a projection
-   * under cumulative flow, has no row.
+   * `formatDecimal` displays them. A cycle has no row when it has no session on or before that day
+   * or the day is past {@link observedLimit}; a projection has none when it has no offset on or
+   * before the day or the day is past its last offset, or under cumulative flow.
    */
   async function expectMainTooltip(
     page: Page,
@@ -904,7 +1016,7 @@ test.describe("Election and cycle backtesting (/cycles)", () => {
           "data-series": series,
         });
       const observedRow = rowOf("observed");
-      const session = lastAtOrBefore(cycle.points, day);
+      const session = lastAtOrBefore(cycle.points, day, observedLimit(body, cycle));
       if (session === undefined) {
         await expect(observedRow).toHaveCount(0);
       } else {
@@ -917,8 +1029,9 @@ test.describe("Election and cycle backtesting (/cycles)", () => {
         );
       }
       const projectionRow = rowOf("projection");
+      const projectedPoints = cycle.projection?.points ?? [];
       const projected = isIndexMetric(metric)
-        ? lastAtOrBefore(cycle.projection?.points ?? [], day)
+        ? lastAtOrBefore(projectedPoints, day, lastOffset(projectedPoints))
         : undefined;
       if (projected === undefined || !isIndexMetric(metric)) {
         await expect(projectionRow).toHaveCount(0);
@@ -1148,6 +1261,22 @@ test.describe("Election and cycle backtesting (/cycles)", () => {
       eventChip(backtester, date).getByRole("button", { name: /^Remove / });
     await expect(chips).toHaveCount(ELECTION_DATES.length);
 
+    // Each cycle's colour and stroke width, read from every part drawn in them once the default
+    // result has drawn its lines and markers; no two cycles share a colour.
+    for (const date of COMPLETED_ELECTION_DATES) {
+      await expect(cycleLine(mainChart, date, "observed")).toHaveCount(1);
+    }
+    await expect(cycleLine(mainChart, FUTURE_ELECTION_DATE, "projection")).toHaveCount(1);
+    await expect(backtester.getByTestId("marker-valuation-floor")).toHaveCount(3);
+    await expect(backtester.getByTestId("marker-volume-exhaustion")).toHaveCount(3);
+    const strokesBefore = new Map<string, Record<string, string>>();
+    for (const date of ELECTION_DATES) {
+      strokesBefore.set(date, await cycleStrokes(backtester, date));
+    }
+    const legendStrokes = ELECTION_DATES.map((date) => strokesBefore.get(date)?.legend);
+    expect(legendStrokes).not.toContain(undefined);
+    expect(new Set(legendStrokes).size).toBe(ELECTION_DATES.length);
+
     // Removing the 2013 chip asks for exactly the three remaining dates, in the same window, and
     // the 2013 cycle leaves the chips, the legend, the summary and the chart.
     const [removed, ...kept] = ELECTION_DATES;
@@ -1169,6 +1298,11 @@ test.describe("Election and cycle backtesting (/cycles)", () => {
     await expect(cycleLine(mainChart, removed, "observed")).toHaveCount(0);
     for (const date of kept.filter((date) => date !== FUTURE_ELECTION_DATE)) {
       await expectObservedLine(mainChart, cycleOf(afterRemoval, date), "price_index");
+    }
+    // The remaining cycles keep their colours and stroke widths in every part, rather than taking
+    // those of the positions they moved up to.
+    for (const date of kept) {
+      await expect.poll(() => cycleStrokes(backtester, date)).toEqual(strokesBefore.get(date));
     }
 
     // A custom date joins the chips in date order and returns under the server's generic label,
@@ -1202,6 +1336,18 @@ test.describe("Election and cycle backtesting (/cycles)", () => {
       "complete",
     );
     await expectObservedLine(mainChart, custom, "price_index");
+    // The added cycle takes the colour and stroke width the removed one freed, and the others
+    // keep theirs.
+    for (const date of kept) {
+      await expect.poll(() => cycleStrokes(backtester, date)).toEqual(strokesBefore.get(date));
+    }
+    const freed = strokesBefore.get(removed);
+    await expect
+      .poll(async () => {
+        const strokes = await cycleStrokes(backtester, CUSTOM_EVENT_DATE);
+        return [strokes.legend, strokes.summary, strokes.observed];
+      })
+      .toEqual([freed?.legend, freed?.summary, freed?.observed]);
 
     // Invalid additions are refused in place without a request: a date already selected, no
     // date, an unfinished date, and a date whose ±180-day window would leave the API's calendar.
@@ -1399,6 +1545,90 @@ test.describe("Election and cycle backtesting (/cycles)", () => {
     expect(requests).toHaveLength(1);
   });
 
+  test("on the window's last day both tooltips keep each cycle's last session before it", async ({
+    page,
+  }) => {
+    test.slow();
+    const initial = nextBacktest(page, () => true);
+    await page.goto("/cycles");
+
+    const backtester = page.getByTestId("terminal-cycle-backtester");
+    await expectReady(backtester, SLOW_READY_TIMEOUT);
+    const { query, body } = await initial;
+    expectWindowQuery(query, "days", "180");
+    const lastDay = body.window.post_days;
+    if (lastDay === null) throw new Error("The default backtest window is not in days");
+
+    // Every completed window ends on its last day, after its last session: each seeded window
+    // closes on a weekend, so its closing days have no session of their own.
+    const completed = COMPLETED_ELECTION_DATES.map((date) => cycleOf(body, date));
+    const lastSessions = completed.map((cycle) => {
+      const last = cycle.points[cycle.points.length - 1];
+      if (last === undefined) throw new Error(`The ${cycle.event_date} cycle has no session`);
+      expect(cycle.status).toBe("complete");
+      expect(calendarDaysBetween(cycle.event_date, cycle.window_end)).toBe(lastDay);
+      expect(last.offset_days).toBeLessThan(lastDay);
+      return { cycle, last };
+    });
+    const awaiting = cycleOf(body, FUTURE_ELECTION_DATE);
+    expect(awaiting.points).toEqual([]);
+    const projected = awaiting.projection?.points.find((point) => point.offset_days === lastDay);
+    if (projected === undefined) throw new Error(`The 2027 projection has no +${lastDay} offset`);
+
+    // The main chart lists each completed cycle's last session and the projection's last offset.
+    const mainChart = backtester.getByTestId("cycle-main-chart");
+    await hoverDay(page, mainChart, lastDay);
+    await expect(mainChart.getByText(/^On or before day \S+ from event$/)).toHaveText(
+      `On or before day ${displayedOffset(lastDay)} from event`,
+    );
+    const rowOf = (eventDate: string, series: LineSeries): Locator =>
+      withAttributes(mainChart, "cycle-tooltip-row", {
+        "data-event-date": eventDate,
+        "data-series": series,
+      });
+    for (const { cycle, last } of lastSessions) {
+      const row = rowOf(cycle.event_date, "observed");
+      await expect(row).toContainText(
+        `${displayedLabel(cycle.label)}${displayedDate(last.trade_date)} \u00b7 ` +
+          `${displayedOffset(last.offset_days)} d`,
+      );
+      await expect(row.locator('[data-part="value"]')).toHaveText(
+        displayedDecimal(last.price_index),
+      );
+    }
+    await expect(rowOf(FUTURE_ELECTION_DATE, "observed")).toHaveCount(0);
+    const projectionRow = rowOf(FUTURE_ELECTION_DATE, "projection");
+    await expect(projectionRow).toContainText(
+      `Projection \u00b7 ${displayedLabel(awaiting.label)}${displayedOffset(lastDay)} d`,
+    );
+    await expect(projectionRow.locator('[data-part="value"]')).toHaveText(
+      displayedDecimal(projected.price_index),
+    );
+    await expect(mainChart.getByTestId("cycle-tooltip-row")).toHaveCount(completed.length + 1);
+
+    // The overlay names the same last session of its selected cycle, the first completed one.
+    const [overlaid] = lastSessions;
+    if (overlaid === undefined) throw new Error("The backtest response has no completed cycle");
+    await expect(backtester.getByTestId("cycle-overlay-select")).toHaveValue(
+      overlaid.cycle.event_date,
+    );
+    const overlayChart = backtester.getByTestId("cycle-overlay-chart");
+    await hoverDay(page, overlayChart, lastDay);
+    const offsetLabel = overlayChart.getByText(/^\(\S+ d\)$/);
+    const { trade_date: lastDate, offset_days: lastOffsetDays } = overlaid.last;
+    await expect(offsetLabel.locator("xpath=..")).toHaveText(
+      `${displayedDate(lastDate)} (${displayedOffset(lastOffsetDays)} d)`,
+    );
+    for (const field of OVERLAY_FIELDS) {
+      const row = withAttributes(overlayChart, "cycle-overlay-tooltip-row", {
+        "data-series": field,
+      });
+      await expect(row.locator('[data-part="value"]')).toHaveText(
+        displayedDecimal(overlaid.last[field], "", "%"),
+      );
+    }
+  });
+
   test("stale and missing overlay rates leave gaps in the overlay and show as —", async ({
     page,
   }) => {
@@ -1525,6 +1755,8 @@ test.describe("IPO valuation sandbox (/ipo)", () => {
   /** Method bar fills of `lib/chartTheme.ts`: emerald-500 at or above the offer, rose-500 below. */
   const OUTPUT_BAR_FILL_AT_OR_ABOVE_OFFER = "#00bc7d";
   const OUTPUT_BAR_FILL_BELOW_OFFER = "#ff2056";
+  /** The offer line's amber, `CHART_COLORS.warning` (#ffb900), as `getComputedStyle` gives it. */
+  const OUTPUT_OFFER_LINE_AMBER = "rgb(255, 185, 0)";
   /** U+00D7, the suffix `lib/format.ts` renders after a ratio. */
   const OUTPUT_RATIO_SIGN = "\u00d7";
   /**
@@ -1553,9 +1785,20 @@ test.describe("IPO valuation sandbox (/ipo)", () => {
   /** One computed style property of an element, as the browser resolves it. */
   async function outputComputedStyle(
     locator: Locator,
-    property: "backgroundColor" | "boxShadow",
+    property: "backgroundColor" | "boxShadow" | "stroke" | "strokeWidth" | "fill",
   ): Promise<string> {
     return locator.evaluate((element, name) => getComputedStyle(element)[name], property);
+  }
+
+  /**
+   * The alpha of a computed colour: the value after the slash of a space-separated form such as
+   * `oklch(l c h / a)`, the fourth argument of `rgba(r, g, b, a)`, and otherwise 1 (opaque).
+   */
+  function outputColorAlpha(color: string): number {
+    const slashed = /\/\s*([\d.]+)(%?)\s*\)$/.exec(color);
+    if (slashed !== null) return Number(slashed[1]) / (slashed[2] === "%" ? 100 : 1);
+    const legacy = /^rgba\((?:[^,]+,){3}\s*([\d.]+)\)$/.exec(color);
+    return legacy === null ? 1 : Number(legacy[1]);
   }
 
   /** An SVG element's box in its chart's user coordinates, where y grows downward. */
@@ -1805,6 +2048,46 @@ test.describe("IPO valuation sandbox (/ipo)", () => {
       OUTPUT_NULL_COMPS_FLAG,
       OUTPUT_NULL_CELL_FLAG,
     ]);
+  });
+
+  test("under forced colours the matrix keeps its tones and selected ring, and the offer line its contrast", async ({
+    page,
+  }) => {
+    // Forced colours repaint every element that does not opt out in the user's palette. The
+    // matrix cells opt out, so the legend's green and rose stay apart, opaque over the Canvas, and
+    // the selected cell keeps its ring, which forcing would drop. The offer line and its label, SVG
+    // the browser leaves in its own amber, are drawn in a system colour instead, and the line is
+    // drawn 2px wide so it stands apart from the grid, which keeps its own dark 1px stroke.
+    await page.emulateMedia({ forcedColors: "active" });
+    const { sandbox } = await openSandbox(page);
+    const matrix = sandbox.getByTestId("terminal-sensitivity-matrix");
+
+    const atOrAbove = outputMatrixCell(matrix, "16.00", "6.00");
+    const below = outputMatrixCell(matrix, "16.00", "3.00");
+    await expect(atOrAbove).toContainClass(OUTPUT_TONE_AT_OR_ABOVE_OFFER);
+    await expect(below).toContainClass(OUTPUT_TONE_BELOW_OFFER);
+    const atOrAboveBackground = await outputComputedStyle(atOrAbove, "backgroundColor");
+    const belowBackground = await outputComputedStyle(below, "backgroundColor");
+    expect(atOrAboveBackground).not.toBe(belowBackground);
+    expect(outputColorAlpha(atOrAboveBackground)).toBe(1);
+    expect(outputColorAlpha(belowBackground)).toBe(1);
+
+    const selectedCell = outputMatrixCell(matrix, "18.00", "4.50");
+    await expect(selectedCell).toHaveAttribute("data-selected", "true");
+    expect(await outputComputedStyle(selectedCell, "boxShadow")).not.toBe("none");
+    expect(
+      await outputComputedStyle(outputMatrixCell(matrix, "18.00", "4.00"), "boxShadow"),
+    ).toBe("none");
+
+    const chart = sandbox.getByTestId("ipo-fair-value-chart");
+    const offerLine = chart.locator("line.recharts-reference-line-line");
+    await expect(offerLine).toHaveCount(1);
+    const offerStroke = await outputComputedStyle(offerLine, "stroke");
+    expect(offerStroke).not.toBe(OUTPUT_OFFER_LINE_AMBER);
+    expect(await outputComputedStyle(offerLine, "strokeWidth")).toBe("2px");
+    const offerLabel = chart.locator("text.recharts-label");
+    await expect(offerLabel).toHaveText("Offer KES 7.50");
+    expect(await outputComputedStyle(offerLabel, "fill")).toBe(offerStroke);
   });
 
   // Request lifecycle of the valuation. The browser clock and the valuation route are under the
@@ -3226,6 +3509,101 @@ test.describe("Custom watchlists and screener (/screener)", () => {
     await expect(flows.getByText("Updating…")).toHaveCount(0, { timeout: SLOW_READY_TIMEOUT });
     await expectFlowsReadouts(flows, scom);
     await expect(flows.getByTestId("flows-coverage")).toContainText("100.00");
+  });
+
+  test("under forced colours the selected counter stays marked in the table and the feed", async ({
+    page,
+  }) => {
+    // Forced colours paint every author background in the system Canvas colour, the selection
+    // tints included, so the selection must show as a Highlight bar: the selected screener row's
+    // accent, and the start border of each selected feed item, which every other item draws in
+    // Canvas.
+    await page.emulateMedia({ forcedColors: "active" });
+    await page.goto("/screener");
+
+    const screener = page.getByTestId("terminal-equity-screener");
+    const feed = page.getByTestId("terminal-anomaly-feed");
+    await expectReady(screener, SLOW_READY_TIMEOUT);
+    await expectReady(feed, SLOW_READY_TIMEOUT);
+
+    const [scomSpike, kcbSpike] = PLANTED_SPIKES;
+    const scomRow = withAttributes(screener, "screener-row", { "data-ticker": scomSpike.ticker });
+    const kcbRow = withAttributes(screener, "screener-row", { "data-ticker": kcbSpike.ticker });
+    await scomRow.getByRole("button", { name: scomSpike.ticker, exact: true }).click();
+    await expect(scomRow).toHaveAttribute("data-selected", "true");
+    await expect(kcbRow).toHaveAttribute("data-selected", "false");
+    await expect(
+      withAttributes(feed, "anomaly-item", {
+        "data-ticker": scomSpike.ticker,
+        "data-trade-date": scomSpike.tradeDate,
+        "data-metric": "volume",
+      }),
+    ).toHaveAttribute("data-selected", "true");
+
+    // The system colours as this page resolves them, read from a probe that is removed at once.
+    // Forced colours keep an author's system colour, so the probe shows each one unchanged.
+    const system = await page.evaluate(() => {
+      const probe = document.createElement("span");
+      document.body.append(probe);
+      probe.style.color = "Canvas";
+      const canvas = getComputedStyle(probe).color;
+      probe.style.color = "Highlight";
+      const highlight = getComputedStyle(probe).color;
+      probe.remove();
+      return { canvas, highlight };
+    });
+    expect(system.highlight).not.toBe(system.canvas);
+    // Both widgets' surfaces are forced to Canvas, which the bars must stand out from.
+    for (const widget of [screener, feed]) {
+      expect(await widget.evaluate((element) => getComputedStyle(element).backgroundColor)).toBe(
+        system.canvas,
+      );
+    }
+
+    const accentOf = (row: Locator) =>
+      row.locator('th[data-column="ticker"]').evaluate((cell) => {
+        const accent = getComputedStyle(cell, "::before");
+        return { content: accent.content, color: accent.backgroundColor, width: accent.width };
+      });
+    const scomAccent = await accentOf(scomRow);
+    expect(scomAccent.content).not.toBe("none");
+    expect(scomAccent.color).toBe(system.highlight);
+    expect(scomAccent.width).toBe("4px");
+    // A row that is not selected draws no accent at all.
+    expect((await accentOf(kcbRow)).content).toBe("none");
+
+    // Every item reserves the same 4px start border, so moving the selection shifts nothing;
+    // only the selected counter's items colour it.
+    const items = await feed.getByTestId("anomaly-item").evaluateAll((elements) =>
+      elements.map((element) => {
+        const style = getComputedStyle(element);
+        return {
+          ticker: element.getAttribute("data-ticker"),
+          selected: element.getAttribute("data-selected") === "true",
+          color: style.borderInlineStartColor,
+          width: style.borderInlineStartWidth,
+        };
+      }),
+    );
+    const selectedItems = items.filter((item) => item.selected);
+    const restingItems = items.filter((item) => !item.selected);
+    expect(selectedItems.length).toBeGreaterThan(0);
+    expect(restingItems.map((item) => item.ticker)).toContain(kcbSpike.ticker);
+    for (const item of selectedItems) {
+      expect(item).toEqual({
+        ticker: scomSpike.ticker,
+        selected: true,
+        color: system.highlight,
+        width: "4px",
+      });
+    }
+    for (const item of restingItems) {
+      expect(item.ticker).not.toBe(scomSpike.ticker);
+      expect({ color: item.color, width: item.width }).toEqual({
+        color: system.canvas,
+        width: "4px",
+      });
+    }
   });
 
   test("a near-constant 10^14 P/E still draws a few distinct, finite axis ticks", async ({
