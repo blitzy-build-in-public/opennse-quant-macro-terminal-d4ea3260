@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type { KeyboardEvent, ReactElement } from "react";
 
-import { fieldErrorMap } from "./lib/apiClient";
 import type { TerminalApiError } from "./lib/apiClient";
 import {
   EMPTY_VALUE,
@@ -42,6 +41,25 @@ export interface EquityScreenerProps extends TerminalWidgetProps {
    * show its valuation bands and flows. Without it, tickers render as plain text.
    */
   onSelectTicker?: (ticker: string) => void;
+  /**
+   * The ticker the caller has selected, for example the last one passed to `onSelectTicker`. Its
+   * row is tinted, marked with a sky accent at its start edge and `data-selected="true"`, and its
+   * ticker button carries `aria-current="true"`. Without it, or when no row matches, no row is
+   * marked.
+   */
+  selectedTicker?: string;
+  /**
+   * The caller's current watchlists, for example as a sibling `WatchlistManager` reports them
+   * through `onWatchlistsChange`. They are a change signal, never the option list: the selector's
+   * options and the names it shows always come from the widget's own `GET /watchlists`. An array
+   * whose lists differ from the previous array's, compared by id, name and `updated_at` in any
+   * order, fetches `GET /watchlists` again; a new array with the same content changes nothing.
+   * When the applied watchlist was in the previous array and is missing from the new one, the
+   * caller deleted it, so the filter returns to all counters at once with a notice naming it. No
+   * other conclusion is drawn from the array, since a caller may not know a list created
+   * elsewhere. Without it, the widget relies on its own requests alone.
+   */
+  watchlists?: Watchlist[];
 }
 
 /** The eight typed numeric filters, in panel order, with their visible labels. */
@@ -67,6 +85,13 @@ const INPUT_FIELDS: ReadonlySet<string> = new Set<string>([
   "watchlist_id",
   ...NUMERIC_FILTERS.map(({ key }) => key),
 ]);
+
+/** The bounded pairs the server checks with `min_exceeds_max`, whose `field` is the minimum. */
+const BOUNDED_FILTERS = [
+  { min: "min_pe", max: "max_pe" },
+  { min: "min_pb", max: "max_pb" },
+  { min: "min_ev_ebitda", max: "max_ev_ebitda" },
+] as const satisfies ReadonlyArray<{ min: NumericFilterKey; max: NumericFilterKey }>;
 
 /** Typing pause after which the numeric drafts are applied; Enter and blur apply at once. */
 const DRAFT_DEBOUNCE_MS = 400;
@@ -289,6 +314,91 @@ function sectorOptions(
   return names;
 }
 
+/** The visible label of a numeric filter. */
+function filterLabel(key: NumericFilterKey): string {
+  return NUMERIC_FILTERS.find((filter) => filter.key === key)?.label ?? key;
+}
+
+/**
+ * A `min_exceeds_max` error on `field` in the visible labels, with both bounds echoed exactly as
+ * they were sent, for example "Min P/E (10) must not exceed Max P/E (5).". `null` when `field` is
+ * not the minimum of a bounded pair or either bound was not sent, so the server's text is kept.
+ */
+function minExceedsMaxMessage(field: string, sent: ScreenerFilters): string | null {
+  const pair = BOUNDED_FILTERS.find(({ min }) => min === field);
+  if (pair === undefined) {
+    return null;
+  }
+  const low = sent[pair.min];
+  const high = sent[pair.max];
+  if (low === undefined || high === undefined) {
+    return null;
+  }
+  return `${filterLabel(pair.min)} (${low}) must not exceed ${filterLabel(pair.max)} (${high}).`;
+}
+
+/** Whether a request field error reports the filtered watchlist as gone. */
+function isMissingWatchlistEntry(field: string, code: string): boolean {
+  return field === "watchlist_id" && code === "watchlist_not_found";
+}
+
+/** Whether the screener request failed because its `watchlist_id` names no watchlist. */
+function isWatchlistNotFound(error: TerminalApiError | null): boolean {
+  return (
+    error !== null &&
+    (error.code === "watchlist_not_found" ||
+      error.fieldErrors.some(({ field, code }) => isMissingWatchlistEntry(field, code)))
+  );
+}
+
+/**
+ * The message beneath each request field the failed request names, first entry per field.
+ * `min_exceeds_max` reads in the visible labels. A `watchlist_not_found` entry is left out: the
+ * widget clears that filter and names the list in its own notice instead of echoing the
+ * identifier. Every other code keeps the server's message.
+ */
+function fieldMessages(error: TerminalApiError, sent: ScreenerFilters): Record<string, string> {
+  const messages: Record<string, string> = {};
+  for (const { field, code, message } of error.fieldErrors) {
+    if (
+      Object.prototype.hasOwnProperty.call(messages, field) ||
+      isMissingWatchlistEntry(field, code)
+    ) {
+      continue;
+    }
+    const labelled = code === "min_exceeds_max" ? minExceedsMaxMessage(field, sent) : null;
+    messages[field] = labelled ?? message;
+  }
+  return messages;
+}
+
+/** Whether two ticker lists, each sorted ascending as the API returns them, are equal. */
+function sameTickers(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((ticker, index) => ticker === right[index]);
+}
+
+/**
+ * The content of a caller's watchlists as one string, the same for the same lists in any order:
+ * each list's id, name and `updated_at`, which the server advances on every ticker addition or
+ * removal. Each entry is JSON-encoded, so no name can merge two entries. `null` without lists.
+ */
+function watchlistsSignature(lists: readonly Watchlist[] | undefined): string | null {
+  if (lists === undefined) {
+    return null;
+  }
+  return lists
+    .map(({ id, name, updated_at }) => JSON.stringify([id, name, updated_at]))
+    .sort()
+    .join("\n");
+}
+
+/** The notice shown once the filtered watchlist is found gone, naming it when it is known. */
+function missingWatchlistNotice(name: string | undefined): string {
+  return name === undefined
+    ? "The selected watchlist no longer exists. Showing all counters."
+    : `“${name}” was deleted. Showing all counters.`;
+}
+
 // Every class below is a complete static string, never assembled from fragments, so Tailwind's
 // source scan and a host's `@source` directive or `content` glob find each one. Only the default
 // palette is used. Focus indicators are outlines, which forced-colors mode keeps.
@@ -301,6 +411,10 @@ const LABEL_CLASS = "text-xs font-medium text-slate-400";
    44px guideline), so 16 columns stay readable. Flagged for designer review. */
 const INPUT_CLASS =
   "w-full min-w-0 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-sm text-slate-100 placeholder:text-slate-600 aria-[invalid=true]:border-rose-500 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-sky-400 disabled:cursor-not-allowed disabled:text-slate-400";
+// The watchlist selector ends a clipped list name with an ellipsis, so it reads as truncated;
+// the selector's title and the context line carry the full name.
+const WATCHLIST_SELECT_CLASS =
+  "w-full min-w-0 text-ellipsis rounded border border-slate-700 bg-slate-950 px-2 py-1 text-sm text-slate-100 placeholder:text-slate-600 aria-[invalid=true]:border-rose-500 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-sky-400 disabled:cursor-not-allowed disabled:text-slate-400";
 const FILTER_FOOTER_CLASS = "mt-3 flex flex-wrap items-center justify-between gap-3";
 const CHECKBOX_LABEL_CLASS = "inline-flex items-center gap-2 text-sm text-slate-200";
 const CHECKBOX_CLASS =
@@ -320,12 +434,20 @@ const WATCHLISTS_NOTICE_CLASS = "mt-1 flex flex-wrap items-center gap-x-2 gap-y-
 const WATCHLISTS_NOTICE_TEXT_CLASS = "text-xs text-rose-400";
 const WATCHLISTS_RETRY_CLASS =
   "rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-slate-700 active:bg-slate-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 aria-[disabled=true]:cursor-wait aria-[disabled=true]:text-slate-400 aria-[disabled=true]:hover:bg-slate-800 aria-[disabled=true]:active:bg-slate-800 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+// The notice that the filtered watchlist is gone and all counters are shown. It is always
+// rendered, so its live region exists before the text arrives; while empty it is screen-reader
+// only, which also takes it out of the field's flex gap. Amber-300 on the slate-900 card is about
+// 12:1, and a long list name wraps anywhere rather than widen the field.
+const WATCHLIST_NOTICE_CLASS = "mt-1 text-xs text-amber-300 [overflow-wrap:anywhere]";
+const WATCHLIST_NOTICE_EMPTY_CLASS = "sr-only";
 
 const BODY_CLASS = "flex flex-col gap-4 motion-safe:transition-opacity motion-safe:duration-200";
 const BODY_DIMMED_CLASS =
   "flex flex-col gap-4 opacity-60 motion-safe:transition-opacity motion-safe:duration-200";
 const CONTEXT_CLASS = "flex flex-wrap gap-x-3 gap-y-1 text-xs text-slate-400";
 const COUNT_CLASS = "font-medium text-slate-200";
+// The applied watchlist's full name; a long one wraps anywhere instead of widening the card.
+const CONTEXT_WATCHLIST_CLASS = "min-w-0 [overflow-wrap:anywhere]";
 const SCROLL_REGION_CLASS =
   "overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 const TABLE_CLASS = "min-w-full border-collapse text-sm";
@@ -350,6 +472,15 @@ const SORT_BUTTON_ACTIVE_CLASS =
   "inline-flex min-h-6 items-center gap-1 rounded text-xs font-semibold text-slate-100 hover:text-slate-300 active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const ROW_HEADER_CLASS =
   "sticky start-0 z-10 whitespace-nowrap bg-slate-900 px-2 py-1.5 text-start font-semibold text-slate-100";
+// The selected counter's row is tinted slate-800, and its sticky ticker cell switches to the same
+// opaque tint, so the row reads as one band while scrolled cells still pass beneath that cell. A
+// 2px sky-400 bar at the cell's start edge (about 6.7:1 on the tint) marks the row beyond the
+// tint alone. The bar is a pseudo-element placed inside the sticky cell, which positions it, so
+// moving the selection shifts nothing. Every text colour in the row stays at least 5.1:1 on the
+// tint (rose-400, the lowest), and the ticker button keeps its own hover and pressed states.
+const SELECTED_ROW_CLASS = "bg-slate-800";
+const ROW_HEADER_SELECTED_CLASS =
+  "sticky start-0 z-10 whitespace-nowrap bg-slate-800 px-2 py-1.5 text-start font-semibold text-slate-100 before:absolute before:inset-y-0 before:start-0 before:w-0.5 before:bg-sky-400 before:content-['']";
 const TICKER_BUTTON_CLASS =
   "min-h-6 rounded font-semibold text-sky-300 underline-offset-2 hover:underline active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 const TEXT_CELL_CLASS = "px-2 py-1.5 text-start text-slate-200";
@@ -547,19 +678,32 @@ function CounterHeader({ column, activeSort, activeOrder, onSort }: CounterHeade
 interface CounterRowProps {
   row: ScreenerRow;
   onSelectTicker?: (ticker: string) => void;
+  /** Whether this row is the caller's `selectedTicker`. */
+  selected: boolean;
 }
 
 /** One equity of the screener, every value formatted from the server's exact strings. */
-function CounterRow({ row, onSelectTicker }: CounterRowProps): ReactElement {
+function CounterRow({ row, onSelectTicker, selected }: CounterRowProps): ReactElement {
   return (
-    <tr data-testid="screener-row" data-ticker={row.ticker}>
-      <th scope="row" data-column="ticker" className={ROW_HEADER_CLASS}>
+    <tr
+      data-testid="screener-row"
+      data-ticker={row.ticker}
+      data-selected={selected ? "true" : "false"}
+      className={selected ? SELECTED_ROW_CLASS : undefined}
+    >
+      <th
+        scope="row"
+        data-column="ticker"
+        className={selected ? ROW_HEADER_SELECTED_CLASS : ROW_HEADER_CLASS}
+      >
         {/* A button only when a handler exists: a control that does nothing would mislead
-            keyboard and screen-reader users, so without one the ticker is plain text. */}
+            keyboard and screen-reader users, so without one the ticker is plain text. Its name
+            stays the bare ticker; aria-current tells assistive technology which one is chosen. */}
         {onSelectTicker ? (
           <button
             type="button"
             onClick={() => onSelectTicker(row.ticker)}
+            aria-current={selected ? "true" : undefined}
             className={TICKER_BUTTON_CLASS}
           >
             {row.ticker}
@@ -694,6 +838,18 @@ function SectorAggregateRow({ aggregate }: { aggregate: SectorAggregate }): Reac
   );
 }
 
+/** A screener response with the filters it answered. */
+interface AnsweredFilters {
+  response: ScreenerResponse | undefined;
+  filters: ScreenerFilters;
+}
+
+/** The caller's last `watchlists` array, with its {@link watchlistsSignature}. */
+interface CallerWatchlists {
+  signature: string | null;
+  lists: Watchlist[] | undefined;
+}
+
 /** Whether the request failed on specific request fields, which are shown beside their inputs. */
 function isFieldError(error: TerminalApiError | null): error is TerminalApiError {
   return error !== null && error.fieldErrors.length > 0;
@@ -720,7 +876,14 @@ const useBrowserLayoutEffect = typeof window === "undefined" ? useEffect : useLa
  * watchlists from `GET /watchlists` and refreshes them whenever it is focused. That request is
  * independent of the counters: if it fails before any list has loaded, the selector is disabled
  * and a message with its own Retry appears beneath it while the counters stay usable, and a list
- * that loaded earlier stays selectable after a later failure.
+ * that loaded earlier stays selectable after a later failure. The options and every list name
+ * shown come from that request alone. Lists passed as `watchlists` only signal a change: an array
+ * with new content fetches the watchlists again, and an applied list it drops from the previous
+ * array was deleted by the caller, so the filter is cleared at once. Each newer payload is then
+ * compared with the one before: an applied watchlist it no longer holds is cleared, and one whose
+ * tickers changed has its counters fetched again while the previous rows stay dimmed. A screener
+ * request answered with `watchlist_not_found` clears the filter as well and never shows its
+ * identifier. Every clearing returns to all counters with a notice naming the list when known.
  */
 export function EquityScreener({
   apiBaseUrl,
@@ -728,6 +891,8 @@ export function EquityScreener({
   className,
   initialFilters,
   onSelectTicker,
+  selectedTicker,
+  watchlists: callerWatchlists,
 }: EquityScreenerProps): ReactElement {
   const baseId = useId();
   const [applied, setApplied] = useState<ScreenerFilters>(() => initialFilters ?? {});
@@ -748,14 +913,28 @@ export function EquityScreener({
     setApplied((current) => applyDrafts(current, drafts));
   }, [drafts]);
 
+  // The filters the shown response answered. A new query aborts the request it supersedes, so a
+  // response always answers the filters current when it arrives, and they are recorded during
+  // that render. Until a refetch settles, the previous response stays on screen under filters
+  // that may have changed since, such as a cleared watchlist or a Reset, so it is judged by the
+  // filters it answered: a dimmed "no match" never turns into the empty-database state meanwhile.
+  const [answered, setAnswered] = useState<AnsweredFilters>(() => ({
+    response: undefined,
+    filters: applied,
+  }));
   const screener = useTerminalQuery<ScreenerResponse>({
     path: "/market/screener",
     query: screenerQuery(applied),
     apiBaseUrl,
     getHeaders,
     // With a narrowing filter set, no rows is a "no match" inside the table, so the filters stay.
-    isEmpty: (response) => response.rows.length === 0 && !hasActiveFilter(applied),
+    isEmpty: (response) =>
+      response.rows.length === 0 &&
+      !hasActiveFilter(response === answered.response ? answered.filters : applied),
   });
+  if (screener.data !== answered.response) {
+    setAnswered({ response: screener.data, filters: applied });
+  }
   const watchlists = useTerminalQuery<Watchlist[]>({ path: "/watchlists", apiBaseUrl, getHeaders });
   // Set once a retry of the watchlist request is asked for, so the list's own Retry stays mounted
   // (as "Retrying…") while a retry of a list that never loaded is in flight.
@@ -766,10 +945,100 @@ export function EquityScreener({
   const restoreWatchlistFocus = useRef(false);
   // Set while focus is moved to the selector programmatically, so that focus does not refetch.
   const skipWatchlistFocusRefetch = useRef(false);
+  // Why the watchlist filter was last cleared for the widget, until the user next picks a list or
+  // presses Reset.
+  const [watchlistNotice, setWatchlistNotice] = useState<string | null>(null);
+
+  // The applied watchlist as this render leaves it: a check below that clears the filter sets it
+  // to undefined, so a later check in the same render does not act on the cleared list again.
+  let appliedWatchlistId = applied.watchlist_id;
+  /** Clear the watchlist filter back to all counters, with a notice naming the list if known. */
+  const clearAppliedWatchlist = (clearedId: string, name: string | undefined): void => {
+    appliedWatchlistId = undefined;
+    setApplied((current) =>
+      current.watchlist_id === clearedId ? withSelectFilter(current, "watchlist_id", "") : current,
+    );
+    setWatchlistNotice(missingWatchlistNotice(name));
+  };
+
+  // The caller's lists, compared by content rather than identity, so a new array with the same
+  // lists changes nothing. They may be stale (WatchlistManager never reloads lists created in
+  // another tab), so they never become the options: new content only fetches the watchlists
+  // again. The one conclusion drawn from them is a deletion the caller itself made, an applied
+  // list in its previous array that the new one lacks, which is cleared before the next commit
+  // so its rows go at once and no later request carries its id. The first array has nothing to
+  // compare with. Both checks run during render, React's pattern for adjusting state when a prop
+  // changes, and the stored signature stops them repeating, so no effect is needed.
+  const callerSignature = watchlistsSignature(callerWatchlists);
+  const [caller, setCaller] = useState<CallerWatchlists>(() => ({
+    signature: callerSignature,
+    lists: callerWatchlists,
+  }));
+  if (callerSignature !== caller.signature) {
+    setCaller({ signature: callerSignature, lists: callerWatchlists });
+    if (callerWatchlists !== undefined) {
+      watchlists.refetch();
+      const deletedId = appliedWatchlistId;
+      const deleted =
+        deletedId === undefined || deletedId === ""
+          ? undefined
+          : caller.lists?.find(({ id }) => id === deletedId);
+      if (
+        deletedId !== undefined &&
+        deleted !== undefined &&
+        !callerWatchlists.some(({ id }) => id === deletedId)
+      ) {
+        clearAppliedWatchlist(deletedId, deleted.name);
+      }
+    }
+  }
+
+  // Each fetched payload is compared with the one before it. An applied watchlist that has left
+  // it, deleted here or in another tab, is cleared the same way; one whose tickers changed has
+  // its counters fetched again, the previous rows staying dimmed until they arrive.
+  const [seenWatchlists, setSeenWatchlists] = useState(watchlists.data);
+  if (watchlists.data !== seenWatchlists) {
+    setSeenWatchlists(watchlists.data);
+    const appliedId = appliedWatchlistId;
+    const before =
+      appliedId === undefined || appliedId === ""
+        ? undefined
+        : seenWatchlists?.find(({ id }) => id === appliedId);
+    const after = watchlists.data?.find(({ id }) => id === appliedId);
+    if (
+      appliedId !== undefined &&
+      before !== undefined &&
+      watchlists.data !== undefined &&
+      after === undefined
+    ) {
+      clearAppliedWatchlist(appliedId, before.name);
+    } else if (
+      before !== undefined &&
+      after !== undefined &&
+      !sameTickers(before.tickers, after.tickers)
+    ) {
+      screener.refetch();
+    }
+  }
 
   const error = screener.error;
+  // A filter naming a watchlist the server does not have, such as an initialFilters id or a list
+  // deleted before the widget saw it go, is cleared the same way and never shown as the raw
+  // message. A list still offered is stale, so the options are fetched again to drop it.
+  const missingWatchlistId = appliedWatchlistId;
+  if (
+    isWatchlistNotFound(error) &&
+    missingWatchlistId !== undefined &&
+    missingWatchlistId !== ""
+  ) {
+    const missing = watchlists.data?.find(({ id }) => id === missingWatchlistId);
+    clearAppliedWatchlist(missingWatchlistId, missing?.name);
+    if (missing !== undefined && !watchlists.isFetching) {
+      watchlists.refetch();
+    }
+  }
   const hasFieldErrors = isFieldError(error);
-  const fieldErrors = hasFieldErrors ? fieldErrorMap(error) : {};
+  const fieldErrors = hasFieldErrors ? fieldMessages(error, applied) : {};
   const otherFieldErrors = Object.entries(fieldErrors).filter(
     ([field]) => !INPUT_FIELDS.has(field),
   );
@@ -832,6 +1101,16 @@ export function EquityScreener({
     selectedWatchlist !== undefined &&
     selectedWatchlist !== "" &&
     !watchlistItems.some((watchlist) => watchlist.id === selectedWatchlist);
+  // The selector's narrow box clips a long list name, so the selected option's full text is its
+  // title, and a known list name also appears in full on the context line above the counters.
+  const selectedWatchlistName =
+    selectedWatchlist === undefined || selectedWatchlist === ""
+      ? undefined
+      : watchlistItems.find((watchlist) => watchlist.id === selectedWatchlist)?.name;
+  let watchlistTitle = "All counters";
+  if (watchlistsUnavailable) watchlistTitle = "Watchlists unavailable";
+  else if (selectedWatchlistName !== undefined) watchlistTitle = selectedWatchlistName;
+  else if (showUnlistedWatchlist) watchlistTitle = "Selected watchlist";
 
   const sectorId = `${baseId}-sector`;
   const watchlistId = `${baseId}-watchlist_id`;
@@ -843,8 +1122,13 @@ export function EquityScreener({
   const invalidOf = (field: string): true | undefined =>
     fieldErrors[field] === undefined ? undefined : true;
   const watchlistsNoticeId = `${baseId}-watchlists-notice`;
+  const watchlistNoticeId = `${baseId}-watchlist-notice`;
   const watchlistDescribedBy =
-    [describedByOf("watchlist_id"), showWatchlistsNotice ? watchlistsNoticeId : undefined]
+    [
+      describedByOf("watchlist_id"),
+      showWatchlistsNotice ? watchlistsNoticeId : undefined,
+      watchlistNotice !== null ? watchlistNoticeId : undefined,
+    ]
       .filter((id): id is string => id !== undefined)
       .join(" ") || undefined;
 
@@ -860,6 +1144,7 @@ export function EquityScreener({
     const restored = initialFilters ?? {};
     setApplied(restored);
     setDrafts(draftsFrom(restored));
+    setWatchlistNotice(null);
   };
   // A failure that reached the screener most likely failed the watchlists too, so Retry repeats
   // both; a watchlist list that loaded is left alone.
@@ -932,13 +1217,15 @@ export function EquityScreener({
             onChange={(event) => {
               const value = event.target.value;
               setApplied((current) => withSelectFilter(current, "watchlist_id", value));
+              setWatchlistNotice(null);
             }}
             // Watchlists can change in a sibling WatchlistManager, so the list is refreshed
             // whenever the selector is focused; the current options stay while it loads.
             onFocus={handleWatchlistFocus}
             aria-invalid={invalidOf("watchlist_id")}
             aria-describedby={watchlistDescribedBy}
-            className={INPUT_CLASS}
+            title={watchlistTitle}
+            className={WATCHLIST_SELECT_CLASS}
           >
             {watchlistsUnavailable ? (
               <option value="">Watchlists unavailable</option>
@@ -961,6 +1248,17 @@ export function EquityScreener({
             message={fieldErrors.watchlist_id}
             id={errorIdOf("watchlist_id")}
           />
+          <p
+            id={watchlistNoticeId}
+            data-testid="screener-watchlist-notice"
+            role="status"
+            aria-live="polite"
+            className={
+              watchlistNotice === null ? WATCHLIST_NOTICE_EMPTY_CLASS : WATCHLIST_NOTICE_CLASS
+            }
+          >
+            {watchlistNotice}
+          </p>
           {showWatchlistsNotice ? (
             <div className={WATCHLISTS_NOTICE_CLASS}>
               {/* The detail is removed while a retry runs, so a repeated failure is re-announced. */}
@@ -1068,7 +1366,12 @@ export function EquityScreener({
     );
   } else {
     tableBody = rows.map((row) => (
-      <CounterRow key={row.ticker} row={row} onSelectTicker={onSelectTicker} />
+      <CounterRow
+        key={row.ticker}
+        row={row}
+        onSelectTicker={onSelectTicker}
+        selected={row.ticker === selectedTicker}
+      />
     ));
   }
 
@@ -1089,6 +1392,11 @@ export function EquityScreener({
             <span className={COUNT_CLASS} aria-live="polite">
               {formatInteger(response.count)} {response.count === 1 ? "counter" : "counters"}
             </span>
+            {selectedWatchlistName !== undefined ? (
+              <span data-testid="screener-context-watchlist" className={CONTEXT_WATCHLIST_CLASS}>
+                Watchlist: {selectedWatchlistName}
+              </span>
+            ) : null}
             <span>
               As of {formatDate(response.as_of)} · Z window {formatInteger(response.z_window)} ·
               threshold {formatDecimal(response.anomaly_threshold, "z")}

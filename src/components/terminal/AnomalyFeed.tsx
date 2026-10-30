@@ -29,6 +29,13 @@ export interface AnomalyFeedProps extends TerminalWidgetProps {
    * valuation bands and flows. Without it tickers render as plain text.
    */
   onSelectTicker?: (ticker: string) => void;
+  /**
+   * The ticker the caller has selected, for example the last one passed to `onSelectTicker`.
+   * Every row of that ticker is tinted, marked with a sky accent at its start edge and
+   * `data-selected="true"`, and its ticker button carries `aria-current="true"`. Without it, or
+   * when no row matches, no row is marked.
+   */
+  selectedTicker?: string;
 }
 
 const DEFAULT_METRIC: AnomalyMetric = "both";
@@ -58,8 +65,14 @@ const UPDATING_CLASS = "text-xs text-slate-400";
 const SCROLL_REGION_CLASS =
   "relative max-h-96 overflow-y-auto rounded p-1 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 const LIST_CLASS = "m-0 list-none p-0";
+// Every row reserves a 2px start border, transparent unless the row's ticker is the selected one;
+// a selected row turns it sky-400 (about 6.7:1 on its tint) and tints itself slate-800, so it is
+// marked beyond the tint alone and moving the selection shifts nothing. Every text colour in the
+// row stays at least 5.5:1 on the tint (slate-400, the lowest).
 const ITEM_CLASS =
-  "flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-slate-800 py-1 last:border-b-0";
+  "flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-s-2 border-slate-800 border-s-transparent py-1 last:border-b-0";
+const ITEM_SELECTED_CLASS =
+  "flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-s-2 border-slate-800 border-s-sky-400 bg-slate-800 py-1 last:border-b-0";
 const ITEM_LEAD_CLASS = "flex min-w-0 items-center gap-2";
 const ITEM_FIGURES_CLASS = "ms-auto flex items-center gap-3 text-end tabular-nums";
 // The button keeps the 44×44 px minimum target; its look matches plain text apart from colour,
@@ -71,6 +84,10 @@ const ITEM_FIGURES_CLASS = "ms-auto flex items-center gap-3 text-end tabular-num
 // columns align across rows.
 const TICKER_BUTTON_CLASS =
   "inline-flex min-h-11 min-w-16 scroll-my-1 cursor-pointer items-center justify-start rounded border-0 bg-transparent px-2 font-mono text-sm font-semibold text-sky-300 hover:bg-slate-800 hover:text-sky-200 active:bg-slate-700 active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+// On a selected row, already slate-800, hover and press each step one shade further, to slate-700
+// (sky-200 at 7.8:1) and slate-600 (sky-200 at about 5.7:1), so both stay visible.
+const TICKER_BUTTON_SELECTED_CLASS =
+  "inline-flex min-h-11 min-w-16 scroll-my-1 cursor-pointer items-center justify-start rounded border-0 bg-transparent px-2 font-mono text-sm font-semibold text-sky-300 hover:bg-slate-700 hover:text-sky-200 active:bg-slate-600 active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const TICKER_TEXT_CLASS =
   "inline-flex min-w-16 items-center px-2 font-mono text-sm font-semibold text-slate-100";
 const DATE_CLASS = "min-w-20 whitespace-nowrap text-xs text-slate-400";
@@ -135,9 +152,11 @@ function settledStatusText(data: AnomaliesResponse): string {
 interface AnomalyRowProps {
   item: AnomalyItem;
   onSelectTicker?: (ticker: string) => void;
+  /** Whether this row's ticker is the caller's `selectedTicker`. */
+  selected: boolean;
 }
 
-function AnomalyRow({ item, onSelectTicker }: AnomalyRowProps): ReactElement {
+function AnomalyRow({ item, onSelectTicker, selected }: AnomalyRowProps): ReactElement {
   const badge = METRIC_BADGES[item.metric];
   const details = itemDetails(item);
   return (
@@ -146,15 +165,17 @@ function AnomalyRow({ item, onSelectTicker }: AnomalyRowProps): ReactElement {
       data-ticker={item.ticker}
       data-trade-date={item.trade_date}
       data-metric={item.metric}
+      data-selected={selected ? "true" : "false"}
       title={details}
-      className={ITEM_CLASS}
+      className={selected ? ITEM_SELECTED_CLASS : ITEM_CLASS}
     >
       <span className={ITEM_LEAD_CLASS}>
         {onSelectTicker ? (
           <button
             type="button"
             onClick={() => onSelectTicker(item.ticker)}
-            className={TICKER_BUTTON_CLASS}
+            aria-current={selected ? "true" : undefined}
+            className={selected ? TICKER_BUTTON_SELECTED_CLASS : TICKER_BUTTON_CLASS}
           >
             <span className="sr-only">Select </span>
             {item.ticker}
@@ -190,14 +211,15 @@ function AnomalyRow({ item, onSelectTicker }: AnomalyRowProps): ReactElement {
  * example "29 spikes at z ≥ 2 over a 20-session window", or "No spikes at …" when it is empty.
  *
  * Works with no props. The root carries `data-testid="terminal-anomaly-feed"` and
- * `data-state`, and each row `data-testid="anomaly-item"` with its ticker, date and metric. The
- * status region is `data-testid="anomaly-feed-status"` and the visible indicator
- * `data-testid="anomaly-feed-updating"`.
+ * `data-state`, and each row `data-testid="anomaly-item"` with its ticker, date, metric and
+ * `data-selected`. The status region is `data-testid="anomaly-feed-status"` and the visible
+ * indicator `data-testid="anomaly-feed-updating"`.
  */
 export function AnomalyFeed({
   metric = DEFAULT_METRIC,
   threshold = DEFAULT_THRESHOLD,
   onSelectTicker,
+  selectedTicker,
   apiBaseUrl,
   getHeaders,
   className,
@@ -272,6 +294,7 @@ export function AnomalyFeed({
                   key={`${item.ticker}|${item.trade_date}|${item.metric}`}
                   item={item}
                   onSelectTicker={onSelectTicker}
+                  selected={item.ticker === selectedTicker}
                 />
               ))}
             </ul>
