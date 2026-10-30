@@ -4,6 +4,10 @@ import type { ReactElement } from "react";
 
 import { formatDate, formatDecimal, formatInteger } from "./lib/format";
 import { useTerminalQuery } from "./lib/useTerminalQuery";
+import {
+  TICKER_BUTTON_CLASS as SHARED_TICKER_BUTTON_CLASS,
+  TICKER_BUTTON_SELECTED_CLASS as SHARED_TICKER_BUTTON_SELECTED_CLASS,
+} from "./shared/controlStyles";
 import { WidgetFrame } from "./shared/WidgetFrame";
 import type {
   AnomaliesResponse,
@@ -46,8 +50,9 @@ const DEFAULT_THRESHOLD = 2;
 const EMPTY_FEED_MESSAGE =
   "No spikes in the latest sessions. With no data loaded yet, run the seeder or an ingestion job.";
 
-// Every class below is a complete static string, never assembled from fragments, so Tailwind's
-// source scan and a host's `@source` directive or `content` glob find each one.
+// Every class token below is written out in full, never assembled from fragments (strings are
+// only joined from complete tokens), so Tailwind's source scan and a host's `@source` directive or
+// `content` glob find each one.
 const SUMMARY_CLASS = "mb-2 text-xs text-slate-400";
 // While a request for new props, or a refetch, is in flight, the previous feed stays on screen,
 // dimmed and marked busy; the opacity change runs only when the user has not asked for reduced
@@ -75,21 +80,24 @@ const ITEM_SELECTED_CLASS =
   "flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-s-2 border-slate-800 border-s-sky-400 bg-slate-800 py-1 last:border-b-0";
 const ITEM_LEAD_CLASS = "flex min-w-0 items-center gap-2";
 const ITEM_FIGURES_CLASS = "ms-auto flex items-center gap-3 text-end tabular-nums";
-// The button keeps the 44×44 px minimum target; its look matches plain text apart from colour,
-// even in a host without a CSS reset. Hover is a Tailwind 4 `hover:` variant, which applies only
-// under `(hover: hover)`, so it never sticks on touch screens. The pressed `active:` state, which
-// touch screens apply without `:hover`, deepens the background one step past hover to slate-700
-// and sets its own sky-200 text, 7.8:1. Button and plain ticker share min-w-16, which fits the
-// usual 3–5 letter NSE ticker, and the date's min-w-20 fits "29 Sep 2026", so the date and badge
-// columns align across rows.
-const TICKER_BUTTON_CLASS =
-  "inline-flex min-h-11 min-w-16 scroll-my-1 cursor-pointer items-center justify-start rounded border-0 bg-transparent px-2 font-mono text-sm font-semibold text-sky-300 hover:bg-slate-800 hover:text-sky-200 active:bg-slate-700 active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
-// On a selected row, already slate-800, hover and press each step one shade further, to slate-700
-// (sky-200 at 7.8:1) and slate-600 (sky-200 at about 5.7:1), so both stay visible.
-const TICKER_BUTTON_SELECTED_CLASS =
-  "inline-flex min-h-11 min-w-16 scroll-my-1 cursor-pointer items-center justify-start rounded border-0 bg-transparent px-2 font-mono text-sm font-semibold text-sky-300 hover:bg-slate-700 hover:text-sky-200 active:bg-slate-600 active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+// The button is the shared compact ticker button of `shared/controlStyles`, the same 24px, 12px
+// medium monospace button as EquityScreener's table tickers; only scroll-my-1 is added here, for
+// the scroll region above. Its look matches plain text apart from colour, even in a host without a
+// CSS reset. Hover is a Tailwind 4 `hover:` variant, which applies only under `(hover: hover)`, so
+// it never sticks on touch screens. The pressed `active:` state, which touch screens apply without
+// `:hover`, deepens the background one step past hover to slate-700 and sets its own sky-200 text,
+// 7.8:1. On a selected row, already slate-800, the shared selected variant steps hover and press
+// one shade further, to slate-700 and slate-600, so both stay visible. The plain ticker shown
+// without a handler takes the same box and type (24px tall, min-w-16, 4px inline padding, 12px
+// medium monospace); min-w-16 fits the usual 3–5 letter NSE ticker, and the date's min-w-20 fits
+// "29 Sep 2026", so the date and badge columns align across rows.
+/* BLITZY [A11Y]: the ticker button is 24px tall, WCAG 2.2 AA's target minimum and below the 44px
+   guideline, matching the screener's ticker buttons on the same page. Flagged for designer
+   review. */
+const TICKER_BUTTON_CLASS = `${SHARED_TICKER_BUTTON_CLASS} scroll-my-1`;
+const TICKER_BUTTON_SELECTED_CLASS = `${SHARED_TICKER_BUTTON_SELECTED_CLASS} scroll-my-1`;
 const TICKER_TEXT_CLASS =
-  "inline-flex min-w-16 items-center px-2 font-mono text-sm font-semibold text-slate-100";
+  "inline-flex min-h-6 min-w-16 items-center px-1 font-mono text-xs font-medium text-slate-100";
 const DATE_CLASS = "min-w-20 whitespace-nowrap text-xs text-slate-400";
 const VALUE_CLASS = "block text-sm text-slate-100";
 const MEAN_CLASS = "block text-xs text-slate-400";

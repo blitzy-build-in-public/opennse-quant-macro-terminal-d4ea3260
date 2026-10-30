@@ -14,6 +14,13 @@ import {
 import type { RequestOptions } from "./lib/apiClient";
 import { formatDate } from "./lib/format";
 import { useTerminalQuery } from "./lib/useTerminalQuery";
+import {
+  CHIP_CLASS,
+  CHIP_REMOVE_BUTTON_CLASS,
+  FIELD_LABEL_CLASS,
+  SECONDARY_BUTTON_CLASS as SHARED_SECONDARY_BUTTON_CLASS,
+  TEXT_FIELD_CLASS,
+} from "./shared/controlStyles";
 import { FieldErrorText, WidgetFrame } from "./shared/WidgetFrame";
 import type { TerminalWidgetProps, Watchlist, WatchlistCreate } from "./types";
 
@@ -56,40 +63,41 @@ const GENERAL_ERROR_KEY = "_general";
 const NOT_FOUND_MESSAGE = "That watchlist no longer exists. The watchlists have been reloaded.";
 const FALLBACK_ERROR_MESSAGE = "The request failed. Please try again.";
 
-// Every class below is a complete static string, never assembled from fragments, so Tailwind's
-// source scan and a host's `@source` directive or `content` glob find each one. Hover styles use
-// Tailwind's `hover:` variant, which only applies on devices that can hover, and transitions run
-// only when the user has not asked for reduced motion.
+// Every class token below is written out in full, never assembled from fragments (strings are
+// only joined from complete tokens), so Tailwind's source scan and a host's `@source` directive or
+// `content` glob find each one. Hover styles use Tailwind's `hover:` variant, which only applies
+// on devices that can hover, and transitions run only when the user has not asked for reduced
+// motion. Labels, inputs, the secondary buttons and the chips use the shared control classes of
+// `shared/controlStyles`, so they match the other widgets' controls.
 const BODY_CLASS = "flex flex-col gap-4";
 const FORM_CLASS = "flex flex-col gap-3";
 const FIELDS_CLASS = "flex flex-wrap gap-3";
 const FIELD_CLASS = "flex min-w-0 flex-1 basis-48 flex-col gap-1";
 const ADD_FIELD_CLASS = "flex min-w-0 flex-1 basis-32 flex-col gap-1";
-const LABEL_CLASS = "text-xs font-medium text-slate-300";
-// Input borders use slate-500, which keeps the 3:1 non-text contrast against the card surface.
-// The error border uses the `aria-[invalid=true]:` variant because Tailwind 3 and Tailwind 4
-// hosts both generate it; Tailwind 3 has no named `aria-invalid:` variant.
-const INPUT_CLASS =
-  "w-full min-w-0 rounded border border-slate-500 bg-slate-950 px-2 py-1 text-sm text-slate-100 placeholder:text-slate-400 aria-[invalid=true]:border-rose-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
-/* BLITZY [A11Y]: buttons keep the compact size of the card's other text controls (about 26px
-   tall, the chip remove buttons 24px square), meeting WCAG 2.2 AA's 24px target minimum but below
-   the 44px guideline. Flagged for designer review. */
+// Inputs are the shared text field: its slate-500 border keeps the 3:1 non-text contrast against
+// the card surface, and lightens to slate-400 on hover and slate-300 when pressed. The rose-400
+// error border uses the `aria-[invalid=true]:` variant because Tailwind 3 and Tailwind 4 hosts
+// both generate it; Tailwind 3 has no named `aria-invalid:` variant.
+const INPUT_CLASS = `${TEXT_FIELD_CLASS} w-full min-w-0`;
+/* BLITZY [A11Y]: inputs and buttons keep the compact size of the card's other text controls
+   (26px tall, the chip remove buttons 24px square), meeting WCAG 2.2 AA's 24px target minimum but
+   below the 44px guideline. Flagged for designer review. */
 // While a request is in flight buttons are `aria-disabled` rather than `disabled`: a button that
 // becomes `disabled` loses keyboard focus to the page body, whereas `aria-disabled` keeps it in
 // place, and the handlers refuse to start a second request.
 // Every button has a pressed `active:` state one step past its hover, so a press also shows on
 // touch screens, which apply `:active` without `:hover`. Filled buttons step their background
 // (slate 800 → 700 → 600, sky and rose 700 → 800 → 900) under slate-100 text, at least 5.3:1 in
-// every state. The delete and chip remove buttons deepen their hover background and set their own
-// light text (rose-200, slate-100), keeping 4.5:1 for text and 3:1 for the remove icon.
+// every state; the secondary (Cancel and Add) buttons also lighten their border to slate-500. The
+// delete and chip remove buttons deepen their hover background and set their own light text
+// (rose-200, slate-100), keeping 4.5:1 for text and 3:1 for the remove icon.
 const PRIMARY_BUTTON_CLASS =
-  "self-start rounded border border-sky-600 bg-sky-700 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-sky-800 active:bg-sky-900 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
-const SECONDARY_BUTTON_CLASS =
-  "rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-slate-700 active:bg-slate-600 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "self-start cursor-pointer rounded border border-sky-600 bg-sky-700 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-sky-800 active:bg-sky-900 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+const SECONDARY_BUTTON_CLASS = `${SHARED_SECONDARY_BUTTON_CLASS} aria-disabled:pointer-events-none aria-disabled:opacity-50`;
 const DELETE_BUTTON_CLASS =
-  "rounded border border-rose-800 bg-slate-900 px-3 py-1 text-xs font-medium text-rose-300 hover:bg-rose-950 active:bg-rose-900 active:text-rose-200 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "cursor-pointer rounded border border-rose-800 bg-slate-900 px-3 py-1 text-xs font-medium text-rose-300 hover:bg-rose-950 active:bg-rose-900 active:text-rose-200 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const CONFIRM_BUTTON_CLASS =
-  "rounded border border-rose-600 bg-rose-700 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-rose-800 active:bg-rose-900 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "cursor-pointer rounded border border-rose-600 bg-rose-700 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-rose-800 active:bg-rose-900 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const GENERAL_ERROR_CLASS =
   "rounded border border-rose-900 bg-slate-950 px-3 py-2 text-xs text-rose-300";
 const EMPTY_LISTS_CLASS = "text-sm text-slate-400";
@@ -106,10 +114,6 @@ const LIST_META_CLASS = "text-xs text-slate-400";
 const LIST_ACTIONS_CLASS = "flex shrink-0 items-center gap-2";
 const CHIPS_CLASS = "mt-2 flex flex-wrap gap-1.5";
 const NO_TICKERS_CLASS = "mt-2 text-xs text-slate-400";
-const CHIP_CLASS =
-  "inline-flex items-center gap-1 rounded-full border border-slate-700 bg-slate-800 ps-2.5 text-xs font-medium text-slate-100";
-const CHIP_REMOVE_CLASS =
-  "inline-flex size-6 items-center justify-center rounded-full text-slate-400 hover:bg-slate-700 hover:text-slate-100 active:bg-slate-600 active:text-slate-100 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const CHIP_ICON_CLASS = "size-3";
 const ADD_FORM_CLASS = "mt-3";
 const ADD_ROW_CLASS = "flex flex-wrap items-end gap-2";
@@ -710,7 +714,7 @@ export function WatchlistManager({
                     data-testid="watchlist-ticker-remove"
                     aria-disabled={buttonDisabled}
                     aria-label={`Remove ${ticker} from ${list.name}`}
-                    className={CHIP_REMOVE_CLASS}
+                    className={CHIP_REMOVE_BUTTON_CLASS}
                     onClick={(event) => handleRemove(event, list, ticker)}
                   >
                     <RemoveIcon />
@@ -729,7 +733,7 @@ export function WatchlistManager({
         >
           <div className={ADD_ROW_CLASS}>
             <div className={ADD_FIELD_CLASS}>
-              <label htmlFor={addId} className={LABEL_CLASS}>
+              <label htmlFor={addId} className={FIELD_LABEL_CLASS}>
                 Add ticker
               </label>
               <input
@@ -786,7 +790,7 @@ export function WatchlistManager({
         >
           <div className={FIELDS_CLASS}>
             <div className={FIELD_CLASS}>
-              <label htmlFor={nameId} className={LABEL_CLASS}>
+              <label htmlFor={nameId} className={FIELD_LABEL_CLASS}>
                 New watchlist name
               </label>
               <input
@@ -807,7 +811,7 @@ export function WatchlistManager({
               <FieldErrorText field="name" message={nameError} id={nameErrorId} />
             </div>
             <div className={FIELD_CLASS}>
-              <label htmlFor={tickersId} className={LABEL_CLASS}>
+              <label htmlFor={tickersId} className={FIELD_LABEL_CLASS}>
                 Tickers (optional)
               </label>
               <input

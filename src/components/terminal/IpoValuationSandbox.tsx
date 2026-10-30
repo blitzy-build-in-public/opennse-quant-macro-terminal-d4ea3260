@@ -30,6 +30,11 @@ import {
 } from "./lib/format";
 import type { DecimalKind, DecimalRangeRule } from "./lib/format";
 import { useTerminalQuery } from "./lib/useTerminalQuery";
+import {
+  FIELD_LABEL_CLASS,
+  SECONDARY_BUTTON_CLASS,
+  TEXT_FIELD_CLASS,
+} from "./shared/controlStyles";
 import { FieldErrorText, WidgetFrame } from "./shared/WidgetFrame";
 import {
   KPI_LABEL_CLASS,
@@ -269,24 +274,26 @@ type LocalErrors = Partial<Record<InputField, string>>;
 // ---------------------------------------------------------------------------------------------
 
 // Every class name is written out in full, never assembled from fragments, so Tailwind's source
-// scan and a host's `@source` directive or `content` glob find each one. Inputs, the slider and
-// the preset selector are 44px tall (h-11), the minimum touch target, since no design source
-// sets a smaller one. Focus indicators are outlines, which forced-colors mode keeps. Hover and
-// press lighten a control (an invalid input stays rose) only while it is enabled; a disabled one
-// dims and shows a not-allowed cursor. Section headings and output cards take the classes shared
-// with the other widgets from ./shared/headingAndTileClasses.
-const LABEL_CLASS = "text-xs font-medium text-slate-300";
+// scan and a host's `@source` directive or `content` glob find each one. Focus indicators are
+// outlines, which forced-colors mode keeps. Labels, the text inputs, the preset selector and the
+// valuation's Retry button use the shared compact controls of `shared/controlStyles` (26px tall),
+// so they match the other widgets' fields and buttons: a slate-500 field border (about 3.7:1 on
+// the slate-900 card, 4.2:1 on the slate-950 fill) lightens to slate-400 on hover and slate-300
+// when pressed, and an input with `aria-invalid` keeps a rose border (rose-400, then rose-300 and
+// rose-200). Hover and press change a field only while it is enabled; a disabled one dims and
+// shows a not-allowed cursor. Only the sliders keep a 44px (h-11) box, because a slider's hit area
+// is the empty space around its thin track. Section headings and output cards take the classes
+// shared with the other widgets from ./shared/headingAndTileClasses.
+/* BLITZY [A11Y]: the text inputs, the preset selector and Retry are 26px tall, at or above WCAG
+   2.2 AA's 24px target minimum and below the 44px guideline, the size of every other widget's
+   fields and buttons. Flagged for designer review. */
 const FOCUS_CLASS =
   "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 // The slider's 44px box is mostly empty space around its track, so its focus outline is drawn
 // inside the box, where it can never overlap the label row above.
 const RANGE_CLASS =
   "block h-11 w-full cursor-pointer rounded accent-sky-400 enabled:hover:accent-sky-300 enabled:active:accent-sky-200 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-sky-400";
-const TEXT_INPUT_BASE_CLASS =
-  "mt-1 block h-11 w-full rounded border bg-slate-950 px-3 text-sm tabular-nums text-slate-100 disabled:cursor-not-allowed disabled:opacity-50 motion-safe:transition-[border-color] motion-safe:duration-150 motion-safe:ease-out";
-const TEXT_INPUT_CLASS = `${TEXT_INPUT_BASE_CLASS} border-slate-700 enabled:hover:border-slate-500 enabled:active:border-slate-400 ${FOCUS_CLASS}`;
-const TEXT_INPUT_INVALID_CLASS = `${TEXT_INPUT_BASE_CLASS} border-rose-500 enabled:hover:border-rose-400 enabled:active:border-rose-300 ${FOCUS_CLASS}`;
-const SELECT_CLASS = `h-11 rounded border border-slate-700 bg-slate-950 px-2 text-sm text-slate-100 enabled:hover:border-slate-500 enabled:active:border-slate-400 disabled:cursor-not-allowed disabled:opacity-50 motion-safe:transition-[border-color] motion-safe:duration-150 motion-safe:ease-out ${FOCUS_CLASS}`;
+const TEXT_INPUT_CLASS = `mt-1 block w-full tabular-nums ${TEXT_FIELD_CLASS}`;
 // The layout follows the widget's own width, never the viewport's: a host may place the widget in
 // a narrow card on a wide screen, and Tailwind 3 has no container-query variants without a plugin.
 // The inputs column starts at 24rem and the output column takes the rest while it keeps at least
@@ -320,7 +327,7 @@ const FLAG_CLASS =
   "rounded border border-amber-800 bg-amber-950 px-2 py-0.5 font-mono text-xs text-amber-200";
 const GENERAL_ERROR_CLASS =
   "flex flex-col gap-1 rounded border border-rose-900 bg-slate-950 p-3 text-sm text-rose-300";
-const RETRY_CLASS = `mt-1 h-11 self-start rounded border border-slate-700 bg-slate-800 px-4 text-xs font-medium text-slate-100 enabled:hover:bg-slate-700 enabled:active:bg-slate-600 disabled:cursor-not-allowed disabled:opacity-50 motion-safe:transition-[background-color] motion-safe:duration-150 motion-safe:ease-out ${FOCUS_CLASS}`;
+const RETRY_CLASS = `${SECONDARY_BUTTON_CLASS} mt-1 self-start`;
 
 // ---------------------------------------------------------------------------------------------
 // Pure helpers (BigInt scaled integers; the only float boundary is the chart's toChartNumber)
@@ -812,7 +819,7 @@ function SliderControl({
   return (
     <div>
       <div className="flex items-baseline justify-between gap-2">
-        <label htmlFor={inputId} className={LABEL_CLASS}>
+        <label htmlFor={inputId} className={FIELD_LABEL_CLASS}>
           {spec.label}
         </label>
         <output
@@ -870,7 +877,7 @@ function TextControl({
     .join(" ");
   return (
     <div>
-      <label htmlFor={inputId} className={LABEL_CLASS}>
+      <label htmlFor={inputId} className={FIELD_LABEL_CLASS}>
         {spec.label}
       </label>
       <input
@@ -884,7 +891,7 @@ function TextControl({
         aria-invalid={error ? true : undefined}
         aria-describedby={describedBy === "" ? undefined : describedBy}
         onChange={(event) => onValueChange(field, event.target.value)}
-        className={error ? TEXT_INPUT_INVALID_CLASS : TEXT_INPUT_CLASS}
+        className={TEXT_INPUT_CLASS}
       />
       {echo === null ? null : (
         <p id={hintId} className="mt-1 text-xs tabular-nums text-slate-400 break-words">
@@ -1402,7 +1409,7 @@ export function IpoValuationSandbox({
   const presetSelector =
     scenario !== undefined && scenarios.length > 1 ? (
       <div className="flex items-center gap-2">
-        <label htmlFor={selectId} className={LABEL_CLASS}>
+        <label htmlFor={selectId} className={FIELD_LABEL_CLASS}>
           Preset
         </label>
         <select
@@ -1410,7 +1417,7 @@ export function IpoValuationSandbox({
           data-testid="ipo-scenario-select"
           value={scenario.id}
           onChange={(event) => setSelectedId(event.target.value)}
-          className={SELECT_CLASS}
+          className={TEXT_FIELD_CLASS}
         >
           {scenarios.map((item) => (
             <option key={item.id} value={item.id}>

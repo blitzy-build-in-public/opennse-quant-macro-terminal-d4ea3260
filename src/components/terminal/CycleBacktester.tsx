@@ -29,6 +29,14 @@ import {
 import { EMPTY_VALUE, formatDate, formatDecimal, formatInteger, toChartNumber } from "./lib/format";
 import type { DecimalKind } from "./lib/format";
 import { useTerminalQuery } from "./lib/useTerminalQuery";
+import {
+  CHIP_CLASS,
+  CHIP_REMOVE_BUTTON_CLASS,
+  SECONDARY_BUTTON_CLASS,
+  TEXT_FIELD_CLASS,
+  TOGGLE_BUTTON_CLASS,
+  TOGGLE_BUTTON_PRESSED_CLASS,
+} from "./shared/controlStyles";
 import { WidgetFrame } from "./shared/WidgetFrame";
 import { SECTION_HEADING_CLASS } from "./shared/headingAndTileClasses";
 import type {
@@ -361,32 +369,32 @@ const STATUS_BADGES: Record<BacktestStatus, { text: string; className: string }>
 const UNKNOWN_STATUS_CLASS =
   "inline-flex whitespace-nowrap rounded border border-slate-700 bg-slate-800 px-1.5 py-0.5 text-xs font-medium text-slate-300";
 
-// Every class below is a complete static string, so Tailwind's source scan and a host's `@source`
-// directive or `content` glob find each one. Margins and paddings of lists, paragraphs and
-// figures are reset explicitly, so the layout does not depend on a host's CSS reset.
-/* BLITZY [A11Y]: the toggle, chip and Add controls keep the card's compact text-control size
-   (24-26px tall, at or above WCAG 2.2 AA's 24px target minimum, below the 44px guideline), as
-   WidgetFrame's Retry button does. Flagged for designer review. */
+// Every class token below is written out in full (strings are only joined from complete tokens),
+// so Tailwind's source scan and a host's `@source` directive or `content` glob find each one.
+// Margins and paddings of lists, paragraphs and figures are reset explicitly, so the layout does
+// not depend on a host's CSS reset. The toggles, chips, Add button and fields use the shared
+// control classes of `shared/controlStyles`, so they match the other widgets' controls.
+/* BLITZY [A11Y]: the toggle, chip, Add and field controls are 26px tall (the chip remove buttons
+   24px square), at or above WCAG 2.2 AA's 24px target minimum but below the 44px guideline, as
+   WidgetFrame's Retry button is. Flagged for designer review. */
 const CONTROLS_CLASS = "flex flex-col gap-3 text-xs text-slate-300";
 const TOOLBAR_CLASS = "flex flex-wrap items-center gap-x-6 gap-y-2";
 const GROUP_CLASS = "flex flex-wrap items-center gap-1";
 const GROUP_LABEL_CLASS = "me-1 text-slate-400";
-const TOGGLE_CLASS =
-  "m-0 cursor-pointer rounded border border-slate-700 bg-slate-900 px-2.5 py-1 text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-slate-100 active:bg-slate-700 active:text-slate-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
-const TOGGLE_ACTIVE_CLASS =
-  "m-0 cursor-pointer rounded border border-sky-700 bg-sky-900 px-2.5 py-1 text-xs font-medium text-sky-100 hover:bg-sky-800 active:bg-sky-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const CHIP_LIST_CLASS = "m-0 flex list-none flex-wrap items-center gap-2 p-0";
-const CHIP_CLASS =
-  "inline-flex items-center gap-1 rounded-full border border-slate-700 bg-slate-800 py-0.5 ps-2.5 pe-0.5 text-xs text-slate-200";
 const CHIP_DATE_CLASS = "text-slate-400";
-const CHIP_REMOVE_CLASS =
-  "m-0 inline-flex h-6 w-6 cursor-pointer items-center justify-center rounded-full border-0 bg-transparent p-0 text-slate-400 hover:bg-slate-700 hover:text-slate-100 active:bg-slate-600 active:text-slate-100 disabled:pointer-events-none disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const ICON_CLASS = "h-3 w-3";
 const MUTED_TEXT_CLASS = "m-0 text-xs text-slate-400";
 const ADD_FORM_CLASS = "flex flex-col gap-1";
 const ADD_ROW_CLASS = "flex flex-wrap items-center gap-2";
-const INPUT_CLASS =
-  "m-0 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-100 [color-scheme:dark] hover:border-slate-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+// The shared field turns its border rose while `aria-invalid` is set. No CSS pseudo-class matches
+// an empty date input, so `data-empty` dims the empty value (the mm/dd/yyyy placeholder) to
+// slate-400. Chromium's UA stylesheet draws its own focus box on the calendar-picker stop, and
+// while that stop is focused neither the host input (:focus, :focus-visible) nor the
+// pseudo-element itself matches a focus pseudo-class, so the pseudo-element is given the sky-400
+// ring from the host's state: focus within the input (:focus-within) but not on its month, day
+// or year fields (which match :focus) is on the picker stop.
+const DATE_INPUT_CLASS = `${TEXT_FIELD_CLASS} data-[empty=true]:text-slate-400 [&::-webkit-calendar-picker-indicator]:cursor-pointer [&::-webkit-calendar-picker-indicator]:rounded-sm [&:focus-within:not(:focus)::-webkit-calendar-picker-indicator]:outline-2 [&:focus-within:not(:focus)::-webkit-calendar-picker-indicator]:outline-offset-0 [&:focus-within:not(:focus)::-webkit-calendar-picker-indicator]:outline-solid [&:focus-within:not(:focus)::-webkit-calendar-picker-indicator]:outline-sky-400`;
 const CHIP_ERROR_CLASS = "m-0 text-xs text-rose-400";
 // While a new window or event set is fetched, the previous result stays mounted and is dimmed.
 const BODY_CLASS = "flex flex-col gap-5";
@@ -427,10 +435,9 @@ const SWATCH_CLASS =
   "h-2 w-5 shrink-0 forced-colors:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
 const MARKER_SWATCH_CLASS =
   "h-3 w-3 shrink-0 forced-colors:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
-// The select drops below its label, and narrows to the card, when the two do not fit one line
-// (a narrow card with a large text setting).
-const SELECT_CLASS =
-  "m-0 max-w-full rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-100 [color-scheme:dark] hover:border-slate-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+// The overlay select is the shared text field. It drops below its label, and narrows to the card,
+// when the two do not fit one line (a narrow card with a large text setting).
+const SELECT_CLASS = `${TEXT_FIELD_CLASS} m-0 max-w-full`;
 const SELECT_LABEL_CLASS =
   "inline-flex min-w-0 flex-wrap items-center gap-2 text-xs text-slate-400";
 // The wrapper scrolls horizontally on narrow cards, so it is focusable for keyboard scrolling.
@@ -2099,7 +2106,9 @@ export function CycleBacktester({
               aria-pressed={windowPreset === option.value}
               aria-describedby={blockedPreset === option.value ? windowErrorId : undefined}
               onClick={() => handleWindowChange(option.value)}
-              className={windowPreset === option.value ? TOGGLE_ACTIVE_CLASS : TOGGLE_CLASS}
+              className={
+                windowPreset === option.value ? TOGGLE_BUTTON_PRESSED_CLASS : TOGGLE_BUTTON_CLASS
+              }
             >
               {option.label}
             </button>
@@ -2116,7 +2125,9 @@ export function CycleBacktester({
               data-testid={option.testId}
               aria-pressed={metric === option.value}
               onClick={() => handleMetricChange(option.value)}
-              className={metric === option.value ? TOGGLE_ACTIVE_CLASS : TOGGLE_CLASS}
+              className={
+                metric === option.value ? TOGGLE_BUTTON_PRESSED_CLASS : TOGGLE_BUTTON_CLASS
+              }
             >
               {option.label}
             </button>
@@ -2171,7 +2182,7 @@ export function CycleBacktester({
                         if (element === null) removeButtonRefs.current.delete(date);
                         else removeButtonRefs.current.set(date, element);
                       }}
-                      className={CHIP_REMOVE_CLASS}
+                      className={CHIP_REMOVE_BUTTON_CLASS}
                     >
                       <svg
                         viewBox="0 0 12 12"
@@ -2210,9 +2221,10 @@ export function CycleBacktester({
             aria-invalid={chipError !== null}
             aria-describedby={chipError !== null ? chipErrorId : undefined}
             data-testid="cycle-custom-date"
-            className={INPUT_CLASS}
+            data-empty={customDate === ""}
+            className={DATE_INPUT_CLASS}
           />
-          <button type="submit" data-testid="cycle-add-date" className={TOGGLE_CLASS}>
+          <button type="submit" data-testid="cycle-add-date" className={SECONDARY_BUTTON_CLASS}>
             Add
           </button>
           <span className={MUTED_TEXT_CLASS}>Up to {MAX_EVENT_DATES} events</span>

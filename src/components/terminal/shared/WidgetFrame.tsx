@@ -4,6 +4,7 @@ import type { ReactElement, ReactNode } from "react";
 
 import type { TerminalApiError } from "../lib/apiClient";
 import type { WidgetState } from "../types";
+import { SECONDARY_BUTTON_CLASS } from "./controlStyles";
 
 /**
  * Default copy of the empty state, shown when a widget's `rows`, `items` or `series` is empty. It
@@ -96,13 +97,15 @@ const DEFAULT_SKELETON_HEIGHT = "h-48";
 const SR_ONLY_CLASS = "sr-only";
 const EMPTY_CLASS = "text-sm text-slate-400";
 const ERROR_CLASS = "rounded border border-rose-900 bg-slate-950 p-3 text-sm text-rose-300";
-// The focus indicator is an outline rather than a box-shadow ring: forced-colors mode drops box
-// shadows but keeps outlines, and Tailwind 4's `outline-none` would remove the outline entirely.
-// Pressed goes one shade beyond hover, as the standalone navigation's links do.
+// Retry is the shared secondary button of `controlStyles`, so it matches the other widgets'
+// secondary buttons: a pointer cursor, and hover and press states that lighten the border, with
+// press one shade beyond hover. Its focus indicator is an outline rather than a box-shadow ring:
+// forced-colors mode drops box shadows but keeps outlines, and Tailwind 4's `outline-none` would
+// remove the outline entirely. `mt-3` overrides the shared class's `m-0` reset, because Tailwind
+// emits the `margin-top` longhand after the `margin` shorthand.
 /* BLITZY [A11Y]: Retry keeps the compact size of the card's other text controls (about 26px tall,
    above WCAG 2.2 AA's 24px target minimum, below the 44px guideline). Flagged for designer review. */
-const RETRY_CLASS =
-  "mt-3 rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-slate-700 active:bg-slate-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+const RETRY_CLASS = `${SECONDARY_BUTTON_CLASS} mt-3`;
 // `min-w-0` lets charts and tables shrink inside a host's grid or flex layout.
 const READY_CLASS = "min-w-0";
 const FIELD_ERROR_CLASS = "mt-1 text-xs text-rose-400";

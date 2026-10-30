@@ -12,6 +12,7 @@ import {
   formatMonth,
 } from "./lib/format";
 import { useTerminalQuery } from "./lib/useTerminalQuery";
+import { TOGGLE_BUTTON_CLASS, TOGGLE_BUTTON_PRESSED_CLASS } from "./shared/controlStyles";
 import { WidgetFrame } from "./shared/WidgetFrame";
 import type {
   DecimalString,
@@ -90,18 +91,17 @@ const LEGEND: ReadonlyArray<{ bucket: Bucket; label: string }> = [
   { bucket: "noData", label: "No data" },
 ];
 
-// The toggle keeps the compact size of the card's other text controls; its pressed variant is the
-// sky accent used for focus and selection elsewhere in the terminal.
-/* BLITZY [A11Y]: the mode toggle is about 26px tall (px-3 py-1 text-xs), above WCAG 2.2 AA's 24px
-   target minimum and below the 44px guideline, matching WidgetFrame's Retry button. Flagged for
-   designer review. */
+// The mode toggle is the shared toggle button of `shared/controlStyles`, so it matches the other
+// widgets' toggles. The shared classes supply the hover state, a press one shade past hover, the
+// pointer cursor, the pressed variant's 2px light sky-400 edge (border plus inset ring, so the
+// selection does not rest on hue alone) and its forced-colours Highlight fill with HighlightText.
+/* BLITZY [A11Y]: the mode toggle is the shared 26px toggle, above WCAG 2.2 AA's 24px target
+   minimum and below the 44px guideline, matching WidgetFrame's Retry button. Flagged for designer
+   review. */
 // Both variants dim and stop pointer input while the toggle is `aria-disabled`, which it is
-// whenever no table is on screen to switch. A press shades one step beyond hover, as the
-// terminal's other buttons do, and the border shifts wherever the fill would match it.
-const TOGGLE_CLASS =
-  "cursor-pointer rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-100 hover:border-slate-500 hover:bg-slate-700 active:bg-slate-600 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
-const TOGGLE_PRESSED_CLASS =
-  "cursor-pointer rounded border border-sky-700 bg-sky-900 px-3 py-1 text-xs font-medium text-sky-100 hover:bg-sky-800 active:border-sky-600 active:bg-sky-700 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+// whenever no table is on screen to switch.
+const TOGGLE_CLASS = `${TOGGLE_BUTTON_CLASS} aria-disabled:pointer-events-none aria-disabled:opacity-50`;
+const TOGGLE_PRESSED_CLASS = `${TOGGLE_BUTTON_PRESSED_CLASS} aria-disabled:pointer-events-none aria-disabled:opacity-50`;
 // The scroller is a keyboard-focusable region, so the periods can be scrolled without a pointer,
 // and an inline-size container, so content inside it can be sized against its visible width
 // (`cqi`) rather than the table's. `relative` makes it the containing block of the absolutely

@@ -13,6 +13,13 @@ import {
 } from "./lib/format";
 import type { DecimalKind } from "./lib/format";
 import { useTerminalQuery } from "./lib/useTerminalQuery";
+import {
+  FIELD_LABEL_CLASS,
+  SECONDARY_BUTTON_CLASS,
+  TEXT_FIELD_CLASS,
+  TICKER_BUTTON_CLASS as SHARED_TICKER_BUTTON_CLASS,
+  TICKER_BUTTON_SELECTED_CLASS as SHARED_TICKER_BUTTON_SELECTED_CLASS,
+} from "./shared/controlStyles";
 import { FieldErrorText, WidgetFrame } from "./shared/WidgetFrame";
 import { SECTION_HEADING_CLASS } from "./shared/headingAndTileClasses";
 import type {
@@ -399,41 +406,39 @@ function missingWatchlistNotice(name: string | undefined): string {
     : `“${name}” was deleted. Showing all counters.`;
 }
 
-// Every class below is a complete static string, never assembled from fragments, so Tailwind's
-// source scan and a host's `@source` directive or `content` glob find each one. Only the default
-// palette is used. Focus indicators are outlines, which forced-colors mode keeps.
+// Every class token below is written out in full, never assembled from fragments (strings are
+// only joined from complete tokens), so Tailwind's source scan and a host's `@source` directive or
+// `content` glob find each one. Only the default palette is used. Focus indicators are outlines,
+// which forced-colors mode keeps. Labels, fields, Reset, Retry and the ticker buttons use the
+// shared control classes of `shared/controlStyles`, so they match the other widgets' controls.
 // 11.5rem keeps the longest select text ("Watchlists unavailable") unclipped beside its arrow.
 const FILTER_GRID_CLASS = "grid grid-cols-[repeat(auto-fill,minmax(11.5rem,1fr))] gap-3";
 const FIELD_CLASS = "flex min-w-0 flex-col gap-1";
-const LABEL_CLASS = "text-xs font-medium text-slate-400";
-/* BLITZY [A11Y]: filter inputs, selects and table buttons keep the compact density of the card's
-   other controls (about 24–30px tall, at or above WCAG 2.2 AA's 24px target minimum, below the
-   44px guideline), so 16 columns stay readable. Flagged for designer review. */
-const INPUT_CLASS =
-  "w-full min-w-0 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-sm text-slate-100 placeholder:text-slate-600 aria-[invalid=true]:border-rose-500 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-sky-400 disabled:cursor-not-allowed disabled:text-slate-400";
-// The watchlist selector ends a clipped list name with an ellipsis, so it reads as truncated;
-// the selector's title and the context line carry the full name.
-const WATCHLIST_SELECT_CLASS =
-  "w-full min-w-0 text-ellipsis rounded border border-slate-700 bg-slate-950 px-2 py-1 text-sm text-slate-100 placeholder:text-slate-600 aria-[invalid=true]:border-rose-500 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-sky-400 disabled:cursor-not-allowed disabled:text-slate-400";
+/* BLITZY [A11Y]: filter inputs, selects, Reset and Retry are 26px tall and the table buttons at
+   least 24px, the compact density of the card's other controls: at or above WCAG 2.2 AA's 24px
+   target minimum, below the 44px guideline, so 16 columns stay readable. Flagged for designer
+   review. */
+// Selects and text inputs share one explicit height, so a filter row's bottom edges align.
+const INPUT_CLASS = `${TEXT_FIELD_CLASS} w-full min-w-0`;
+// The watchlist selector is the shared field too. It ends a clipped list name with an ellipsis,
+// so it reads as truncated; the selector's title and the context line carry the full name.
+const WATCHLIST_SELECT_CLASS = `${TEXT_FIELD_CLASS} w-full min-w-0 text-ellipsis`;
 const FILTER_FOOTER_CLASS = "mt-3 flex flex-wrap items-center justify-between gap-3";
-const CHECKBOX_LABEL_CLASS = "inline-flex items-center gap-2 text-sm text-slate-200";
+// The checkbox's label is its click target, so it tints on hover and deepens when pressed; the
+// negative margin offsets its padding, keeping the text aligned with the filters above.
+const CHECKBOX_LABEL_CLASS =
+  "-mx-1.5 inline-flex cursor-pointer items-center gap-2 rounded px-1.5 py-0.5 text-sm text-slate-200 hover:bg-slate-800 hover:text-slate-50 active:bg-slate-700 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const CHECKBOX_CLASS =
-  "h-4 w-4 accent-sky-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
-// Buttons have a pressed `active:` state one step past their hover, so a press also shows on
-// touch screens, which apply `:active` without `:hover`. Reset steps its background slate
-// 800 → 700 → 600 under slate-100 text, at least 6.9:1 in every state.
-const RESET_CLASS =
-  "rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-slate-700 active:bg-slate-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "h-4 w-4 cursor-pointer accent-sky-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 const OTHER_ERRORS_CLASS = "mt-2";
 // The watchlist selector's own failure notice, beneath it: the counters stay usable, so the list
 // is retried here rather than through the card's error state. Its text matches field errors
-// (rose-400 on the slate-900 card, about 6.6:1). Retry steps slate 800 → 700 → 600 like Reset;
-// while a retry runs it stays focusable but aria-disabled, with slate-400 text (about 5.7:1)
-// and no hover or press change.
+// (rose-400 on the slate-900 card, about 6.6:1). Retry is the shared secondary button, like
+// Reset; while a retry runs it stays focusable but aria-disabled, with slate-400 text (about
+// 5.6:1), a wait cursor and no hover or press change to its background or border.
 const WATCHLISTS_NOTICE_CLASS = "mt-1 flex flex-wrap items-center gap-x-2 gap-y-1";
 const WATCHLISTS_NOTICE_TEXT_CLASS = "text-xs text-rose-400";
-const WATCHLISTS_RETRY_CLASS =
-  "rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-slate-700 active:bg-slate-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 aria-[disabled=true]:cursor-wait aria-[disabled=true]:text-slate-400 aria-[disabled=true]:hover:bg-slate-800 aria-[disabled=true]:active:bg-slate-800 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+const WATCHLISTS_RETRY_CLASS = `${SECONDARY_BUTTON_CLASS} aria-[disabled=true]:cursor-wait aria-[disabled=true]:text-slate-400 aria-[disabled=true]:hover:border-slate-700 aria-[disabled=true]:hover:bg-slate-800 aria-[disabled=true]:active:border-slate-700 aria-[disabled=true]:active:bg-slate-800`;
 // The notice that the filtered watchlist is gone and all counters are shown. It is always
 // rendered, so its live region exists before the text arrives; while empty it is screen-reader
 // only, which also takes it out of the field's flex gap. Amber-300 on the slate-900 card is about
@@ -484,13 +489,13 @@ const TH_STICKY_CLASS =
   "sticky start-0 z-10 whitespace-nowrap [border-block-end-width:1px] border-slate-700 bg-slate-900 px-2 py-1.5 text-start align-bottom text-xs font-medium text-slate-400 after:pointer-events-none after:absolute after:inset-y-0 after:end-0 after:w-px after:bg-slate-700";
 const TH_NUMERIC_CLASS =
   "whitespace-nowrap [border-block-end-width:1px] border-slate-700 px-2 py-1.5 text-end align-bottom text-xs font-medium text-slate-400";
-// Sort and ticker buttons are text only, so their pressed state is the sky-200 text shade, 13.4:1
-// on the card surface and distinct from every resting and hover colour. The selected sort button,
-// already slate-100, dims to slate-300 on hover.
+// Sort buttons are text only, so their pressed state is the sky-200 text shade, 13.4:1 on the card
+// surface and distinct from every resting and hover colour. The selected sort button, already
+// slate-100, dims to slate-300 on hover.
 const SORT_BUTTON_CLASS =
-  "inline-flex min-h-6 items-center gap-1 rounded text-xs font-medium text-slate-400 hover:text-slate-100 active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "inline-flex min-h-6 cursor-pointer items-center gap-1 rounded text-xs font-medium text-slate-400 hover:text-slate-100 active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const SORT_BUTTON_ACTIVE_CLASS =
-  "inline-flex min-h-6 items-center gap-1 rounded text-xs font-semibold text-slate-100 hover:text-slate-300 active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "inline-flex min-h-6 cursor-pointer items-center gap-1 rounded text-xs font-semibold text-slate-100 hover:text-slate-300 active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 // A plain header label gets the sort buttons' 24px centred line box, so in a bottom-aligned
 // header row every label's text shares one baseline, sortable or not.
 const HEADER_LABEL_CLASS = "inline-flex min-h-6 items-center";
@@ -519,8 +524,12 @@ const SUMMARY_SECTOR_TEXT_CLASS =
 const SELECTED_ROW_CLASS = "bg-slate-800";
 const ROW_HEADER_SELECTED_CLASS =
   "sticky start-0 z-10 whitespace-nowrap bg-slate-800 px-2 py-1.5 text-start font-medium text-slate-200 before:absolute before:inset-y-0 before:start-0 before:w-0.5 before:bg-sky-400 before:content-[''] after:pointer-events-none after:absolute after:inset-y-0 after:end-0 after:w-px after:bg-slate-700";
-const TICKER_BUTTON_CLASS =
-  "min-h-6 rounded font-medium text-sky-300 underline-offset-2 hover:underline active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
+// The ticker button is the shared 24px monospace ticker button that AnomalyFeed also uses, at the
+// same size and weight; on the selected row its hover and pressed backgrounds step one shade
+// past the row's slate-800 tint. Its -mx-1 only offsets its 4px inline padding, so the ticker
+// text stays aligned with the column header.
+const TICKER_BUTTON_CLASS = `${SHARED_TICKER_BUTTON_CLASS} -mx-1`;
+const TICKER_BUTTON_SELECTED_CLASS = `${SHARED_TICKER_BUTTON_SELECTED_CLASS} -mx-1`;
 const TEXT_CELL_CLASS = "px-2 py-1.5 text-start text-slate-200";
 // A minimum width keeps company names to about two lines instead of one word per line.
 const COMPANY_CELL_CLASS = "min-w-[12rem] px-2 py-1.5 text-start text-slate-200";
@@ -746,7 +755,7 @@ function CounterRow({ row, onSelectTicker, selected }: CounterRowProps): ReactEl
             type="button"
             onClick={() => onSelectTicker(row.ticker)}
             aria-current={selected ? "true" : undefined}
-            className={TICKER_BUTTON_CLASS}
+            className={selected ? TICKER_BUTTON_SELECTED_CLASS : TICKER_BUTTON_CLASS}
           >
             {row.ticker}
           </button>
@@ -1269,7 +1278,7 @@ export function EquityScreener({
     <div role="search" aria-label="Screener filters">
       <div className={FILTER_GRID_CLASS}>
         <div className={FIELD_CLASS}>
-          <label htmlFor={sectorId} className={LABEL_CLASS}>
+          <label htmlFor={sectorId} className={FIELD_LABEL_CLASS}>
             Sector
           </label>
           <select
@@ -1294,7 +1303,7 @@ export function EquityScreener({
           <FieldErrorText field="sector" message={fieldErrors.sector} id={errorIdOf("sector")} />
         </div>
         <div className={FIELD_CLASS}>
-          <label htmlFor={watchlistId} className={LABEL_CLASS}>
+          <label htmlFor={watchlistId} className={FIELD_LABEL_CLASS}>
             Watchlist
           </label>
           <select
@@ -1378,7 +1387,7 @@ export function EquityScreener({
           const inputId = `${baseId}-${key}`;
           return (
             <div key={key} className={FIELD_CLASS}>
-              <label htmlFor={inputId} className={LABEL_CLASS}>
+              <label htmlFor={inputId} className={FIELD_LABEL_CLASS}>
                 {label}
               </label>
               <input
@@ -1420,7 +1429,7 @@ export function EquityScreener({
           type="button"
           data-testid="screener-reset"
           onClick={handleReset}
-          className={RESET_CLASS}
+          className={SECONDARY_BUTTON_CLASS}
         >
           Reset
         </button>
