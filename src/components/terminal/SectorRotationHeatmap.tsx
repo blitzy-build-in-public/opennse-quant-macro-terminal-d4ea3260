@@ -103,26 +103,45 @@ const TOGGLE_CLASS =
 const TOGGLE_PRESSED_CLASS =
   "cursor-pointer rounded border border-sky-700 bg-sky-900 px-3 py-1 text-xs font-medium text-sky-100 hover:bg-sky-800 active:border-sky-600 active:bg-sky-700 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 // The scroller is a keyboard-focusable region, so the periods can be scrolled without a pointer,
-// and a size container, so the caption text can wrap to its visible width.
+// and an inline-size container, so content inside it can be sized against its visible width
+// (`cqi`) rather than the table's. `relative` makes it the containing block of the absolutely
+// positioned `sr-only` caption and "No data" spans, which would otherwise escape the overflow
+// clip and widen the host page.
 const SCROLL_CLASS =
-  "@container overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
+  "@container relative overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 const TABLE_CLASS = "w-full border-collapse text-xs tabular-nums";
-const CAPTION_CLASS = "caption-top pb-2 text-start text-xs text-slate-400";
-// A caption box is as wide as its table, so on a narrow screen its text would run under the
-// scroller's edge. The text instead wraps to the scroller's width and stays pinned while the
-// periods scroll.
-const CAPTION_TEXT_CLASS = "sticky start-0 inline-block max-w-[100cqi]";
+// The table's description: the visible text above the scroll region, and the screen-reader-only
+// caption that names both the table and the region. A visible caption box is as wide as its
+// table, so on a narrow screen its text would run past the scrollport; above the scroller the
+// text wraps to the card's width instead.
+const DESCRIPTION_CLASS = "m-0 pb-2 text-start text-xs text-slate-400";
 // The sector column stays in view while the periods scroll horizontally; its opaque surface hides
-// the cells passing beneath it.
+// the cells passing beneath it. Its headers wrap rather than grow: each one's text sits in a
+// `STICKY_HEADER_TEXT_CLASS` span capped so the header cell is at most 45% of the scroller's
+// visible width, so a long sector name never crowds the periods out of a narrow scroller and at
+// least one whole period column fits beside it at every scroll position, while a word as long as
+// "Telecommunications" still fits whole on a 375px screen. A 1px `::after` divider at the
+// cell's inline end marks where the pinned column ends; the sticky cell is its containing block,
+// so the divider travels with the column where collapsed table borders would not. The corner's
+// end border, slate-900 like the surface and so unseen, takes the same half of the collapsed
+// border that the cells' borders give each row header, so the corner's divider lines up exactly
+// with the rows' divider instead of sitting a pixel further out.
 const CORNER_HEADER_CLASS =
-  "sticky start-0 z-10 whitespace-nowrap bg-slate-900 px-2 py-1.5 text-start font-medium text-slate-300";
-const PERIOD_HEADER_CLASS = "whitespace-nowrap px-2 py-1.5 text-end font-medium text-slate-300";
+  "sticky start-0 z-10 border-e border-slate-900 bg-slate-900 px-2 py-1.5 text-start font-medium text-slate-400 after:pointer-events-none after:absolute after:inset-y-0 after:end-0 after:w-px after:bg-slate-700";
+const PERIOD_HEADER_CLASS = "whitespace-nowrap px-2 py-1.5 text-end font-medium text-slate-400";
 const ROW_HEADER_CLASS =
-  "sticky start-0 z-10 whitespace-nowrap bg-slate-900 px-2 py-1.5 text-start font-medium text-slate-200";
+  "sticky start-0 z-10 bg-slate-900 px-2 py-1.5 text-start font-medium text-slate-200 after:pointer-events-none after:absolute after:inset-y-0 after:end-0 after:w-px after:bg-slate-700";
+// `max-w-*` on a table cell is not reliably honoured, so the cap sits on this inner block: 45cqi
+// less the cell's 1rem inline padding and the 1px cell border it shares with the first period
+// cell. `break-words` breaks only a word too long for the cap; it leaves whole words in the
+// column's minimum width, which an overflowing table gives every column.
+const STICKY_HEADER_TEXT_CLASS = "block max-w-[calc(45cqi_-_1rem_-_1px)] break-words";
 const CELL_CLASS = "whitespace-nowrap border border-slate-900 px-2 py-1.5 text-end";
-// The market row is set apart from the sectors by a heavier rule above it.
+// The market row is set apart from the sectors by a heavier rule above it. It is the table's
+// total row, so its header is deliberately heavier and brighter than the sector row headers; it
+// shares the sector column's capped, wrapping text and its divider.
 const MARKET_HEADER_CLASS =
-  "sticky start-0 z-10 whitespace-nowrap border-bs-2 border-bs-slate-600 bg-slate-900 px-2 py-1.5 text-start font-semibold text-slate-100";
+  "sticky start-0 z-10 border-bs-2 border-bs-slate-600 bg-slate-900 px-2 py-1.5 text-start font-semibold text-slate-100 after:pointer-events-none after:absolute after:inset-y-0 after:end-0 after:w-px after:bg-slate-700";
 const MARKET_CELL_CLASS =
   "whitespace-nowrap border border-slate-900 border-bs-2 border-bs-slate-600 px-2 py-1.5 text-end font-semibold";
 const LEGEND_CLASS = "mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-slate-400";
@@ -237,7 +256,7 @@ function SectorRow({ row, periodEnds, mode }: SectorRowProps): ReactElement {
   return (
     <tr data-testid="heatmap-row" data-sector={row.sector}>
       <th scope="row" className={ROW_HEADER_CLASS}>
-        {row.sector}
+        <span className={STICKY_HEADER_TEXT_CLASS}>{row.sector}</span>
       </th>
       {periodEnds.map((period, index) => {
         const cell = byPeriod.get(period);
@@ -270,21 +289,24 @@ function HeatmapTable({ data, mode }: HeatmapTableProps): ReactElement {
   const captionId = useId();
   const isWeekly = data.interval === "week";
   const marketByPeriod = cellsByPeriod(data.market);
+  const description = `Capitalization-weighted sector returns (%), ${
+    isWeekly ? "weekly" : "monthly"
+  } periods ending ${formatDate(data.as_of)}`;
   return (
     <>
+      {/* The visible description; screen readers get the same text once, as the caption. */}
+      <p aria-hidden="true" className={DESCRIPTION_CLASS}>
+        {description}
+      </p>
       <div role="region" aria-labelledby={captionId} tabIndex={0} className={SCROLL_CLASS}>
         <table className={TABLE_CLASS}>
-          <caption id={captionId} className={CAPTION_CLASS}>
-            <span className={CAPTION_TEXT_CLASS}>
-              {`Capitalization-weighted sector returns (%), ${
-                isWeekly ? "weekly" : "monthly"
-              } periods ending ${formatDate(data.as_of)}`}
-            </span>
+          <caption id={captionId} className="sr-only">
+            {description}
           </caption>
           <thead>
             <tr>
               <th scope="col" className={CORNER_HEADER_CLASS}>
-                Sector
+                <span className={STICKY_HEADER_TEXT_CLASS}>Sector</span>
               </th>
               {data.period_ends.map((period, index) => (
                 <th
@@ -311,7 +333,7 @@ function HeatmapTable({ data, mode }: HeatmapTableProps): ReactElement {
           <tfoot>
             <tr data-testid="heatmap-market-row">
               <th scope="row" className={MARKET_HEADER_CLASS}>
-                Market
+                <span className={STICKY_HEADER_TEXT_CLASS}>Market</span>
               </th>
               {data.period_ends.map((period, index) => {
                 const cell = marketByPeriod.get(period);

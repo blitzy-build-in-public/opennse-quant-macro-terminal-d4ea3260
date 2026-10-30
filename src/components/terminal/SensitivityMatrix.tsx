@@ -56,7 +56,22 @@ const SCROLL_REGION_CLASS =
 
 // Every class below is a complete static string, never assembled from fragments, so Tailwind's
 // source scan and a host's `@source` directive find each one.
-const HEADER_CLASS = "whitespace-nowrap px-2 py-1.5 font-medium text-slate-300";
+// Column headers, the corner included, and the WACC row headers use the terminal's table header
+// tokens: muted slate-400 above the columns, brighter slate-200 beside the rows.
+const COL_HEADER_CLASS = "whitespace-nowrap px-2 py-1.5 font-medium text-slate-400";
+// The label column (the corner and the WACC row headers) stays pinned to the scroll region's start
+// edge while the value columns scroll beneath it, so every value keeps its WACC label in view. The
+// card's slate-900 surface makes it opaque, and z-10 paints it over the cells passing under it,
+// the positioned explained cells included. A 1 px slate-700 `::after` line on its end edge,
+// positioned by the sticky header, moves with the column, so a partly scrolled value never sits
+// flush against a label. Row headers align to the top, as the two-line cells do, so each label
+// lines up with its row's fair values. The corner's end border, slate-900 like the surface and so
+// unseen, takes the same half of the collapsed border that the cells' borders give each row
+// header, so the corner's divider lines up exactly with the rows' divider.
+const CORNER_HEADER_CLASS =
+  "sticky start-0 z-10 w-px whitespace-nowrap border-e border-slate-900 bg-slate-900 px-2 py-1.5 text-start font-medium text-slate-400 after:pointer-events-none after:absolute after:inset-y-0 after:end-0 after:w-px after:bg-slate-700";
+const ROW_HEADER_CLASS =
+  "sticky start-0 z-10 whitespace-nowrap bg-slate-900 px-2 py-1.5 text-start align-top font-medium text-slate-200 after:pointer-events-none after:absolute after:inset-y-0 after:end-0 after:w-px after:bg-slate-700";
 const CELL_CLASS = "border border-slate-900 px-2 py-1.5 text-end align-top";
 const TONE_AT_OR_ABOVE_OFFER = "bg-emerald-900/60 text-emerald-100";
 const TONE_BELOW_OFFER = "bg-rose-900/60 text-rose-100";
@@ -72,8 +87,10 @@ const EXPLAINED_CELL_CLASS = "relative";
 // these touches the cell's comparison colours.
 const EXPLANATION_TRIGGER_CLASS =
   "peer m-0 block w-full cursor-help appearance-none rounded border-0 bg-transparent p-0 text-end text-inherit decoration-dotted underline-offset-2 [font:inherit] [letter-spacing:inherit] enabled:hover:underline enabled:active:opacity-80 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-slate-100 focus-visible:[outline:2px_solid_transparent]";
+// z-20 keeps the keyboard tooltip above the pinned label column (z-10), which a tooltip below a
+// first-row cell, or one extending leftward from a right-half cell, can overlap.
 const EXPLANATION_TIP_CLASS =
-  "pointer-events-none absolute z-10 w-max max-w-[14rem] whitespace-normal break-words rounded-md border border-slate-600 bg-slate-950 px-2 py-1 text-start text-xs font-normal text-slate-100 shadow-lg";
+  "pointer-events-none absolute z-20 w-max max-w-[14rem] whitespace-normal break-words rounded-md border border-slate-600 bg-slate-950 px-2 py-1 text-start text-xs font-normal text-slate-100 shadow-lg";
 // A tooltip sits above its cell, except on the first body row. The table's scroll region is a
 // scroll container, and content overflowing a scroll container's top can never be scrolled to,
 // so a multi-line tooltip above a first-row cell, with only the header row over it, would lose
@@ -164,13 +181,57 @@ interface CellExplanationProps {
 }
 
 /**
+ * Brings a keyboard-focused explanation into view inside the matrix's scroll region. Neither the
+ * browser's focus scroll nor `scrollIntoView` knows about the pinned label column, so either can
+ * leave the focused value beneath it. The region is therefore first scrolled until the button's
+ * cell clears its row's label; the cell's padding keeps the focus ring, drawn outside the button,
+ * clear of the label too. The tooltip, which paints above the label column, is then shifted along
+ * the row just enough to fit inside the region, and finally scrolled into view, which also brings
+ * a below-cell tooltip running past the region's bottom into view. A tooltip without a box, as on
+ * a pointer focus, which does not show it, scrolls and shifts nothing.
+ */
+function revealExplanation(button: HTMLElement, tip: HTMLElement): void {
+  tip.style.transform = "";
+  if (tip.getClientRects().length === 0) return;
+  const region = button.closest<HTMLElement>('[role="region"]');
+  const label = button.closest("tr")?.querySelector<HTMLElement>(":scope > th");
+  if (region !== null && label !== null && label !== undefined) {
+    const regionRect = region.getBoundingClientRect();
+    const innerLeft = regionRect.left + region.clientLeft;
+    const innerRight = innerLeft + region.clientWidth;
+    // The label column sits at the inline start: the left edge, or the right one in RTL. How far
+    // the cell reaches beneath the label, and past the region's inline end edge:
+    const labelRect = label.getBoundingClientRect();
+    const cellRect = (button.closest("td") ?? button).getBoundingClientRect();
+    const rtl = getComputedStyle(region).direction === "rtl";
+    const underLabel = rtl ? cellRect.right - labelRect.left : labelRect.right - cellRect.left;
+    const pastEnd = rtl ? innerLeft - cellRect.left : cellRect.right - innerRight;
+    // A growing scrollLeft moves the content left. Whole pixels, rounded towards a clear cell,
+    // since the region may snap a fractional scroll offset.
+    const towardEnd = rtl ? -1 : 1;
+    if (underLabel > 0) {
+      region.scrollLeft -= towardEnd * Math.ceil(underLabel);
+    } else if (pastEnd > 0) {
+      // Never so far that a cell wider than the space beside the labels slips beneath them.
+      region.scrollLeft += towardEnd * Math.min(Math.ceil(pastEnd), Math.floor(-underLabel));
+    }
+    const tipRect = tip.getBoundingClientRect();
+    let shift = 0;
+    if (tipRect.right > innerRight) shift = innerRight - tipRect.right;
+    if (tipRect.left + shift < innerLeft) shift = innerLeft - tipRect.left;
+    if (shift !== 0) tip.style.transform = `translateX(${shift}px)`;
+  }
+  tip.scrollIntoView({ block: "nearest", inline: "nearest" });
+}
+
+/**
  * Keyboard access to a cell's explanation, which a pointer user gets from the cell's `title`. The
  * cell's content becomes a focusable button, described by a tooltip that shows while the button
  * has keyboard focus: above the cell, or below it on the first body row, since the table's scroll
- * region cannot scroll to a tooltip overflowing its top. Focusing scrolls the tooltip into view,
- * which a narrow, horizontally scrolled region, or a below-cell tooltip running past the region's
- * bottom, would otherwise cut off. Escape hides the tooltip without moving focus, so it no longer
- * covers neighbouring cells, and leaving the button restores it for the next visit.
+ * region cannot scroll to a tooltip overflowing its top. Focusing brings the button and its
+ * tooltip into view with {@link revealExplanation}, so neither a narrow, horizontally scrolled
+ * region nor the pinned label column cuts them off. Escape hides the tooltip without moving focus,
+ * so it no longer covers neighbouring cells, and leaving the button restores it for the next visit.
  */
 function CellExplanation({
   explanation,
@@ -191,15 +252,20 @@ function CellExplanation({
         type="button"
         aria-describedby={tipId}
         className={EXPLANATION_TRIGGER_CLASS}
-        onFocus={() => {
-          // The browser scrolls only the button into view. The tooltip has no box unless keyboard
-          // focus shows it, so a pointer focus scrolls nothing.
-          tipRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+        onFocus={(event) => {
+          // The browser scrolls only the button into view, and without regard to the pinned
+          // label column. The tooltip has no box unless keyboard focus shows it, so a pointer
+          // focus scrolls nothing.
+          if (tipRef.current !== null) revealExplanation(event.currentTarget, tipRef.current);
         }}
         onKeyDown={(event) => {
           if (event.key === "Escape") setDismissed(true);
         }}
-        onBlur={() => setDismissed(false)}
+        onBlur={() => {
+          // The shift fitted the tooltip to this visit's scroll position; the next visit refits it.
+          if (tipRef.current !== null) tipRef.current.style.transform = "";
+          setDismissed(false);
+        }}
       >
         {children}
       </button>
@@ -260,9 +326,9 @@ function MatrixCell({
         <span className="block font-medium">
           {formatDecimal(cell.fair_value_per_share_kes, "per_share", { unit: false })}
         </span>
-        <span className="block text-xs">
-          {formatDecimal(cell.upside_pct, "pct", { signed: true })}
-        </span>
+        {/* Same size as the fair value, as every td in the terminal's tables shares one size; the
+            upside reads as the secondary line by its lighter weight. */}
+        <span className="block">{formatDecimal(cell.upside_pct, "pct", { signed: true })}</span>
         {flags === "" ? null : <span className="sr-only">{flags}</span>}
       </>
     );
@@ -328,17 +394,17 @@ export function SensitivityMatrix({
         {CAPTION_TEXT}
       </p>
       <div role="region" aria-labelledby={captionId} tabIndex={0} className={SCROLL_REGION_CLASS}>
-        <table className="min-w-full border-collapse text-sm tabular-nums">
+        <table className="min-w-full border-collapse text-xs tabular-nums">
           <caption id={captionId} className="sr-only">{CAPTION_TEXT}</caption>
           <thead>
             <tr>
               {/* w-px with the headers' nowrap shrinks the label column to its text, so a wide
                   container gives its spare width to the value columns rather than the labels. */}
-              <th scope="col" className={`${HEADER_CLASS} w-px text-start`}>
+              <th scope="col" className={CORNER_HEADER_CLASS}>
                 WACC <span aria-hidden="true">↓</span> / Margin <span aria-hidden="true">→</span>
               </th>
               {cols.map((col) => (
-                <th key={col.key} scope="col" className={`${HEADER_CLASS} text-end`}>
+                <th key={col.key} scope="col" className={`${COL_HEADER_CLASS} text-end`}>
                   {formatDecimal(col.value, "pct")}
                 </th>
               ))}
@@ -349,7 +415,7 @@ export function SensitivityMatrix({
               const rowCells = data.cells[i];
               return (
                 <tr key={row.key}>
-                  <th scope="row" className={`${HEADER_CLASS} text-start`}>
+                  <th scope="row" className={ROW_HEADER_CLASS}>
                     {formatDecimal(row.value, "pct")}
                   </th>
                   {cols.map((col, j) => {

@@ -440,23 +440,31 @@ const SELECT_LABEL_CLASS =
 const TABLE_WRAPPER_CLASS =
   "relative min-w-0 overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 const TABLE_CLASS = "w-full border-collapse text-xs";
-// Headers and the window cell may wrap between words, so the table fits narrower cards.
-const TH_CLASS = "px-2 py-1.5 text-start align-bottom font-medium text-slate-400";
-const TH_NUMERIC_CLASS = "px-2 py-1.5 text-end align-bottom font-medium text-slate-400";
-const TH_ROW_CLASS = "whitespace-nowrap px-2 py-1.5 text-start align-top font-normal";
+// Column headers stay on one line, so a long off-screen header never deepens the header row;
+// the wrapper scrolls instead. The window cell may wrap between its two dates.
+const TH_CLASS = "whitespace-nowrap px-2 py-1.5 text-start align-bottom font-medium text-slate-400";
+const TH_NUMERIC_CLASS =
+  "whitespace-nowrap px-2 py-1.5 text-end align-bottom font-medium text-slate-400";
+const TH_ROW_CLASS =
+  "whitespace-nowrap px-2 py-1.5 text-start align-top font-medium text-slate-200";
 const TR_CLASS = "border-t border-slate-800";
 const TD_CLASS = "whitespace-nowrap px-2 py-1.5 align-top text-slate-200";
 const TD_WRAP_CLASS = "px-2 py-1.5 align-top text-slate-200";
 const NOWRAP_CLASS = "whitespace-nowrap";
 const TD_NUMERIC_CLASS = "whitespace-nowrap px-2 py-1.5 text-end align-top tabular-nums text-slate-200";
 // Flag codes wrap between codes; a code breaks only when it alone is wider than the column.
-const TD_FLAGS_CLASS = "min-w-[11rem] break-words px-2 py-1.5 align-top text-slate-500";
+// The 11rem minimum applies only to a cell that holds codes, so a column of "—" cells stays
+// as narrow as its header and the table still fits a wide card.
+const TD_FLAGS_CLASS = "min-w-[11rem] break-words px-2 py-1.5 align-top text-slate-400";
+const TD_FLAGS_EMPTY_CLASS = "px-2 py-1.5 align-top text-slate-400";
+// The cycle label takes the row header's weight and colour; the event date beneath it is the
+// secondary line.
+const CYCLE_LABEL_CLASS = "block";
+const CYCLE_DATE_CLASS = "block font-normal text-slate-400";
 // The Cycle cell leads with the cycle's line swatch, centred on the label's 1rem text-xs line, so
 // a row is identifiable by the same colour as its line on the main chart.
 const CYCLE_CELL_CLASS = "flex items-start gap-1.5";
 const CYCLE_SWATCH_SLOT_CLASS = "flex h-4 shrink-0 items-center";
-const CYCLE_LABEL_CLASS = "block font-medium text-slate-100";
-const CYCLE_DATE_CLASS = "block text-slate-400";
 // A cohort count with tickers is a disclosure that lists them in place, so they are reachable by
 // keyboard and touch, not only from its hover tooltip. Closed, it is an end-aligned count with a
 // dotted underline and a chevron; open, the list wraps beneath it within a bounded width.
@@ -2767,7 +2775,9 @@ export function CycleBacktester({
                       testId="cycle-excluded-count"
                     />
                   </td>
-                  <td className={TD_FLAGS_CLASS}>
+                  <td
+                    className={cycle.flags.length > 0 ? TD_FLAGS_CLASS : TD_FLAGS_EMPTY_CLASS}
+                  >
                     {cycle.flags.length > 0 ? cycle.flags.join(", ") : EMPTY_VALUE}
                   </td>
                 </tr>

@@ -448,9 +448,28 @@ const CONTEXT_CLASS = "flex flex-wrap gap-x-3 gap-y-1 text-xs text-slate-400";
 const COUNT_CLASS = "font-medium text-slate-200";
 // The applied watchlist's full name; a long one wraps anywhere instead of widening the card.
 const CONTEXT_WATCHLIST_CLASS = "min-w-0 [overflow-wrap:anywhere]";
+// `relative` makes each table's scroller the containing block of its absolutely positioned
+// `sr-only` caption, which would otherwise escape the overflow clip and widen the host page.
 const SCROLL_REGION_CLASS =
-  "overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
-const TABLE_CLASS = "min-w-full border-collapse text-sm";
+  "relative overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
+// The sector summary's scroller is also an inline-size container, so its sticky sector names can
+// be capped against the scroller's visible width (`cqi`) rather than the table's (see
+// SUMMARY_SECTOR_TEXT_CLASS). Without a container, as in a Tailwind 3 host lacking container
+// queries, `cqi` resolves against the small viewport, which still caps the column.
+const SUMMARY_SCROLL_REGION_CLASS =
+  "@container relative overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
+// Each scroller sits in a positioned frame with an edge fade over its inline end, shown while
+// columns lie beyond that edge (see useOverflowEnd), since overlay scrollbars give no cue. The
+// fade blends the card surface (slate-900) in over 2rem and ignores the pointer, so the cells
+// beneath stay clickable. It stays inside the scroller's box, clear of its offset focus outline,
+// and is fully transparent once the end is reached or when the table fits, so nothing stays
+// covered. `bg-gradient-to-*` is the gradient direction Tailwind 3 and Tailwind 4 both generate.
+const SCROLL_FRAME_CLASS = "relative";
+const SCROLL_FADE_CLASS =
+  "pointer-events-none absolute inset-y-0 end-0 w-8 bg-gradient-to-l from-slate-900 to-transparent opacity-100 rtl:bg-gradient-to-r motion-safe:transition-opacity motion-safe:duration-150 motion-safe:ease-out";
+const SCROLL_FADE_HIDDEN_CLASS =
+  "pointer-events-none absolute inset-y-0 end-0 w-8 bg-gradient-to-l from-slate-900 to-transparent opacity-0 rtl:bg-gradient-to-r motion-safe:transition-opacity motion-safe:duration-150 motion-safe:ease-out";
+const TABLE_CLASS = "min-w-full border-collapse text-xs";
 const TBODY_CLASS = "divide-y divide-slate-800";
 // The header divider is written as the arbitrary property `[border-block-end-width:1px]`
 // because Tailwind 3 and Tailwind 4 hosts both generate it; the named block-end border width
@@ -458,9 +477,11 @@ const TBODY_CLASS = "divide-y divide-slate-800";
 const TH_CLASS =
   "whitespace-nowrap [border-block-end-width:1px] border-slate-700 px-2 py-1.5 text-start align-bottom text-xs font-medium text-slate-400";
 // The first column (ticker or sector) stays in view while a wide table scrolls sideways; its
-// opaque background matches the card surface so scrolled cells pass beneath it.
+// opaque background matches the card surface so scrolled cells pass beneath it. Its inline-end
+// edge is a 1px slate-700 `::after` line: the sticky cell is its containing block, so the line
+// travels with the pinned column, which a collapsed cell border does not reliably do.
 const TH_STICKY_CLASS =
-  "sticky start-0 z-10 whitespace-nowrap [border-block-end-width:1px] border-slate-700 bg-slate-900 px-2 py-1.5 text-start align-bottom text-xs font-medium text-slate-400";
+  "sticky start-0 z-10 whitespace-nowrap [border-block-end-width:1px] border-slate-700 bg-slate-900 px-2 py-1.5 text-start align-bottom text-xs font-medium text-slate-400 after:pointer-events-none after:absolute after:inset-y-0 after:end-0 after:w-px after:bg-slate-700";
 const TH_NUMERIC_CLASS =
   "whitespace-nowrap [border-block-end-width:1px] border-slate-700 px-2 py-1.5 text-end align-bottom text-xs font-medium text-slate-400";
 // Sort and ticker buttons are text only, so their pressed state is the sky-200 text shade, 13.4:1
@@ -470,19 +491,36 @@ const SORT_BUTTON_CLASS =
   "inline-flex min-h-6 items-center gap-1 rounded text-xs font-medium text-slate-400 hover:text-slate-100 active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const SORT_BUTTON_ACTIVE_CLASS =
   "inline-flex min-h-6 items-center gap-1 rounded text-xs font-semibold text-slate-100 hover:text-slate-300 active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+// A plain header label gets the sort buttons' 24px centred line box, so in a bottom-aligned
+// header row every label's text shares one baseline, sortable or not.
+const HEADER_LABEL_CLASS = "inline-flex min-h-6 items-center";
 const ROW_HEADER_CLASS =
-  "sticky start-0 z-10 whitespace-nowrap bg-slate-900 px-2 py-1.5 text-start font-semibold text-slate-100";
+  "sticky start-0 z-10 whitespace-nowrap bg-slate-900 px-2 py-1.5 text-start font-medium text-slate-200 after:pointer-events-none after:absolute after:inset-y-0 after:end-0 after:w-px after:bg-slate-700";
+// A sector name wraps rather than widening its sticky row header, which would otherwise take the
+// longest name's width and, on a narrow screen, crowd the values out of view. The cap keeps the
+// header to 45% of the summary scroller's visible width, in container units because the table is
+// wider than the scroller, leaving the rest for the columns scrolling beside it. It sits on an
+// inner block because `max-w-*` on a table cell is not reliably honoured; the block overrides the
+// header's `whitespace-nowrap`, which the ticker headers keep. The cap is 45cqi less the header's
+// 1rem inline padding: the summary's cells have no side borders, and the `::after` divider takes
+// no width. `w-max` sizes the block to its name up to the cap, so only a longer name wraps; an
+// auto-width block would wrap every name at its longest word, because the table overflows even on
+// wide screens and so gives every column its narrowest width. `break-words` breaks only a word
+// too long for the cap, so ordinary words stay whole.
+const SUMMARY_SECTOR_TEXT_CLASS =
+  "block w-max max-w-[calc(45cqi_-_1rem)] whitespace-normal break-words";
 // The selected counter's row is tinted slate-800, and its sticky ticker cell switches to the same
 // opaque tint, so the row reads as one band while scrolled cells still pass beneath that cell. A
 // 2px sky-400 bar at the cell's start edge (about 6.7:1 on the tint) marks the row beyond the
 // tint alone. The bar is a pseudo-element placed inside the sticky cell, which positions it, so
 // moving the selection shifts nothing. Every text colour in the row stays at least 5.1:1 on the
-// tint (rose-400, the lowest), and the ticker button keeps its own hover and pressed states.
+// tint (rose-400, the lowest), and the ticker button keeps its own hover and pressed states. The
+// cell keeps the resting row header's weight, colour and inline-end divider.
 const SELECTED_ROW_CLASS = "bg-slate-800";
 const ROW_HEADER_SELECTED_CLASS =
-  "sticky start-0 z-10 whitespace-nowrap bg-slate-800 px-2 py-1.5 text-start font-semibold text-slate-100 before:absolute before:inset-y-0 before:start-0 before:w-0.5 before:bg-sky-400 before:content-['']";
+  "sticky start-0 z-10 whitespace-nowrap bg-slate-800 px-2 py-1.5 text-start font-medium text-slate-200 before:absolute before:inset-y-0 before:start-0 before:w-0.5 before:bg-sky-400 before:content-[''] after:pointer-events-none after:absolute after:inset-y-0 after:end-0 after:w-px after:bg-slate-700";
 const TICKER_BUTTON_CLASS =
-  "min-h-6 rounded font-semibold text-sky-300 underline-offset-2 hover:underline active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
+  "min-h-6 rounded font-medium text-sky-300 underline-offset-2 hover:underline active:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 const TEXT_CELL_CLASS = "px-2 py-1.5 text-start text-slate-200";
 // A minimum width keeps company names to about two lines instead of one word per line.
 const COMPANY_CELL_CLASS = "min-w-[12rem] px-2 py-1.5 text-start text-slate-200";
@@ -547,7 +585,11 @@ interface ZScoreCellProps {
   flags: readonly string[];
 }
 
-/** A rolling Z-score with its spike badge; the badge's text, not its colour, carries meaning. */
+/**
+ * A rolling Z-score with its spike badge; the badge's text, not its colour, carries meaning. The
+ * badge precedes the value, so the value is always the cell's inline-end item and every row's
+ * number stays aligned at the column's end whether or not it has a badge.
+ */
 function ZScoreCell({ metric, value, isAnomaly, flags }: ZScoreCellProps): ReactElement {
   const badge = isAnomaly ? (
     <span className={metric === "volume_z" ? VOLUME_BADGE_CLASS : TURNOVER_BADGE_CLASS}>
@@ -558,8 +600,8 @@ function ZScoreCell({ metric, value, isAnomaly, flags }: ZScoreCellProps): React
     return (
       <td data-column={metric} title={nullMetricTitle(flags, metric)} className={NULL_CELL_CLASS}>
         <span className={Z_CELL_INNER_CLASS}>
-          {EMPTY_VALUE}
           {badge}
+          {EMPTY_VALUE}
         </span>
       </td>
     );
@@ -567,8 +609,8 @@ function ZScoreCell({ metric, value, isAnomaly, flags }: ZScoreCellProps): React
   return (
     <td data-column={metric} className={NUMERIC_CELL_CLASS}>
       <span className={Z_CELL_INNER_CLASS}>
-        {formatDecimal(value, "z")}
         {badge}
+        {formatDecimal(value, "z")}
       </span>
     </td>
   );
@@ -650,7 +692,7 @@ function CounterHeader({ column, activeSort, activeOrder, onSort }: CounterHeade
   if (sort === undefined) {
     return (
       <th scope="col" className={thClass}>
-        {column.label}
+        <span className={HEADER_LABEL_CLASS}>{column.label}</span>
       </th>
     );
   }
@@ -783,7 +825,7 @@ function SectorAggregateRow({ aggregate }: { aggregate: SectorAggregate }): Reac
   return (
     <tr data-testid="sector-aggregate-row" data-sector={aggregate.sector}>
       <th scope="row" data-column="sector" className={ROW_HEADER_CLASS}>
-        {aggregate.sector}
+        <span className={SUMMARY_SECTOR_TEXT_CLASS}>{aggregate.sector}</span>
       </th>
       <td data-column="constituent_count" className={NUMERIC_CELL_CLASS}>
         {formatInteger(constituents)}
@@ -861,6 +903,52 @@ function isFieldError(error: TerminalApiError | null): error is TerminalApiError
  * effect runs and React 18 warns about layout effects, it is `useEffect`.
  */
 const useBrowserLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
+
+/** Content hidden past a scroller's inline end by at most this many pixels is rounding. */
+const OVERFLOW_TOLERANCE_PX = 1;
+
+/**
+ * Whether a horizontal scroller has content hidden beyond its inline-end edge, which drives the
+ * edge fade of {@link SCROLL_FADE_CLASS}. Returns a callback ref for the scroller, so a scroller
+ * that mounts after the widget (the sector summary) is tracked too, and the flag.
+ *
+ * The flag starts false, so server and client markup match and no fade shows before layout. It is
+ * set only from the scroller's `scroll` events and from a `ResizeObserver` on the scroller and its
+ * table, whose first observation arrives once they are laid out and whose later ones follow a
+ * resize or a table that grows or shrinks with its rows. `Math.abs(scrollLeft)` keeps the end
+ * right in right-to-left layouts, where `scrollLeft` runs from 0 to negative values. Listeners are
+ * removed, and the flag cleared, when the scroller unmounts. Without `ResizeObserver` (non-browser
+ * test environments) only scrolling updates the flag.
+ */
+function useOverflowEnd(): [(node: HTMLElement | null) => void, boolean] {
+  const [overflowEnd, setOverflowEnd] = useState(false);
+  const detach = useRef<(() => void) | null>(null);
+  const ref = useCallback((node: HTMLElement | null) => {
+    detach.current?.();
+    detach.current = null;
+    if (node === null) {
+      setOverflowEnd(false);
+      return;
+    }
+    const update = (): void => {
+      const hidden = node.scrollWidth - node.clientWidth - Math.abs(node.scrollLeft);
+      setOverflowEnd(hidden > OVERFLOW_TOLERANCE_PX);
+    };
+    node.addEventListener("scroll", update, { passive: true });
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
+    if (observer !== null) {
+      observer.observe(node);
+      for (const child of Array.from(node.children)) {
+        observer.observe(child);
+      }
+    }
+    detach.current = () => {
+      node.removeEventListener("scroll", update);
+      observer?.disconnect();
+    };
+  }, []);
+  return [ref, overflowEnd];
+}
 
 
 /**
@@ -1116,6 +1204,7 @@ export function EquityScreener({
   const watchlistId = `${baseId}-watchlist_id`;
   const anomaliesId = `${baseId}-anomalies_only`;
   const summaryHeadingId = `${baseId}-sector-summary`;
+  const countersCaptionId = `${baseId}-counters-caption`;
   const errorIdOf = (field: string): string => `${baseId}-${field}-error`;
   const describedByOf = (field: string): string | undefined =>
     fieldErrors[field] === undefined ? undefined : errorIdOf(field);
@@ -1347,6 +1436,9 @@ export function EquityScreener({
     </div>
   );
 
+  const [countersScrollRef, countersOverflowEnd] = useOverflowEnd();
+  const [summaryScrollRef, summaryOverflowEnd] = useOverflowEnd();
+
   let tableBody: ReactElement | ReactElement[];
   if (response === undefined) {
     tableBody = (
@@ -1403,28 +1495,39 @@ export function EquityScreener({
             </span>
           </p>
         ) : null}
-        <div
-          role="region"
-          aria-label="Screener counters"
-          tabIndex={0}
-          className={SCROLL_REGION_CLASS}
-        >
-          <table className={TABLE_CLASS}>
-            <thead>
-              <tr>
-                {COUNTER_COLUMNS.map((column) => (
-                  <CounterHeader
-                    key={column.id}
-                    column={column}
-                    activeSort={activeSort}
-                    activeOrder={activeOrder}
-                    onSort={handleSort}
-                  />
-                ))}
-              </tr>
-            </thead>
-            <tbody className={TBODY_CLASS}>{tableBody}</tbody>
-          </table>
+        <div className={SCROLL_FRAME_CLASS}>
+          <div
+            ref={countersScrollRef}
+            role="region"
+            aria-labelledby={countersCaptionId}
+            tabIndex={0}
+            data-overflow-end={countersOverflowEnd ? "true" : "false"}
+            className={SCROLL_REGION_CLASS}
+          >
+            <table className={TABLE_CLASS}>
+              <caption id={countersCaptionId} className="sr-only">
+                Screener counters
+              </caption>
+              <thead>
+                <tr>
+                  {COUNTER_COLUMNS.map((column) => (
+                    <CounterHeader
+                      key={column.id}
+                      column={column}
+                      activeSort={activeSort}
+                      activeOrder={activeOrder}
+                      onSort={handleSort}
+                    />
+                  ))}
+                </tr>
+              </thead>
+              <tbody className={TBODY_CLASS}>{tableBody}</tbody>
+            </table>
+          </div>
+          <div
+            aria-hidden="true"
+            className={countersOverflowEnd ? SCROLL_FADE_CLASS : SCROLL_FADE_HIDDEN_CLASS}
+          />
         </div>
         {response !== undefined ? (
           <div className={SUMMARY_SECTION_CLASS}>
@@ -1438,32 +1541,43 @@ export function EquityScreener({
             {aggregates.length === 0 ? (
               <p className={SUMMARY_NOTE_CLASS}>No sector data for this date</p>
             ) : (
-              <div
-                role="region"
-                aria-labelledby={summaryHeadingId}
-                tabIndex={0}
-                className={SCROLL_REGION_CLASS}
-              >
-                <table className={TABLE_CLASS}>
-                  <thead>
-                    <tr>
-                      {SUMMARY_COLUMNS.map((column) => (
-                        <th
-                          key={column.label}
-                          scope="col"
-                          className={summaryHeaderClass(column)}
-                        >
-                          {column.label}
-                        </th>
+              <div className={SCROLL_FRAME_CLASS}>
+                <div
+                  ref={summaryScrollRef}
+                  role="region"
+                  aria-labelledby={summaryHeadingId}
+                  tabIndex={0}
+                  data-overflow-end={summaryOverflowEnd ? "true" : "false"}
+                  className={SUMMARY_SCROLL_REGION_CLASS}
+                >
+                  <table className={TABLE_CLASS}>
+                    {/* The region keeps the visible heading as its name; the caption names the
+                        table itself with the same words. */}
+                    <caption className="sr-only">Sector summary</caption>
+                    <thead>
+                      <tr>
+                        {SUMMARY_COLUMNS.map((column) => (
+                          <th
+                            key={column.label}
+                            scope="col"
+                            className={summaryHeaderClass(column)}
+                          >
+                            <span className={HEADER_LABEL_CLASS}>{column.label}</span>
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className={TBODY_CLASS}>
+                      {aggregates.map((aggregate) => (
+                        <SectorAggregateRow key={aggregate.sector} aggregate={aggregate} />
                       ))}
-                    </tr>
-                  </thead>
-                  <tbody className={TBODY_CLASS}>
-                    {aggregates.map((aggregate) => (
-                      <SectorAggregateRow key={aggregate.sector} aggregate={aggregate} />
-                    ))}
-                  </tbody>
-                </table>
+                    </tbody>
+                  </table>
+                </div>
+                <div
+                  aria-hidden="true"
+                  className={summaryOverflowEnd ? SCROLL_FADE_CLASS : SCROLL_FADE_HIDDEN_CLASS}
+                />
               </div>
             )}
           </div>
