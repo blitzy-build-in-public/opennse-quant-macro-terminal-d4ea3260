@@ -1,4 +1,4 @@
-"""Idempotent fallback seeder: fills the ``terminal_`` tables with deterministic Kenyan market data.
+"""Idempotent fallback seeder: deterministic Kenyan market data for nine ``terminal_`` tables.
 
 Run it as ``python -m opennse_terminal.seed.seed_terminal_db [--database-url URL]`` or
 ``opennse-terminal seed [--database-url URL]``; both call :func:`main`, and ``--help`` lists the
@@ -9,11 +9,13 @@ at the packaged migration head ("run `opennse-terminal migrate upgrade head` fir
 interrupted by Ctrl-C, or ``143`` terminated by SIGTERM, with any uncommitted seed transaction
 rolled back and a started run recorded ``failed`` ("cancelled").
 
-What is written. The records of :func:`opennse_terminal.seed.synthetic.generate_all`: the eight
-attachment counters, their synthetic daily prices and fundamentals, the macro and bond history,
-the four election cycles, the Quickmart IPO preset, and the "NSE Core 8" watchlist owned by
-``TerminalSettings.default_owner_key``. Only ``terminal_`` tables are touched, through the ORM
-models and :func:`opennse_terminal.db.upsert.upsert_rows`; no user or auth row is created.
+What is written. The records of :func:`opennse_terminal.seed.synthetic.generate_all`, in nine
+reference, history and watchlist tables: the eight attachment counters, their synthetic daily
+prices and fundamentals, the macro and bond history, the four election cycles, the Quickmart IPO
+preset, and the "NSE Core 8" watchlist owned by ``TerminalSettings.default_owner_key``. Each run
+also adds its own ``terminal_ingestion_runs`` row. No ``terminal_corporate_filings`` row is
+written; only ``POST /ingest/pdf`` writes those. Only ``terminal_`` tables are touched, through the
+ORM models and :func:`opennse_terminal.db.upsert.upsert_rows`; no user or auth row is created.
 
 Idempotency. Every insert is ``INSERT ... ON CONFLICT (<natural key>) DO NOTHING``, and generation
 is deterministic, so a re-run inserts no data rows and adds only its own

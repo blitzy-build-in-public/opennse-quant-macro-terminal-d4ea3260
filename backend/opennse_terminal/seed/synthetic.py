@@ -30,11 +30,14 @@ Calendar. Price rows are dated on :func:`synthetic_sessions`, a simplified mock 
 (weekdays minus eight fixed-date holidays). It is not an exchange calendar and never dates real
 data: analytics use the observed market sessions, and live NSE runs use ``ingestion/calendar.py``.
 
-No future rows. Nothing is dated after :data:`~opennse_terminal.seed.reference_data.ANCHOR_DATE`
-(2026-09-30); every generator raises ``RuntimeError`` rather than return such a row. The 2027
-election is seeded only as an event definition in ``terminal_cycles``: rows dated after the
-present would be read as observed history, so its trajectory is the backtester's labelled
-projection from the completed cycles instead.
+No future history. Price trade dates, fundamentals period ends and macro and bond observation
+dates never pass :data:`~opennse_terminal.seed.reference_data.ANCHOR_DATE` (2026-09-30):
+:func:`generate_prices`, :func:`generate_fundamentals`, :func:`generate_macro` and
+:func:`generate_bonds` raise ``RuntimeError`` rather than return such a row. The only later dates
+are forward reference dates, never observations: bond maturity dates (up to 2051-09-30) and the
+2027-08-10 event date. The 2027 election is seeded only as an event definition in
+``terminal_cycles``: rows dated after the present would be read as observed history, so its
+trajectory is the backtester's labelled projection from the completed cycles instead.
 """
 
 import functools

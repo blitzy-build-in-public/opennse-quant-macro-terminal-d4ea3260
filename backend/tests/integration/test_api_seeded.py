@@ -995,6 +995,36 @@ def test_documented_query_parameters_keep_their_defaults_and_bounds(
 
 
 # ---------------------------------------------------------------------------------------------
+# Trailing-slash paths
+# ---------------------------------------------------------------------------------------------
+#
+# The standalone app is built with ``redirect_slashes=False``. Starlette's default would answer a
+# path with a trailing slash with a 307 to a ``Location`` built from the request's ``Host``
+# header, which the client does not have to tell the truth about, and a 307 resends a POST body.
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        pytest.param("GET", "/health/", None, id="get-health"),
+        pytest.param("POST", "/ipo/valuation/", {}, id="post-ipo-valuation"),
+    ],
+)
+async def test_trailing_slash_path_is_a_404_without_a_host_built_redirect(
+    client: httpx.AsyncClient, method: str, path: str, body: JsonObject | None
+) -> None:
+    """A trailing-slash path under a forged ``Host`` is FastAPI's standard 404, with no
+    ``Location`` header, rather than a redirect to that host."""
+    response = await client.request(
+        method, f"{BASE}{path}", headers={"Host": "evil.example"}, json=body
+    )
+
+    assert response.status_code == 404, response.text
+    assert "location" not in response.headers
+    assert response.json() == {"detail": "Not Found"}
+
+
+# ---------------------------------------------------------------------------------------------
 # Market service on per-test seeded clones (services/market_service.py)
 # ---------------------------------------------------------------------------------------------
 #

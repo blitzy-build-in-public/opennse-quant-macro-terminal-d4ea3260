@@ -19,11 +19,14 @@ are whole KES, and prices are KES per share; ``fx_kes_usd`` is KES per USD; ``fx
 is millions of USD; share counts and volumes are ``int``. Every fractional value is a ``Decimal``
 built from a string literal, so no float enters the seed.
 
-No seeded value is dated after :data:`ANCHOR_DATE` (2026-09-30). Rows dated in the future would be
-read as observed history: they would move every market endpoint's default ``as_of``, enter the
-valuation bands, Z-score windows and flows, and mark the 2027 cycle complete on invented data. The
-2027 election is therefore only an event definition in :data:`CYCLES`; its trajectory is the
-backtester's labelled projection from the completed cycles.
+No future history. No price trade date, fundamentals period end, or macro or bond observation
+date is after :data:`ANCHOR_DATE` (2026-09-30). Rows dated in the future would be read as observed
+history: they would move every market endpoint's default ``as_of``, enter the valuation bands,
+Z-score windows and flows, and mark the 2027 cycle complete on invented data. The only later dates
+are forward reference dates, never observations: the bond maturity dates (observation date plus a
+tenor of :data:`BOND_TENOR_SPREADS`) and the 2027-08-10 event in :data:`CYCLES`. The 2027 election
+is therefore only an event definition; its trajectory is the backtester's labelled projection from
+the completed cycles.
 """
 
 from collections.abc import Mapping
@@ -117,7 +120,9 @@ SEED_SOURCE: Final = "seed"
 
 # SEED_MARKET_DATA.md §1: the date of the latest macroeconomic benchmarks.
 ANCHOR_DATE: Final = date(2026, 9, 30)
-"""Last seeded date for prices, macro indicators and bond yields. Nothing is dated after it."""
+"""Last seeded trade or observation date of prices, macro indicators and bond yields. No trade,
+period-end or observation date is after it; only forward reference dates are (bond maturities and
+the 2027 event in :data:`CYCLES`)."""
 
 # --- SYNTHETIC --- mock-history extent, covering the 2013 cycle's ±12-month window and MA20 lead
 SERIES_START: Final = date(2012, 1, 2)
@@ -345,8 +350,8 @@ class CycleReference:
 
 
 # SEED_MARKET_DATA.md §4, verbatim: cycle labels and election dates. The 2027 row defines the event
-# only: no seed row is dated after ANCHOR_DATE, and its trajectory is the backtester's labelled
-# projection from the three completed cycles.
+# only: its date is a forward reference date, no observation is seeded after ANCHOR_DATE, and its
+# trajectory is the backtester's labelled projection from the three completed cycles.
 CYCLES: Final[tuple[CycleReference, ...]] = (
     CycleReference(label="2013 Cycle", event_date=date(2013, 3, 4)),
     CycleReference(label="2017 Cycle", event_date=date(2017, 8, 8)),
