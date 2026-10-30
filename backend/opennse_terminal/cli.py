@@ -15,8 +15,11 @@ Subcommands, each reading the database from ``TERMINAL_DATABASE_URL`` (or ``.env
   and is never started inside the API.
 
 Exit codes (:data:`EXIT_CODES` for run statuses): ``0`` succeeded, partial or no new data; ``1``
-failed; ``2`` invalid arguments, or from ``seed`` the schema is not at head; ``3``
-layout changed; ``4`` blocked by robots.txt; ``5`` ambiguous NSE session; ``130`` interrupted.
+failed, or from ``seed`` its own invalid arguments; ``2`` invalid arguments to any other
+command, or from ``seed`` the schema is not at head; ``3`` layout changed; ``4`` blocked by
+robots.txt; ``5`` ambiguous NSE session; ``130`` interrupted (Ctrl-C); ``143`` terminated by
+SIGTERM during ``ingest``, ``import`` or ``seed``, after the run was recorded ``failed``
+("cancelled").
 
 Importing this module is cheap: the migrations, seeder, ingestion and scheduler modules are
 imported inside the handlers, and the registry and importer modules that supply the argparse
@@ -28,14 +31,17 @@ import asyncio
 import logging
 import os
 import re
+import signal
 import stat
 import sys
 import textwrap
-from collections.abc import Callable, Mapping, Sequence
+import threading
+import time
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from datetime import date
 from pathlib import Path
-from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, cast
+from types import FrameType, MappingProxyType
+from typing import TYPE_CHECKING, Any, Final, TypeVar, cast
 
 from pydantic import ValidationError
 
@@ -52,10 +58,13 @@ __all__ = [
     "EXIT_FAILED",
     "EXIT_INTERRUPTED",
     "EXIT_OK",
+    "EXIT_TERMINATED",
     "PROG",
+    "TerminatedError",
     "build_parser",
     "configure_logging",
     "main",
+    "run_terminable",
 ]
 
 logger = logging.getLogger("opennse_terminal.cli")
@@ -74,6 +83,10 @@ returns it itself, and exits 1 on its own usage errors so the two never read ali
 subcommand exits 2 only for invalid arguments (argparse)."""
 EXIT_INTERRUPTED: Final = 130
 """128 + SIGINT: the shell's code for a command stopped by Ctrl-C."""
+EXIT_TERMINATED: Final = 143
+"""128 + SIGTERM: returned when ``ingest``, ``import`` or ``seed`` is stopped by SIGTERM (see
+:func:`run_terminable`), after its run was recorded ``failed`` ("cancelled") and its uncommitted
+changes rolled back."""
 
 EXIT_CODES: Final[Mapping[str, int]] = MappingProxyType(
     {
@@ -110,12 +123,16 @@ examples:
 exit codes:
   0    succeeded, partial or no_new_data
   1    failed (a network failure, a held lock, an unverified exchange calendar,
-       or an error before the run could be recorded)
-  2    invalid arguments; from seed, the schema is not at migration head
+       or an error before the run could be recorded); seed also exits 1 for its
+       own invalid arguments
+  2    invalid arguments, except seed's own (those exit 1); from seed, only that
+       the schema is not at migration head
   3    layout_changed: the source layout changed and nothing was written
   4    blocked_by_robots: robots.txt disallows the source URL
   5    ambiguous_session: the NSE session could not be dated; re-run with --trade-date
   130  interrupted (Ctrl-C); uncommitted changes were rolled back
+  143  terminated (SIGTERM) during ingest, import or seed; uncommitted changes
+       were rolled back and the run recorded failed (cancelled)
 """
 
 _MIGRATE_DESCRIPTION: Final = """\
@@ -192,6 +209,26 @@ def _bounded_int(low: int, high: int) -> Callable[[str], int]:
     return parse
 
 
+def _migration_revision(text: str) -> str:
+    """argparse type of ``migrate``'s ``REVISION``: Alembic revision text, returned unchanged.
+
+    Rejects only text that no revision can match, which Alembic would otherwise reject only after
+    connecting, most of it with a bare ``AssertionError``: empty or whitespace-only text, and
+    text ending in ``@``, which leaves nothing after the ``@`` to name a revision (a revision id
+    never contains ``@``). Everything else, ``head``, ``base``, ``+1``, ``terminal_0001@+1`` and
+    ``@head`` included, goes to Alembic as typed, and Alembic reports any revision it cannot
+    resolve. The rejected text is quoted with ``repr``, so the error stays on one line.
+    """
+    if not text or text.isspace():
+        raise argparse.ArgumentTypeError(f"must not be empty or whitespace only, got {text!r}")
+    if text.endswith("@"):
+        raise argparse.ArgumentTypeError(
+            f"no revision follows '@' in {text!r}; expected LABEL@REVISION, such as "
+            "terminal_0001@+1"
+        )
+    return text
+
+
 def _names_supporting(option: str) -> str:
     """Registered pipeline names whose spec sets ``supports_<option>``, for help and errors."""
     from opennse_terminal.ingestion.registry import PIPELINES
@@ -245,6 +282,7 @@ def _build_parsers() -> tuple[argparse.ArgumentParser, Mapping[str, argparse.Arg
     upgrade.add_argument(
         "revision",
         nargs="?",
+        type=_migration_revision,
         default="head",
         metavar="REVISION",
         help="target revision, such as head or terminal_0001 (default: %(default)s)",
@@ -261,7 +299,10 @@ def _build_parsers() -> tuple[argparse.ArgumentParser, Mapping[str, argparse.Arg
         formatter_class=raw,
     )
     downgrade.add_argument(
-        "revision", metavar="REVISION", help="target revision, such as base or terminal_0001"
+        "revision",
+        type=_migration_revision,
+        metavar="REVISION",
+        help="target revision, such as base or terminal_0001",
     )
 
     # No options of its own: every argument after "seed" goes to the seeder's parser unchanged,
@@ -417,6 +458,123 @@ def _check_import(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
 
 
 # ---------------------------------------------------------------------------------------------
+# Event loop with SIGTERM cancellation
+# ---------------------------------------------------------------------------------------------
+
+_T = TypeVar("_T")
+
+
+class TerminatedError(BaseException):
+    """Raised by :func:`run_terminable` when SIGTERM cancelled the coroutine it ran.
+
+    A ``BaseException``, like ``KeyboardInterrupt``, so that the handlers' ``except Exception``
+    blocks never read a termination as a failed run; :func:`main` and the seeder's ``main`` turn
+    it into :data:`EXIT_TERMINATED`.
+    """
+
+
+def _install_sigterm_handler(
+    loop: asyncio.AbstractEventLoop, on_sigterm: Callable[[], None]
+) -> Callable[[], None] | None:
+    """Make SIGTERM call ``on_sigterm`` on ``loop``; return the function that restores SIG_DFL.
+
+    Returns ``None``, having installed nothing, outside the main thread, while SIGTERM's
+    disposition is anything but ``SIG_DFL`` (a host's own handler, or ``SIG_IGN``), and where the
+    interpreter cannot install a handler; SIGTERM then keeps its disposition. This is the rule
+    ``asyncio.run`` applies to SIGINT. ``loop.add_signal_handler`` is used where the loop supports
+    it (Unix); where it raises ``NotImplementedError`` (the Windows event loops), ``signal.signal``
+    installs a handler that calls ``on_sigterm`` through ``loop.call_soon_threadsafe``, the one
+    loop call that is safe from a signal handler, as the scheduler's stop handlers do.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return None
+    if signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL:
+        return None
+    try:
+        loop.add_signal_handler(signal.SIGTERM, on_sigterm)
+    except NotImplementedError:
+
+        def handle_signal(_signum: int, _frame: FrameType | None) -> None:
+            loop.call_soon_threadsafe(on_sigterm)
+
+        try:
+            signal.signal(signal.SIGTERM, handle_signal)
+        except ValueError:
+            # An interpreter whose main thread does not handle signals.
+            return None
+
+        def restore_default() -> None:
+            if signal.getsignal(signal.SIGTERM) is handle_signal:
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+        return restore_default
+    except (RuntimeError, OSError):
+        # The loop could not route the signal to itself (set_wakeup_fd refused, or the signal
+        # cannot be caught here).
+        return None
+
+    def remove_handler() -> None:
+        # remove_signal_handler reinstates SIG_DFL, the disposition found before installing.
+        loop.remove_signal_handler(signal.SIGTERM)
+
+    return remove_handler
+
+
+def run_terminable(main: Coroutine[Any, Any, _T]) -> _T:
+    """Run ``main`` with ``asyncio.run`` and return its result, cancelling it on SIGTERM.
+
+    ``asyncio.run`` turns the first SIGINT into a cancellation of its main task, but leaves
+    SIGTERM at its default disposition, which kills the process before an ingestion run or the
+    seeder can roll back and record itself. Here the first SIGTERM cancels the main task too, and
+    only it: tasks ``main`` started, such as ``execute_pipeline``'s commit and run-row writes, run
+    on until the main task has waited for them. A run is therefore recorded ``failed``
+    ("cancelled") and its data transaction rolled back, and once ``main`` has ended cancelled,
+    :class:`TerminatedError` is raised. A further SIGTERM while ``main`` unwinds is logged and
+    ignored. An outcome other than a cancellation (a result, or another exception) is kept even
+    after SIGTERM, as ``asyncio.run`` keeps it after Ctrl-C; a ``CancelledError`` that no SIGTERM
+    preceded propagates unchanged.
+
+    The handler is installed only in the main thread and only while SIGTERM has its default
+    disposition (see :func:`_install_sigterm_handler`), so a host's own handler, an ignored
+    SIGTERM and calls from worker threads (``asyncio.to_thread(main, argv)``) are left as they
+    are; SIG_DFL is restored when ``main`` ends. Like ``asyncio.run``, this must be called
+    outside a running event loop.
+
+    Raises:
+        TerminatedError: SIGTERM cancelled ``main``.
+    """
+    terminated = False
+
+    async def run_main() -> _T:
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+
+        def on_sigterm() -> None:
+            nonlocal terminated
+            if terminated:
+                logger.info("received SIGTERM again; already stopping, waiting for the rollback")
+                return
+            terminated = True
+            logger.info("received SIGTERM; cancelling and rolling back")
+            if task is not None:
+                task.cancel()
+
+        restore = _install_sigterm_handler(loop, on_sigterm)
+        try:
+            return await main
+        finally:
+            if restore is not None:
+                restore()
+
+    try:
+        return asyncio.run(run_main())
+    except asyncio.CancelledError:
+        if terminated:
+            raise TerminatedError("terminated by SIGTERM") from None
+        raise
+
+
+# ---------------------------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------------------------
 
@@ -484,13 +642,34 @@ def _failure_reason(exc: Exception) -> str:
     return type(exc).__name__
 
 
+def _raised_in_revision_map(exc: BaseException) -> bool:
+    """Whether ``exc`` was raised inside Alembic's revision map (``alembic.script.revision``).
+
+    The innermost frame of its traceback is the code that raised it. ``env.py`` runs Alembic
+    under ``asyncio.run`` and ``AsyncConnection.run_sync``, and both keep those frames.
+    """
+    from alembic.script.revision import RevisionMap
+
+    frame = exc.__traceback__
+    if frame is None:
+        return False
+    while frame.tb_next is not None:
+        frame = frame.tb_next
+    module: object = frame.tb_frame.f_globals.get("__name__")
+    return module == RevisionMap.__module__
+
+
 def _cmd_migrate(args: argparse.Namespace) -> int:
     """``migrate upgrade|downgrade REVISION`` against ``TerminalSettings().database_url``.
 
-    Logs one INFO line on success and one ERROR line on failure. ``REVISION`` is unrestricted
-    command-line text and goes to Alembic as typed; on both lines it, and Alembic's message,
-    which can quote it, are escaped by :func:`_log_text`, so neither can break or forge a line.
-    The database is named only by its credential-free ``database_log_label``.
+    Logs one INFO line on success and one ERROR line on failure. ``REVISION`` has passed
+    :func:`_migration_revision` and otherwise goes to Alembic as typed; on both lines it, and
+    Alembic's message, which can quote it, are escaped by :func:`_log_text`, so neither can break
+    or forge a line. Alembic's revision map raises an ``AssertionError`` without a message for
+    some revisions it cannot resolve from the database's current revision, such as ``head+1``, a
+    step past the head; the line then names the revision as invalid. Any other failure that is
+    not Alembic's own error is described by :func:`_failure_reason`. The database is named only
+    by its credential-free ``database_log_label``.
     """
     from alembic.util import CommandError
 
@@ -512,6 +691,16 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
         # Alembic's own errors, such as an unknown revision, name only revisions, but quote the
         # revision as typed, so they are escaped like it.
         reason = _log_text(str(exc))
+    except AssertionError as exc:
+        # Only an assertion of the revision map is the revision's fault; any other, from a
+        # driver or a migration script, is named by its type like every unexpected error.
+        if _raised_in_revision_map(exc):
+            reason = (
+                f"invalid revision '{_log_text(revision)}': Alembic could not resolve it from "
+                "the database's current revision"
+            )
+        else:
+            reason = _failure_reason(exc)
     except Exception as exc:
         reason = _failure_reason(exc)
     else:
@@ -564,8 +753,9 @@ async def _ingest(
     Each name is a separate ``registry.run_pipeline`` call, so each run takes its own advisory
     lock and run row. A run that raises instead of returning a result, for example because its
     run row could not be written, is logged and counted as failed, and the sequence continues.
-    Cancellation (Ctrl-C) stops the sequence. Every run shares one ``HostSpacing``, so requests
-    to one host stay ``scraper_min_interval_seconds`` apart across the runs as within each.
+    Cancellation (Ctrl-C or SIGTERM) stops the sequence. Every run shares one ``HostSpacing``, so
+    requests to one host stay ``scraper_min_interval_seconds`` apart across the runs as within
+    each.
     """
     from opennse_terminal.ingestion import registry
     from opennse_terminal.ingestion.http import HostSpacing
@@ -586,7 +776,11 @@ async def _ingest(
 
 
 def _cmd_ingest(args: argparse.Namespace) -> int:
-    """``ingest NAME``, or ``ingest cbk``: exit with the first non-zero code in run order."""
+    """``ingest NAME``, or ``ingest cbk``: exit with the first non-zero code in run order.
+
+    The runs go through :func:`run_terminable`, so SIGTERM, like Ctrl-C, records the current run
+    ``failed`` ("cancelled") and stops the sequence (:class:`TerminatedError`).
+    """
     from opennse_terminal.ingestion.registry import CBK_PIPELINES
 
     name = cast(str, args.name)
@@ -596,7 +790,7 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
     if settings is None:
         return EXIT_FAILED
     names = CBK_PIPELINES if name == CBK_GROUP else (name,)
-    outcomes = asyncio.run(_ingest(names, settings, trade_date=trade_date, limit=limit))
+    outcomes = run_terminable(_ingest(names, settings, trade_date=trade_date, limit=limit))
     code = next((code for _name, code in outcomes if code != EXIT_OK), EXIT_OK)
     if name == CBK_GROUP:
         logger.info(
@@ -609,7 +803,11 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
 
 
 def _cmd_import(args: argparse.Namespace) -> int:
-    """``import KIND PATH [--sheet NAME]`` through ``tabular_import.import_file``."""
+    """``import KIND PATH [--sheet NAME]`` through ``tabular_import.import_file``.
+
+    The import goes through :func:`run_terminable`, so SIGTERM, like Ctrl-C, records the run
+    ``failed`` ("cancelled") and rolls its data back (:class:`TerminatedError`).
+    """
     from opennse_terminal.ingestion.files.tabular_import import import_file
 
     kind = cast(str, args.kind)
@@ -619,7 +817,7 @@ def _cmd_import(args: argparse.Namespace) -> int:
     if settings is None:
         return EXIT_FAILED
     try:
-        result = asyncio.run(import_file(kind, path, sheet, settings=settings, trigger="cli"))
+        result = run_terminable(import_file(kind, path, sheet, settings=settings, trigger="cli"))
     except Exception as exc:
         logger.error("import %s: the run could not be recorded: %s", kind, _failure_reason(exc))
         return EXIT_FAILED
@@ -660,15 +858,38 @@ _CHECKS: Final[Mapping[str, Callable[[argparse.Namespace, argparse.ArgumentParse
 # ---------------------------------------------------------------------------------------------
 
 
+class _UtcFormatter(logging.Formatter):
+    """Render ``%(asctime)s`` in UTC as ISO-8601 with milliseconds and a ``Z`` suffix.
+
+    For example ``2026-10-29T23:19:45.871Z``. The stdlib default renders host-local time with no
+    offset, which on an Africa/Nairobi host reads three hours off the UTC run rows.
+    """
+
+    # Formatter calls self.converter(record.created); staticmethod stops mypy from reading the
+    # assigned function as a method whose first argument is self.
+    converter = staticmethod(time.gmtime)
+    default_time_format = "%Y-%m-%dT%H:%M:%S"
+    default_msec_format = "%s.%03dZ"
+
+
 def configure_logging() -> None:
-    """Log INFO and above to stderr as ``<time> <LEVEL> <logger> <message>``.
+    """Log INFO and above to stderr as ``<time> <LEVEL> <logger> <message>``, the time in UTC.
+
+    The time is ISO-8601 with milliseconds and a ``Z`` suffix (``2026-10-29T23:19:45.871Z``), the
+    clock of the ``timestamptz`` ``started_at`` and ``finished_at`` of ``terminal_ingestion_runs``,
+    so log lines and run rows correlate whatever the host's time zone.
 
     The one logging setup of the command-line entry points, shared by the ``opennse-terminal``
     console script (:func:`main`) and ``python -m opennse_terminal.seed.seed_terminal_db``, so no
-    library module adds a handler. ``logging.basicConfig`` leaves a root logger that already has
-    handlers unchanged, so a host or test harness that configured logging keeps its own setup.
+    library module adds a handler. A root logger that already has handlers is left unchanged, as
+    ``logging.basicConfig`` leaves it, so a host or test harness that configured logging keeps its
+    own setup.
     """
-    logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
+    if not logging.getLogger().handlers:
+        # Checked here as well as in basicConfig, so no handler is built only to be discarded.
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(_UtcFormatter(_LOG_FORMAT))
+        logging.basicConfig(level=logging.INFO, handlers=[handler])
     # Alembic logs one INFO line per built-in plugin when it is first imported, which the
     # handlers' lazy imports would print as noise after logging is configured.
     logging.getLogger("alembic.runtime.plugins").setLevel(logging.WARNING)
@@ -708,6 +929,10 @@ def main(argv: list[str] | None = None) -> int:
       invalid arguments. A ``SystemExit`` raised by a handler becomes its code the same way
       (``None`` is 0; a non-integer code is logged at ERROR by its type and returns 1).
     * Ctrl-C, while parsing or while a command runs, logs one WARNING and returns 130.
+    * SIGTERM while ``ingest`` or ``import`` runs (:func:`run_terminable`) cancels the run, which
+      is recorded ``failed`` ("cancelled") with its data rolled back, then logs one WARNING and
+      returns 143. ``migrate`` keeps SIGTERM's default disposition, and ``scheduler`` handles it
+      itself as a request to stop (exit 0).
     * Any other exception that escapes parsing or a handler, such as a failed lazy import, logs
       one ERROR naming the command (``opennse-terminal`` before one is parsed) and the
       exception's type, never its text or traceback, which can carry the database URL, and
@@ -739,6 +964,11 @@ def main(argv: list[str] | None = None) -> int:
         # ("cancelled") and its data transaction rolled back, as is a migration's.
         logger.warning("interrupted; uncommitted changes were rolled back")
         return EXIT_INTERRUPTED
+    except TerminatedError:
+        # run_terminable cancelled the running task on SIGTERM and let it unwind, so the run is
+        # recorded failed ("cancelled") and its data transaction rolled back.
+        logger.warning("terminated (SIGTERM); uncommitted changes were rolled back")
+        return EXIT_TERMINATED
     except Exception as exc:
         # Type name only, with no traceback: exception text can quote the database URL and its
         # password, as in _failure_reason and the seeder.

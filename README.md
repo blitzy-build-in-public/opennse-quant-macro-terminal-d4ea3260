@@ -503,7 +503,12 @@ Every run is recorded in `terminal_ingestion_runs` and ends with one of these st
 | `ambiguous_session` | The NSE session shown could not be dated; re-run with `--trade-date` | No | 5 |
 | `failed` | Network failure after retries, lock held, exchange calendar not verified for the year, or an unexpected error | No (rolled back) | 1 |
 
-Exit code 2 means invalid arguments, or from `seed` a schema not at head; 130 means interrupted.
+Exit code 2 means invalid arguments, or from `seed` a schema not at head; `seed` exits 1 for its
+own invalid arguments. 130 means interrupted by Ctrl-C, and 143 terminated by SIGTERM during
+`ingest`, `import` or `seed`: uncommitted changes are rolled back and the run is recorded `failed`
+with `error_message` "cancelled". A run left `running` by a process that was killed outright
+(SIGKILL, out of memory) is recorded `failed` with `error_message` "abandoned" by the next run of
+the same pipeline.
 
 **Scheduler.** `opennse-terminal scheduler` runs APScheduler in its own process, in
 `TERMINAL_TIMEZONE` (Africa/Nairobi, UTC+3, no daylight saving):

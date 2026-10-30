@@ -24,7 +24,9 @@ Covered:
   ``partial`` for a row whose turnover, rounded to 0.01, overflows its column.
 - The transaction-scoped advisory lock: a second run fails with "lock held" while the first is
   blocked inside its fetch, and the lock is free again after a run whose parser raises and after
-  a run cancelled mid-fetch.
+  a run cancelled mid-fetch; a run holding it records earlier rows of its pipeline left
+  ``running`` as ``failed`` ("abandoned"); and an ``opennse-terminal import`` child process
+  stopped by SIGTERM records its run ``failed`` ("cancelled") and exits 143.
 - Provenance: a scrape replaces seeded prices and later scraped prices but never CSV-imported
   ones, and never touches ``foreign_net_flow_kes`` or ``flow_source``.
 - Consecutive CBK runs through ``registry.run_pipelines`` and the CLI's ``ingest`` loop share one
@@ -51,8 +53,10 @@ import logging
 import os
 import re
 import runpy
+import signal
 import sys
 import threading
+import time as time_module
 import uuid
 import zlib
 from collections import defaultdict
@@ -64,13 +68,14 @@ from decimal import Context, Decimal, localcontext
 from enum import Enum
 from itertools import pairwise
 from pathlib import Path
-from types import MappingProxyType
+from types import FrameType, MappingProxyType
 from typing import Any, Final, NoReturn, Protocol, cast, get_args
 from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
 import respx
+from alembic.script import ScriptDirectory
 from alembic.util import CommandError
 from bs4 import BeautifulSoup
 from sqlalchemy import (
@@ -813,6 +818,166 @@ async def test_lock_released_after_cancellation(
     assert retried.rows_written == 8
 
 
+async def test_run_holding_the_lock_finishes_earlier_runs_left_running(
+    seeded_database: SeededClone,
+    fixture_text: Callable[[str], str],
+    robots: respx.MockRouter,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A process killed outright (SIGKILL, out of memory) leaves its run ``running``. The next
+    run of that pipeline, once it holds the lock, records such a row ``failed`` ("abandoned")
+    with ``finished_at``, naming itself in ``details``; a finished row, a row that started after
+    it and another pipeline's running row keep their values."""
+    now = datetime.now(UTC)
+    rows = {
+        "abandoned": ("nse_market_statistics", "running", now - timedelta(hours=1)),
+        "finished": ("nse_market_statistics", "failed", now - timedelta(hours=2)),
+        "later": ("nse_market_statistics", "running", now + timedelta(hours=1)),
+        "other_pipeline": ("cbk_fx", "running", now - timedelta(hours=1)),
+    }
+    ids = {label: uuid.uuid4() for label in rows}
+    async with seeded_database.engine.begin() as conn:
+        await conn.execute(
+            postgresql.insert(TerminalIngestionRun),
+            [
+                {
+                    "id": ids[label],
+                    "pipeline": pipeline,
+                    "trigger": "cli",
+                    "started_at": started_at,
+                    "finished_at": started_at if status != "running" else None,
+                    "status": status,
+                    "rows_fetched": 3,
+                    "rows_written": 0,
+                    "rows_rejected": 0,
+                    "error_message": "lock held" if status != "running" else None,
+                    "details": {},
+                }
+                for label, (pipeline, status, started_at) in rows.items()
+            ],
+        )
+    before = {label: await run_row(seeded_database, run_id) for label, run_id in ids.items()}
+    caplog.set_level(logging.INFO, logger=LOGGER)
+
+    result = await run(scrape(seeded_database, FixtureFetcher(fixture_text)), seeded_database)
+
+    assert result.status is RunStatus.SUCCEEDED, result.error_message
+    after = {label: await run_row(seeded_database, run_id) for label, run_id in ids.items()}
+    abandoned = after.pop("abandoned")
+    assert (abandoned["status"], abandoned["error_message"]) == ("failed", "abandoned")
+    assert abandoned["finished_at"] is not None
+    assert abandoned["details"] == {"abandoned_by": str(result.run_id)}
+    assert abandoned["rows_fetched"] == 3
+    assert after == {label: before[label] for label in after}
+    assert (await run_row(seeded_database, result.run_id))["status"] == "succeeded"
+    assert [record.getMessage() for record in _warnings_and_errors(caplog)] == [
+        f"ingestion run {result.run_id} (nse_market_statistics) recorded 1 earlier run(s) left "
+        "running as failed (abandoned)"
+    ]
+
+
+# A console-script process whose import blocks inside its locked data transaction: argv is the
+# CSV file, a marker file, and the seconds its cancellation takes to unwind. The marker reads
+# "locked" once the run holds its lock and "cancelled" once SIGTERM has cancelled it.
+_SIGTERM_IMPORT_CHILD = """\
+import asyncio
+import signal
+import sys
+from pathlib import Path
+
+from opennse_terminal import cli
+from opennse_terminal.ingestion.files import tabular_import
+
+csv_path, marker, unwind_seconds = sys.argv[1], Path(sys.argv[2]), float(sys.argv[3])
+
+
+async def blocking_fetch(self, ctx):
+    marker.write_text("locked")
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        marker.write_text("cancelled")
+        await asyncio.sleep(unwind_seconds)
+        raise
+
+
+tabular_import.TabularImportPipeline.fetch = blocking_fetch
+# A console script starts with SIGTERM at its default, whatever the test runner inherited.
+signal.signal(signal.SIGTERM, signal.SIG_DFL)
+sys.exit(cli.main(["import", "daily_prices", csv_path]))
+"""
+_SUBPROCESS_WAIT_SECONDS: Final = 60.0
+
+
+async def _wait_for_marker(marker: Path, content: str, process: asyncio.subprocess.Process) -> None:
+    """Wait, bounded, until the child process has written ``content`` to ``marker``."""
+    async with asyncio.timeout(_SUBPROCESS_WAIT_SECONDS):
+        while not (marker.exists() and marker.read_text(encoding="utf-8") == content):
+            assert process.returncode is None, f"the child exited {process.returncode} early"
+            await asyncio.sleep(0.05)
+
+
+@pytest.mark.parametrize(
+    ("signals", "unwind_seconds"),
+    [pytest.param(1, "0", id="sigterm"), pytest.param(2, "1.0", id="sigterm-repeated")],
+)
+async def test_sigterm_to_a_cli_import_records_the_run_cancelled_and_exits_143(
+    seeded_database: SeededClone, tmp_path: Path, signals: int, unwind_seconds: str
+) -> None:
+    """``opennse-terminal import`` stopped by SIGTERM while it holds its lock: the run is rolled
+    back and recorded ``failed`` ("cancelled") with ``finished_at``, one WARNING is logged and
+    the process exits 143. A second SIGTERM while the run unwinds is logged and ignored. The
+    signal goes to a child process only, never to the test runner."""
+    csv_path = write_csv(
+        tmp_path,
+        "prices.csv",
+        "ticker,trade_date,close_price,volume",
+        ["SCOM,2026-10-27,30.00,100"],
+    )
+    marker = tmp_path / "marker"
+    env = {**os.environ, "TERMINAL_DATABASE_URL": seeded_database.settings.database_url}
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _SIGTERM_IMPORT_CHILD,
+        str(csv_path),
+        str(marker),
+        unwind_seconds,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+        cwd=tmp_path,
+    )
+    try:
+        await _wait_for_marker(marker, "locked", process)
+        process.send_signal(signal.SIGTERM)
+        if signals == 2:
+            await _wait_for_marker(marker, "cancelled", process)
+            process.send_signal(signal.SIGTERM)
+        _stdout, stderr_bytes = await asyncio.wait_for(
+            process.communicate(), _SUBPROCESS_WAIT_SECONDS
+        )
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+
+    stderr = stderr_bytes.decode()
+    assert process.returncode == cli.EXIT_TERMINATED, stderr
+    warnings = [line for line in stderr.splitlines() if " WARNING " in line]
+    assert len(warnings) == 1, stderr
+    assert warnings[0].endswith(
+        " WARNING opennse_terminal.cli terminated (SIGTERM); uncommitted changes were rolled back"
+    )
+    assert ("received SIGTERM again" in stderr) == (signals == 2)
+    assert "Traceback" not in stderr
+    [cancelled] = await runs_of(seeded_database, "csv_import:daily_prices")
+    assert (cancelled["status"], cancelled["error_message"]) == ("failed", "cancelled")
+    assert cancelled["finished_at"] is not None
+    assert await prices_on(seeded_database, SESSION) == {}
+
+
 # --- Price versus flow provenance -------------------------------------------------------------
 
 
@@ -1253,6 +1418,16 @@ async def _transaction(conn: _ConnectionDouble) -> AsyncIterator[_TransactionDou
         conn.outcome = COMMITTED
 
 
+def _is_abandon_update(statement: Any) -> bool:
+    """Whether ``statement`` is ``RunRecorder.mark_abandoned``'s update: the one run-row update
+    whose ``WHERE`` tests ``status``, where a run's final update matches only its id."""
+    return (
+        isinstance(statement, Update)
+        and statement.whereclause is not None
+        and "terminal_ingestion_runs.status = " in str(statement.whereclause)
+    )
+
+
 class _ConnectionDouble:
     """Stands in for ``AsyncConnection``: records statements and its transaction's outcome."""
 
@@ -1278,6 +1453,10 @@ class _ConnectionDouble:
             and self._engine.insert_error is not None
         ):
             raise self._engine.insert_error
+        if _is_abandon_update(statement):
+            if self._engine.abandon_error is not None:
+                raise self._engine.abandon_error
+            return _ResultDouble(rowcount=self._engine.abandoned_rowcount)
         if isinstance(statement, Update):
             self._engine.update_started.set()
             if self._engine.update_release is not None:
@@ -1303,6 +1482,11 @@ class _EngineDouble:
     insert, its final update and the data commit until they are set; the matching ``*_started``
     event is set when each begins. ``insert_error``, when given, is raised by the run row's
     insert once any hold is released.
+
+    The update that finishes earlier runs left ``running`` (``RunRecorder.mark_abandoned``) is
+    told apart from a run's final update by its ``status`` condition, and kept out of
+    ``updates`` and of the final update's hold and failure settings: it reports
+    ``abandoned_rowcount`` rows, or raises ``abandon_error`` when given.
     """
 
     def __init__(
@@ -1316,12 +1500,16 @@ class _EngineDouble:
         hold_insert: bool = False,
         hold_update: bool = False,
         hold_commit: bool = False,
+        abandoned_rowcount: int = 0,
+        abandon_error: BaseException | None = None,
     ) -> None:
         self.lock_available = lock_available
         self.update_rowcount = update_rowcount
         self.fail_run_updates = fail_run_updates
         self.fail_commit = fail_commit
         self.insert_error = insert_error
+        self.abandoned_rowcount = abandoned_rowcount
+        self.abandon_error = abandon_error
         self.insert_started = asyncio.Event()
         self.update_started = asyncio.Event()
         self.commit_started = asyncio.Event()
@@ -1361,7 +1549,21 @@ class _EngineDouble:
 
     @property
     def updates(self) -> list[_Executed]:
-        return self._run_record_statements(Update)
+        """The run rows' final updates, without the abandoned-run update."""
+        return [
+            executed
+            for executed in self._run_record_statements(Update)
+            if not _is_abandon_update(executed.statement)
+        ]
+
+    @property
+    def abandon_updates(self) -> list[_Executed]:
+        """The updates of ``RunRecorder.mark_abandoned``, one per run that took the lock."""
+        return [
+            executed
+            for executed in self._run_record_statements(Update)
+            if _is_abandon_update(executed.statement)
+        ]
 
     @property
     def data_connections(self) -> list[_ConnectionDouble]:
@@ -2615,13 +2817,30 @@ async def test_succeeded_run_writes_every_row_in_one_locked_committed_transactio
 
     result = await _execute(pipeline, engine, http, trigger="schedule")
 
-    # The running row commits first, the data transaction runs on its own connection, and the
-    # final update uses a third, separate connection.
-    assert [conn.kind for conn in engine.connections] == [RUN_RECORD, DATA, RUN_RECORD]
+    # The running row commits first and the data transaction runs on its own connection; once
+    # the lock is held, the update finishing earlier runs left running, and then the final
+    # update, each use a separate run-record connection.
+    assert [conn.kind for conn in engine.connections] == [RUN_RECORD, DATA, RUN_RECORD, RUN_RECORD]
     (insert,) = engine.inserts
     run_id = insert.params["id"]
     assert (insert.params["pipeline"], insert.params["trigger"]) == ("test_quotes", "schedule")
     assert insert.params["source_url"] == SOURCE_URL
+    abandon_conn = engine.connections[2]
+    assert abandon_conn.outcome == COMMITTED
+    (abandon,) = engine.abandon_updates
+    assert [executed.statement for executed in abandon_conn.executed] == [abandon.statement]
+    abandon_params = dict(abandon.params)
+    assert abandon_params.pop("finished_at").utcoffset() == timedelta(0)
+    # Rows of this pipeline still running, other than this run, that started before it.
+    assert abandon_params == {
+        "status": "failed",
+        "error_message": "abandoned",
+        "details": {"abandoned_by": str(run_id)},
+        "pipeline_1": "test_quotes",
+        "status_1": "running",
+        "id_1": run_id,
+        "id_2": run_id,
+    }
 
     (data,) = engine.data_connections
     assert (data.outcome, data.closed) == (COMMITTED, True)
@@ -3103,6 +3322,8 @@ async def test_held_lock_ends_failed_without_fetching(
     assert result.status is RunStatus.FAILED
     assert result.error_message == "lock held"
     assert pipeline.contexts == []
+    # Without the lock, another run of the pipeline may be live: no earlier run is finished.
+    assert engine.abandon_updates == []
     (data,) = engine.data_connections
     assert data.outcome == ROLLED_BACK
     assert [str(executed.statement) for executed in data.executed] == [IDLE_TIMEOUT_SQL, LOCK_SQL]
@@ -3119,6 +3340,52 @@ async def test_held_lock_ends_failed_without_fetching(
         f"ingestion run {result.run_id} (test_quotes) failed: lock held",
     )
     assert error.exc_info is None
+
+
+@pytest.mark.parametrize(
+    ("engine_options", "warning"),
+    [
+        pytest.param(
+            {"abandoned_rowcount": 2},
+            "ingestion run {run_id} (test_quotes) recorded 2 earlier run(s) left running as "
+            "failed (abandoned)",
+            id="rows-marked",
+        ),
+        pytest.param(
+            {"abandon_error": RuntimeError("update failed: password=s3cr3t")},
+            "ingestion run {run_id} (test_quotes) could not finish earlier runs left running: "
+            "RuntimeError",
+            id="update-failed",
+        ),
+    ],
+)
+async def test_earlier_runs_left_running_are_finished_best_effort(
+    settings: TerminalSettings,
+    caplog: pytest.LogCaptureFixture,
+    engine_options: dict[str, Any],
+    warning: str,
+) -> None:
+    """With the lock held, the abandoned-run update runs once: rows it marked are one WARNING
+    with their count, and its failure is one WARNING by type only, after which the run goes on
+    and succeeds."""
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    engine = _EngineDouble(**engine_options)
+    pipeline = _QuotePipeline(settings, cells=["1.00", "2.00"])
+
+    result = await _execute(pipeline, engine, _HttpDouble())
+
+    assert result.status is RunStatus.SUCCEEDED
+    assert result.rows_written == 2
+    assert len(engine.abandon_updates) == 1
+    (update,) = engine.updates
+    assert update.params["status"] == "succeeded"
+    (record,) = _warnings_and_errors(caplog)
+    assert (record.levelno, record.getMessage()) == (
+        logging.WARNING,
+        warning.format(run_id=result.run_id),
+    )
+    assert record.exc_info is None
+    assert "s3cr3t" not in caplog.text
 
 
 async def test_run_name_keys_the_run_row_the_lock_and_the_context(
@@ -5279,6 +5546,168 @@ def test_migrate_log_text_escapes_only_unprintable(text: str, expected: str) -> 
     assert cli._log_text(text) == expected
 
 
+# --- migrate REVISION argument --------------------------------------------------------------
+
+# Text that no revision can match. Alembic would reject each only after connecting, most of them
+# with an AssertionError that carries no message.
+_BLANK_REVISION = "must not be empty or whitespace only, got {}"
+_NOTHING_AFTER_AT = (
+    "no revision follows '@' in {}; expected LABEL@REVISION, such as terminal_0001@+1"
+)
+_UNMATCHABLE_REVISIONS = [
+    pytest.param("", _BLANK_REVISION.format("''"), id="empty"),
+    pytest.param(" ", _BLANK_REVISION.format("' '"), id="space"),
+    pytest.param("\t\n", _BLANK_REVISION.format("'\\t\\n'"), id="tab-newline"),
+    pytest.param("\u2028", _BLANK_REVISION.format("'\\u2028'"), id="line-separator"),
+    pytest.param("@", _NOTHING_AFTER_AT.format("'@'"), id="at-sign"),
+    pytest.param("@@", _NOTHING_AFTER_AT.format("'@@'"), id="two-at-signs"),
+    pytest.param("head@", _NOTHING_AFTER_AT.format("'head@'"), id="head-at"),
+    pytest.param("terminal_0001@", _NOTHING_AFTER_AT.format("'terminal_0001@'"), id="id-at"),
+    pytest.param("x@y@", _NOTHING_AFTER_AT.format("'x@y@'"), id="label-revision-at"),
+]
+
+# Revision syntax Alembic parses, beside the rejected shapes: an empty label before "@" and
+# surrounding whitespace included, which Alembic resolves or reports itself.
+_ALEMBIC_REVISION_SYNTAX = {
+    "head": "head",
+    "heads": "heads",
+    "base": "base",
+    "step-up": "+1",
+    "step-down": "-1",
+    "revision-id": "terminal_0001",
+    "label-step": "terminal_0001@+1",
+    "heads-label-step": "heads@-1",
+    "empty-label": "@head",
+    "leading-space": " head",
+    "space-after-at": "head@ ",
+}
+
+
+def _recording_migrate(
+    monkeypatch: pytest.MonkeyPatch, error: Callable[[], Exception] | None = None
+) -> list[tuple[str, str]]:
+    """Replace both migration functions with one recording its calls and raising ``error()``."""
+    calls: list[tuple[str, str]] = []
+
+    def fake_migrate(database_url: str, target_revision: str) -> None:
+        calls.append((database_url, target_revision))
+        if error is not None:
+            raise error()
+
+    monkeypatch.setenv("TERMINAL_DATABASE_URL", _UNREACHABLE_DATABASE_URL)
+    # _cmd_migrate imports both functions when it runs, so it picks up the fakes.
+    monkeypatch.setattr(migrations, "run_upgrade", fake_migrate)
+    monkeypatch.setattr(migrations, "run_downgrade", fake_migrate)
+    return calls
+
+
+@pytest.mark.parametrize("direction", ["upgrade", "downgrade"])
+@pytest.mark.parametrize(("revision", "message"), _UNMATCHABLE_REVISIONS)
+def test_migrate_rejects_a_revision_nothing_can_match(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    revision: str,
+    message: str,
+    direction: str,
+) -> None:
+    """Empty or whitespace-only text, and text ending in ``@``, is a usage error (exit 2) that
+    names the problem on one line after the usage line, and Alembic is never called."""
+    calls = _recording_migrate(monkeypatch)
+
+    assert cli.main(["migrate", direction, revision]) == 2
+
+    assert calls == []
+    usage, error = capsys.readouterr().err.splitlines()
+    assert usage.startswith(f"usage: {cli.PROG} migrate {direction} [-h] ")
+    assert error == f"{cli.PROG} migrate {direction}: error: argument REVISION: {message}"
+
+
+@pytest.mark.parametrize(
+    ("argv", "revision"),
+    [
+        pytest.param(["upgrade"], "head", id="upgrade-default"),
+        *(
+            pytest.param([direction, text], text, id=f"{direction}-{name}")
+            for direction in ("upgrade", "downgrade")
+            for name, text in _ALEMBIC_REVISION_SYNTAX.items()
+        ),
+    ],
+)
+def test_migrate_passes_alembic_revision_syntax_unchanged(
+    monkeypatch: pytest.MonkeyPatch, argv: list[str], revision: str
+) -> None:
+    """Every other revision, and upgrade's default ``head``, reaches Alembic exactly as typed."""
+    calls = _recording_migrate(monkeypatch)
+
+    assert cli.main(["migrate", *argv]) == cli.EXIT_OK
+
+    assert calls == [(_UNREACHABLE_DATABASE_URL, revision)]
+
+
+def _revision_map_assertion() -> AssertionError:
+    """The ``AssertionError`` without a message that Alembic's revision map raises for
+    ``head+1``, a step past the head, its traceback ending inside the map. No database is read."""
+    script = ScriptDirectory.from_config(migrations.build_alembic_config())
+    with pytest.raises(AssertionError) as raised:
+        list(script.iterate_revisions("head+1", "base"))
+    assert str(raised.value) == ""
+    return raised.value
+
+
+_UNRESOLVED = "Alembic could not resolve it from the database's current revision"
+
+
+@pytest.mark.parametrize("direction", ["upgrade", "downgrade"])
+@pytest.mark.parametrize(
+    ("revision", "error", "reason"),
+    [
+        pytest.param(
+            "head+1",
+            _revision_map_assertion,
+            f"invalid revision 'head+1': {_UNRESOLVED}",
+            id="revision-map",
+        ),
+        pytest.param(
+            f"nope\r\n{_FORGED_RECORD}",
+            _revision_map_assertion,
+            f"invalid revision 'nope\\r\\n{_FORGED_RECORD}': {_UNRESOLVED}",
+            id="revision-map-escaped",
+        ),
+        pytest.param(
+            "head+1",
+            lambda: AssertionError("internal detail"),
+            "AssertionError",
+            id="other-assertion",
+        ),
+    ],
+)
+def test_migrate_names_the_revision_an_alembic_assertion_rejects(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    revision: str,
+    error: Callable[[], Exception],
+    reason: str,
+    direction: str,
+) -> None:
+    """An ``AssertionError`` from Alembic's revision map is logged as the revision being
+    invalid, escaped onto the one ERROR line; one raised anywhere else is named by its type
+    only, and its text is never logged."""
+    calls = _recording_migrate(monkeypatch, error)
+    caplog.set_level(logging.INFO, logger=_CLI_LOGGER)
+
+    assert cli.main(["migrate", direction, revision]) == cli.EXIT_FAILED
+
+    assert calls == [(_UNREACHABLE_DATABASE_URL, revision)]
+    records = [record for record in caplog.records if record.name == _CLI_LOGGER]
+    assert [record.levelno for record in records] == [logging.ERROR]
+    message = records[0].getMessage()
+    assert len(message.splitlines()) == 1
+    assert message.isprintable(), f"raw control or separator character in {message!r}"
+    assert message.startswith(f"migrate {direction} to ")
+    assert message.endswith(f' on database "x" on 127.0.0.1:1 failed: {reason}')
+    assert "internal detail" not in message
+
+
 # --- Subcommand help ------------------------------------------------------------------------
 
 # Phrases every subcommand help but seed's carries: argparse shows the top-level epilog, which
@@ -5601,6 +6030,7 @@ _LEAK_MARKER = "s3cr3t-marker-7f1c"
 _MARKED_DATABASE_URL = f"postgresql+asyncpg://u:{_LEAK_MARKER}@127.0.0.1:1/x"
 _SEED_MODULE = "opennse_terminal.seed.seed_terminal_db"
 _INTERRUPTED_LINE = "interrupted; uncommitted changes were rolled back"
+_TERMINATED_LINE = "terminated (SIGTERM); uncommitted changes were rolled back"
 
 
 def _fail_building_parsers(monkeypatch: pytest.MonkeyPatch) -> str:
@@ -5721,6 +6151,107 @@ def test_boundary_ctrl_c_returns_130_with_one_warning(
 
 
 @pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["ingest", "cbk_fx"], id="ingest"),
+        pytest.param(["import", "daily_prices", "{csv}"], id="import"),
+    ],
+)
+def test_boundary_sigterm_in_ingest_or_import_returns_143_with_one_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+    argv: list[str],
+) -> None:
+    """``ingest`` and ``import`` run their coroutine through ``run_terminable``; the
+    ``TerminatedError`` it raises after SIGTERM is one WARNING line and exit 143."""
+    csv_path = write_csv(tmp_path, "prices.csv", "ticker,trade_date,close_price,volume", [])
+    ran: list[str] = []
+
+    def terminated(main: Any) -> NoReturn:
+        ran.append(main.__qualname__)
+        main.close()
+        raise cli.TerminatedError("terminated by SIGTERM")
+
+    monkeypatch.setenv("TERMINAL_DATABASE_URL", _UNREACHABLE_DATABASE_URL)
+    monkeypatch.setattr(cli, "run_terminable", terminated)
+    caplog.set_level(logging.INFO)
+
+    code = cli.main([token.format(csv=csv_path) for token in argv])
+
+    assert code == cli.EXIT_TERMINATED == 143
+    assert ran == ["_ingest" if argv[0] == "ingest" else "import_file"]
+    assert [
+        (record.name, record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ] == [(_CLI_LOGGER, logging.WARNING, _TERMINATED_LINE)]
+
+
+def _host_sigterm_handler(signum: int, frame: FrameType | None) -> None:
+    """A host application's own SIGTERM handler. No signal is sent, so it never runs."""
+    raise AssertionError("no SIGTERM is sent in this test")
+
+
+def _sigterm_disposition_inside_run_terminable() -> tuple[object, str]:
+    """SIGTERM's disposition while ``run_terminable`` runs its coroutine, and the result."""
+
+    async def read_disposition() -> tuple[object, str]:
+        return signal.getsignal(signal.SIGTERM), "done"
+
+    return cli.run_terminable(read_disposition())
+
+
+@pytest.mark.parametrize(
+    ("disposition", "in_worker_thread", "installed"),
+    [
+        pytest.param(signal.SIG_DFL, False, True, id="main-thread-default"),
+        pytest.param(signal.SIG_IGN, False, False, id="ignored"),
+        pytest.param(_host_sigterm_handler, False, False, id="host-handler"),
+        pytest.param(signal.SIG_DFL, True, False, id="worker-thread"),
+    ],
+)
+def test_run_terminable_routes_sigterm_only_from_the_main_thread_at_its_default(
+    disposition: Any, in_worker_thread: bool, installed: bool
+) -> None:
+    """While the coroutine runs, SIGTERM is routed to the event loop only in the main thread and
+    only when its disposition was ``SIG_DFL``, the rule ``asyncio.run`` applies to SIGINT: a
+    host's handler, ``SIG_IGN`` and a worker thread's call leave it untouched. Afterwards the
+    disposition is the one found. The disposition is only read; no signal is sent."""
+    previous = signal.signal(signal.SIGTERM, disposition)
+    try:
+        if in_worker_thread:
+            outcomes: list[tuple[object, str]] = []
+            worker = threading.Thread(
+                target=lambda: outcomes.append(_sigterm_disposition_inside_run_terminable())
+            )
+            worker.start()
+            worker.join(WAIT_SECONDS)
+            (outcome,) = outcomes
+        else:
+            outcome = _sigterm_disposition_inside_run_terminable()
+        after = signal.getsignal(signal.SIGTERM)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+    seen, result = outcome
+    assert result == "done"
+    assert (seen is not disposition) == installed
+    assert after is disposition
+
+
+def test_run_terminable_lets_a_cancellation_without_sigterm_propagate() -> None:
+    """A coroutine that ends cancelled with no SIGTERM received raises ``CancelledError``, not
+    ``TerminatedError``."""
+
+    async def cancelled() -> None:
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        cli.run_terminable(cancelled())
+
+
+@pytest.mark.parametrize(
     ("argv", "exit_code", "stream", "expected"),
     [
         pytest.param(["--help"], 0, "out", f"usage: {cli.PROG} ", id="help"),
@@ -5811,20 +6342,89 @@ def test_boundary_seed_outcome_becomes_the_returned_code(
         assert _LEAK_MARKER not in output
 
 
+@contextlib.contextmanager
+def _bare_root_logger() -> Iterator[logging.Logger]:
+    """Give the root logger no handlers inside the block, as in a fresh CLI process.
+
+    Its handlers and level are restored on exit, inside the test, because pytest adds its capture
+    handlers during the call phase and removes them from whichever list the root then holds.
+    """
+    root = logging.getLogger()
+    handlers, level = root.handlers, root.level
+    root.handlers = []
+    try:
+        yield root
+    finally:
+        root.handlers = handlers
+        # setLevel, unlike assigning the attribute, also clears the loggers' cached levels.
+        root.setLevel(level)
+
+
 def test_logging_configure_logging_sets_info_format_and_quiets_alembic_plugins(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``configure_logging`` asks ``basicConfig`` for INFO in the CLI format, which leaves a
-    configured root logger alone, and raises Alembic's plugin logger to WARNING."""
-    calls: list[dict[str, object]] = []
+    """``configure_logging`` leaves a root logger that already has handlers (pytest's) alone,
+    and gives one without INFO and a single stderr handler in the CLI format with UTC times.
+    Either way it raises Alembic's plugin logger to WARNING."""
     plugins = logging.getLogger("alembic.runtime.plugins")
-    monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: calls.append(kwargs))
+    root = logging.getLogger()
+    harness_handlers, harness_level = list(root.handlers), root.level
+    assert harness_handlers
     monkeypatch.setattr(plugins, "level", logging.NOTSET)
 
     cli.configure_logging()
 
-    assert calls == [{"level": logging.INFO, "format": cli._LOG_FORMAT}]
+    assert root.handlers == harness_handlers
+    assert root.level == harness_level
     assert plugins.level == logging.WARNING
+
+    monkeypatch.setattr(plugins, "level", logging.NOTSET)
+    with _bare_root_logger() as bare_root:
+        cli.configure_logging()
+        handlers, level = list(bare_root.handlers), bare_root.level
+
+    (handler,) = handlers
+    assert level == logging.INFO
+    assert isinstance(handler, logging.StreamHandler)
+    assert handler.stream is sys.stderr
+    assert isinstance(handler.formatter, cli._UtcFormatter)
+    assert handler.formatter._fmt == cli._LOG_FORMAT
+    assert plugins.level == logging.WARNING
+    assert root.handlers == harness_handlers
+
+
+def test_logging_times_are_utc_iso_8601_on_a_nairobi_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a host in Africa/Nairobi time (UTC+3), the handler ``configure_logging`` installs
+    renders a record's time in UTC with milliseconds and ``Z``, the clock of the run rows'
+    ``started_at`` and ``finished_at``; the stdlib default reads three hours ahead, unmarked."""
+    with _bare_root_logger() as bare_root:
+        cli.configure_logging()
+        (handler,) = bare_root.handlers
+    record = logging.makeLogRecord(
+        {
+            "name": "opennse_terminal.ingestion.base",
+            "levelno": logging.INFO,
+            "levelname": "INFO",
+            "msg": "ingestion run started",
+            "created": datetime(2026, 10, 29, 23, 19, 45, tzinfo=UTC).timestamp(),
+            "msecs": 871.0,
+        }
+    )
+    try:
+        with monkeypatch.context() as patch:
+            # Africa/Nairobi's rule as a POSIX TZ string, so no system tz database is needed.
+            patch.setenv("TZ", "EAT-3")
+            time_module.tzset()
+            configured = handler.format(record)
+            stdlib_default = logging.Formatter(cli._LOG_FORMAT).format(record)
+    finally:
+        time_module.tzset()
+
+    rest = "INFO opennse_terminal.ingestion.base ingestion run started"
+    assert stdlib_default == f"2026-10-30 02:19:45,871 {rest}"
+    assert configured == f"2026-10-29T23:19:45.871Z {rest}"
 
 
 def test_logging_seed_module_entry_uses_the_cli_configuration(

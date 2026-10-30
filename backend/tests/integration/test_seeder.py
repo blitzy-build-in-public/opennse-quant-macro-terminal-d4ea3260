@@ -12,7 +12,9 @@ What they prove, against PostgreSQL:
   without aborting the transaction, and the head on a migrated one;
 * content and provenance: the seeded template holds every attachment value and the stated row
   counts, and every seeded row or column is marked ``seed`` so real data can supersede it;
-* precedence: rows written by the CSV/Excel importer survive a re-seed untouched.
+* precedence: rows written by the CSV/Excel importer survive a re-seed untouched;
+* cancellation: a seed cancelled while a statement runs on the server rolls back and leaves one
+  ``failed`` ("cancelled") run row.
 
 Seeded tests request the root conftest's ``seeded_database``, a fresh function-scoped clone of the
 migrated and seeded template: the seeder and the importer open their own connections, which an
@@ -374,6 +376,86 @@ async def test_seed_entry_points_are_idempotent(
     assert len(new_runs) == 2
     for run in new_runs:
         _assert_idle_seed_run(run)
+
+
+# ---------------------------------------------------------------------------------------------
+# Cancellation (AAP 0.6.1: a run that rolls back is still visible with its final status)
+# ---------------------------------------------------------------------------------------------
+
+_SLOW_STATEMENT: Final = "SELECT pg_sleep(60)"
+_ACTIVE_STATEMENTS: Final = text(
+    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND query = :query"
+)
+_WAIT_SECONDS: Final = 30.0
+
+
+async def _active(engine: AsyncEngine, query: str) -> int:
+    """How many server sessions of the database are running ``query``."""
+    async with engine.connect() as connection:
+        return int((await connection.execute(_ACTIVE_STATEMENTS, {"query": query})).scalar_one())
+
+
+async def test_cancelled_seed_records_a_failed_run_and_rolls_back(
+    seeded_database: _SeededDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Ctrl-C or SIGTERM cancels the seed task while one of its statements runs on the server:
+    the seed transaction, its running row with it, rolls back, the session still records the run
+    ``failed`` ("cancelled") in a fresh transaction, and the cancellation propagates."""
+    engine = seeded_database.engine
+    counts_before = await _counts(engine)
+    runs_before = await _seed_runs(engine)
+    writing = asyncio.Event()
+
+    async def slow_write(
+        session: AsyncSession, dataset: object, *, owner_key: str, run_id: uuid.UUID
+    ) -> None:
+        writing.set()
+        await session.execute(text(_SLOW_STATEMENT))
+
+    monkeypatch.setattr(seed_terminal_db, "_write_dataset", slow_write)
+    caplog.set_level(logging.INFO, logger="opennse_terminal")
+
+    async with build_session_factory(engine)() as session:
+        # slow_write never reads the dataset, so none is generated.
+        task = asyncio.create_task(
+            seed_terminal_db.seed(
+                session,
+                settings=seeded_database.settings,
+                dataset=object(),  # type: ignore[arg-type]
+            )
+        )
+        await asyncio.wait_for(writing.wait(), _WAIT_SECONDS)
+        async with asyncio.timeout(_WAIT_SECONDS):
+            while not await _active(engine, _SLOW_STATEMENT):
+                await asyncio.sleep(0.05)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, _WAIT_SECONDS)
+
+    assert await _active(engine, _SLOW_STATEMENT) == 0
+    assert await _counts(engine) == counts_before
+    (run,) = _new_runs(runs_before, await _seed_runs(engine))
+    assert (run["pipeline"], run["trigger"]) == (
+        seed_terminal_db.SEED_PIPELINE,
+        seed_terminal_db.SEED_TRIGGER,
+    )
+    assert (run["status"], run["error_message"]) == ("failed", "cancelled")
+    assert run["finished_at"] is not None
+    assert run["started_at"] <= run["finished_at"]
+    assert (run["rows_fetched"], run["rows_written"], run["rows_rejected"]) == (0, 0, 0)
+    assert [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ] == [
+        (
+            logging.WARNING,
+            f"seed run {run['id']} was cancelled; its uncommitted changes were rolled back",
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -836,7 +918,8 @@ async def test_reseed_preserves_imported_rows(
 #   record: the OS reason for an ``OSError``, the type name for anything else.
 # * The not-at-head message is logged once, and the ``seeding <label>`` line is never a URL.
 # * ``main`` returns its exit code and never raises ``SystemExit``: 1 for a usage error, 0 for
-#   ``--help`` (which documents the precondition, examples and exit codes), 130 for Ctrl-C.
+#   ``--help`` (which documents the precondition, examples and exit codes), 130 for Ctrl-C and
+#   143 for SIGTERM.
 # * A failure once connected is logged by exception type only. SQLAlchemy errors embed the
 #   failed statement's parameters, such as ``default_owner_key``, so neither their text nor a
 #   traceback may reach stderr, a log record or the failed run's ``error_message``.
@@ -1121,36 +1204,59 @@ def test_main_help_documents_the_precondition_examples_and_exit_codes(
         "\n  2    schema not at migration head: run `opennse-terminal migrate upgrade head` "
         "first\n",
         "\n  130  interrupted (Ctrl-C); any uncommitted seed transaction was rolled back\n",
+        "\n  143  terminated (SIGTERM); any uncommitted seed transaction was rolled back\n",
     ):
         assert exit_line in help_text
     assert "opennse:opennse@" not in help_text
 
 
-def test_main_reports_an_interrupt_in_one_line_and_returns_130(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("interrupt", "exit_code", "line"),
+    [
+        pytest.param(
+            KeyboardInterrupt,
+            130,
+            "seeding interrupted; any uncommitted seed transaction was rolled back, "
+            "and re-running the seeder is safe\n",
+            id="ctrl-c",
+        ),
+        pytest.param(
+            cli.TerminatedError,
+            cli.EXIT_TERMINATED,
+            "seeding terminated (SIGTERM); any uncommitted seed transaction was rolled back, "
+            "and re-running the seeder is safe\n",
+            id="sigterm",
+        ),
+    ],
+)
+def test_main_reports_an_interrupt_in_one_line_and_returns_its_code(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    interrupt: type[BaseException],
+    exit_code: int,
+    line: str,
 ) -> None:
+    """Ctrl-C (``KeyboardInterrupt`` from ``asyncio.run``) and SIGTERM (``TerminatedError`` from
+    ``cli.run_terminable``) each end in one stderr line and 130 or 143, never a traceback."""
     sources: list[str] = []
 
     # A plain function, so no coroutine or event loop is created: the interrupt arrives where
-    # asyncio.run would raise it.
+    # the event loop would raise it.
     def interrupted_run_seed(settings: TerminalSettings, *, url_source: str) -> int:
         sources.append(url_source)
-        raise KeyboardInterrupt
+        raise interrupt
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TERMINAL_DATABASE_URL", REFUSED_URL)
     monkeypatch.setattr(seed_terminal_db, "run_seed", interrupted_run_seed)
 
-    exit_code = seed_terminal_db.main(["--database-url", VALID_URL])
+    assert seed_terminal_db.main(["--database-url", VALID_URL]) == exit_code
 
-    assert exit_code == 130
     assert sources == ["--database-url"]
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == (
-        "seeding interrupted; any uncommitted seed transaction was rolled back, "
-        "and re-running the seeder is safe\n"
-    )
+    assert captured.err == line
 
 
 @pytest.mark.parametrize(
@@ -1509,7 +1615,7 @@ async def test_seed_reports_invalid_default_settings_once_by_type(
     _assert_type_only(caplog)
 
 
-async def test_record_failure_stores_the_type_and_logs_its_own_failure_by_type(
+async def test_record_failure_stores_the_message_and_logs_its_own_failure_by_type(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     run_id = uuid.uuid4()
@@ -1525,7 +1631,7 @@ async def test_record_failure_stores_the_type_and_logs_its_own_failure_by_type(
         session,  # type: ignore[arg-type]
         run_id=run_id,
         started_at=datetime(2026, 9, 30, 12, 0, tzinfo=UTC),
-        exc=_watchlist_insert_error(),
+        error_message=type(_watchlist_insert_error()).__name__,
     )
 
     assert session.calls == ["rollback", "add", "commit"]

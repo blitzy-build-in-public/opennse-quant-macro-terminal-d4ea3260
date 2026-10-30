@@ -14,6 +14,9 @@ Run lifecycle (one call of :func:`execute_pipeline`):
    run ``failed`` with "lock held". PostgreSQL releases the lock when the transaction ends: on
    commit, on rollback after an exception, and on cancellation or process death when the
    connection closes. The lock is never taken at session level nor twice on one connection.
+   Holding it, the run records every earlier row of its run name still ``running`` as
+   ``failed`` with ``error_message`` "abandoned" (:meth:`RunRecorder.mark_abandoned`, on a
+   separate connection): their process died without recording them, for example on SIGKILL.
 3. Fetching, parsing, validation, reconciliation and the upsert all happen inside that
    transaction, one stage after another; any exception rolls everything back. ``parse`` and
    ``validate`` run in a worker thread, so decoding a large file never blocks the event loop.
@@ -45,7 +48,10 @@ Status                 Condition                                                
                        ``details``)
 ``failed``             network failure after retries (:class:`FetchFailed`), lock  no
                        held (:class:`LockHeld`), exchange calendar not verified,
-                       a rejected PDF upload, cancellation or an unexpected error
+                       a rejected PDF upload, cancellation or an unexpected
+                       error; or, as ``"abandoned"``, a run whose process died
+                       while ``running``, once a later run of its name holds
+                       the lock
 =====================  ==========================================================  ============
 
 Units convention for every record a pipeline writes: ``*_pct`` columns hold percentage points
@@ -76,8 +82,9 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import Enum, StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar, Final, Generic, Literal, TypeVar, get_args
 
-from sqlalchemy import String, bindparam, insert, text, update
+from sqlalchemy import String, bindparam, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from sqlalchemy.orm import aliased
 
 from opennse_terminal.config import TerminalSettings
 from opennse_terminal.ingestion.calendar import CalendarNotVerified
@@ -127,6 +134,8 @@ REJECTED_SAMPLE_LIMIT: Final = 50
 """Number of rejected rows kept in ``details.rejected``."""
 
 _MAX_ERROR_MESSAGE_CHARS: Final = 2_000
+# error_message of a run whose process ended without recording it (RunRecorder.mark_abandoned).
+_ABANDONED: Final = "abandoned"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -736,6 +745,48 @@ class RunRecorder:
         if result.rowcount == 0:
             raise LookupError(f"no ingestion run with id {run_id}")
 
+    async def mark_abandoned(self, pipeline: str, *, current_run_id: uuid.UUID) -> int:
+        """Finish the earlier runs of ``pipeline`` that their process left ``running``; return
+        how many rows were changed.
+
+        One conditional ``UPDATE`` in its own short transaction: every row of ``pipeline`` whose
+        status is still ``running``, other than ``current_run_id``, and whose ``started_at`` is
+        before that run's becomes ``failed`` with ``finished_at`` now (UTC), ``error_message``
+        ``"abandoned"`` and ``details`` ``{"abandoned_by": "<current_run_id>"}``. Its counts are
+        kept. A process stopped by SIGKILL, an out-of-memory kill or a host crash records nothing
+        itself, so this is how such a row reaches a final status.
+
+        Call it only while holding the pipeline's advisory lock: no other run of ``pipeline`` is
+        then inside its locked phase. A run that started earlier but has not yet tried the lock
+        may be marked too; its own final update, which is unconditional, then replaces the mark,
+        so a live run's recorded outcome always stands.
+        """
+        # An alias, so the subquery reads the current run's row and never correlates with the
+        # row being updated.
+        current = aliased(TerminalIngestionRun, name="current_run")
+        current_started_at = (
+            select(current.started_at).where(current.id == current_run_id).scalar_subquery()
+        )
+        statement = (
+            update(TerminalIngestionRun)
+            .where(
+                TerminalIngestionRun.pipeline == pipeline,
+                TerminalIngestionRun.status == RunStatus.RUNNING.value,
+                TerminalIngestionRun.id != current_run_id,
+                TerminalIngestionRun.started_at < current_started_at,
+            )
+            .values(
+                status=RunStatus.FAILED.value,
+                finished_at=datetime.now(UTC),
+                error_message=_ABANDONED,
+                details={"abandoned_by": str(current_run_id)},
+            )
+        )
+        async with self._engine.begin() as conn:
+            result = await conn.execute(statement)
+        abandoned: int = result.rowcount
+        return abandoned
+
     async def record(
         self,
         *,
@@ -902,6 +953,34 @@ def _threshold_breach(parsed: int, rejected: int, min_rows: int) -> SourceLayout
     )
 
 
+async def _mark_abandoned_runs(engine: AsyncEngine, run_name: str, run_id: uuid.UUID) -> None:
+    """Finish the earlier runs of ``run_name`` left ``running`` by a process that ended without
+    recording them (:meth:`RunRecorder.mark_abandoned`).
+
+    Called once the run holds its advisory lock; the update uses a run-record connection of its
+    own, never the data connection. Best effort: an error is logged at WARNING by its type only
+    and the run goes on; a cancellation propagates like any other. Marked rows are counted in a
+    WARNING.
+    """
+    try:
+        abandoned = await RunRecorder(engine).mark_abandoned(run_name, current_run_id=run_id)
+    except Exception as exc:
+        logger.warning(
+            "ingestion run %s (%s) could not finish earlier runs left running: %s",
+            run_id,
+            run_name,
+            type(exc).__name__,
+        )
+        return
+    if abandoned:
+        logger.warning(
+            "ingestion run %s (%s) recorded %d earlier run(s) left running as failed (abandoned)",
+            run_id,
+            run_name,
+            abandoned,
+        )
+
+
 async def _run_in_transaction(
     pipeline: Pipeline[Any, Any],
     engine: AsyncEngine,
@@ -914,6 +993,9 @@ async def _run_in_transaction(
 ) -> RunStatus:
     """Run fetch -> parse -> validate -> reconcile -> upsert in one data transaction holding the
     run's transaction-scoped advisory lock, and return ``succeeded`` or ``partial``.
+
+    Once the lock is held, earlier runs of the same run name still ``running`` are recorded
+    ``failed`` ("abandoned") by :func:`_mark_abandoned_runs`, before the fetch.
 
     The thresholds of :func:`evaluate_thresholds` are applied to the validation and
     reconciliation rejections before the upsert, then, when :meth:`Pipeline.write_rejections`
@@ -934,6 +1016,7 @@ async def _run_in_transaction(
         if not acquired:
             logger.warning("advisory lock held for %s", run_name)
             raise LockHeld(run_name)
+        await _mark_abandoned_runs(engine, run_name, run_id)
 
         ctx = RunContext(
             run_id=run_id,
@@ -1175,7 +1258,10 @@ async def execute_pipeline(
     3. One dedicated connection opens the data transaction before fetching, sets the 30-minute
        ``idle_in_transaction_session_timeout`` and takes
        ``pg_try_advisory_xact_lock(hashtext('terminal:' || run_name))``; a held lock raises
-       :class:`LockHeld`. Fetch, parse, validate, reconcile, the thresholds of
+       :class:`LockHeld`. With the lock held, earlier rows of ``run_name`` still ``running``
+       are recorded ``failed`` ("abandoned") on a separate connection
+       (:meth:`RunRecorder.mark_abandoned`; best effort, an error is logged at WARNING by type
+       and the run goes on). Fetch, parse, validate, reconcile, the thresholds of
        :func:`evaluate_thresholds` and the upsert run inside it, in that order, then the
        thresholds again when :meth:`Pipeline.write_rejections` reports rows the upsert could not
        write; ``parse`` and ``validate`` run in a worker thread. It commits on success and rolls

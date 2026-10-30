@@ -6,7 +6,8 @@ examples and exit codes. The database comes from ``TERMINAL_DATABASE_URL`` (or `
 ``--database-url`` overrides it. Exit codes: ``0`` seeded (including a re-run that inserts
 nothing); ``1`` failed and rolled back, or invalid arguments or settings; ``2`` the schema is not
 at the packaged migration head ("run `opennse-terminal migrate upgrade head` first"); ``130``
-interrupted by Ctrl-C, with any uncommitted seed transaction rolled back.
+interrupted by Ctrl-C, or ``143`` terminated by SIGTERM, with any uncommitted seed transaction
+rolled back and a started run recorded ``failed`` ("cancelled").
 
 What is written. The records of :func:`opennse_terminal.seed.synthetic.generate_all`: the eight
 attachment counters, their synthetic daily prices and fundamentals, the macro and bond history,
@@ -120,6 +121,14 @@ _INTERRUPTED_MESSAGE: Final = (
     "seeding interrupted; any uncommitted seed transaction was rolled back, "
     "and re-running the seeder is safe"
 )
+# 128 + SIGTERM, the shell's code for a command stopped by SIGTERM.
+_EXIT_TERMINATED: Final = 143
+_TERMINATED_MESSAGE: Final = (
+    "seeding terminated (SIGTERM); any uncommitted seed transaction was rolled back, "
+    "and re-running the seeder is safe"
+)
+# error_message of a seed run stopped by Ctrl-C or SIGTERM, as for a cancelled ingestion run.
+_CANCELLED_MESSAGE: Final = "cancelled"
 _SEED_CALENDAR: Final = "synthetic"
 # Where main() took the database URL from, named in the messages about the URL itself.
 _URL_SOURCE_FLAG: Final = "--database-url"
@@ -142,6 +151,7 @@ exit codes:
   1    failed and rolled back, or invalid arguments or settings
   2    schema not at migration head: run `opennse-terminal migrate upgrade head` first
   130  interrupted (Ctrl-C); any uncommitted seed transaction was rolled back
+  143  terminated (SIGTERM); any uncommitted seed transaction was rolled back
 """
 
 # to_regclass returns NULL instead of raising for a missing relation, so an unmigrated database
@@ -373,14 +383,17 @@ def _data_through(dataset: SeedDataset) -> str | None:
 
 
 async def _record_failure(
-    session: AsyncSession, *, run_id: uuid.UUID, started_at: datetime, exc: Exception
+    session: AsyncSession, *, run_id: uuid.UUID, started_at: datetime, error_message: str
 ) -> None:
     """Roll back the seed transaction and record the run as ``failed`` in a fresh transaction.
 
-    ``error_message`` is the exception's type name only. SQLAlchemy errors embed the failed
-    statement's parameters, such as the watchlist's ``default_owner_key``, so their text is never
-    stored or logged. Best effort: an error here is logged with the run id and its type name, then
-    suppressed, so the caller re-raises the original.
+    ``error_message`` is the failed run's exception type name only, or ``"cancelled"``.
+    SQLAlchemy errors embed the failed statement's parameters, such as the watchlist's
+    ``default_owner_key``, so their text is never stored or logged. Best effort: an error here is
+    logged with the run id and its type name, then suppressed, so the caller re-raises the
+    original. The session stays usable after a cancellation that interrupted one of its
+    statements: SQLAlchemy discards that connection, and the rollback and the insert run on a
+    fresh one from the pool.
     """
     try:
         await session.rollback()
@@ -396,7 +409,7 @@ async def _record_failure(
                 rows_fetched=0,
                 rows_written=0,
                 rows_rejected=0,
-                error_message=type(exc).__name__,
+                error_message=error_message,
                 details={},
             )
         )
@@ -405,6 +418,32 @@ async def _record_failure(
         logger.error(
             "could not record seed run %s as failed: %s", run_id, type(record_exc).__name__
         )
+
+
+async def _record_cancellation(
+    session: AsyncSession, *, run_id: uuid.UUID, started_at: datetime
+) -> None:
+    """Record a cancelled seed run as ``failed`` with ``"cancelled"`` (:func:`_record_failure`).
+
+    The recording runs in a task of its own to completion, however often the calling task is
+    cancelled meanwhile (a repeated Ctrl-C or SIGTERM), so the run row is never lost midway; the
+    caller re-raises the cancellation it is handling once this returns.
+    """
+    recording = asyncio.create_task(
+        _record_failure(
+            session, run_id=run_id, started_at=started_at, error_message=_CANCELLED_MESSAGE
+        )
+    )
+    while not recording.done():
+        try:
+            # asyncio.wait neither cancels the task it waits for nor raises its exception.
+            await asyncio.wait((recording,))
+        except asyncio.CancelledError:
+            # The seed is already being cancelled; the caller re-raises once this is recorded.
+            continue
+    # Retrieved, so asyncio never reports an outcome as unretrieved; _record_failure suppresses
+    # every error of its own.
+    recording.result()
 
 
 async def seed(
@@ -431,6 +470,13 @@ async def seed(
     On any failure after the schema check, generation and its invariant checks included, the
     transaction is rolled back, the run is recorded as ``failed`` in a fresh transaction (best
     effort, with the exception's type name as ``error_message``) and the exception is re-raised.
+    ``asyncio.CancelledError`` (Ctrl-C, or SIGTERM through ``opennse-terminal seed`` and
+    :func:`main`) is handled the same way, with ``"cancelled"`` as ``error_message``: that
+    recording runs to completion even if the task is cancelled again, one WARNING ``seed run
+    <run_id> was cancelled; its uncommitted changes were rolled back`` names the run, and the
+    cancellation is re-raised. A cancellation that arrives once the commit has reached the server
+    leaves that run's ``succeeded`` row in place; recording the failure then conflicts with it
+    and is logged at ERROR by type.
 
     Every failure it raises is logged exactly once at ERROR on ``opennse_terminal.seed``, with no
     traceback, and then re-raised unchanged, so callers receive the exception itself and need not
@@ -492,8 +538,19 @@ async def seed(
         }
         await session.flush()
         await session.commit()
+    except asyncio.CancelledError:
+        # Ctrl-C (asyncio.run) or SIGTERM (cli.run_terminable) cancelled the seed. The running row
+        # was part of the rolled-back transaction, so the run is recorded afresh, then the
+        # cancellation propagates.
+        await _record_cancellation(session, run_id=run_id, started_at=started_at)
+        logger.warning(
+            "seed run %s was cancelled; its uncommitted changes were rolled back", run_id
+        )
+        raise
     except Exception as exc:
-        await _record_failure(session, run_id=run_id, started_at=started_at, exc=exc)
+        await _record_failure(
+            session, run_id=run_id, started_at=started_at, error_message=type(exc).__name__
+        )
         # The one record of this failure: callers, run_seed included, do not log it again. Only
         # the type name is logged: the exception's text, and so its traceback, can carry SQL
         # parameters such as default_owner_key. The caller receives the exception itself.
@@ -576,8 +633,9 @@ async def run_seed(settings: TerminalSettings, *, url_source: str = "settings.da
     carry SQL parameters such as ``default_owner_key``.
 
     The engine is disposed whenever it was created. ``asyncio.CancelledError`` and
-    ``KeyboardInterrupt`` are not caught: they propagate after that disposal. A coroutine, so
-    code that already runs an event loop (such as test fixtures) awaits it.
+    ``KeyboardInterrupt`` are not caught: they propagate after that disposal, a cancelled run
+    having been recorded ``failed`` ("cancelled") by :func:`seed`. A coroutine, so code that
+    already runs an event loop (such as test fixtures) awaits it.
     """
     try:
         engine = build_engine(settings)
@@ -668,15 +726,20 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
     """Parse ``argv`` (default ``sys.argv[1:]``), seed, and return the exit code.
 
     ``0`` seeded, and after ``-h``/``--help``; ``1`` failed and rolled back, or invalid arguments
-    or settings; ``2`` the schema is not at head; ``130`` interrupted by Ctrl-C, reported in one
-    line on stderr rather than a traceback. It never raises ``SystemExit``: argparse's exits for
-    ``--help`` and usage errors become the returned code, so ``opennse-terminal seed`` and other
-    in-process callers always receive an int. ``prog`` is passed to :func:`build_parser`.
+    or settings; ``2`` the schema is not at head; ``130`` interrupted by Ctrl-C and ``143``
+    terminated by SIGTERM, each reported in one line on stderr rather than a traceback, after a
+    started run was recorded ``failed`` ("cancelled"). It never raises ``SystemExit``: argparse's
+    exits for ``--help`` and usage errors become the returned code, so ``opennse-terminal seed``
+    and other in-process callers always receive an int. ``prog`` is passed to
+    :func:`build_parser`.
 
-    Runs :func:`run_seed` with ``asyncio.run``, so it must be called outside a running event
-    loop; async callers await :func:`run_seed` or :func:`seed` instead, or call this through
-    ``asyncio.to_thread``. Invalid settings (for example a non-asyncpg ``--database-url``) print
-    the validation message, which never repeats the URL, and return 1.
+    Runs :func:`run_seed` through ``opennse_terminal.cli.run_terminable`` (``asyncio.run``, with
+    SIGTERM cancelling the seed as Ctrl-C does when called from the main thread with SIGTERM's
+    default disposition), so it must be called outside a running event loop; async callers
+    await :func:`run_seed` or :func:`seed` instead, or call this through ``asyncio.to_thread``.
+    The CLI module is imported only here, so importing the seeder as a library never imports it.
+    Invalid settings (for example a non-asyncpg ``--database-url``) print the validation
+    message, which never repeats the URL, and return 1.
     """
     try:
         args = build_parser(prog=prog).parse_args(argv)
@@ -697,18 +760,27 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
     except ValidationError as exc:
         print(f"invalid terminal settings: {exc}", file=sys.stderr)
         return _EXIT_FAILED
+    # The CLI owns the console scripts' signal handling as it owns their logging; imported on
+    # this call only, so importing the seeder as a library never imports the CLI.
+    from opennse_terminal.cli import TerminatedError, run_terminable
+
     try:
-        return asyncio.run(run_seed(settings, url_source=url_source))
+        return run_terminable(run_seed(settings, url_source=url_source))
     except KeyboardInterrupt:
         # asyncio.run cancels the seed on Ctrl-C and then raises KeyboardInterrupt. The seed
-        # transaction commits only at the very end, so nothing partial is kept.
+        # transaction commits only at the very end, so nothing partial is kept, and seed() has
+        # recorded the run failed ("cancelled").
         print(_INTERRUPTED_MESSAGE, file=sys.stderr)
         return _EXIT_INTERRUPTED
+    except TerminatedError:
+        # run_terminable cancelled the seed on SIGTERM, exactly as Ctrl-C does.
+        print(_TERMINATED_MESSAGE, file=sys.stderr)
+        return _EXIT_TERMINATED
 
 
 if __name__ == "__main__":
-    # The CLI owns logging configuration. It is imported only on this entry, so importing the
-    # seeder as a library neither imports the CLI nor adds a handler.
+    # The CLI owns logging configuration. It is imported only on this entry and in main(), so
+    # importing the seeder as a library neither imports the CLI nor adds a handler.
     from opennse_terminal.cli import configure_logging
 
     configure_logging()

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import logging
 import pprint
 import re
 import socket
@@ -473,6 +474,48 @@ async def test_upgrade_from_terminal_0001_cascades_ticker_renames(
     assert await _run_cli(["migrate", "upgrade", "head"]) == cli.EXIT_OK
     assert await _terminal_versions(engine) == [(head_revision(),)]
     assert await _ticker_fk_actions(engine) == TICKER_FK_ACTIONS_AT_HEAD
+
+
+async def test_migrate_names_a_revision_alembic_cannot_resolve_as_invalid(
+    empty_database: _DatabaseHandle,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A revision Alembic cannot resolve from the database's current revision exits 1 with one
+    ERROR line naming it invalid, and the recorded revision stays where it was.
+
+    After connecting, Alembic's revision map raises an ``AssertionError`` without a message for
+    ``upgrade head+1`` at the head, a step past it, and for ``downgrade head@-1`` at base, where
+    there is nothing to step down from.
+
+    1. ``migrate upgrade head``, then ``migrate upgrade head+1``.
+    2. ``migrate downgrade base``, then ``migrate downgrade head@-1``.
+    """
+    engine = empty_database.engine
+    monkeypatch.setenv("TERMINAL_DATABASE_URL", empty_database.url)
+    caplog.set_level(logging.INFO, logger=cli.logger.name)
+    unresolved = "Alembic could not resolve it from the database's current revision"
+
+    for setup, direction, revision, versions in (
+        ("upgrade head", "upgrade", "head+1", [(head_revision(),)]),
+        ("downgrade base", "downgrade", "head@-1", []),
+    ):
+        assert await _run_cli(["migrate", *setup.split()]) == cli.EXIT_OK
+        caplog.clear()
+
+        assert await _run_cli(["migrate", direction, revision]) == cli.EXIT_FAILED
+
+        assert await _terminal_versions(engine) == versions
+        lines = [
+            (record.levelno, record.getMessage())
+            for record in caplog.records
+            if record.name == cli.logger.name
+        ]
+        assert len(lines) == 1, lines
+        level, message = lines[0]
+        assert level == logging.ERROR
+        assert message.startswith(f"migrate {direction} to {revision} on database ")
+        assert message.endswith(f" failed: invalid revision '{revision}': {unresolved}")
 
 
 # ---------------------------------------------------------------------------------------------
