@@ -1,0 +1,9 @@
+# coverage.py reads its configuration only from the working directory, so this file sits at the
+# repository root, where `pytest backend/tests --cov=opennse_terminal` and `coverage report` run.
+# Alembic loads migrations/env.py and the revision scripts under module names outside the
+# opennse_terminal package, so the package directory is also measured by path. The path is relative
+# to the repository root; run from backend/, --cov=opennse_terminal already names the directory.
+# source_dirs is merged with pytest-cov's --cov value, whereas [run] source would be overridden.
+[run]
+source_dirs =
+    backend/opennse_terminal

@@ -135,6 +135,9 @@ npm run test:e2e
 - mypy does not discover a configuration file below the working directory, so `--config-file` is
   required; without it, strict mode and the import overrides would silently not apply. ruff and
   pytest find `backend/pyproject.toml` from their target paths.
+- coverage reads its configuration from the working directory, so the repository-root
+  `.coveragerc` measures `backend/opennse_terminal` by path, which counts the Alembic-loaded
+  `env.py` and revision scripts.
 - `pytest` skips `live` tests by default (`addopts = "-m 'not live' ..."`). Run
   `pytest backend/tests -m live` to hit the real public sources.
 - Integration tests need PostgreSQL at `TERMINAL_TEST_DATABASE_URL`. They use its administrative
