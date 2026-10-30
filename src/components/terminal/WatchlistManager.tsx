@@ -37,6 +37,15 @@ const MAX_CREATE_TICKERS = 100;
 const MAX_TICKER_LENGTH = 16;
 /** Separators of the creation form's ticker list: commas and any whitespace. */
 const TICKER_SEPARATORS = /[\s,]+/;
+/**
+ * How long after a successful create or ticker addition a submit of the same form, holding
+ * nothing or exactly the text just saved, is taken as a repeat of the activation that saved it
+ * (the second click of a double click, or a doubled Enter) and ignored. 500 ms is the common
+ * desktop default double-click interval.
+ */
+const REPEAT_SUBMIT_WINDOW_MS = 500;
+/** Form key of the creation form in a {@link FormSave}. */
+const CREATE_FORM_KEY = "create";
 
 /**
  * Key of the general error line in the `errors` map. Field keys are API field names or
@@ -86,11 +95,15 @@ const GENERAL_ERROR_CLASS =
 const EMPTY_LISTS_CLASS = "text-sm text-slate-400";
 const LISTS_CLASS = "flex flex-col gap-3";
 const LIST_ITEM_CLASS = "rounded border border-slate-800 bg-slate-950 p-3";
+// The list header keeps its actions top-right whatever the name's length. The title grows from a
+// zero basis (`flex-1`) with no minimum width (`min-w-0`), so a long or unbroken name wraps inside
+// it instead of claiming the whole line, and the actions never shrink (`shrink-0`). `flex-wrap`
+// only moves the actions to their own row when the header is narrower than the actions themselves.
 const LIST_HEADER_CLASS = "flex flex-wrap items-start justify-between gap-2";
-const LIST_TITLE_CLASS = "min-w-0";
+const LIST_TITLE_CLASS = "min-w-0 flex-1";
 const LIST_NAME_CLASS = "text-sm font-medium text-slate-100 break-words";
 const LIST_META_CLASS = "text-xs text-slate-400";
-const LIST_ACTIONS_CLASS = "flex items-center gap-2";
+const LIST_ACTIONS_CLASS = "flex shrink-0 items-center gap-2";
 const CHIPS_CLASS = "mt-2 flex flex-wrap gap-1.5";
 const NO_TICKERS_CLASS = "mt-2 text-xs text-slate-400";
 const CHIP_CLASS =
@@ -118,6 +131,16 @@ type Mutation =
 interface LocalLists {
   base: Watchlist[] | undefined;
   lists: Watchlist[];
+}
+
+/** The last successful save of a form, kept to recognise a submit that repeats it. */
+interface FormSave {
+  /** {@link CREATE_FORM_KEY} for the creation form, or the add form's {@link tickerErrorKey}. */
+  form: string;
+  /** The trimmed name created, or the upper-cased ticker added. */
+  value: string;
+  /** When the save succeeded, as a `performance.now()` reading. */
+  at: number;
 }
 
 /** Result of parsing the creation form's ticker text. */
@@ -288,7 +311,10 @@ function RemoveIcon(): ReactElement {
  * that API returns. The response of an abandoned mutation changes nothing on screen, moves no
  * focus, shows no error and never reaches `onWatchlistsChange`, and the controls are released at
  * once. A successful create or ticker addition clears only the inputs that still hold the
- * submitted text, so a draft typed while the request was pending survives.
+ * submitted text, so a draft typed while the request was pending survives. A submit of the same
+ * form within half a second of that success, holding nothing or exactly the text saved, repeats
+ * the click or Enter that saved it, so it is ignored: it sends nothing, shows no validation error
+ * and keeps the success announcement.
  *
  * Rendering depends only on props and state, with no dates or locale formatting; the one effect
  * only aborts a pending mutation. Server-rendered markup therefore hydrates without a mismatch.
@@ -320,6 +346,9 @@ export function WatchlistManager({
   // The controller of the pending mutation, or `null` when none is pending. Read and written only
   // in event handlers, request callbacks and effect cleanup.
   const mutationController = useRef<AbortController | null>(null);
+  // The last successful create or ticker addition, or `null` before the first. Written only in
+  // success callbacks and read only in submit handlers.
+  const lastSave = useRef<FormSave | null>(null);
   const nameInputRef = useRef<HTMLInputElement>(null);
   const baseId = useId();
   // The API target, normalized as the watchlist query normalizes it, so an `apiBaseUrl` naming
@@ -417,10 +446,27 @@ export function WatchlistManager({
     );
   }
 
+  /**
+   * Whether a submit of `form` holding the normalized `value` repeats the activation of its last
+   * successful save: it arrives within {@link REPEAT_SUBMIT_WINDOW_MS} of that save and the form
+   * holds nothing, as success left it, or exactly the value saved, as a handler that runs before
+   * the cleared form renders still sees it. `submittedAt` is the submit event's `timeStamp`,
+   * which counts from the same time origin as `performance.now()`. Called only in submit
+   * handlers.
+   */
+  function isRepeatSubmit(form: string, value: string, submittedAt: number): boolean {
+    const save = lastSave.current;
+    if (save === null || save.form !== form) return false;
+    if (submittedAt - save.at >= REPEAT_SUBMIT_WINDOW_MS) return false;
+    return value === "" || value === save.value;
+  }
+
   function handleCreate(event: FormEvent<HTMLFormElement>): void {
     event.preventDefault();
     if (inFlight.current) return;
     const trimmedName = name.trim();
+    // The repeat leaves the success announcement in place and shows no error for the cleared form.
+    if (isRepeatSubmit(CREATE_FORM_KEY, trimmedName, event.timeStamp)) return;
     const nameMessage = nameProblem(trimmedName);
     const parsed = parseTickers(tickersText);
     if (nameMessage !== null || !parsed.ok) {
@@ -446,6 +492,7 @@ export function WatchlistManager({
         return sortByName([...lists.filter((list) => list.id !== created.id), created]);
       },
       () => {
+        lastSave.current = { form: CREATE_FORM_KEY, value: trimmedName, at: performance.now() };
         setName((current) => (current === submittedName ? "" : current));
         setTickersText((current) => (current === submittedTickers ? "" : current));
         return `Created watchlist ${trimmedName}`;
@@ -482,15 +529,20 @@ export function WatchlistManager({
     setNotice("");
   }
 
+  /**
+   * Move focus from a Cancel `button` to the Delete button beside it. Cancel leaves once the
+   * confirmation ends, and focus left on it would fall back to the page.
+   */
+  function focusDeleteButton(button: HTMLButtonElement): void {
+    button.parentElement
+      ?.querySelector<HTMLButtonElement>('[data-testid="watchlist-delete-button"]')
+      ?.focus();
+  }
+
   function handleCancelClick(event: MouseEvent<HTMLButtonElement>): void {
     if (inFlight.current) return;
     const button = event.currentTarget;
-    // Cancel leaves once the confirmation ends, so keyboard focus returns to the Delete button.
-    if (hasKeyboardFocus(button)) {
-      button.parentElement
-        ?.querySelector<HTMLButtonElement>('[data-testid="watchlist-delete-button"]')
-        ?.focus();
-    }
+    if (hasKeyboardFocus(button)) focusDeleteButton(button);
     cancelDelete();
   }
 
@@ -499,6 +551,15 @@ export function WatchlistManager({
       event.preventDefault();
       cancelDelete();
     }
+  }
+
+  /** Escape on Cancel ends the confirmation, as it does on Confirm. */
+  function handleCancelKeyDown(event: KeyboardEvent<HTMLButtonElement>, list: Watchlist): void {
+    if (event.key !== "Escape" || confirmDeleteId !== list.id || inFlight.current) return;
+    event.preventDefault();
+    // A key press always comes from the keyboard, so focus moves without the focus-visible test.
+    focusDeleteButton(event.currentTarget);
+    cancelDelete();
   }
 
   /** Drop the error shown for `key` once its input is edited; other errors stay. */
@@ -511,6 +572,9 @@ export function WatchlistManager({
     if (inFlight.current) return;
     const submittedTicker = addTicker[list.id] ?? "";
     const ticker = submittedTicker.trim().toUpperCase();
+    const formKey = tickerErrorKey(list.id);
+    // As for creation, a repeat keeps the success announcement and shows no error.
+    if (isRepeatSubmit(formKey, ticker, event.timeStamp)) return;
     const problem = tickerProblem(ticker);
     if (problem !== null) {
       setErrors({ [tickerErrorKey(list.id)]: problem });
@@ -529,6 +593,7 @@ export function WatchlistManager({
         return withList(lists, updated);
       },
       () => {
+        lastSave.current = { form: formKey, value: ticker, at: performance.now() };
         // As for creation: a ticker typed while the request was pending survives its success.
         setAddTicker((current) =>
           current[list.id] === submittedTicker ? { ...current, [list.id]: "" } : current,
@@ -620,6 +685,7 @@ export function WatchlistManager({
                 aria-label={`Cancel deleting ${list.name}`}
                 className={SECONDARY_BUTTON_CLASS}
                 onClick={handleCancelClick}
+                onKeyDown={(event) => handleCancelKeyDown(event, list)}
               >
                 Cancel
               </button>

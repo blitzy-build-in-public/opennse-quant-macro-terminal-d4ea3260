@@ -105,8 +105,12 @@ const UNIT_AFFIXES: Record<DecimalKind, { prefix: string; suffix: string }> = {
   discount_factor: { prefix: "", suffix: "" },
 };
 
-/** A plain decimal string: optional sign, integer digits, optional fraction digits. */
-const DECIMAL_PATTERN = /^([+-]?)(\d+)(?:\.(\d+))?$/;
+/**
+ * A plain decimal string: optional sign, optional integer digits, optional `.` with optional
+ * fraction digits. {@link formatDecimal} also requires at least one digit, so it accepts exactly
+ * the text {@link parseScaled} accepts, except that it does not trim.
+ */
+const DECIMAL_PATTERN = /^([+-]?)(\d*)(?:\.(\d*))?$/;
 
 /** Removes redundant leading zeros, keeping at least one digit (`"007"` becomes `"7"`). */
 function stripLeadingZeros(digits: string): string {
@@ -128,10 +132,13 @@ function groupDigits(digits: string): string {
  * Formats an exact decimal string for display, without converting it to a number.
  *
  * - `null`, `undefined` and `""` give {@link EMPTY_VALUE}.
- * - A string that is not a plain decimal (`/^[+-]?\d+(\.\d+)?$/`, untrimmed) is returned
- *   unchanged, so unexpected server text is shown rather than hidden.
- * - Leading zeros of the integer part are removed and its digits grouped with `,`. The fraction
- *   is kept exactly as received, never rounded or padded: the server has already quantized it.
+ * - A string that is not a plain decimal (an optional sign, then digits with at most one `.`,
+ *   holding at least one digit, untrimmed) is returned unchanged, so unexpected server text is
+ *   shown rather than hidden: `"."`, `"+"`, `" 5"`, `"1e5"` and `"1,000"` are not decimals.
+ * - Leading zeros of the integer part are removed and its digits grouped with `,`; an empty
+ *   integer part shows as `0` and a bare trailing `.` is dropped, so the `".5"` and `"5."` forms
+ *   that {@link parseScaled} accepts display like `"0.5"` and `"5"`. The fraction digits are kept
+ *   exactly as received, never rounded or padded: the server has already quantized them.
  * - Zero (every digit `0`, as in `"-0.00"`) carries no sign; a negative value carries U+2212; a
  *   positive value carries `+` only with `signed: true`.
  * - The sign follows a currency prefix and precedes a suffix: `KES −1,234.00`, `−9.11%`.
@@ -143,6 +150,8 @@ function groupDigits(digits: string): string {
  * @example formatDecimal("33.25", "per_share") === "KES 33.25"
  * @example formatDecimal("0.25", "tenor") === "0.25y"
  * @example formatDecimal("0.847458", "discount_factor") === "0.847458"
+ * @example formatDecimal(".5", "kes") === "KES 0.5"
+ * @example formatDecimal("5.", "kes") === "KES 5"
  * @example formatDecimal(null, "ratio") === "—"
  */
 export function formatDecimal(
@@ -155,8 +164,13 @@ export function formatDecimal(
   if (match === null) return value;
 
   const signText = match[1] ?? "";
-  const integerDigits = stripLeadingZeros(match[2] ?? "0");
-  const fractionDigits = match[3];
+  const integerText = match[2] ?? "";
+  // A bare trailing point carries no fraction digits, so `"5."` shows as `5`.
+  const fractionDigits = match[3] === "" ? undefined : match[3];
+  // Text without any digit, such as `"."` or `"-."`, is not a number.
+  if (integerText === "" && fractionDigits === undefined) return value;
+  // Empty integer digits read as zero, so `".5"` shows as `0.5`.
+  const integerDigits = stripLeadingZeros(integerText);
   const isZero = integerDigits === "0" && /^0*$/.test(fractionDigits ?? "");
 
   let sign = "";

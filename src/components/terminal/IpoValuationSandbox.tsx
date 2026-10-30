@@ -248,6 +248,11 @@ const TEXTS: Record<TextField, TextSpec> = {
 const INPUT_FIELDS: ReadonlySet<string> = new Set<string>([...SLIDER_FIELDS, ...TEXT_FIELDS]);
 
 type SliderPositions = Record<SliderField, string>;
+/**
+ * Per slider, the exact preset value it holds until the user moves it, or null once it is
+ * serialized from its position. Only a preset value off the slider grid is held.
+ */
+type HeldSliderValues = Record<SliderField, DecimalString | null>;
 type TextValues = Record<TextField, string>;
 type LocalErrors = Partial<Record<InputField, string>>;
 
@@ -342,8 +347,9 @@ function snapToGrid(spec: SliderSpec, scaled: bigint, unit: bigint): string {
 
 /**
  * Slider position of a preset value. The value is parsed at its own precision, so a server value
- * such as `"18.0000"` or one off the slider grid still lands on the nearest step. A preset the
- * API validated always parses; text that does not parse starts the slider at its lower bound.
+ * such as `"18.0000"` sits on its step, and the thumb of a value off the slider grid sits on the
+ * nearest step while {@link heldPresetValue} keeps the value itself. A preset the API validated
+ * always parses; text that does not parse starts the slider at its lower bound.
  */
 function presetPosition(spec: SliderSpec, value: DecimalString): string {
   const text = value.trim();
@@ -359,26 +365,66 @@ function inputPosition(spec: SliderSpec, raw: string): string | null {
   return parsed === null ? null : snapToGrid(spec, parsed, ONE);
 }
 
-/** A slider's current value as the plain decimal string sent to the API. */
-function sliderValue(positions: SliderPositions, field: SliderField): DecimalString {
-  return formatScaled(BigInt(positions[field]), SLIDERS[field].scale);
+/**
+ * The exact value a slider holds from its preset, or null when there is none to hold: the trimmed
+ * preset text when it differs numerically from its position serialized at the slider's scale,
+ * that is when it lies off the slider grid. An offer of `"7.52"` on the 0.05 grid is held while
+ * the thumb sits at 7.50; `"7.50"`, `"18.0000"` and `"4000000000.00"` equal their positions and
+ * are not held, so they are sent as `"7.50"`, `"18.00"` and `"4000000000"`. Text that does not
+ * parse is not held either and leaves the slider at its lower bound.
+ */
+function heldPresetValue(spec: SliderSpec, value: DecimalString): DecimalString | null {
+  const text = value.trim();
+  const serialized = formatScaled(BigInt(presetPosition(spec, text)), spec.scale);
+  const comparison = compareDecimal(serialized, text);
+  return comparison === null || comparison === 0 ? null : text;
 }
 
-/** A slider's current value for display, for example `"18.00%"`, `"KES 7.50"` or `"0.50 pp"`. */
-function sliderDisplay(field: SliderField, position: string): string {
+/**
+ * A slider's current value as the plain decimal string sent to the API: its held preset value
+ * while it has one, else its position serialized at the slider's scale.
+ */
+function sliderValue(
+  positions: SliderPositions,
+  held: HeldSliderValues,
+  field: SliderField,
+): DecimalString {
+  return held[field] ?? formatScaled(BigInt(positions[field]), SLIDERS[field].scale);
+}
+
+/**
+ * A slider's current value, as {@link sliderValue} returns it, for display: for example
+ * `"18.00%"`, `"KES 7.50"`, `"0.50 pp"`, or a held preset value such as `"KES 4,100,000,000.00"`.
+ */
+function sliderDisplay(field: SliderField, value: DecimalString): string {
   const spec = SLIDERS[field];
-  const value = formatScaled(BigInt(position), spec.scale);
   return spec.suffix === undefined
     ? formatDecimal(value, spec.kind)
     : formatDecimal(value, spec.kind, { unit: false }) + spec.suffix;
 }
 
+/**
+ * Slider positions of a preset. The thumb of a value off the slider grid sits on the nearest
+ * step, and {@link initialHeldValues} keeps the value itself until that slider is moved.
+ */
 function initialPositions(assumptions: IpoValuationRequest): SliderPositions {
   const positions = {} as SliderPositions;
   for (const field of SLIDER_FIELDS) {
     positions[field] = presetPosition(SLIDERS[field], assumptions[field]);
   }
   return positions;
+}
+
+/**
+ * The exact preset values the sliders hold, null for each slider whose preset value is on its
+ * grid (see {@link heldPresetValue}).
+ */
+function initialHeldValues(assumptions: IpoValuationRequest): HeldSliderValues {
+  const held = {} as HeldSliderValues;
+  for (const field of SLIDER_FIELDS) {
+    held[field] = heldPresetValue(SLIDERS[field], assumptions[field]);
+  }
+  return held;
 }
 
 /** Decimal strings exactly as received; integers in their plain decimal form. */
@@ -436,22 +482,27 @@ function toJsonInteger(text: string): number {
 }
 
 /**
- * The `POST /ipo/valuation` body for valid inputs: sliders serialized from their positions,
- * decimal texts trimmed but otherwise unchanged, integer texts as JSON integers. The sensitivity
- * axes are omitted, so the server's 5 WACC × 7 margin defaults apply.
+ * The `POST /ipo/valuation` body for valid inputs: sliders as their held preset values, else
+ * serialized from their positions; decimal texts trimmed but otherwise unchanged, integer texts
+ * as JSON integers. The sensitivity axes are omitted, so the server's 5 WACC × 7 margin defaults
+ * apply.
  */
-function buildRequest(positions: SliderPositions, texts: TextValues): IpoValuationRequest {
+function buildRequest(
+  positions: SliderPositions,
+  held: HeldSliderValues,
+  texts: TextValues,
+): IpoValuationRequest {
   return {
-    offer_price_kes: sliderValue(positions, "offer_price_kes"),
-    revenue_growth_pct: sliderValue(positions, "revenue_growth_pct"),
-    ebitda_margin_pct: sliderValue(positions, "ebitda_margin_pct"),
-    margin_expansion_pct: sliderValue(positions, "margin_expansion_pct"),
-    wacc_pct: sliderValue(positions, "wacc_pct"),
-    terminal_growth_pct: sliderValue(positions, "terminal_growth_pct"),
-    net_debt_kes: sliderValue(positions, "net_debt_kes"),
-    nwc_pct_revenue: sliderValue(positions, "nwc_pct_revenue"),
-    peer_ev_ebitda_multiple: sliderValue(positions, "peer_ev_ebitda_multiple"),
-    dcf_weight_pct: sliderValue(positions, "dcf_weight_pct"),
+    offer_price_kes: sliderValue(positions, held, "offer_price_kes"),
+    revenue_growth_pct: sliderValue(positions, held, "revenue_growth_pct"),
+    ebitda_margin_pct: sliderValue(positions, held, "ebitda_margin_pct"),
+    margin_expansion_pct: sliderValue(positions, held, "margin_expansion_pct"),
+    wacc_pct: sliderValue(positions, held, "wacc_pct"),
+    terminal_growth_pct: sliderValue(positions, held, "terminal_growth_pct"),
+    net_debt_kes: sliderValue(positions, held, "net_debt_kes"),
+    nwc_pct_revenue: sliderValue(positions, held, "nwc_pct_revenue"),
+    peer_ev_ebitda_multiple: sliderValue(positions, held, "peer_ev_ebitda_multiple"),
+    dcf_weight_pct: sliderValue(positions, held, "dcf_weight_pct"),
     capex_pct_revenue: texts.capex_pct_revenue.trim(),
     da_pct_revenue: texts.da_pct_revenue.trim(),
     tax_rate_pct: texts.tax_rate_pct.trim(),
@@ -463,11 +514,17 @@ function buildRequest(positions: SliderPositions, texts: TextValues): IpoValuati
   };
 }
 
-/** Digit-grouped reading of a valid long value, such as `KES 45,000,000,000.00`. */
+/**
+ * Digit-grouped reading of a valid long value, such as `KES 45,000,000,000.00` or
+ * `500,000,000 shares`; a count equal to one, `"1"` or `"01"`, reads `1 share`.
+ */
 function echoText(spec: TextSpec, value: string): string | null {
   const text = value.trim();
   if (spec.echo === "kes") return formatDecimal(text, "kes");
-  if (spec.echo === "shares") return formatDecimal(text, "kes", { unit: false }) + " shares";
+  if (spec.echo === "shares") {
+    const noun = compareDecimal(text, "1") === 0 ? " share" : " shares";
+    return formatDecimal(text, "kes", { unit: false }) + noun;
+  }
   return null;
 }
 
@@ -598,8 +655,13 @@ function FairValueChart({ response }: { response: IpoValuationResponse }): React
 interface SliderControlProps {
   field: SliderField;
   inputId: string;
-  /** Position in slider units, an integer string. */
+  /** Position in slider units, an integer string: the thumb's step, nearest a held value. */
   position: string;
+  /**
+   * The value sent to the API (see {@link sliderValue}), shown beside the slider and as its
+   * `aria-valuetext`: a held preset value exactly, else the position serialized.
+   */
+  value: DecimalString;
   error: string | undefined;
   onPositionChange: (field: SliderField, raw: string) => void;
 }
@@ -608,11 +670,12 @@ function SliderControl({
   field,
   inputId,
   position,
+  value,
   error,
   onPositionChange,
 }: SliderControlProps): ReactElement {
   const spec = SLIDERS[field];
-  const display = sliderDisplay(field, position);
+  const display = sliderDisplay(field, value);
   const errorId = `${inputId}-error`;
   return (
     <div>
@@ -865,7 +928,9 @@ interface SandboxWorkspaceProps {
 /**
  * Inputs initialized from one preset, and the server's valuation of their current values. The
  * parent remounts it with `key={scenario.id}` when the preset changes, so its state starts from
- * the new preset's assumptions through `useState` initializers.
+ * the new preset's assumptions through `useState` initializers. A slider whose preset value lies
+ * off its grid holds that exact value, shown and sent unchanged with its thumb on the nearest
+ * step, until the user moves that slider.
  *
  * Recalculation: every change updates only its own input state, so a slider's `<output>` follows
  * each input event. The derived request key changes, and once it has been stable for
@@ -888,6 +953,9 @@ function SandboxWorkspace({
   const idPrefix = useId();
   const [positions, setPositions] = useState<SliderPositions>(() =>
     initialPositions(scenario.assumptions),
+  );
+  const [heldValues, setHeldValues] = useState<HeldSliderValues>(() =>
+    initialHeldValues(scenario.assumptions),
   );
   const [texts, setTexts] = useState<TextValues>(() => initialTexts(scenario.assumptions));
   const [result, setResult] = useState<ValuationResult | null>(null);
@@ -915,8 +983,8 @@ function SandboxWorkspace({
   const hasLocalErrors = Object.keys(localErrors).length > 0;
   /** The serialized request body, or null while a text input is invalid. */
   const requestKey = useMemo(
-    () => (hasLocalErrors ? null : JSON.stringify(buildRequest(positions, texts))),
-    [hasLocalErrors, positions, texts],
+    () => (hasLocalErrors ? null : JSON.stringify(buildRequest(positions, heldValues, texts))),
+    [hasLocalErrors, positions, heldValues, texts],
   );
   const isRecalculating = requestKey !== null && requestKey !== settledKey;
 
@@ -999,6 +1067,11 @@ function SandboxWorkspace({
     const next = inputPosition(SLIDERS[field], raw);
     if (next === null) return;
     setPositions((previous) => (previous[field] === next ? previous : { ...previous, [field]: next }));
+    // Moving a slider releases its held preset value, so it is serialized from its position from
+    // now on; the other sliders keep theirs.
+    setHeldValues((previous) =>
+      previous[field] === null ? previous : { ...previous, [field]: null },
+    );
   }, []);
 
   const handleTextChange = useCallback((field: TextField, value: string): void => {
@@ -1042,6 +1115,7 @@ function SandboxWorkspace({
                   field={field}
                   inputId={`${idPrefix}-${field}`}
                   position={positions[field]}
+                  value={sliderValue(positions, heldValues, field)}
                   error={fieldError(field)}
                   onPositionChange={handlePositionChange}
                 />

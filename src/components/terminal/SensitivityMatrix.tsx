@@ -131,13 +131,16 @@ function toneClass(cell: SensitivityCell, offerPriceKes: DecimalString): string 
 
 /**
  * Explanation of a cell, its pointer tooltip (`title`) and, for a null or flagged cell, its
- * keyboard tooltip: the reason codes of a null cell, otherwise the upside and any flags.
+ * keyboard tooltip: the reason codes of a null cell, otherwise the signed upside against the
+ * offer and any flags. A negative upside is labelled "Downside" and any other (zero, positive, or
+ * not comparable exactly) "Upside", the same wording as the sandbox's upside card.
  */
 function cellTitle(cell: SensitivityCell, offerText: string): string {
   const flags = cell.flags.join(", ");
   if (cell.fair_value_per_share_kes === null) return flags === "" ? "Not computable" : flags;
+  const label = compareDecimal(cell.upside_pct, "0") === -1 ? "Downside" : "Upside";
   const upsideText = formatDecimal(cell.upside_pct, "pct", { signed: true });
-  const upside = `Upside ${upsideText} against offer KES ${offerText}`;
+  const upside = `${label} ${upsideText} vs offer KES ${offerText}`;
   return flags === "" ? upside : `${upside}; ${flags}`;
 }
 
