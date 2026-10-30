@@ -142,10 +142,13 @@ npm run test:e2e
   `pytest backend/tests -m live` to hit the real public sources.
 - Integration tests need PostgreSQL at `TERMINAL_TEST_DATABASE_URL`. They use its administrative
   database `opennse_test` (created by `docker/postgres-init.sql`) only to create and drop their own
-  template and clone databases, so the role needs `CREATEDB`. They do not depend on the seed steps
-  above. pytest reads `TERMINAL_TEST_DATABASE_URL` only from the process environment, never from
-  `.env`, and uses the compose server's `opennse_test` when it is unset or empty; to test against
-  another server, set it on the pytest command line or export it, as shown under
+  template and clone databases, so the role needs `CREATEDB`. At session start they also drop what
+  an earlier, killed session left: `opennse_test_template`, `opennse_test_<label>_<uuid8>` and
+  `opennse_iso_[<label>_]<uuid8>`. A second session on the same server would lose its databases
+  the same way, so run one pytest session per server at a time. They do not depend on the seed
+  steps above. pytest reads `TERMINAL_TEST_DATABASE_URL` only from the process environment, never
+  from `.env`, and uses the compose server's `opennse_test` when it is unset or empty; to test
+  against another server, set it on the pytest command line or export it, as shown under
   [Configuration](#configuration).
 - `npm run lint` runs ESLint, then `node scripts/check-terminal-boundary.mjs` (the widget import
   boundary), then the same script with `--self-test`.

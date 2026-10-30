@@ -29,9 +29,10 @@ key to ``terminal_equities.ticker`` in the models and in the offline DDL of the 
 history, at the head and at ``terminal_0001``. A last section, on the root conftest's
 ``database_factory`` and creating no host object, covers the lifecycle of the suite's own
 databases: the URLs the factory generates connect to the database they name, a database whose
-``CREATE DATABASE`` committed is dropped even when its creating call fails or is cancelled, and
-private factories create only empty databases, which migrate to head through those URLs. Each
-section opens with its own contract.
+``CREATE DATABASE`` committed is dropped even when its creating call fails or is cancelled, the
+databases a killed session left are reclaimed by a later session's factory, and private
+factories create only empty databases, which migrate to head through those URLs. Each section
+opens with its own contract.
 """
 
 from __future__ import annotations
@@ -879,16 +880,19 @@ def test_first_revision_ddl_keeps_its_shipped_ticker_fk_actions(
 # - a database whose ``CREATE DATABASE`` committed is dropped by ``close()`` even when the
 #   creating call then fails or is cancelled;
 # - a caller cancelled while its ``CREATE DATABASE`` is in flight raises ``CancelledError`` only
-#   once that statement has settled, so the database it leaves behind is tracked and dropped.
+#   once that statement has settled, so the database it leaves behind is tracked and dropped;
+# - the databases a killed session left, which no factory tracks any more, are reclaimed by a
+#   later factory, which keeps its own databases and every name the suite never generates.
 #
 # The factory class is reached as ``type(database_factory)``, because test modules never import
 # a conftest. Each test builds private factories over AUTOCOMMIT engines of its own and closes
-# them in ``finally``. A private factory only ever creates empty databases: the seeded
-# template's name is fixed, so a private factory that built it would destroy the session's
-# template.
+# them in ``finally``. A private factory only ever creates empty databases, copied from
+# ``template0`` under either name prefix: the seeded template's name is fixed, so a private
+# factory that built it would destroy the session's template.
 #
-# Only catalogue and server-function queries are written as SQL in this section; no table is
-# read or written.
+# Only catalogue and server-function queries, and the reclaim test's ``CREATE DATABASE`` and
+# ``DROP DATABASE`` statements, which spell out one fixed name literally, are written as SQL in
+# this section; nothing is interpolated into them, and no table is read or written.
 # ---------------------------------------------------------------------------------------------
 
 WAIT_SECONDS: Final[float] = 120.0
@@ -907,6 +911,20 @@ _CREATE_DATABASE: Final = re.compile(r'CREATE DATABASE "?(?P<name>[a-z0-9_]{1,63
 """A factory's ``CREATE DATABASE`` statement, capturing the generated database name."""
 
 _EXISTS_SQL: Final[str] = "SELECT 1 FROM pg_database WHERE datname = :name"
+
+_SEEDED_TEMPLATE: Final[str] = "opennse_test_template"
+"""The root conftest's fixed template name; a reclaim must keep it while this session owns it."""
+
+_KEPT_DATABASE: Final[str] = "opennse_test_reclaim_kept"
+"""A database name with the clone prefix but no ``_<uuid8>`` suffix, which a reclaim must keep.
+The name is fixed, so a run killed before its cleanup leaves no new name behind."""
+
+_DROP_KEPT_SQL: Final[str] = "DROP DATABASE IF EXISTS opennse_test_reclaim_kept WITH (FORCE)"
+"""Drops ``_KEPT_DATABASE``, which it names literally: a database name cannot be a bound
+parameter."""
+
+_CREATE_KEPT_SQL: Final[str] = "CREATE DATABASE opennse_test_reclaim_kept TEMPLATE template0"
+"""Creates ``_KEPT_DATABASE`` empty, naming it literally as ``_DROP_KEPT_SQL`` does."""
 
 _Execute = Callable[..., Awaitable[None]]
 """Signature of the factory's ``_execute(statement, **params)`` statement runner."""
@@ -932,7 +950,8 @@ class _Factory(Protocol):
     """The part of the root conftest's ``DatabaseFactory`` these tests use.
 
     ``_live`` (database name to handle engine) is what ``close()`` drops, and ``_execute`` runs
-    each administrative statement; the cancellation tests read the first and wrap the second.
+    each administrative statement; the cancellation tests read the first and wrap the second,
+    and the reclaim test removes names from the first and runs statements through the second.
     """
 
     _live: dict[str, AsyncEngine | None]
@@ -944,11 +963,17 @@ class _Factory(Protocol):
     def url_for(self, name: str) -> str:
         """The administrative URL pointed at database ``name``, password included."""
 
+    async def create_from_template(self, label: str, template: str | None = None) -> _Handle:
+        """Create ``opennse_test_<label>_<uuid8>`` as a copy of ``template``."""
+
     async def create_empty(self, label: str) -> _Handle:
         """Create the empty database ``opennse_iso_<label>_<uuid8>`` from ``template0``."""
 
     async def drop(self, handle: _Handle) -> None:
         """Dispose the handle's engine and drop its database."""
+
+    async def reclaim_orphans(self) -> list[str]:
+        """Drop the suite-named databases this factory does not track; return their names."""
 
     async def close(self) -> None:
         """Drop every database still tracked."""
@@ -1226,3 +1251,57 @@ async def test_caller_cancelled_during_create_waits_for_it_and_leaves_it_to_clos
                 if caller.done() and not caller.cancelled():
                     caller.exception()
                 await _drop_leftovers(factory, held)
+
+
+async def test_reclaim_drops_what_a_killed_session_left_and_nothing_else(
+    database_factory: _Factory,
+    make_settings: Callable[..., TerminalSettings],
+) -> None:
+    """``reclaim_orphans()`` drops exactly the databases a killed session left behind.
+
+    A private factory stands in for the killed session. It creates one database of each name
+    shape the suite generates: ``opennse_iso_<uuid8>``, ``opennse_iso_<label>_<uuid8>`` and
+    ``opennse_test_<label>_<uuid8>`` (copied from ``template0``, so the seeded template is never
+    touched). It then forgets them and disposes their engines, which is what SIGKILL leaves: the
+    databases exist and no factory tracks them. The session factory must drop and return those
+    three, and keep the empty database it created itself, a database whose name the suite never
+    generates, and the seeded template when this session has built it.
+    """
+    orphans: list[str] = []
+    async with (
+        _autocommit_engine(make_settings()) as engine,
+        _private_factory(type(database_factory), engine) as killed,
+    ):
+        own = await asyncio.wait_for(database_factory.create_empty("reclaim_own"), WAIT_SECONDS)
+        try:
+            handles = [
+                await asyncio.wait_for(killed.create_empty(""), WAIT_SECONDS),
+                await asyncio.wait_for(killed.create_empty("reclaim_orphan"), WAIT_SECONDS),
+                await asyncio.wait_for(
+                    killed.create_from_template("reclaim_orphan", "template0"), WAIT_SECONDS
+                ),
+            ]
+            for handle in handles:
+                orphans.append(handle.name)
+                await handle.engine.dispose()
+                del killed._live[handle.name]
+            # Precondition: one orphan of each generated shape.
+            assert re.fullmatch(r"opennse_iso_[0-9a-f]{8}", orphans[0]), orphans
+            assert re.fullmatch(r"opennse_iso_reclaim_orphan_[0-9a-f]{8}", orphans[1]), orphans
+            assert re.fullmatch(r"opennse_test_reclaim_orphan_[0-9a-f]{8}", orphans[2]), orphans
+            await killed._execute(_DROP_KEPT_SQL)
+            await killed._execute(_CREATE_KEPT_SQL)
+            template_present = await _exists(engine, _SEEDED_TEMPLATE)
+
+            reclaimed = await asyncio.wait_for(database_factory.reclaim_orphans(), WAIT_SECONDS)
+
+            assert sorted(reclaimed) == sorted(orphans)
+            assert [name for name in orphans if await _exists(engine, name)] == []
+            assert await _exists(engine, own.name)
+            assert await _exists(engine, _KEPT_DATABASE)
+            assert await _exists(engine, _SEEDED_TEMPLATE) == template_present
+        finally:
+            try:
+                await _drop_leftovers(killed, [*orphans, _KEPT_DATABASE])
+            finally:
+                await database_factory.drop(own)

@@ -20,15 +20,18 @@ Fixtures:
   the administrative connection only: it creates and drops databases and never holds data.
 - ``seeded_template`` is ``opennse_test_template``, migrated to head and seeded once per session.
 - ``database_factory`` creates seeded clones and empty databases, drops them, and drops whatever
-  is left at the end of the session.
+  is left at the end of the session. At session start it reclaims the clones, empty databases
+  and template an earlier, killed session left; like the fixed template name, this assumes one
+  pytest session per PostgreSQL server.
 - ``seeded_database`` is a fresh seeded clone per test, for code that opens its own connections
   (the advisory-lock and run-record connections of the ingestion runs) and so cannot run inside
   a rollback-wrapped session.
 
 Every test that requests a database fixture, directly or through another fixture, is marked
-``integration``, so ``pytest -m "not integration"`` runs without PostgreSQL. An unreachable
-server fails those tests with an explicit message and never skips them, because the coverage
-gates depend on them.
+``integration``, so ``pytest -m "not integration and not live"`` runs without PostgreSQL. The
+command restates ``not live`` because an ``-m`` on the command line replaces the
+``-m 'not live'`` default in ``addopts``. An unreachable server fails the ``integration`` tests
+with an explicit message and never skips them, because the coverage gates depend on them.
 
 These fixtures create and drop databases only. Every table comes from the terminal's own
 migrations, so no ``users``, ``auth`` or other non-``terminal_`` table is created here. Test
@@ -90,6 +93,15 @@ _SUFFIX_LENGTH: Final[int] = 8
 _DATABASE_NAME: Final = re.compile(r"[a-z0-9_]{1,63}")
 _NAME_PREFIX: Final = re.compile(r"[a-z][a-z0-9_]*")
 _UNSAFE_LABEL_CHARACTERS: Final = re.compile(r"[^a-z0-9_]")
+_GENERATED_NAME: Final = re.compile(
+    rf"(?:{re.escape(CLONE_PREFIX)}|{re.escape(EMPTY_PREFIX)})"
+    rf"_(?:[a-z0-9_]+_)?[0-9a-f]{{{_SUFFIX_LENGTH}}}"
+)
+"""A clone or empty-database name :func:`database_name` generates, label optional; matched with
+``fullmatch``. It rejects the administrative ``opennse_test`` and :data:`TEMPLATE_DATABASE`."""
+_LIST_DATABASES_SQL: Final[str] = (
+    "SELECT datname FROM pg_database WHERE datname <> current_database() ORDER BY datname"
+)
 
 _T = TypeVar("_T")
 
@@ -261,6 +273,11 @@ class DatabaseFactory:
     session, and cached; a failed build is cached too, so later requests fail at once instead of
     rebuilding. Empty databases are copied from ``template0``. Every database created here is
     tracked and dropped at the end of the session if a test left it behind.
+
+    A session that is killed outright (SIGKILL, a CI timeout) drops nothing, so
+    :meth:`reclaim_orphans`, run once at session start, drops the clones, empty databases and
+    template an earlier session left. Like the fixed template name, this assumes one pytest
+    session per PostgreSQL server: another session's databases would be dropped as leftovers.
 
     A database is tracked before its ``CREATE DATABASE`` runs, because that statement commits on
     its own and the call that issued it can still fail or be cancelled afterwards. Creating a
@@ -454,6 +471,49 @@ class DatabaseFactory:
         await self._execute(f"DROP DATABASE IF EXISTS {self._quote(name)} WITH (FORCE)")
         logger.info("dropped database %s", name)
 
+    async def reclaim_orphans(self) -> list[str]:
+        """Drop the databases an earlier, killed session left on the server; return their names.
+
+        It drops every database whose name has the shape :func:`database_name` gives clones and
+        empty databases, and :data:`TEMPLATE_DATABASE` while this factory has not created it,
+        except the databases this factory tracks. Nothing else is touched: not the administrative
+        database, not a development database, not a name this suite never generates. A database
+        that cannot be dropped is logged by name and error type and left; the others are dropped
+        regardless. It runs under the template lock, so it never drops a template being built.
+        """
+        async with self._template_lock:
+            async with self._admin.connect() as connection:
+                result = await connection.execute(text(_LIST_DATABASES_SQL))
+                present: list[str] = list(result.scalars())
+            candidates = [
+                name
+                for name in present
+                if name not in self._live
+                and (
+                    _GENERATED_NAME.fullmatch(name) is not None
+                    or (name == TEMPLATE_DATABASE and not self._template_created)
+                )
+            ]
+            dropped: list[str] = []
+            for name in candidates:
+                try:
+                    await self._drop_database(name)
+                except Exception as exc:
+                    logger.warning(
+                        "could not reclaim test database %s left by an earlier session: %s",
+                        name,
+                        type(exc).__name__,
+                    )
+                else:
+                    dropped.append(name)
+            if dropped:
+                logger.info(
+                    "reclaimed %d test database(s) left by an earlier session: %s",
+                    len(dropped),
+                    ", ".join(dropped),
+                )
+            return dropped
+
     async def close(self) -> None:
         """Drop every database still tracked, then the template; re-raise the first failure.
 
@@ -530,9 +590,15 @@ async def admin_engine() -> AsyncIterator[AsyncEngine]:
 
 @pytest_asyncio.fixture(scope="session")
 async def database_factory(admin_engine: AsyncEngine) -> AsyncIterator[DatabaseFactory]:
-    """The session's :class:`DatabaseFactory`; leftover databases are dropped at session end."""
+    """The session's :class:`DatabaseFactory`; leftover databases are dropped at session end.
+
+    Before it is handed out, it reclaims what an earlier, killed session left behind
+    (:meth:`DatabaseFactory.reclaim_orphans`), so crash leftovers never accumulate on the server.
+    Like the fixed template name, this assumes one pytest session per PostgreSQL server.
+    """
     factory = DatabaseFactory(admin_engine)
     try:
+        await factory.reclaim_orphans()
         yield factory
     finally:
         await factory.close()
