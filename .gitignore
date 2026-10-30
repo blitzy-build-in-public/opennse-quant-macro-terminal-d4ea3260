@@ -1,0 +1,41 @@
+# Recorded source fixtures (backend/tests/fixtures/: HTML, CSV, PDF) and the exchange-closure
+# package data (backend/opennse_terminal/ingestion/data/nse_closures.csv) are tracked on purpose.
+# Never add *.pdf, *.csv, *.html, fixtures/ or data/ patterns here. package-lock.json is committed.
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Node / Next.js (unanchored, so e2e/host-fixture/.next/ and its next-env.d.ts match too)
+node_modules/
+.next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+npm-debug.log*
+
+# Playwright
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
+# Python (dist/ holds the wheel built by the packaging check)
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# OS / editor
+.DS_Store
+*.swp

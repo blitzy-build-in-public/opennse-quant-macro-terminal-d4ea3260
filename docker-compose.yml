@@ -1,0 +1,45 @@
+# OpenNSE Quant & Macro Terminal: PostgreSQL 17 for local development and tests.
+#
+# Development and test database only; this is not a production deployment. The API, scheduler
+# and Next.js processes run on the host (see README.md), so no application service is declared.
+#
+#   docker compose up -d --wait postgres
+#   docker compose exec postgres pg_isready -U opennse
+#
+# opennse/opennse are throwaway development credentials and must match TERMINAL_DATABASE_URL
+# and TERMINAL_TEST_DATABASE_URL in .env.example. POSTGRES_USER is the container superuser, so it
+# holds the CREATEDB the integration suite needs for its template and clone databases.
+name: opennse-terminal
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: opennse
+      POSTGRES_PASSWORD: opennse
+      POSTGRES_DB: opennse
+    ports:
+      # Loopback only, so the throwaway superuser credentials above are unreachable from other
+      # hosts. Remote access is an explicit opt-in: a compose override file that replaces this
+      # list (ports: !override), used only with secured, non-default credentials.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - opennse-pgdata:/var/lib/postgresql/data
+      # Creates opennse_test. The entrypoint runs init scripts only when it initialises an empty
+      # data volume; to run it again, recreate the volume (erases data): docker compose down -v
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      # Probes TCP, not the Unix socket. On first boot the entrypoint runs a temporary server that
+      # serves only the socket while it runs the init scripts; TCP 5432 is served only by the final
+      # server, which starts after 01-init.sql has created opennse_test. So the container turns
+      # healthy, and up -d --wait returns, only once the final server is up. pg_isready itself
+      # does not check that the database named by -d exists.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U opennse -d opennse_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  opennse-pgdata: {}

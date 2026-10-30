@@ -1,0 +1,36 @@
+-- OpenNSE Terminal: PostgreSQL 17 development and test database initialisation.
+--
+-- Purpose
+--   Creates `opennse_test`, the administrative database that
+--   TERMINAL_TEST_DATABASE_URL points at. The integration suite
+--   (backend/tests/integration/conftest.py) connects here only to create and
+--   drop its own databases: the migrated and seeded `opennse_test_template`,
+--   the per-module and per-test clones made from it, and the empty isolation
+--   databases made from template0. None of those are created by this script.
+--
+-- When it runs
+--   docker-compose.yml mounts this file read-only as
+--   /docker-entrypoint-initdb.d/01-init.sql. The postgres:17 entrypoint runs it
+--   automatically, once, on the first initialisation of an empty data volume,
+--   through psql with ON_ERROR_STOP as POSTGRES_USER `opennse` (a superuser,
+--   so it holds CREATEDB) while connected to POSTGRES_DB `opennse`. The image
+--   creates `opennse` itself, so it is deliberately not created here.
+--
+-- Re-running it
+--   Recreate the volume, which also erases the `opennse` development data:
+--     docker compose down -v && docker compose up -d postgres
+--   Or, keeping an existing volume:
+--     docker compose exec postgres createdb -U opennse opennse_test
+--
+-- Scope
+--   Development and test only. This script creates no tables, schemas, roles,
+--   grants, extensions, users or auth objects, and loads no data. Every
+--   `terminal_` table comes from `opennse-terminal migrate upgrade head`, the
+--   Alembic history in backend/opennse_terminal/migrations/; seed data comes
+--   from the seeder.
+--
+-- CREATE DATABASE cannot run inside a transaction block, so the statement is
+-- left bare for psql to autocommit. Owner, encoding, locale and template
+-- (template1) stay at the image defaults.
+
+CREATE DATABASE opennse_test;

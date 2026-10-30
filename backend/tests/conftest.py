@@ -1,0 +1,643 @@
+"""Root pytest configuration: fixture paths, hermetic settings and lazy PostgreSQL primitives.
+
+Why the database primitives live here. The test plan puts the database lifecycle in
+``integration/conftest.py`` and has this root conftest register nothing that needs a database.
+The CBK pipeline tests and the CSV/Excel importer tests under ``unit/ingestion/`` also run full
+pipelines that write rows and record runs in PostgreSQL, and pytest offers a sub-directory
+conftest's fixtures only to the tests beneath it. The shared primitives are therefore defined
+here, and they are lazy: nothing connects to PostgreSQL until a test requests one of
+:data:`DATABASE_FIXTURES`, so pure unit tests stay database-free. ``integration/conftest.py``
+builds the integration-only scopes on top of them: module clones, rollback-wrapped sessions,
+empty isolation databases and the ASGI client.
+
+Fixtures:
+
+- ``fixtures_dir``, ``fixture_bytes`` and ``fixture_text`` read recorded source content under
+  ``tests/fixtures/``.
+- ``make_settings`` and ``test_settings`` build ``TerminalSettings`` from explicit values only,
+  so neither the developer's ``.env`` nor ``TERMINAL_*`` variables leak into a test.
+- ``admin_engine`` is an AUTOCOMMIT engine on ``TERMINAL_TEST_DATABASE_URL``. That database is
+  the administrative connection only: it creates and drops databases and never holds data.
+- ``seeded_template`` is ``opennse_test_template``, migrated to head and seeded once per session.
+- ``database_factory`` creates seeded clones and empty databases, drops them, and drops whatever
+  is left at the end of the session. At session start it reclaims the clones, empty databases
+  and template an earlier, killed session left; like the fixed template name, this assumes one
+  pytest session per PostgreSQL server.
+- ``seeded_database`` is a fresh seeded clone per test, for code that opens its own connections
+  (the advisory-lock and run-record connections of the ingestion runs) and so cannot run inside
+  a rollback-wrapped session.
+
+Every test that requests a database fixture, directly or through another fixture, is marked
+``integration``, so ``pytest -m "not integration and not live"`` runs without PostgreSQL. The
+command restates ``not live`` because an ``-m`` on the command line replaces the
+``-m 'not live'`` default in ``addopts``. An unreachable server fails the ``integration`` tests
+with an explicit message and never skips them, because the coverage gates depend on them.
+
+These fixtures create and drop databases only. Every table comes from the terminal's own
+migrations, so no ``users``, ``auth`` or other non-``terminal_`` table is created here. Test
+modules reach everything through fixtures and never import this module.
+"""
+
+import asyncio
+import logging
+import os
+import re
+import time
+import uuid
+from collections.abc import AsyncIterator, Callable, Coroutine
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Final, Protocol, TypeVar
+
+import pytest
+import pytest_asyncio
+from sqlalchemy import text
+from sqlalchemy.engine import URL
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+from opennse_terminal.config import TerminalSettings
+from opennse_terminal.db.session import build_engine, database_log_label, dispose_terminal_engine
+from opennse_terminal.migrations import run_upgrade
+from opennse_terminal.seed.seed_terminal_db import run_seed
+
+logger = logging.getLogger("tests.conftest")
+
+FIXTURES: Final[Path] = Path(__file__).parent / "fixtures"
+"""Root of the recorded source fixtures (``nse/``, ``cbk/``, ``files/``)."""
+
+DEFAULT_TEST_DATABASE_URL: Final[str] = (
+    "postgresql+asyncpg://opennse:opennse@localhost:5432/opennse_test"
+)
+"""Administrative database used when ``TERMINAL_TEST_DATABASE_URL`` is unset. It is created by
+``docker/postgres-init.sql``; the credentials are those of the throwaway development container."""
+
+TEMPLATE_DATABASE: Final[str] = "opennse_test_template"
+"""The migrated and seeded template every seeded clone is copied from."""
+
+CLONE_PREFIX: Final[str] = "opennse_test"
+"""Name prefix of seeded clones: ``opennse_test_<label>_<uuid8>``."""
+
+EMPTY_PREFIX: Final[str] = "opennse_iso"
+"""Name prefix of empty databases copied from ``template0``: ``opennse_iso_<label>_<uuid8>``."""
+
+DATABASE_FIXTURES: Final[frozenset[str]] = frozenset(
+    {"admin_engine", "seeded_template", "database_factory", "seeded_database"}
+)
+"""Fixtures that need PostgreSQL; a test depending on any of them is marked ``integration``."""
+
+ADMIN_CONNECT_TIMEOUT_SECONDS: Final[float] = 10.0
+"""asyncpg's connect timeout for administrative connections, so a missing server fails fast."""
+
+_MAX_IDENTIFIER_LENGTH: Final[int] = 63
+_SUFFIX_LENGTH: Final[int] = 8
+_DATABASE_NAME: Final = re.compile(r"[a-z0-9_]{1,63}")
+_NAME_PREFIX: Final = re.compile(r"[a-z][a-z0-9_]*")
+_UNSAFE_LABEL_CHARACTERS: Final = re.compile(r"[^a-z0-9_]")
+_GENERATED_NAME: Final = re.compile(
+    rf"(?:{re.escape(CLONE_PREFIX)}|{re.escape(EMPTY_PREFIX)})"
+    rf"_(?:[a-z0-9_]+_)?[0-9a-f]{{{_SUFFIX_LENGTH}}}"
+)
+"""A clone or empty-database name :func:`database_name` generates, label optional; matched with
+``fullmatch``. It rejects the administrative ``opennse_test`` and :data:`TEMPLATE_DATABASE`."""
+_LIST_DATABASES_SQL: Final[str] = (
+    "SELECT datname FROM pg_database WHERE datname <> current_database() ORDER BY datname"
+)
+
+_T = TypeVar("_T")
+
+
+def test_database_url() -> str:
+    """Return the administrative database URL: ``TERMINAL_TEST_DATABASE_URL``, or the default.
+
+    An empty variable counts as unset. ``.env`` is not read: the backend ignores this key there,
+    and the suite must not silently follow a developer's file.
+    """
+    return os.environ.get("TERMINAL_TEST_DATABASE_URL") or DEFAULT_TEST_DATABASE_URL
+
+
+def build_test_settings(**overrides: Any) -> TerminalSettings:
+    """Build ``TerminalSettings`` from explicit values only.
+
+    Every field is passed as a keyword argument, which outranks environment variables in
+    pydantic-settings, and ``_env_file=None`` keeps ``.env`` out. The values are the documented
+    defaults, except ``database_url`` (:func:`test_database_url`) and a test scraper contact.
+    ``overrides`` replace any of them; an unknown name raises ``TypeError``, because the settings
+    ignore extra keys and a misspelt override would otherwise be dropped silently.
+    """
+    unknown = sorted(set(overrides) - set(TerminalSettings.model_fields))
+    if unknown:
+        raise TypeError(f"unknown TerminalSettings field(s): {', '.join(unknown)}")
+    values: dict[str, Any] = {
+        "database_url": test_database_url(),
+        "default_owner_key": "local",
+        "timezone": "Africa/Nairobi",
+        "fundamentals_lag_days": 90,
+        "scraper_contact": "tests@example.invalid",
+        "scraper_min_interval_seconds": 2.0,
+        "scraper_timeout_seconds": 30,
+        "scraper_max_retries": 3,
+        "pdf_max_bytes": 20_971_520,
+        "pdf_max_pages": 400,
+        "pdf_max_concurrency": 2,
+    }
+    values.update(overrides)
+    # _env_file rides in the mapping because type checkers model the constructor on the fields
+    # alone and would reject it as a literal keyword.
+    return TerminalSettings(**{"_env_file": None, **values})
+
+
+def _fixture_path(relative: str | os.PathLike[str]) -> Path:
+    """Resolve ``relative`` under :data:`FIXTURES`, refusing paths that leave it."""
+    root = FIXTURES.resolve()
+    candidate = (root / relative).resolve()
+    shown = os.fspath(relative)
+    if not candidate.is_relative_to(root):
+        raise ValueError(f"fixture path {shown!r} resolves outside {root}")
+    if not candidate.is_file():
+        raise FileNotFoundError(f"test fixture {shown!r} not found under {root}")
+    return candidate
+
+
+def read_fixture_bytes(relative: str | os.PathLike[str]) -> bytes:
+    """Return the bytes of the fixture at ``relative`` (for example ``"cbk/fx_end_period.csv"``)."""
+    return _fixture_path(relative).read_bytes()
+
+
+def read_fixture_text(relative: str | os.PathLike[str], encoding: str = "utf-8") -> str:
+    """Return the fixture at ``relative`` decoded with ``encoding``."""
+    return _fixture_path(relative).read_text(encoding=encoding)
+
+
+class FixtureTextReader(Protocol):
+    """Signature of the ``fixture_text`` fixture's reader."""
+
+    def __call__(self, relative: str | os.PathLike[str], encoding: str = "utf-8") -> str: ...
+
+
+@pytest.fixture(scope="session")
+def fixtures_dir() -> Path:
+    """The recorded-fixture root, ``backend/tests/fixtures``."""
+    return FIXTURES
+
+
+@pytest.fixture(scope="session")
+def fixture_bytes() -> Callable[[str | os.PathLike[str]], bytes]:
+    """Reader of fixture bytes by path relative to ``fixtures_dir``.
+
+    Raises ``FileNotFoundError`` naming a missing fixture and ``ValueError`` for a path that
+    resolves outside the fixture root.
+    """
+    return read_fixture_bytes
+
+
+@pytest.fixture(scope="session")
+def fixture_text() -> FixtureTextReader:
+    """Reader of fixture text, ``(relative, encoding="utf-8") -> str``.
+
+    Raises the same errors as ``fixture_bytes``.
+    """
+    return read_fixture_text
+
+
+@pytest.fixture(scope="session")
+def make_settings() -> Callable[..., TerminalSettings]:
+    """Factory ``(**overrides) -> TerminalSettings`` that never reads ``.env`` or the environment.
+
+    For example ``make_settings(database_url=handle.url, pdf_max_bytes=1024)``.
+    """
+    return build_test_settings
+
+
+@pytest.fixture
+def test_settings() -> TerminalSettings:
+    """A fresh ``make_settings()`` per test, pointing at the administrative test database."""
+    return build_test_settings()
+
+
+# ---------------------------------------------------------------------------------------------
+# PostgreSQL primitives (lazy: nothing below runs unless a test requests a database fixture)
+# ---------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DatabaseHandle:
+    """A database created for tests, with the settings and the engine that address it.
+
+    ``engine`` is owned by the factory that created the handle and is disposed when the database
+    is dropped. ``url`` carries the password, so it is left out of ``repr()`` and therefore out of
+    assertion and traceback output.
+    """
+
+    name: str
+    url: str = field(repr=False)
+    settings: TerminalSettings
+    engine: AsyncEngine
+
+
+def database_name(prefix: str, label: str) -> str:
+    """Return a unique PostgreSQL database name ``<prefix>_<label>_<uuid8>``.
+
+    The label is lowercased, every character outside ``[a-z0-9_]`` becomes ``_``, and it is
+    shortened so the name fits PostgreSQL's 63-byte identifier limit; an empty label is left out.
+    ``prefix`` must be a lowercase identifier (``ValueError`` otherwise). The result always
+    matches ``[a-z0-9_]{1,63}``, so it can be quoted into ``CREATE DATABASE`` safely: database
+    identifiers cannot be bound parameters.
+    """
+    if not _NAME_PREFIX.fullmatch(prefix):
+        raise ValueError(f"database name prefix must match {_NAME_PREFIX.pattern}: {prefix!r}")
+    fixed = len(prefix) + 1 + _SUFFIX_LENGTH
+    if fixed > _MAX_IDENTIFIER_LENGTH:
+        raise ValueError(f"database name prefix is too long: {prefix!r}")
+    budget = max(0, _MAX_IDENTIFIER_LENGTH - fixed - 1)
+    cleaned = _UNSAFE_LABEL_CHARACTERS.sub("_", label.lower()).strip("_")[:budget].rstrip("_")
+    suffix = uuid.uuid4().hex[:_SUFFIX_LENGTH]
+    name = "_".join(part for part in (prefix, cleaned, suffix) if part)
+    assert _DATABASE_NAME.fullmatch(name), name
+    return name
+
+
+def _unreachable_message(url: str | URL, exc: BaseException) -> str:
+    # database_log_label names only the database, host and port: the URL's password and query
+    # values (asyncpg also accepts ?password=...) never reach the test report.
+    return (
+        f"PostgreSQL not reachable at {database_log_label(url)} ({type(exc).__name__}); "
+        "run `docker compose up -d postgres`, or point TERMINAL_TEST_DATABASE_URL at a running "
+        "server whose role holds CREATEDB"
+    )
+
+
+class DatabaseFactory:
+    """Creates and drops the suite's databases on the administrative server.
+
+    Seeded clones are copied from :data:`TEMPLATE_DATABASE`, which is built on first use, once per
+    session, and cached; a failed build is cached too, so later requests fail at once instead of
+    rebuilding. Empty databases are copied from ``template0``. Every database created here is
+    tracked and dropped at the end of the session if a test left it behind.
+
+    A session that is killed outright (SIGKILL, a CI timeout) drops nothing, so
+    :meth:`reclaim_orphans`, run once at session start, drops the clones, empty databases and
+    template an earlier session left. Like the fixed template name, this assumes one pytest
+    session per PostgreSQL server: another session's databases would be dropped as leftovers.
+
+    A database is tracked before its ``CREATE DATABASE`` runs, because that statement commits on
+    its own and the call that issued it can still fail or be cancelled afterwards. Creating a
+    database, and building the template, run to completion even when their caller is cancelled
+    meanwhile, and :meth:`close` waits for them, so nothing is dropped while it is still being
+    created, migrated or seeded.
+    """
+
+    def __init__(self, admin_engine: AsyncEngine) -> None:
+        self._admin = admin_engine
+        self._preparer = admin_engine.dialect.identifier_preparer
+        # Database name -> its handle's engine; None from just before CREATE DATABASE until the
+        # engine exists, and for good when the creating call failed or was cancelled.
+        self._live: dict[str, AsyncEngine | None] = {}
+        # Creation work that has not settled yet; see _run_to_completion.
+        self._in_flight: set[asyncio.Task[Any]] = set()
+        self._template_lock = asyncio.Lock()
+        self._template_created = False
+        self._template_ready = False
+        self._template_failure: str | None = None
+
+    def url_for(self, name: str) -> str:
+        """The administrative URL pointed at database ``name``, password included.
+
+        The URL's ``database`` query option is removed and every other query option, such as a
+        Unix-socket ``host`` directory, is kept. asyncpg applies query options after the URL path,
+        so an administrative URL such as ``.../postgres?database=opennse_test`` would otherwise
+        connect every template, clone and empty database URL to the administrative database and
+        write their tables and rows there.
+        """
+        url = self._admin.url.set(database=name).difference_update_query(["database"])
+        return url.render_as_string(hide_password=False)
+
+    def _quote(self, name: str) -> str:
+        if not _DATABASE_NAME.fullmatch(name):
+            raise ValueError(f"not a database name this suite creates: {name!r}")
+        return self._preparer.quote(name)
+
+    async def _execute(self, statement: str, **params: object) -> None:
+        async with self._admin.connect() as connection:
+            await connection.execute(text(statement), params)
+
+    async def _run_to_completion(self, work: Coroutine[Any, Any, _T], action: str) -> _T:
+        """Await ``work`` in a task of its own that the caller's cancellation does not stop.
+
+        Cancelling a caller half-way through ``CREATE DATABASE`` leaves it unknown whether the
+        database exists, and the template's migration runs in a thread that cancellation cannot
+        stop at all. A cancelled caller therefore keeps waiting until ``work`` has settled and
+        only then raises its ``CancelledError``; a failure of ``work`` is then logged by type,
+        since the cancellation takes precedence. Otherwise ``work``'s result is returned, or its
+        exception (its own ``CancelledError`` included) raised. ``action`` names the work in that
+        log record and must not hold a URL. The task stays in ``_in_flight`` until it settles,
+        which :meth:`close` waits for.
+        """
+        task = asyncio.create_task(work)
+        self._in_flight.add(task)
+        task.add_done_callback(self._in_flight.discard)
+        interrupted: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                # asyncio.wait neither cancels the task it waits for nor raises its exception, so
+                # a CancelledError here is always the caller's own.
+                await asyncio.wait((task,))
+            except asyncio.CancelledError as exc:
+                interrupted = exc
+        if interrupted is None:
+            return task.result()
+        # The outcome is retrieved either way, so asyncio never reports it as unretrieved.
+        if not task.cancelled() and (failure := task.exception()) is not None:
+            logger.error(
+                "%s failed after its caller was cancelled: %s", action, type(failure).__name__
+            )
+        raise interrupted
+
+    async def seeded_template(self) -> str:
+        """Return :data:`TEMPLATE_DATABASE`, building it on the first call of the session."""
+        async with self._template_lock:
+            if not self._template_ready and self._template_failure is None:
+                # The build records its own outcome, so a caller cancelled during it neither
+                # discards a finished template nor skips caching a failed one.
+                await self._run_to_completion(
+                    self._record_template_build(), f"building {TEMPLATE_DATABASE}"
+                )
+            if self._template_failure is not None:
+                pytest.fail(self._template_failure, pytrace=False)
+            return TEMPLATE_DATABASE
+
+    async def _record_template_build(self) -> None:
+        """Build the template, then mark it ready or cache the failure that later calls repeat.
+
+        The first failure's exception propagates unchanged; a seeding failure, reported as a
+        message, is cached and raised by :meth:`seeded_template` with ``pytest.fail``.
+        """
+        try:
+            failure = await self._build_template()
+        except Exception as exc:
+            self._template_failure = (
+                f"building {TEMPLATE_DATABASE} failed earlier in this session "
+                f"({type(exc).__name__})"
+            )
+            raise
+        if failure is not None:
+            self._template_failure = failure
+        else:
+            self._template_ready = True
+
+    async def _build_template(self) -> str | None:
+        """Create, migrate and seed the template; return a failure message or ``None``."""
+        started = time.perf_counter()
+        quoted = self._quote(TEMPLATE_DATABASE)
+        logger.info("building seeded template database %s", TEMPLATE_DATABASE)
+        await self._execute(f"DROP DATABASE IF EXISTS {quoted} WITH (FORCE)")
+        # Recorded first: CREATE DATABASE commits before its connection is released, and a
+        # failure in between must still leave the template to close(). Dropping a template that
+        # was never created is harmless there (DROP DATABASE IF EXISTS).
+        self._template_created = True
+        await self._execute(f"CREATE DATABASE {quoted}")
+        url = self.url_for(TEMPLATE_DATABASE)
+        # env.py drives its own engine with asyncio.run, so the upgrade runs off this loop.
+        await asyncio.to_thread(run_upgrade, url, "head")
+        exit_code = await run_seed(build_test_settings(database_url=url))
+        if exit_code != 0:
+            return (
+                f"seeding {TEMPLATE_DATABASE} exited with code {exit_code}; "
+                "see the captured stderr and log output"
+            )
+        # run_seed disposes its own engine; engines cached by session_factory are released too.
+        await dispose_terminal_engine()
+        # CREATE DATABASE ... TEMPLATE fails while the template has any connection. Refusing new
+        # connections and ending the remaining ones keeps every later clone from tripping on
+        # one; DROP DATABASE and cloning both work on a database that refuses connections.
+        await self._execute(f"ALTER DATABASE {quoted} WITH ALLOW_CONNECTIONS false")
+        await self._execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = :name AND pid <> pg_backend_pid()",
+            name=TEMPLATE_DATABASE,
+        )
+        logger.info(
+            "seeded template database %s ready in %.1f s",
+            TEMPLATE_DATABASE,
+            time.perf_counter() - started,
+        )
+        return None
+
+    async def create_from_template(self, label: str, template: str | None = None) -> DatabaseHandle:
+        """Create ``opennse_test_<label>_<uuid8>`` as a copy of ``template``.
+
+        ``template`` defaults to the seeded template, which is built first if this session has
+        not built it yet.
+        """
+        source = template if template is not None else TEMPLATE_DATABASE
+        if source == TEMPLATE_DATABASE:
+            source = await self.seeded_template()
+        return await self._create(CLONE_PREFIX, label, source)
+
+    async def create_empty(self, label: str) -> DatabaseHandle:
+        """Create the empty database ``opennse_iso_<label>_<uuid8>`` from ``template0``."""
+        return await self._create(EMPTY_PREFIX, label, "template0")
+
+    async def _create(self, prefix: str, label: str, template: str) -> DatabaseHandle:
+        name = database_name(prefix, label)
+        statement = f"CREATE DATABASE {self._quote(name)} TEMPLATE {self._quote(template)}"
+        # Tracked before the statement runs: it commits before its connection is released, and
+        # a failure or cancellation in between must still leave the database to close(), which
+        # drops a name that was never created harmlessly (DROP DATABASE IF EXISTS).
+        self._live[name] = None
+        await self._run_to_completion(self._execute(statement), f"creating database {name}")
+        url = self.url_for(name)
+        settings = build_test_settings(database_url=url)
+        engine = build_engine(settings)
+        self._live[name] = engine
+        logger.info("created database %s from %s", name, template)
+        return DatabaseHandle(name=name, url=url, settings=settings, engine=engine)
+
+    async def drop(self, handle: DatabaseHandle) -> None:
+        """Dispose ``handle.engine``, then drop its database; dropping twice is harmless.
+
+        Only clones and empty databases can be dropped this way (``ValueError`` otherwise), so a
+        hand-built handle can never remove the template, the administrative database or a
+        shared development database.
+        """
+        name = handle.name
+        droppable = name.startswith((f"{CLONE_PREFIX}_", f"{EMPTY_PREFIX}_"))
+        if name == TEMPLATE_DATABASE or not droppable:
+            raise ValueError(f"refusing to drop a database this factory does not create: {name!r}")
+        await handle.engine.dispose()
+        await self._drop_database(name)
+        self._live.pop(name, None)
+
+    async def _drop_database(self, name: str) -> None:
+        await self._execute(f"DROP DATABASE IF EXISTS {self._quote(name)} WITH (FORCE)")
+        logger.info("dropped database %s", name)
+
+    async def reclaim_orphans(self) -> list[str]:
+        """Drop the databases an earlier, killed session left on the server; return their names.
+
+        It drops every database whose name has the shape :func:`database_name` gives clones and
+        empty databases, and :data:`TEMPLATE_DATABASE` while this factory has not created it,
+        except the databases this factory tracks. Nothing else is touched: not the administrative
+        database, not a development database, not a name this suite never generates. A database
+        that cannot be dropped is logged by name and error type and left; the others are dropped
+        regardless. It runs under the template lock, so it never drops a template being built.
+        """
+        async with self._template_lock:
+            async with self._admin.connect() as connection:
+                result = await connection.execute(text(_LIST_DATABASES_SQL))
+                present: list[str] = list(result.scalars())
+            candidates = [
+                name
+                for name in present
+                if name not in self._live
+                and (
+                    _GENERATED_NAME.fullmatch(name) is not None
+                    or (name == TEMPLATE_DATABASE and not self._template_created)
+                )
+            ]
+            dropped: list[str] = []
+            for name in candidates:
+                try:
+                    await self._drop_database(name)
+                except Exception as exc:
+                    logger.warning(
+                        "could not reclaim test database %s left by an earlier session: %s",
+                        name,
+                        type(exc).__name__,
+                    )
+                else:
+                    dropped.append(name)
+            if dropped:
+                logger.info(
+                    "reclaimed %d test database(s) left by an earlier session: %s",
+                    len(dropped),
+                    ", ".join(dropped),
+                )
+            return dropped
+
+    async def close(self) -> None:
+        """Drop every database still tracked, then the template; re-raise the first failure.
+
+        It first waits for a template build and for any creation still in flight, whose caller
+        was cancelled but whose ``CREATE DATABASE`` or migration has not finished: dropping
+        before then would miss a database committed a moment later.
+        """
+        async with self._template_lock:
+            if self._in_flight:
+                # The creating callers retrieve the outcomes; this only waits for them.
+                await asyncio.wait(set(self._in_flight))
+            await self._drop_everything()
+
+    async def _drop_everything(self) -> None:
+        """The body of :meth:`close`, run once nothing is being created any more."""
+        first_error: Exception | None = None
+        # Engines cached by session_factory (the API's default session provider) may point at
+        # these databases; they are released before the databases disappear under them.
+        try:
+            await dispose_terminal_engine()
+        except Exception as exc:
+            first_error = exc
+        leftovers = list(self._live.items())
+        self._live.clear()
+        names = [name for name, _engine in leftovers]
+        if self._template_created:
+            names.append(TEMPLATE_DATABASE)
+        for _name, engine in leftovers:
+            if engine is not None:
+                try:
+                    await engine.dispose()
+                except Exception as exc:
+                    first_error = first_error or exc
+        for name in names:
+            try:
+                await self._drop_database(name)
+            except Exception as exc:
+                logger.error("could not drop test database %s: %s", name, type(exc).__name__)
+                first_error = first_error or exc
+        self._template_created = False
+        if first_error is not None:
+            raise first_error
+
+
+@pytest_asyncio.fixture(scope="session")
+async def admin_engine() -> AsyncIterator[AsyncEngine]:
+    """AUTOCOMMIT engine on the administrative test database (``CREATE DATABASE`` needs it).
+
+    Fails, never skips, every requesting test when the server cannot be reached.
+    """
+    settings = build_test_settings()
+    engine = build_engine(
+        settings,
+        isolation_level="AUTOCOMMIT",
+        connect_args={"timeout": ADMIN_CONNECT_TIMEOUT_SECONDS},
+    )
+    try:
+        failure: str | None = None
+        try:
+            async with engine.connect() as connection:
+                await connection.execute(text("SELECT 1"))
+        except Exception as exc:
+            # asyncpg's connect errors (refused, timeout, bad password, missing database) reach
+            # here unwrapped by SQLAlchemy. Failing outside this block keeps the original
+            # traceback, whose frames show the connection parameters and password, out of the
+            # report.
+            failure = _unreachable_message(settings.database_url, exc)
+        if failure is not None:
+            pytest.fail(failure, pytrace=False)
+        yield engine
+    finally:
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture(scope="session")
+async def database_factory(admin_engine: AsyncEngine) -> AsyncIterator[DatabaseFactory]:
+    """The session's :class:`DatabaseFactory`; leftover databases are dropped at session end.
+
+    Before it is handed out, it reclaims what an earlier, killed session left behind
+    (:meth:`DatabaseFactory.reclaim_orphans`), so crash leftovers never accumulate on the server.
+    Like the fixed template name, this assumes one pytest session per PostgreSQL server.
+    """
+    factory = DatabaseFactory(admin_engine)
+    try:
+        await factory.reclaim_orphans()
+        yield factory
+    finally:
+        await factory.close()
+
+
+@pytest_asyncio.fixture(scope="session")
+async def seeded_template(database_factory: DatabaseFactory) -> str:
+    """Name of the migrated and seeded template, built once per session and dropped at its end."""
+    return await database_factory.seeded_template()
+
+
+@pytest_asyncio.fixture
+async def seeded_database(
+    request: pytest.FixtureRequest,
+    database_factory: DatabaseFactory,
+    seeded_template: str,
+) -> AsyncIterator[DatabaseHandle]:
+    """A fresh seeded clone for one test, dropped afterwards.
+
+    For tests whose code under test opens its own connections, such as the advisory-lock
+    connection and the separate run-record connection of an ingestion run, which an outer
+    rollback transaction cannot wrap.
+    """
+    label = request.module.__name__.rpartition(".")[2].removeprefix("test_")
+    handle = await database_factory.create_from_template(label, seeded_template)
+    try:
+        yield handle
+    finally:
+        await database_factory.drop(handle)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Mark ``integration`` every test that needs PostgreSQL through any fixture it requests.
+
+    ``tryfirst`` runs this before pytest's own ``-m`` deselection, so ``-m "not integration"``
+    sees the marks. ``fixturenames`` holds the full fixture closure, so a fixture built on a
+    database fixture (``integration/conftest.py``'s module clones) marks its tests as well.
+    """
+    for item in items:
+        if DATABASE_FIXTURES.intersection(getattr(item, "fixturenames", ())):
+            item.add_marker(pytest.mark.integration)
