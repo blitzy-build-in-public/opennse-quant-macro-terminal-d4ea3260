@@ -30,9 +30,9 @@ history, at the head and at ``terminal_0001``. A last section, on the root conft
 ``database_factory`` and creating no host object, covers the lifecycle of the suite's own
 databases: the URLs the factory generates connect to the database they name, a database whose
 ``CREATE DATABASE`` committed is dropped even when its creating call fails or is cancelled, the
-databases a killed session left are reclaimed by a later session's factory, and private
-factories create only empty databases, which migrate to head through those URLs. Each section
-opens with its own contract.
+databases a killed session left are reclaimed by a later session's factory, which logs and
+leaves one it cannot drop and still drops the rest, and private factories create only empty
+databases, which migrate to head through those URLs. Each section opens with its own contract.
 """
 
 from __future__ import annotations
@@ -882,7 +882,9 @@ def test_first_revision_ddl_keeps_its_shipped_ticker_fk_actions(
 # - a caller cancelled while its ``CREATE DATABASE`` is in flight raises ``CancelledError`` only
 #   once that statement has settled, so the database it leaves behind is tracked and dropped;
 # - the databases a killed session left, which no factory tracks any more, are reclaimed by a
-#   later factory, which keeps its own databases and every name the suite never generates.
+#   later factory, which keeps its own databases and every name the suite never generates;
+# - a leftover the reclaim cannot drop is logged by name and error type only and left in place,
+#   and the reclaim still drops and returns the others.
 #
 # The factory class is reached as ``type(database_factory)``, because test modules never import
 # a conftest. Each test builds private factories over AUTOCOMMIT engines of its own and closes
@@ -890,9 +892,9 @@ def test_first_revision_ddl_keeps_its_shipped_ticker_fk_actions(
 # ``template0`` under either name prefix: the seeded template's name is fixed, so a private
 # factory that built it would destroy the session's template.
 #
-# Only catalogue and server-function queries, and the reclaim test's ``CREATE DATABASE`` and
-# ``DROP DATABASE`` statements, which spell out one fixed name literally, are written as SQL in
-# this section; nothing is interpolated into them, and no table is read or written.
+# Only catalogue and server-function queries, and the first reclaim test's ``CREATE DATABASE``
+# and ``DROP DATABASE`` statements, which spell out one fixed name literally, are written as SQL
+# in this section; nothing is interpolated into them, and no table is read or written.
 # ---------------------------------------------------------------------------------------------
 
 WAIT_SECONDS: Final[float] = 120.0
@@ -949,9 +951,10 @@ class _Handle(Protocol):
 class _Factory(Protocol):
     """The part of the root conftest's ``DatabaseFactory`` these tests use.
 
-    ``_live`` (database name to handle engine) is what ``close()`` drops, and ``_execute`` runs
-    each administrative statement; the cancellation tests read the first and wrap the second,
-    and the reclaim test removes names from the first and runs statements through the second.
+    ``_live`` (database name to handle engine) is what ``close()`` drops, ``_execute`` runs each
+    administrative statement, and ``_drop_database`` drops one database. The cancellation tests
+    read the first and wrap the second. The reclaim tests remove names from the first; one runs
+    statements through the second, and the other wraps the third.
     """
 
     _live: dict[str, AsyncEngine | None]
@@ -971,6 +974,9 @@ class _Factory(Protocol):
 
     async def drop(self, handle: _Handle) -> None:
         """Dispose the handle's engine and drop its database."""
+
+    async def _drop_database(self, name: str) -> None:
+        """Drop database ``name`` if it exists, ending its connections."""
 
     async def reclaim_orphans(self) -> list[str]:
         """Drop the suite-named databases this factory does not track; return their names."""
@@ -1305,3 +1311,69 @@ async def test_reclaim_drops_what_a_killed_session_left_and_nothing_else(
                 await _drop_leftovers(killed, [*orphans, _KEPT_DATABASE])
             finally:
                 await database_factory.drop(own)
+
+
+async def test_reclaim_logs_a_leftover_it_cannot_drop_and_still_drops_the_rest(
+    database_factory: _Factory,
+    make_settings: Callable[..., TerminalSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A leftover ``reclaim_orphans()`` cannot drop is logged and kept; the others are dropped.
+
+    A private factory stands in for the killed session: it creates two empty databases, then
+    forgets them and disposes their engines. The session factory's ``_drop_database`` is wrapped
+    to raise for the first of them, with an error whose message carries a marker, and to drop
+    every other name. Reclaim works in name order, so it meets the refused drop first. It must
+    still drop the second and return only that one, keep the first, and log one WARNING naming
+    the first database and the error's type, never the error's message.
+    """
+    marker = "reclaimdropMARK"
+    conftest_logger = "tests.conftest"
+    orphans: list[str] = []
+    attempted: list[str] = []
+    async with (
+        _autocommit_engine(make_settings()) as engine,
+        _private_factory(type(database_factory), engine) as killed,
+    ):
+        try:
+            # The labels sort in this order, so the refused drop is attempted before the other.
+            for label in ("reclaim_failing", "reclaim_later"):
+                handle = await asyncio.wait_for(killed.create_empty(label), WAIT_SECONDS)
+                orphans.append(handle.name)
+                await handle.engine.dispose()
+                del killed._live[handle.name]
+            failing, later = orphans
+            original = database_factory._drop_database
+
+            async def refuse_failing(name: str) -> None:
+                attempted.append(name)
+                if name == failing:
+                    raise PermissionError(marker)
+                await original(name)
+
+            monkeypatch.setattr(database_factory, "_drop_database", refuse_failing)
+            caplog.set_level(logging.WARNING, logger=conftest_logger)
+
+            reclaimed = await asyncio.wait_for(database_factory.reclaim_orphans(), WAIT_SECONDS)
+
+            assert reclaimed == [later]
+            assert attempted == [failing, later]
+            assert await _exists(engine, failing)
+            assert not await _exists(engine, later)
+            warnings = [
+                (record.levelno, record.getMessage())
+                for record in caplog.records
+                if record.name == conftest_logger and record.levelno >= logging.WARNING
+            ]
+            assert warnings == [
+                (
+                    logging.WARNING,
+                    f"could not reclaim test database {failing} left by an earlier session: "
+                    "PermissionError",
+                )
+            ]
+            assert marker not in caplog.text
+        finally:
+            # Dropped through the private factory, whose _drop_database is not wrapped.
+            await _drop_leftovers(killed, orphans)

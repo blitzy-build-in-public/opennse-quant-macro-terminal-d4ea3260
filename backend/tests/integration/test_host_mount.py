@@ -3801,6 +3801,21 @@ def _assert_no_secret(text: str) -> None:
             id="quote-and-newline-escaped",
         ),
         pytest.param(
+            f"postgresql+asyncpg://{USER_MARKER}@db\u2028forged\x85x\u2029y:5432/opennse",
+            'database "opennse" on db\\u2028forged\\u0085x\\u2029y:5432',
+            id="line-separators-and-nel-escaped",
+        ),
+        pytest.param(
+            f"postgresql+asyncpg://{USER_MARKER}@db.example:5432/op\x9ben\x7fnse",
+            'database "op\\u009ben\\u007fnse" on db.example:5432',
+            id="c1-control-and-del-escaped",
+        ),
+        pytest.param(
+            f"postgresql+asyncpg://{USER_MARKER}@db.example:5432/donn\u00e9es",
+            'database "donn\u00e9es" on db.example:5432',
+            id="printable-non-ascii-kept",
+        ),
+        pytest.param(
             f"mysql+pymysql://{USER_MARKER}:{USERINFO_PW_MARKER}@db.example:3306/app"
             f"?password={QUERY_PW_MARKER}",
             'database "app" on db.example:3306',
@@ -3818,6 +3833,7 @@ def test_label_names_only_the_database_host_and_port(url: str | URL, expected: s
     assert "postgresql" not in label
     assert "mysql" not in label
     assert "\n" not in label
+    assert len(label.splitlines()) == 1
     _assert_no_secret(label)
 
 

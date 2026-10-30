@@ -56,9 +56,20 @@ _CACHE: dict[str, tuple[AsyncEngine, async_sessionmaker[AsyncSession]]] = {}
 
 
 def _escaped(text: str) -> str:
-    """``text`` with quotes, backslashes and control characters escaped as in a JSON string, so a
-    crafted host or database name can neither end its quotes nor break or forge a log line."""
-    return json.dumps(text, ensure_ascii=False)[1:-1]
+    r"""``text`` as the body of a JSON string in which every non-printable character is escaped.
+
+    Quotes and backslashes are escaped as in any JSON string, and so is every character that
+    ``str.isprintable()`` rejects: the C0 and C1 controls (``DEL`` and ``NEL`` included), the line
+    and paragraph separators U+2028 and U+2029, and every other separator, format, surrogate,
+    private-use or unassigned code point, each written as ``\uXXXX`` (a surrogate pair above
+    U+FFFF), except ``\n``, ``\r``, ``\t``, ``\b`` and ``\f``, which keep their short escapes.
+    Printable text, non-ASCII letters included, is kept, so ``données`` reads unchanged. A crafted
+    host or database name can therefore neither end its quotes nor break or forge a log line.
+    """
+    escaped = json.dumps(text, ensure_ascii=False)[1:-1]
+    if escaped.isprintable():
+        return escaped
+    return "".join(char if char.isprintable() else json.dumps(char)[1:-1] for char in escaped)
 
 
 def database_log_label(url: str | URL) -> str:
@@ -75,8 +86,11 @@ def database_log_label(url: str | URL) -> str:
 
     The driver, the username, the password and the whole query string are dropped: asyncpg takes
     connection arguments, the password included, from query values, which
-    ``URL.render_as_string(hide_password=True)`` prints unchanged. Quotes, backslashes and control
-    characters in the host or database are escaped as in a JSON string.
+    ``URL.render_as_string(hide_password=True)`` prints unchanged. In the host and the database,
+    quotes, backslashes and every non-printable character (C0 and C1 controls, U+2028 and U+2029,
+    format characters, surrogates and the like) are written as JSON string escapes, while
+    printable text, non-ASCII letters included, is kept; so a crafted host or database name can
+    neither end its quotes nor break or forge a log line.
 
     It never raises, and never echoes a URL it cannot take apart reliably: a string that
     ``make_url`` cannot parse, and a URL whose host or database contains ``@`` (the parser's
