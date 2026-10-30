@@ -2531,3 +2531,88 @@ async def test_requests_need_an_open_client(
     # Closing a client that is not open is a no-op.
     await client.__aexit__(None, None, None)
     assert network.sent == []
+
+
+def fail_closing(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
+    """Make closing every ``httpx.AsyncClient`` raise ``error``."""
+
+    async def aclose(self: httpx.AsyncClient) -> None:
+        raise error
+
+    monkeypatch.setattr(httpx.AsyncClient, "aclose", aclose)
+
+
+@pytest.mark.parametrize(
+    "in_flight",
+    [
+        pytest.param(RobotsDisallowed(INFLATION_URL), id="ingestion-error"),
+        pytest.param(asyncio.CancelledError(), id="cancelled"),
+    ],
+)
+async def test_close_error_while_an_exception_unwinds_is_logged_and_the_original_propagates(
+    network: FakeNetwork,
+    make_client: ClientFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    in_flight: BaseException,
+) -> None:
+    """Closing the ``httpx`` client raises while an exception leaves the ``async with``: the
+    close error is one WARNING naming both exception types, never its text, and the exception
+    that was unwinding propagates as it was raised, so the run keeps its own status."""
+    fail_closing(monkeypatch, RuntimeError("close failed: SECRET-CLOSE-MARKER"))
+    client = make_client()
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        with pytest.raises(type(in_flight)) as raised:
+            async with client:
+                raise in_flight
+
+    assert raised.value is in_flight
+    assert raised.value.__context__ is None
+    assert warnings_logged(caplog) == [
+        f"closing the HTTP client raised RuntimeError while unwinding {type(in_flight).__name__}"
+    ]
+    assert all(record.exc_info is None for record in caplog.records)
+    assert "SECRET-CLOSE-MARKER" not in caplog.text
+    with pytest.raises(RuntimeError, match="not open"):
+        await client.fetch(INFLATION_URL)
+    assert network.sent == []
+
+
+@pytest.mark.parametrize(
+    ("in_flight", "close_error"),
+    [
+        pytest.param(
+            None, RuntimeError("close failed: SECRET-CLOSE-MARKER"), id="nothing-unwinding"
+        ),
+        pytest.param(
+            RobotsDisallowed(INFLATION_URL), asyncio.CancelledError(), id="cancelled-while-closing"
+        ),
+    ],
+)
+async def test_close_error_propagates_when_nothing_unwinds_or_closing_is_cancelled(
+    network: FakeNetwork,
+    make_client: ClientFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    in_flight: BaseException | None,
+    close_error: BaseException,
+) -> None:
+    """A close error is kept from replacing only an unwinding exception, and only when it is an
+    ``Exception``: one raised after a clean exit, which the run executor records as an error
+    after the commit, and a cancellation received while closing both propagate, unlogged. The
+    client is closed either way."""
+    fail_closing(monkeypatch, close_error)
+    client = make_client()
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        with pytest.raises(type(close_error)) as raised:
+            async with client:
+                if in_flight is not None:
+                    raise in_flight
+
+    assert raised.value is close_error
+    assert warnings_logged(caplog) == []
+    with pytest.raises(RuntimeError, match="not open"):
+        await client.fetch(INFLATION_URL)
+    assert network.sent == []

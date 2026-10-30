@@ -1082,10 +1082,30 @@ class PoliteClient:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Close the ``httpx`` client and its connections."""
+        """Close the ``httpx`` client and its connections. The client is no longer open
+        afterwards, whatever closing raised, so it can be opened again.
+
+        When an exception is leaving the ``async with`` block, an ``Exception`` raised while
+        closing never replaces it: the close error is logged at WARNING by the two exception
+        types only (exception text can carry connection details) and dropped, so the block's own
+        exception propagates unchanged and a run ends with the status that exception maps to. A
+        ``BaseException`` that is not an ``Exception``, such as a cancellation received while
+        closing, still propagates. When the block exited cleanly, a close error propagates.
+        """
         client, self._client = self._client, None
-        if client is not None:
+        if client is None:
+            return
+        if exc is None:
             await client.aclose()
+            return
+        try:
+            await client.aclose()
+        except Exception as close_error:
+            logger.warning(
+                "closing the HTTP client raised %s while unwinding %s",
+                type(close_error).__name__,
+                type(exc).__name__,
+            )
 
     async def ensure_allowed(self, url: str) -> None:
         """Return only if ``robots.txt`` of the URL's origin lets ``OpenNSE-Terminal`` fetch it.

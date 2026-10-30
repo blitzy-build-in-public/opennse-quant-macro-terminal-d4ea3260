@@ -35,8 +35,11 @@ Covered:
 - The pipeline framework (``ingestion.base``) on engine and connection doubles, the
   ``db.upsert`` writers, and the SQL of the price-precedence guard: each in its own section
   below, whose banner states the contract it holds.
-- The ``opennse-terminal`` console script (``cli``), run in-process without a database, in the
-  last section below.
+- The ``opennse-terminal`` console script (``cli``), run in-process without a database, in its
+  own section below.
+- Registry and scheduler orchestration: the pipeline registry (``ingestion.registry``) and the
+  scheduler process (``ingestion.scheduler``), on capturing doubles without a database, in the
+  last two sections below.
 """
 
 from __future__ import annotations
@@ -48,6 +51,7 @@ import copy
 import errno
 import gc
 import importlib.util
+import inspect
 import json
 import logging
 import os
@@ -60,16 +64,24 @@ import time as time_module
 import uuid
 import zlib
 from collections import defaultdict
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from dataclasses import FrozenInstanceError, dataclass
+from dataclasses import FrozenInstanceError, dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Context, Decimal, localcontext
 from enum import Enum
 from itertools import pairwise
 from pathlib import Path
-from types import FrameType, MappingProxyType
-from typing import Any, Final, NoReturn, Protocol, cast, get_args
+from types import FrameType, MappingProxyType, ModuleType
+from typing import Any, Final, NoReturn, Protocol, TypeVar, cast, get_args
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -77,6 +89,15 @@ import pytest
 import respx
 from alembic.script import ScriptDirectory
 from alembic.util import CommandError
+from apscheduler.events import (
+    EVENT_JOB_ADDED,
+    EVENT_JOB_ERROR,
+    EVENT_JOB_EXECUTED,
+    EVENT_JOB_MISSED,
+    JobEvent,
+    JobExecutionEvent,
+)
+from apscheduler.triggers.cron import CronTrigger
 from bs4 import BeautifulSoup
 from sqlalchemy import (
     Boolean,
@@ -114,7 +135,7 @@ from opennse_terminal.db.upsert import (
     upsert_prices,
     upsert_rows,
 )
-from opennse_terminal.ingestion import base, registry
+from opennse_terminal.ingestion import base, registry, scheduler
 from opennse_terminal.ingestion import http as ingestion_http
 from opennse_terminal.ingestion.base import (
     MAX_INVALID_FRACTION,
@@ -146,6 +167,7 @@ from opennse_terminal.ingestion.calendar import CalendarNotVerified
 from opennse_terminal.ingestion.cbk import CBK_BASE_URL
 from opennse_terminal.ingestion.cbk.bonds import TREASURY_BONDS_URL
 from opennse_terminal.ingestion.cbk.inflation import INFLATION_URL
+from opennse_terminal.ingestion.cbk.reserves import CbkReservesPipeline
 from opennse_terminal.ingestion.files import tabular_import
 from opennse_terminal.ingestion.files.tabular_import import import_file
 from opennse_terminal.ingestion.http import HostSpacing
@@ -156,6 +178,8 @@ from opennse_terminal.ingestion.nse.market_statistics import (
     NseQuote,
     SectorTable,
 )
+from opennse_terminal.ingestion.registry import PipelineSpec
+from opennse_terminal.ingestion.scheduler import JobDefinition
 from opennse_terminal.models import (
     TerminalBondYield,
     TerminalCorporateFiling,
@@ -2884,6 +2908,21 @@ async def test_run_recorder_start_gives_each_run_a_new_id() -> None:
     assert first != second
 
 
+async def test_run_recorder_start_inserts_and_returns_the_id_its_caller_gives() -> None:
+    engine = _EngineDouble()
+    run_id = await RunRecorder(cast(AsyncEngine, engine)).start(
+        pipeline="pdf_filing",
+        trigger="api",
+        run_id=uuid.UUID("0c4f8e2a-5b7d-4e19-a3c6-d8f1b2e4a6c9"),
+    )
+
+    assert run_id == uuid.UUID("0c4f8e2a-5b7d-4e19-a3c6-d8f1b2e4a6c9")
+    (conn,) = engine.connections
+    assert (conn.kind, conn.outcome) == (RUN_RECORD, COMMITTED)
+    (insert,) = engine.inserts
+    assert insert.params["id"] == uuid.UUID("0c4f8e2a-5b7d-4e19-a3c6-d8f1b2e4a6c9")
+
+
 async def test_run_recorder_start_rejects_an_unknown_trigger_before_connecting() -> None:
     engine = _EngineDouble()
     with pytest.raises(ValueError, match="unknown run trigger 'manual'"):
@@ -3474,6 +3513,79 @@ async def test_fetch_exception_becomes_the_run_status_with_its_evidence(
         assert record.exc_info is None
         assert message not in caplog.text
         assert CSV_URL not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("error", "status", "message", "exit_code"),
+    [
+        pytest.param(
+            SourceLayoutChanged(
+                expected=("year", "month"), found=("yr",), message="header row changed"
+            ),
+            RunStatus.LAYOUT_CHANGED,
+            "header row changed",
+            3,
+            id="source-layout-changed",
+        ),
+        pytest.param(
+            RobotsDisallowed(CSV_URL),
+            RunStatus.BLOCKED_BY_ROBOTS,
+            f"robots.txt blocks {CSV_URL} (disallowed)",
+            4,
+            id="robots-disallowed",
+        ),
+        pytest.param(
+            AmbiguousSession({"reason": "label_mismatch", "label_session": date(2026, 10, 27)}),
+            RunStatus.AMBIGUOUS_SESSION,
+            "ambiguous session: label_mismatch",
+            5,
+            id="ambiguous-session",
+        ),
+    ],
+)
+async def test_run_status_survives_its_http_client_raising_on_close(
+    settings: TerminalSettings,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+    status: RunStatus,
+    message: str,
+    exit_code: int,
+) -> None:
+    """The run opens its own ``PoliteClient``, whose ``httpx`` client raises on closing while the
+    pipeline's exception unwinds the run: the run still ends with that exception's status and CLI
+    exit code, never ``failed`` with ``unexpected_error``, and the close error is logged by its
+    type only."""
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    caplog.set_level(logging.WARNING, logger="opennse_terminal.ingestion.http")
+
+    async def aclose(self: httpx.AsyncClient) -> None:
+        raise RuntimeError("close failed: SECRET-CLOSE-MARKER")
+
+    monkeypatch.setattr(httpx.AsyncClient, "aclose", aclose)
+    engine = _EngineDouble()
+    pipeline = _QuotePipeline(settings, cells=["1.00"], fetch_error=error)
+
+    result = await execute_pipeline(pipeline, cast(AsyncEngine, engine), trigger="cli")
+
+    (ctx,) = pipeline.contexts
+    assert isinstance(ctx.http, ingestion_http.PoliteClient)
+    assert (result.status, result.error_message) == (status, message)
+    assert cli.EXIT_CODES[result.status] == exit_code
+    (data,) = engine.data_connections
+    assert data.outcome == ROLLED_BACK
+    (update,) = engine.updates
+    assert (update.params["status"], update.params["error_message"]) == (status.value, message)
+    assert update.params["details"] == result.details
+    assert "exception" not in result.details
+    assert "after_commit_error" not in result.details
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "opennse_terminal.ingestion.http" and record.levelno >= logging.WARNING
+    ] == [f"closing the HTTP client raised RuntimeError while unwinding {type(error).__name__}"]
+    assert all(record.exc_info is None for record in caplog.records)
+    assert "SECRET-CLOSE-MARKER" not in caplog.text
 
 
 async def test_exception_after_parsing_keeps_the_fetched_count_and_writes_nothing(
@@ -7135,3 +7247,2222 @@ def test_logging_seed_module_entry_uses_the_cli_configuration(
     assert exit_info.value.code == 0
     assert configured == ["configure_logging"]
     assert "usage: python -m opennse_terminal.seed.seed_terminal_db" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------------------------
+# Pipeline registry (``opennse_terminal.ingestion.registry``)
+#
+# Covered: the registered names, their specs and run options (:data:`PIPELINES`,
+# :data:`CBK_PIPELINES` and the ``limit`` bounds); :func:`load_pipeline` for every registered
+# name and its error paths; that importing the registry imports no pipeline module; the option
+# routing of :func:`create_pipeline` (``trade_date`` for ``nse_market_statistics`` only,
+# ``limit`` 1-26 for ``cbk_reserves`` only); and the engine, spacing, error and cancellation
+# handling of :func:`run_pipeline` and :func:`run_pipelines`.
+#
+# Every test is offline: no network, no database (no test requests a database fixture) and no
+# browser. The pipeline loader, the engine factory, ``execute_pipeline`` and ``HostSpacing`` are
+# replaced by capturing doubles wherever a run is involved, so nothing is fetched, connected to or
+# slept on. Expected names, classes, bounds and messages are literals from the plan and the
+# registry's documented contract, never recomputed from the module under test.
+# ---------------------------------------------------------------------------------------------
+
+
+REGISTRY_LOGGER = "opennse_terminal.ingestion.registry"
+
+REGISTERED_NAMES = (
+    "nse_market_statistics",
+    "cbk_rates_csv",
+    "cbk_inflation",
+    "cbk_fx",
+    "cbk_bonds",
+    "cbk_reserves",
+)
+CBK_NAMES = ("cbk_rates_csv", "cbk_inflation", "cbk_fx", "cbk_bonds", "cbk_reserves")
+NOT_TAKING_LIMIT = (
+    "nse_market_statistics",
+    "cbk_rates_csv",
+    "cbk_inflation",
+    "cbk_fx",
+    "cbk_bonds",
+)
+VALID_NAMES_MESSAGE = (
+    "valid names: nse_market_statistics, cbk_rates_csv, cbk_inflation, cbk_fx, cbk_bonds, "
+    "cbk_reserves"
+)
+PIPELINE_MODULES = (
+    "opennse_terminal.ingestion.nse.market_statistics",
+    "opennse_terminal.ingestion.cbk.rates_csv",
+    "opennse_terminal.ingestion.cbk.inflation",
+    "opennse_terminal.ingestion.cbk.fx",
+    "opennse_terminal.ingestion.cbk.bonds",
+    "opennse_terminal.ingestion.cbk.reserves",
+)
+HEAVY_LIBRARIES = ("playwright", "pdfplumber", "pandas", "bs4")
+TRADE_DATE = date(2026, 10, 27)
+
+# Stands for connection detail a real database error could carry; no log line may repeat an
+# exception's message.
+REGISTRY_SENTINEL = "sentinel-connection-detail-4f1c"
+
+FAKE_MODULE = "registry_test_fake_sources"
+MISSING_MODULE = "registry_test_absent_source_module"
+
+# The child interpreter imports the registry, then prints which watched modules are loaded.
+_IMPORT_PROBE_SCRIPT = (
+    "import sys\n"
+    "import opennse_terminal.ingestion.registry\n"
+    "print('\\n'.join(name for name in sys.argv[1:] if name in sys.modules))\n"
+)
+_PROBE_TIMEOUT_SECONDS = 120
+
+
+def run_result(
+    pipeline: str,
+    run_id: str,
+    status: RunStatus = RunStatus.SUCCEEDED,
+    *,
+    fetched: int = 0,
+    written: int = 0,
+    rejected: int = 0,
+    error_message: str | None = None,
+) -> RunResult:
+    """A recorded result with the given literal values and empty ``details``."""
+    return RunResult(
+        run_id=uuid.UUID(run_id),
+        pipeline=pipeline,
+        status=status,
+        rows_fetched=fetched,
+        rows_written=written,
+        rows_rejected=rejected,
+        error_message=error_message,
+        details={},
+    )
+
+
+RESULTS: Mapping[str, RunResult] = MappingProxyType(
+    {
+        "nse_market_statistics": run_result(
+            "nse_market_statistics",
+            "0b6a3d6e-1c1f-4f0e-9a51-6b3f8d1e2a01",
+            fetched=70,
+            written=68,
+            rejected=2,
+        ),
+        "cbk_rates_csv": run_result(
+            "cbk_rates_csv", "0b6a3d6e-1c1f-4f0e-9a51-6b3f8d1e2a02", fetched=423, written=423
+        ),
+        "cbk_inflation": run_result(
+            "cbk_inflation", "0b6a3d6e-1c1f-4f0e-9a51-6b3f8d1e2a03", fetched=261, written=261
+        ),
+        "cbk_fx": run_result(
+            "cbk_fx", "0b6a3d6e-1c1f-4f0e-9a51-6b3f8d1e2a04", fetched=405, written=405
+        ),
+        "cbk_bonds": run_result(
+            "cbk_bonds", "0b6a3d6e-1c1f-4f0e-9a51-6b3f8d1e2a05", fetched=326, written=326
+        ),
+        "cbk_reserves": run_result(
+            "cbk_reserves", "0b6a3d6e-1c1f-4f0e-9a51-6b3f8d1e2a06", fetched=5, written=5
+        ),
+    }
+)
+"""One literal result per registered pipeline, returned by :class:`ExecuteDouble` by default."""
+
+LOCK_HELD = run_result(
+    "cbk_inflation",
+    "0b6a3d6e-1c1f-4f0e-9a51-6b3f8d1e2a13",
+    RunStatus.FAILED,
+    error_message="lock held",
+)
+
+
+# --- Doubles ---------------------------------------------------------------------------------
+
+
+class FakeSourcePipeline(Pipeline[str, str]):
+    """A well-formed pipeline class for the fake source module. The registry only loads and
+    constructs pipelines, so each stage fails the test if it is ever called."""
+
+    name = "fake_source"
+
+    async def fetch(self, ctx: RunContext) -> str:
+        raise AssertionError("the registry never fetches")
+
+    def parse(self, raw: str) -> list[str]:
+        raise AssertionError("the registry never parses")
+
+    def validate(self, records: Sequence[str]) -> ValidationOutcome[str]:
+        raise AssertionError("the registry never validates")
+
+    async def upsert(self, conn: AsyncConnection, records: Sequence[str], run_id: uuid.UUID) -> int:
+        raise AssertionError("the registry never upserts")
+
+
+class MisnamedPipeline(FakeSourcePipeline):
+    """A pipeline whose ``name`` differs from the name it is registered under."""
+
+    name = "another_source"
+
+
+class PlainClass:
+    """A class that is not a ``Pipeline`` subclass, although it carries the registered name."""
+
+    name = "fake_plain_class"
+
+
+@dataclass(eq=False)
+class BuiltPipeline:
+    """What a :class:`RecordingLoader` class constructs: the registry name it was loaded under and
+    the exact positional and keyword arguments of the constructor call. Compared by identity, so
+    two runs never share one."""
+
+    name: str
+    args: tuple[object, ...]
+    kwargs: dict[str, object]
+
+
+class RecordingLoader:
+    """Stands in for ``registry.load_pipeline``: records each name loaded and returns a
+    constructor for it, which records its call as a :class:`BuiltPipeline` or raises the error
+    scripted for that name."""
+
+    def __init__(self, constructor_errors: Mapping[str, Exception] | None = None) -> None:
+        self.loaded: list[str] = []
+        self.built: list[BuiltPipeline] = []
+        self._constructor_errors = dict(constructor_errors or {})
+
+    def __call__(self, name: str) -> Callable[..., BuiltPipeline]:
+        self.loaded.append(name)
+
+        def construct(*args: object, **kwargs: object) -> BuiltPipeline:
+            error = self._constructor_errors.get(name)
+            if error is not None:
+                raise error
+            built = BuiltPipeline(name=name, args=args, kwargs=kwargs)
+            self.built.append(built)
+            return built
+
+        return construct
+
+
+class FakeEngine:
+    """Stands in for the ``AsyncEngine`` from ``build_engine``: counts ``dispose()`` calls and
+    raises ``dispose_error`` from each when given."""
+
+    def __init__(self, dispose_error: Exception | None = None) -> None:
+        self.dispose_calls = 0
+        self._dispose_error = dispose_error
+
+    async def dispose(self) -> None:
+        self.dispose_calls += 1
+        if self._dispose_error is not None:
+            raise self._dispose_error
+
+
+class EngineFactory:
+    """Stands in for ``registry.build_engine``: records the settings of every call and returns
+    the same :class:`FakeEngine` each time."""
+
+    def __init__(self, engine: FakeEngine) -> None:
+        self.engine = engine
+        self.calls: list[TerminalSettings] = []
+
+    def __call__(self, settings: TerminalSettings) -> FakeEngine:
+        self.calls.append(settings)
+        return self.engine
+
+
+@dataclass(frozen=True, slots=True)
+class ExecuteCall:
+    """One call of :class:`ExecuteDouble`, with the arguments the registry passed."""
+
+    pipeline: BuiltPipeline
+    engine: FakeEngine
+    trigger: RunTrigger
+    spacing: HostSpacing | None
+
+
+class ExecuteDouble:
+    """Stands in for ``registry.execute_pipeline``: records every call, then raises the exception
+    scripted for the pipeline's name or returns its result (:data:`RESULTS` by default). Its
+    signature has no ``http`` parameter, so a registry that passed one would fail the run."""
+
+    def __init__(self, outcomes: Mapping[str, RunResult | BaseException] | None = None) -> None:
+        self.calls: list[ExecuteCall] = []
+        self._outcomes: dict[str, RunResult | BaseException] = {**RESULTS, **(outcomes or {})}
+
+    async def __call__(
+        self,
+        pipeline: BuiltPipeline,
+        engine: FakeEngine,
+        *,
+        trigger: RunTrigger,
+        spacing: HostSpacing | None,
+    ) -> RunResult:
+        self.calls.append(ExecuteCall(pipeline, engine, trigger, spacing))
+        outcome = self._outcomes[pipeline.name]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+class SpacingFactory:
+    """Stands in for ``ingestion.http.HostSpacing`` in ``run_pipelines``: records every instance
+    it creates. The instances are real, and are only passed along, never awaited."""
+
+    def __init__(self) -> None:
+        self.created: list[HostSpacing] = []
+
+    def __call__(self) -> HostSpacing:
+        spacing = HostSpacing()
+        self.created.append(spacing)
+        return spacing
+
+
+@dataclass
+class RunDoubles:
+    """The doubles installed in place of the registry's run dependencies."""
+
+    loader: RecordingLoader
+    engines: EngineFactory
+    execute: ExecuteDouble
+    spacings: SpacingFactory = field(default_factory=SpacingFactory)
+
+
+def install_run_doubles(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    outcomes: Mapping[str, RunResult | BaseException] | None = None,
+    constructor_errors: Mapping[str, Exception] | None = None,
+    dispose_error: Exception | None = None,
+) -> RunDoubles:
+    """Replace the pipeline loader, ``build_engine``, ``execute_pipeline`` and ``HostSpacing``."""
+    doubles = RunDoubles(
+        loader=RecordingLoader(constructor_errors),
+        engines=EngineFactory(FakeEngine(dispose_error)),
+        execute=ExecuteDouble(outcomes),
+    )
+    monkeypatch.setattr(registry, "load_pipeline", doubles.loader)
+    monkeypatch.setattr(registry, "build_engine", doubles.engines)
+    monkeypatch.setattr(registry, "execute_pipeline", doubles.execute)
+    monkeypatch.setattr(ingestion_http, "HostSpacing", doubles.spacings)
+    return doubles
+
+
+def registry_records(caplog: pytest.LogCaptureFixture) -> list[tuple[int, str]]:
+    """The registry's captured log records as ``(level, message)`` pairs, in order."""
+    return [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.name == REGISTRY_LOGGER
+    ]
+
+
+@pytest.fixture
+def fake_sources(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Register a fake source module and a registry that points into it (and at a missing one)."""
+    module = ModuleType(FAKE_MODULE)
+    module.__dict__.update(
+        FakeSourcePipeline=FakeSourcePipeline,
+        MisnamedPipeline=MisnamedPipeline,
+        PlainClass=PlainClass,
+        source_pipeline_name="fake_source",
+    )
+    monkeypatch.setitem(sys.modules, FAKE_MODULE, module)
+    monkeypatch.delitem(sys.modules, MISSING_MODULE, raising=False)
+    monkeypatch.setattr(
+        registry,
+        "PIPELINES",
+        MappingProxyType(
+            {
+                "fake_source": PipelineSpec(module=FAKE_MODULE, attr="FakeSourcePipeline"),
+                "fake_plain_class": PipelineSpec(module=FAKE_MODULE, attr="PlainClass"),
+                "fake_not_a_class": PipelineSpec(module=FAKE_MODULE, attr="source_pipeline_name"),
+                "fake_misnamed": PipelineSpec(module=FAKE_MODULE, attr="MisnamedPipeline"),
+                "fake_missing_attr": PipelineSpec(module=FAKE_MODULE, attr="AbsentPipeline"),
+                "fake_missing_module": PipelineSpec(
+                    module=MISSING_MODULE, attr="FakeSourcePipeline"
+                ),
+            }
+        ),
+    )
+
+
+# --- The registered pipelines ----------------------------------------------------------------
+
+
+def test_registered_names_are_the_six_public_sources_in_order() -> None:
+    assert list(registry.PIPELINES) == list(REGISTERED_NAMES)
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        pytest.param(
+            "nse_market_statistics",
+            PipelineSpec(
+                module="opennse_terminal.ingestion.nse.market_statistics",
+                attr="MarketStatisticsPipeline",
+                supports_trade_date=True,
+                supports_limit=False,
+            ),
+            id="nse_market_statistics",
+        ),
+        pytest.param(
+            "cbk_rates_csv",
+            PipelineSpec(
+                module="opennse_terminal.ingestion.cbk.rates_csv",
+                attr="CbkRatesCsvPipeline",
+                supports_trade_date=False,
+                supports_limit=False,
+            ),
+            id="cbk_rates_csv",
+        ),
+        pytest.param(
+            "cbk_inflation",
+            PipelineSpec(
+                module="opennse_terminal.ingestion.cbk.inflation",
+                attr="CbkInflationPipeline",
+                supports_trade_date=False,
+                supports_limit=False,
+            ),
+            id="cbk_inflation",
+        ),
+        pytest.param(
+            "cbk_fx",
+            PipelineSpec(
+                module="opennse_terminal.ingestion.cbk.fx",
+                attr="CbkFxPipeline",
+                supports_trade_date=False,
+                supports_limit=False,
+            ),
+            id="cbk_fx",
+        ),
+        pytest.param(
+            "cbk_bonds",
+            PipelineSpec(
+                module="opennse_terminal.ingestion.cbk.bonds",
+                attr="CbkBondsPipeline",
+                supports_trade_date=False,
+                supports_limit=False,
+            ),
+            id="cbk_bonds",
+        ),
+        pytest.param(
+            "cbk_reserves",
+            PipelineSpec(
+                module="opennse_terminal.ingestion.cbk.reserves",
+                attr="CbkReservesPipeline",
+                supports_trade_date=False,
+                supports_limit=True,
+            ),
+            id="cbk_reserves",
+        ),
+    ],
+)
+def test_each_spec_names_its_module_class_and_options(name: str, expected: PipelineSpec) -> None:
+    """``--trade-date`` belongs to ``nse_market_statistics`` only, ``--limit`` to
+    ``cbk_reserves`` only."""
+    assert registry.PIPELINES[name] == expected
+
+
+def test_registry_mapping_is_read_only() -> None:
+    writable_view: Any = registry.PIPELINES
+    assert isinstance(registry.PIPELINES, MappingProxyType)
+    with pytest.raises(TypeError):
+        writable_view["cbk_new_source"] = PipelineSpec(module="x", attr="y")
+    with pytest.raises(TypeError):
+        del writable_view["cbk_fx"]
+    assert list(registry.PIPELINES) == list(REGISTERED_NAMES)
+
+
+def test_cbk_pipelines_run_in_the_documented_order() -> None:
+    assert registry.CBK_PIPELINES == (
+        "cbk_rates_csv",
+        "cbk_inflation",
+        "cbk_fx",
+        "cbk_bonds",
+        "cbk_reserves",
+    )
+
+
+def test_limit_bounds_are_one_to_twenty_six() -> None:
+    assert registry.MIN_LIMIT == 1
+    assert registry.MAX_LIMIT == 26
+
+
+# --- load_pipeline ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "module", "class_name"),
+    [
+        pytest.param(
+            "nse_market_statistics",
+            "opennse_terminal.ingestion.nse.market_statistics",
+            "MarketStatisticsPipeline",
+            id="nse_market_statistics",
+        ),
+        pytest.param(
+            "cbk_rates_csv",
+            "opennse_terminal.ingestion.cbk.rates_csv",
+            "CbkRatesCsvPipeline",
+            id="cbk_rates_csv",
+        ),
+        pytest.param(
+            "cbk_inflation",
+            "opennse_terminal.ingestion.cbk.inflation",
+            "CbkInflationPipeline",
+            id="cbk_inflation",
+        ),
+        pytest.param("cbk_fx", "opennse_terminal.ingestion.cbk.fx", "CbkFxPipeline", id="cbk_fx"),
+        pytest.param(
+            "cbk_bonds", "opennse_terminal.ingestion.cbk.bonds", "CbkBondsPipeline", id="cbk_bonds"
+        ),
+        pytest.param(
+            "cbk_reserves",
+            "opennse_terminal.ingestion.cbk.reserves",
+            "CbkReservesPipeline",
+            id="cbk_reserves",
+        ),
+    ],
+)
+def test_load_pipeline_returns_the_registered_class(
+    name: str, module: str, class_name: str
+) -> None:
+    """The class is a ``Pipeline`` subclass whose ``name`` is the name it is registered under,
+    so its runs are recorded and locked under that name."""
+    loaded = registry.load_pipeline(name)
+
+    assert issubclass(loaded, Pipeline)
+    assert (loaded.__module__, loaded.__name__) == (module, class_name)
+    assert loaded is getattr(sys.modules[module], class_name)
+    assert loaded.name == name
+
+
+def test_load_pipeline_rejects_an_unknown_name_listing_the_valid_ones() -> None:
+    with pytest.raises(KeyError) as excinfo:
+        registry.load_pipeline("nse_bonds")
+
+    assert excinfo.value.args == (f"unknown pipeline 'nse_bonds'; {VALID_NAMES_MESSAGE}",)
+
+
+@pytest.mark.usefixtures("fake_sources")
+def test_load_pipeline_imports_the_module_its_spec_names() -> None:
+    """The positive control of the fake registry the error cases below use."""
+    assert registry.load_pipeline("fake_source") is FakeSourcePipeline
+
+
+@pytest.mark.usefixtures("fake_sources")
+@pytest.mark.parametrize(
+    ("name", "error", "message"),
+    [
+        pytest.param(
+            "fake_plain_class",
+            TypeError,
+            "registry_test_fake_sources.PlainClass is not a Pipeline subclass",
+            id="class-not-a-pipeline",
+        ),
+        pytest.param(
+            "fake_not_a_class",
+            TypeError,
+            "registry_test_fake_sources.source_pipeline_name is not a Pipeline subclass",
+            id="attribute-not-a-class",
+        ),
+        pytest.param(
+            "fake_misnamed",
+            TypeError,
+            "registry_test_fake_sources.MisnamedPipeline.name is 'another_source'; "
+            "the registry expects 'fake_misnamed'",
+            id="pipeline-with-another-name",
+        ),
+        pytest.param(
+            "fake_missing_attr",
+            AttributeError,
+            "module 'registry_test_fake_sources' has no attribute 'AbsentPipeline'",
+            id="missing-attribute",
+        ),
+        pytest.param(
+            "fake_missing_module",
+            ModuleNotFoundError,
+            "No module named 'registry_test_absent_source_module'",
+            id="missing-module",
+        ),
+        pytest.param(
+            "cbk_fx",
+            KeyError,
+            "unknown pipeline 'cbk_fx'; valid names: fake_source, fake_plain_class, "
+            "fake_not_a_class, fake_misnamed, fake_missing_attr, fake_missing_module",
+            id="name-not-in-this-registry",
+        ),
+    ],
+)
+def test_load_pipeline_rejects_a_spec_that_does_not_resolve_to_its_pipeline(
+    name: str, error: type[Exception], message: str
+) -> None:
+    with pytest.raises(error) as excinfo:
+        registry.load_pipeline(name)
+
+    assert type(excinfo.value) is error
+    assert excinfo.value.args == (message,)
+
+
+async def test_importing_the_registry_imports_no_pipeline_module(tmp_path: Path) -> None:
+    """A fresh interpreter that imports only the registry has loaded none of the six pipeline
+    modules, nor Playwright, pdfplumber, pandas or BeautifulSoup4, so the CLI can list the names
+    without loading them."""
+    watched = ["opennse_terminal.ingestion.registry", *PIPELINE_MODULES, *HEAVY_LIBRARIES]
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _IMPORT_PROBE_SCRIPT,
+        *watched,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        cwd=tmp_path,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), _PROBE_TIMEOUT_SECONDS)
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+
+    assert process.returncode == 0, stderr.decode()
+    assert stdout.decode().split() == ["opennse_terminal.ingestion.registry"]
+
+
+# --- create_pipeline: option routing ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "options", "expected_kwargs"),
+    [
+        *(pytest.param(name, {}, {}, id=f"{name}-no-options") for name in REGISTERED_NAMES),
+        pytest.param(
+            "cbk_reserves",
+            {"trade_date": None, "limit": None},
+            {},
+            id="cbk_reserves-options-given-as-none",
+        ),
+        pytest.param(
+            "nse_market_statistics",
+            {"trade_date": TRADE_DATE},
+            {"trade_date": TRADE_DATE},
+            id="nse_market_statistics-trade-date",
+        ),
+        pytest.param("cbk_reserves", {"limit": 1}, {"limit": 1}, id="cbk_reserves-limit-1"),
+        pytest.param("cbk_reserves", {"limit": 26}, {"limit": 26}, id="cbk_reserves-limit-26"),
+    ],
+)
+def test_create_pipeline_passes_only_the_given_options_as_keywords(
+    monkeypatch: pytest.MonkeyPatch,
+    test_settings: TerminalSettings,
+    name: str,
+    options: dict[str, Any],
+    expected_kwargs: dict[str, object],
+) -> None:
+    loader = RecordingLoader()
+    monkeypatch.setattr(registry, "load_pipeline", loader)
+
+    # Typed as object: the loader double's constructors return BuiltPipeline records.
+    created: object = registry.create_pipeline(name, test_settings, **options)
+
+    assert loader.loaded == [name]
+    [built] = loader.built
+    assert created is built
+    assert len(built.args) == 1
+    assert built.args[0] is test_settings
+    assert built.kwargs == expected_kwargs
+
+
+@pytest.mark.parametrize(
+    ("name", "options", "error", "message"),
+    [
+        *(
+            pytest.param(
+                name,
+                {"trade_date": TRADE_DATE},
+                ValueError,
+                f"pipeline '{name}' does not take a trade date; only nse_market_statistics does",
+                id=f"trade-date-for-{name}",
+            )
+            for name in CBK_NAMES
+        ),
+        *(
+            pytest.param(
+                name,
+                {"limit": 2},
+                ValueError,
+                f"pipeline '{name}' does not take a limit; only cbk_reserves does",
+                id=f"limit-for-{name}",
+            )
+            for name in NOT_TAKING_LIMIT
+        ),
+        pytest.param(
+            "nse_market_statistics",
+            {"trade_date": TRADE_DATE, "limit": 2},
+            ValueError,
+            "pipeline 'nse_market_statistics' does not take a limit; only cbk_reserves does",
+            id="trade-date-with-limit-for-nse",
+        ),
+        pytest.param(
+            "cbk_reserves",
+            {"trade_date": TRADE_DATE, "limit": 2},
+            ValueError,
+            "pipeline 'cbk_reserves' does not take a trade date; only nse_market_statistics does",
+            id="trade-date-with-limit-for-reserves",
+        ),
+        pytest.param(
+            "cbk_reserves",
+            {"limit": 0},
+            ValueError,
+            "limit must be between 1 and 26, got 0",
+            id="limit-0",
+        ),
+        pytest.param(
+            "cbk_reserves",
+            {"limit": 27},
+            ValueError,
+            "limit must be between 1 and 26, got 27",
+            id="limit-27",
+        ),
+        pytest.param(
+            "cbk_reserves",
+            {"limit": -1},
+            ValueError,
+            "limit must be between 1 and 26, got -1",
+            id="limit-minus-1",
+        ),
+        pytest.param(
+            "cbk_reserve",
+            {"limit": 2},
+            KeyError,
+            f"unknown pipeline 'cbk_reserve'; {VALID_NAMES_MESSAGE}",
+            id="unknown-name",
+        ),
+    ],
+)
+def test_create_pipeline_rejects_a_name_or_option_before_importing_the_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    test_settings: TerminalSettings,
+    name: str,
+    options: dict[str, Any],
+    error: type[Exception],
+    message: str,
+) -> None:
+    loader = RecordingLoader()
+    monkeypatch.setattr(registry, "load_pipeline", loader)
+
+    with pytest.raises(error) as excinfo:
+        registry.create_pipeline(name, test_settings, **options)
+
+    assert type(excinfo.value) is error
+    assert excinfo.value.args == (message,)
+    assert loader.loaded == []
+
+
+@pytest.mark.parametrize(
+    ("limit", "expected_limit"),
+    [
+        pytest.param(None, None, id="newest-not-yet-ingested"),
+        pytest.param(1, 1, id="limit-1"),
+        pytest.param(26, 26, id="limit-26"),
+    ],
+)
+def test_create_pipeline_constructs_the_real_reserves_pipeline(
+    test_settings: TerminalSettings, limit: int | None, expected_limit: int | None
+) -> None:
+    """Un-doubled: the real class takes the routed ``limit``. Its constructor does no I/O."""
+    pipeline = registry.create_pipeline("cbk_reserves", test_settings, limit=limit)
+
+    assert type(pipeline) is CbkReservesPipeline
+    assert pipeline.settings is test_settings
+    assert pipeline.limit == expected_limit
+
+
+@pytest.mark.parametrize(
+    ("name", "option"),
+    [
+        pytest.param("nse_market_statistics", "trade_date", id="nse_market_statistics-trade_date"),
+        pytest.param("cbk_reserves", "limit", id="cbk_reserves-limit"),
+    ],
+)
+def test_real_pipeline_classes_take_their_option_as_a_keyword(name: str, option: str) -> None:
+    """The keyword the routing passes is the one the real constructor declares, keyword-only.
+
+    ``MarketStatisticsPipeline`` is checked by signature rather than constructed: its constructor
+    loads the shipped exchange-calendar file, and these tests do no I/O.
+    """
+    parameter = inspect.signature(registry.load_pipeline(name)).parameters[option]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is None
+
+
+# --- run_pipeline ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("trigger", "with_spacing"),
+    [
+        pytest.param("cli", True, id="cli-with-shared-spacing"),
+        pytest.param("schedule", False, id="schedule-without-spacing"),
+    ],
+)
+async def test_run_pipeline_runs_on_its_own_engine_and_disposes_it(
+    monkeypatch: pytest.MonkeyPatch,
+    test_settings: TerminalSettings,
+    trigger: RunTrigger,
+    with_spacing: bool,
+) -> None:
+    doubles = install_run_doubles(monkeypatch)
+    spacing = HostSpacing() if with_spacing else None
+
+    result = await registry.run_pipeline(
+        "cbk_reserves", test_settings, trigger=trigger, limit=3, spacing=spacing
+    )
+
+    assert result == RESULTS["cbk_reserves"]
+    assert doubles.engines.calls == [test_settings]
+    assert doubles.engines.calls[0] is test_settings
+    [built] = doubles.loader.built
+    assert built.kwargs == {"limit": 3}
+    assert doubles.execute.calls == [
+        ExecuteCall(built, doubles.engines.engine, trigger, spacing),
+    ]
+    assert doubles.execute.calls[0].spacing is spacing
+    assert doubles.engines.engine.dispose_calls == 1
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        pytest.param(RuntimeError, id="execute-raises"),
+        pytest.param(asyncio.CancelledError, id="cancelled"),
+    ],
+)
+async def test_run_pipeline_disposes_the_engine_when_the_run_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    test_settings: TerminalSettings,
+    error_type: type[BaseException],
+) -> None:
+    error = error_type(f"run row not written: {REGISTRY_SENTINEL}")
+    doubles = install_run_doubles(monkeypatch, outcomes={"cbk_fx": error})
+
+    with pytest.raises(type(error)) as excinfo:
+        await registry.run_pipeline("cbk_fx", test_settings, trigger="cli")
+
+    assert excinfo.value is error
+    assert len(doubles.execute.calls) == 1
+    assert doubles.engines.engine.dispose_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "options", "error"),
+    [
+        pytest.param("cbk_fxx", {}, KeyError, id="unknown-name"),
+        pytest.param("cbk_fx", {"trade_date": TRADE_DATE}, ValueError, id="trade-date-for-cbk"),
+        pytest.param("cbk_reserves", {"limit": 27}, ValueError, id="limit-27"),
+    ],
+)
+async def test_run_pipeline_rejects_options_before_building_an_engine(
+    monkeypatch: pytest.MonkeyPatch,
+    test_settings: TerminalSettings,
+    name: str,
+    options: dict[str, Any],
+    error: type[Exception],
+) -> None:
+    doubles = install_run_doubles(monkeypatch)
+
+    with pytest.raises(error):
+        await registry.run_pipeline(name, test_settings, trigger="cli", **options)
+
+    assert doubles.loader.loaded == []
+    assert doubles.engines.calls == []
+    assert doubles.execute.calls == []
+
+
+async def test_run_pipeline_logs_a_failed_dispose_by_type_and_returns_the_result(
+    monkeypatch: pytest.MonkeyPatch,
+    test_settings: TerminalSettings,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger=REGISTRY_LOGGER)
+    doubles = install_run_doubles(
+        monkeypatch, dispose_error=OSError(f"pool close: {REGISTRY_SENTINEL}")
+    )
+
+    result = await registry.run_pipeline("cbk_bonds", test_settings, trigger="cli")
+
+    assert result == RESULTS["cbk_bonds"]
+    assert doubles.engines.engine.dispose_calls == 1
+    assert registry_records(caplog) == [
+        (logging.WARNING, "could not dispose the ingestion engine: OSError"),
+    ]
+    assert REGISTRY_SENTINEL not in caplog.text
+
+
+async def test_run_pipeline_keeps_the_run_error_when_dispose_also_fails(
+    monkeypatch: pytest.MonkeyPatch, test_settings: TerminalSettings
+) -> None:
+    """A pool that fails to close never replaces the exception already propagating."""
+    error = RuntimeError("run row not written")
+    doubles = install_run_doubles(
+        monkeypatch, outcomes={"cbk_bonds": error}, dispose_error=OSError("pool close")
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await registry.run_pipeline("cbk_bonds", test_settings, trigger="cli")
+
+    assert excinfo.value is error
+    assert doubles.engines.engine.dispose_calls == 1
+
+
+# --- run_pipelines ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("names", "error", "message"),
+    [
+        pytest.param(
+            "cbk_fx",
+            TypeError,
+            "names must be a sequence of pipeline names, not a single string",
+            id="single-string",
+        ),
+        pytest.param(
+            ["cbk_rates_csv", "cbk_inflaton", "cbk_fx"],
+            KeyError,
+            f"unknown pipeline 'cbk_inflaton'; {VALID_NAMES_MESSAGE}",
+            id="unknown-name-among-valid-ones",
+        ),
+    ],
+)
+async def test_run_pipelines_checks_the_names_before_running_any(
+    monkeypatch: pytest.MonkeyPatch,
+    test_settings: TerminalSettings,
+    names: str | list[str],
+    error: type[Exception],
+    message: str,
+) -> None:
+    """A misspelt name, or a single string passed for the sequence, starts no run."""
+    doubles = install_run_doubles(monkeypatch)
+
+    with pytest.raises(error) as excinfo:
+        await registry.run_pipelines(names, test_settings, trigger="schedule")
+
+    assert type(excinfo.value) is error
+    assert excinfo.value.args == (message,)
+    assert doubles.loader.loaded == []
+    assert doubles.spacings.created == []
+    assert doubles.engines.calls == []
+    assert doubles.execute.calls == []
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "expected_results"),
+    [
+        pytest.param(
+            {},
+            [RESULTS[name] for name in CBK_NAMES],
+            id="all-succeed",
+        ),
+        pytest.param(
+            {"cbk_inflation": LOCK_HELD},
+            [
+                RESULTS["cbk_rates_csv"],
+                LOCK_HELD,
+                RESULTS["cbk_fx"],
+                RESULTS["cbk_bonds"],
+                RESULTS["cbk_reserves"],
+            ],
+            id="a-failed-status-does-not-stop-the-sequence",
+        ),
+    ],
+)
+async def test_run_pipelines_runs_each_name_in_order_on_one_engine_and_spacing(
+    monkeypatch: pytest.MonkeyPatch,
+    test_settings: TerminalSettings,
+    outcomes: Mapping[str, RunResult],
+    expected_results: list[RunResult],
+) -> None:
+    doubles = install_run_doubles(monkeypatch, outcomes=outcomes)
+
+    results = await registry.run_pipelines(CBK_NAMES, test_settings, trigger="schedule")
+
+    assert results == expected_results
+    assert doubles.loader.loaded == list(CBK_NAMES)
+    assert [call.pipeline.name for call in doubles.execute.calls] == list(CBK_NAMES)
+    assert [call.pipeline for call in doubles.execute.calls] == doubles.loader.built
+    assert len({id(call.pipeline) for call in doubles.execute.calls}) == len(CBK_NAMES)
+    assert all(
+        built.args == (test_settings,) and built.args[0] is test_settings and built.kwargs == {}
+        for built in doubles.loader.built
+    )
+    assert doubles.engines.calls == [test_settings]
+    assert all(call.engine is doubles.engines.engine for call in doubles.execute.calls)
+    [spacing] = doubles.spacings.created
+    assert all(call.spacing is spacing for call in doubles.execute.calls)
+    assert {call.trigger for call in doubles.execute.calls} == {"schedule"}
+    assert doubles.engines.engine.dispose_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("execute_raises", "constructor_raises", "logged", "message", "executed"),
+    [
+        pytest.param(
+            ("cbk_inflation",),
+            (),
+            [
+                "ingestion run of cbk_inflation raised RuntimeError; "
+                "continuing with the remaining pipelines",
+            ],
+            "1 of 5 ingestion runs raised instead of returning a result",
+            ["cbk_rates_csv", "cbk_inflation", "cbk_fx", "cbk_bonds", "cbk_reserves"],
+            id="one-run-raises",
+        ),
+        pytest.param(
+            ("cbk_inflation",),
+            ("cbk_bonds",),
+            [
+                "ingestion run of cbk_inflation raised RuntimeError; "
+                "continuing with the remaining pipelines",
+                "ingestion run of cbk_bonds raised TypeError; "
+                "continuing with the remaining pipelines",
+            ],
+            "2 of 5 ingestion runs raised instead of returning a result",
+            ["cbk_rates_csv", "cbk_inflation", "cbk_fx", "cbk_reserves"],
+            id="a-run-and-a-constructor-raise",
+        ),
+    ],
+)
+async def test_run_pipelines_runs_the_rest_and_raises_the_errors_together(
+    monkeypatch: pytest.MonkeyPatch,
+    test_settings: TerminalSettings,
+    caplog: pytest.LogCaptureFixture,
+    execute_raises: tuple[str, ...],
+    constructor_raises: tuple[str, ...],
+    logged: list[str],
+    message: str,
+    executed: list[str],
+) -> None:
+    """A run that raises (``execute_pipeline`` failing to write its run row, or a pipeline that
+    cannot be constructed) is logged by type only; the remaining pipelines still run, and the
+    errors are raised together at the end, each noted with its pipeline."""
+    caplog.set_level(logging.INFO, logger=REGISTRY_LOGGER)
+    execute_errors = {
+        name: RuntimeError(f"run row not written: {REGISTRY_SENTINEL}") for name in execute_raises
+    }
+    constructor_errors = {
+        name: TypeError(f"bad argument: {REGISTRY_SENTINEL}") for name in constructor_raises
+    }
+    doubles = install_run_doubles(
+        monkeypatch, outcomes=execute_errors, constructor_errors=constructor_errors
+    )
+    raised_by = [name for name in CBK_NAMES if name in {*execute_raises, *constructor_raises}]
+    expected_errors = [{**execute_errors, **constructor_errors}[name] for name in raised_by]
+
+    with pytest.raises(ExceptionGroup) as excinfo:
+        await registry.run_pipelines(CBK_NAMES, test_settings, trigger="schedule")
+
+    group = excinfo.value
+    assert group.message == message
+    assert len(group.exceptions) == len(expected_errors)
+    assert all(
+        raised is expected
+        for raised, expected in zip(group.exceptions, expected_errors, strict=True)
+    )
+    assert [raised.__notes__ for raised in group.exceptions] == [
+        [f"raised by the {name} ingestion run"] for name in raised_by
+    ]
+    assert registry_records(caplog) == [(logging.ERROR, line) for line in logged]
+    assert REGISTRY_SENTINEL not in caplog.text
+    assert doubles.loader.loaded == list(CBK_NAMES)
+    assert [call.pipeline.name for call in doubles.execute.calls] == executed
+    assert doubles.engines.calls == [test_settings]
+    assert doubles.engines.engine.dispose_calls == 1
+
+
+async def test_run_pipelines_stops_at_once_when_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+    test_settings: TerminalSettings,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger=REGISTRY_LOGGER)
+    cancellation = asyncio.CancelledError()
+    doubles = install_run_doubles(monkeypatch, outcomes={"cbk_inflation": cancellation})
+
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await registry.run_pipelines(CBK_NAMES, test_settings, trigger="schedule")
+
+    assert excinfo.value is cancellation
+    assert doubles.loader.loaded == ["cbk_rates_csv", "cbk_inflation"]
+    assert [call.pipeline.name for call in doubles.execute.calls] == [
+        "cbk_rates_csv",
+        "cbk_inflation",
+    ]
+    assert doubles.engines.engine.dispose_calls == 1
+    assert registry_records(caplog) == []
+
+
+# ---------------------------------------------------------------------------------------------
+# Scheduler process (``opennse_terminal.ingestion.scheduler``)
+#
+# Covered: the two cron jobs and their options (:data:`JOB_DEFINITIONS`, :data:`JOB_DEFAULTS`);
+# :func:`build_scheduler`, both as built (unstarted, Africa/Nairobi, the real cron triggers' fire
+# times) and through a capturing ``AsyncIOScheduler`` double (the exact constructor, ``add_job``
+# and ``add_listener`` calls); the job-event log lines; the scheduled job callable and
+# :func:`run_job` (trigger ``"schedule"``, per-result log lines, errors named by type only, the
+# cancellation contract); the SIGINT/SIGTERM stop handlers, with and without loop signal
+# support; the wait for in-flight jobs; the ``_serve`` and :func:`run_forever` lifecycle; and the
+# import-time check that every scheduled pipeline is registered.
+#
+# Every test is offline and runs no scheduled job: no network, no database (no test requests a
+# database fixture), no real sleep. The registry's ``run_pipelines`` and the APScheduler scheduler
+# are replaced by capturing doubles wherever a job would run, and the real schedulers built here
+# are never started. Code that inspects every task of its loop runs in a synchronous test on an
+# event loop of its own, and code that calls ``asyncio.run`` in a thread of its own, never on the
+# session loop the async tests share.
+# Tests of signal handling run under the standard SIGINT and SIGTERM dispositions of a Python
+# process, whatever the launch of pytest left in place, and compare the handlers with those; the
+# dispositions found before each such test are reinstated after it.
+# Expected schedules, options and messages are literals from the plan (cron Tuesday-Saturday
+# 07:30 and Monday-Friday 18:15 in Africa/Nairobi; ``coalesce=True``, ``max_instances=1``,
+# ``misfire_grace_time=3600``) and the module's documented log lines.
+# ---------------------------------------------------------------------------------------------
+
+
+SCHEDULER_LOGGER = "opennse_terminal.ingestion.scheduler"
+# CBK_NAMES (the registry section above) and NAIROBI (the module constants) serve here as well.
+NSE_NAMES = ("nse_market_statistics",)
+JOB_OPTIONS = {"coalesce": True, "max_instances": 1, "misfire_grace_time": 3600}
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+# Monday 26 October 2026, midnight in Nairobi: the week the fire-time tests walk through.
+MONDAY_MIDNIGHT = datetime(2026, 10, 26, 0, 0, tzinfo=NAIROBI)
+NSE_RUN_TIME = datetime(2026, 10, 27, 7, 30, tzinfo=NAIROBI)
+CBK_RUN_TIME = datetime(2026, 10, 26, 18, 15, tzinfo=NAIROBI)
+
+# Stands for connection detail a real database error could carry; no log line may repeat an
+# exception's message or traceback.
+SCHEDULER_SENTINEL = "sentinel-connection-detail-9b2e"
+
+# Bounds a wait that returns at once when the code under test works; reached only when it hangs.
+SAFETY_TIMEOUT_SECONDS = 30
+_YIELD_LIMIT = 100
+
+SettingsFactory = Callable[..., TerminalSettings]
+SignalHandler = Callable[[int, FrameType | None], Any] | int | None
+
+_T = TypeVar("_T")
+
+RATES_RESULT = RunResult(
+    run_id=uuid.UUID("5d2c7a10-8f3e-4c1b-9a6d-2e4f6a8b0c11"),
+    pipeline="cbk_rates_csv",
+    status=RunStatus.SUCCEEDED,
+    rows_fetched=424,
+    rows_written=423,
+    rows_rejected=1,
+    error_message=None,
+    details={},
+)
+INFLATION_RESULT = RunResult(
+    run_id=uuid.UUID("5d2c7a10-8f3e-4c1b-9a6d-2e4f6a8b0c12"),
+    pipeline="cbk_inflation",
+    status=RunStatus.FAILED,
+    rows_fetched=0,
+    rows_written=0,
+    rows_rejected=0,
+    error_message="lock held",
+    details={},
+)
+NSE_RESULT = RunResult(
+    run_id=uuid.UUID("5d2c7a10-8f3e-4c1b-9a6d-2e4f6a8b0c13"),
+    pipeline="nse_market_statistics",
+    status=RunStatus.AMBIGUOUS_SESSION,
+    rows_fetched=70,
+    rows_written=0,
+    rows_rejected=0,
+    error_message=None,
+    details={},
+)
+
+
+# --- Helpers and doubles ---------------------------------------------------------------------
+
+
+def scheduler_records(caplog: pytest.LogCaptureFixture) -> list[tuple[int, str]]:
+    """The scheduler's captured log records as ``(level, message)`` pairs, in order."""
+    return [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.name == SCHEDULER_LOGGER
+    ]
+
+
+def current_stop_handlers() -> dict[signal.Signals, SignalHandler]:
+    """The handlers now installed for SIGINT and SIGTERM."""
+    return {sig: signal.getsignal(sig) for sig in STOP_SIGNALS}
+
+
+def raise_handled_signal(signum: signal.Signals, pre_test_handler: SignalHandler) -> None:
+    """Send ``signum`` to this process, refusing while its pre-test handler is still installed:
+    under pytest that handler is the default action, which would end the test run rather than
+    exercise the code under test."""
+    if signal.getsignal(signum) == pre_test_handler:
+        raise AssertionError(f"no stop handler is installed for {signum.name}; not raising it")
+    signal.raise_signal(signum)
+
+
+def run_on_fresh_loop(main: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
+    """Run ``main()`` to completion on a new event loop, never the session loop, then close it."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(main())
+    finally:
+        loop.close()
+
+
+def run_in_new_thread(target: Callable[[], object]) -> int:
+    """Run ``target()`` to completion in a new thread, raise again here what it raised, and
+    return that thread's identifier. A thread still running after the safety timeout fails the
+    test; being a daemon, it cannot keep the test process alive."""
+    raised: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            target()
+        except BaseException as exc:  # handed to the calling thread, which raises it again
+            raised.append(exc)
+
+    worker = threading.Thread(target=run, name="test-scheduler-run-forever", daemon=True)
+    worker.start()
+    worker.join(SAFETY_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        raise AssertionError(f"the thread did not finish within {SAFETY_TIMEOUT_SECONDS} seconds")
+    if raised:
+        raise raised[0]
+    assert worker.ident is not None
+    return worker.ident
+
+
+async def within_safety_timeout(awaitable: Awaitable[_T]) -> _T:
+    """Await ``awaitable``, failing with ``TimeoutError`` only if it hangs."""
+    async with asyncio.timeout(SAFETY_TIMEOUT_SECONDS):
+        return await awaitable
+
+
+async def yield_until(condition: Callable[[], bool], what: str) -> None:
+    """Give the running loop up to 100 iterations, without sleeping, until ``condition()``."""
+    for _ in range(_YIELD_LIMIT):
+        if condition():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"{what} did not happen within {_YIELD_LIMIT} loop iterations")
+
+
+def fire_times(trigger: Any, start: datetime, count: int) -> list[datetime]:
+    """The first ``count`` fire times of ``trigger`` after ``start``, each computed from the
+    previous one as APScheduler does after a run."""
+    times: list[datetime] = []
+    previous: datetime | None = None
+    now = start
+    for _ in range(count):
+        fire = trigger.get_next_fire_time(previous, now)
+        assert isinstance(fire, datetime)
+        times.append(fire)
+        previous = now = fire
+    return times
+
+
+@pytest.fixture
+def stop_handlers_before() -> Iterator[dict[signal.Signals, SignalHandler]]:
+    """The standard SIGINT and SIGTERM dispositions, installed for the test, which are yielded;
+    the dispositions really in place before the test are reinstated after it, ``SIG_IGN``
+    included.
+
+    The standard dispositions, ``default_int_handler`` for SIGINT and ``SIG_DFL`` for SIGTERM,
+    are those of a Python process started normally, which the ``opennse-terminal scheduler``
+    process is. They are installed because, on Unix, the loop's ``remove_signal_handler`` resets
+    each signal to its standard disposition, not to the one it replaced; the dispositions pytest
+    inherits depend on how it was launched (a background job of a non-interactive shell starts
+    with SIGINT ignored, and Python keeps that), so only the standard ones make the comparison
+    after removal independent of the launch.
+    """
+    really_before = current_stop_handlers()
+    try:
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        yield current_stop_handlers()
+    finally:
+        for sig, handler in really_before.items():
+            # getsignal() gives None for a handler not installed from Python, which signal()
+            # cannot reinstate; that signal keeps its standard disposition.
+            if handler is not None:
+                signal.signal(sig, handler)
+
+
+class RecordingAsyncIOScheduler:
+    """Stands in for ``AsyncIOScheduler`` in ``build_scheduler``: records the constructor's
+    keyword arguments and every ``add_job`` and ``add_listener`` call, and schedules nothing."""
+
+    def __init__(self, **options: object) -> None:
+        self.options = options
+        self.added_jobs: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        self.listeners: list[tuple[object, ...]] = []
+
+    def add_job(self, *args: object, **kwargs: object) -> None:
+        self.added_jobs.append((args, kwargs))
+
+    def add_listener(self, *args: object) -> None:
+        self.listeners.append(args)
+
+
+class RunPipelinesDouble:
+    """Stands in for ``registry.run_pipelines``: records each call together with the scheduler
+    log lines already emitted when it was made, then raises ``error``, blocks until cancelled
+    (``block``), or returns ``results``."""
+
+    def __init__(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        *,
+        results: list[RunResult] | None = None,
+        error: BaseException | None = None,
+        block: bool = False,
+    ) -> None:
+        self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        self.logged_before_call: list[list[tuple[int, str]]] = []
+        self.started = asyncio.Event()
+        self._caplog = caplog
+        self._results = results if results is not None else []
+        self._error = error
+        self._block = block
+        self._never_set = asyncio.Event()
+
+    async def __call__(self, *args: object, **kwargs: object) -> list[RunResult]:
+        self.calls.append((args, kwargs))
+        self.logged_before_call.append(scheduler_records(self._caplog))
+        self.started.set()
+        if self._block:
+            await self._never_set.wait()
+        if self._error is not None:
+            raise self._error
+        return self._results
+
+
+class LoopWithoutSignalHandlers:
+    """An event loop as ``_install_stop_handlers`` sees one on Windows: ``add_signal_handler``
+    raises ``NotImplementedError``, and ``call_soon_threadsafe`` records the arguments of each
+    callback and runs it at once."""
+
+    def __init__(self) -> None:
+        self.threadsafe_calls: list[tuple[object, ...]] = []
+
+    def add_signal_handler(self, sig: int, callback: Callable[..., object], *args: object) -> None:
+        raise NotImplementedError
+
+    def call_soon_threadsafe(self, callback: Callable[..., object], *args: object) -> None:
+        self.threadsafe_calls.append(args)
+        callback(*args)
+
+
+class StoppingScheduler:
+    """Stands in for an ``AsyncIOScheduler`` whose ``shutdown(wait=False)`` takes effect a few
+    loop iterations later: ``running`` reads True ``polls_while_running`` times, then False."""
+
+    def __init__(self, polls_while_running: int) -> None:
+        self.polls = 0
+        self._polls_while_running = polls_while_running
+
+    @property
+    def running(self) -> bool:
+        self.polls += 1
+        return self.polls <= self._polls_while_running
+
+
+@dataclass(frozen=True, slots=True)
+class FakeJob:
+    """What ``_serve`` reads of a scheduled job."""
+
+    id: str
+    next_run_time: datetime
+
+
+class TimelineHandler(logging.Handler):
+    """Appends each log line to the timeline the fake scheduler records its calls on, so the
+    order of calls and log lines can be asserted together."""
+
+    def __init__(self, timeline: list[str]) -> None:
+        super().__init__(level=logging.INFO)
+        self.timeline = timeline
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.timeline.append(f"{record.levelname} {record.getMessage()}")
+
+
+class ServedScheduler:
+    """Stands in for the scheduler ``build_scheduler`` returns, in ``_serve``: records
+    ``start``, ``get_jobs`` and ``shutdown`` on the timeline. ``start()`` raises
+    ``start_error``; otherwise it starts the task of a scheduled job, a run in progress when the
+    process is stopped, and asks the running loop to deliver SIGTERM, as an operator stopping
+    the process would, once it has checked that a stop handler is installed.
+
+    Like ``AsyncIOScheduler``, it applies ``shutdown()`` on a later loop iteration: ``running``
+    still reads True for ``POLLS_WHILE_STOPPING`` polls after the call. At the next poll the
+    scheduler stops and cancels the job's task, as its executor does, and the job then takes
+    ``RECORDING_YIELDS`` loop iterations, without sleeping, to finish recording the run it
+    interrupted, as ``execute_pipeline`` does, before it records that on the timeline."""
+
+    POLLS_WHILE_STOPPING = 3
+    RECORDING_YIELDS = 5
+
+    def __init__(
+        self,
+        timeline: list[str],
+        pre_test_handlers: dict[signal.Signals, SignalHandler],
+        start_error: Exception | None = None,
+    ) -> None:
+        self.timeline = timeline
+        self.handlers_at_start: dict[signal.Signals, SignalHandler] | None = None
+        self.job: asyncio.Task[None] | None = None
+        self.polls_after_shutdown = 0
+        self._pre_test_handlers = pre_test_handlers
+        self._start_error = start_error
+        self._running = False
+        self._shutdown_requested = False
+
+    @property
+    def running(self) -> bool:
+        if self._running and self._shutdown_requested:
+            self.polls_after_shutdown += 1
+            if self.polls_after_shutdown > self.POLLS_WHILE_STOPPING:
+                self._running = False
+                self.timeline.append("shutdown applied: job nse_equities_eod cancelled")
+                assert self.job is not None
+                self.job.cancel()
+        return self._running
+
+    def start(self) -> None:
+        self.timeline.append("start")
+        self.handlers_at_start = current_stop_handlers()
+        if self._start_error is not None:
+            raise self._start_error
+        if signal.getsignal(signal.SIGTERM) == self._pre_test_handlers[signal.SIGTERM]:
+            raise AssertionError("no SIGTERM stop handler is installed; not delivering SIGTERM")
+        self._running = True
+        loop = asyncio.get_running_loop()
+        self.job = loop.create_task(self._run_job_until_cancelled())
+        loop.call_soon(signal.raise_signal, signal.SIGTERM)
+
+    def get_jobs(self) -> list[FakeJob]:
+        self.timeline.append("get_jobs")
+        return [
+            FakeJob("nse_equities_eod", NSE_RUN_TIME),
+            FakeJob("cbk_macro", CBK_RUN_TIME),
+        ]
+
+    def shutdown(self, wait: bool = True) -> None:
+        self.timeline.append(f"shutdown(wait={wait})")
+        self._shutdown_requested = True
+
+    async def _run_job_until_cancelled(self) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            for _ in range(self.RECORDING_YIELDS):
+                await asyncio.sleep(0)
+            self.timeline.append("job nse_equities_eod recorded its run")
+            raise
+
+
+@pytest.fixture
+def timeline(caplog: pytest.LogCaptureFixture) -> Iterator[list[str]]:
+    """An ordered list of the fake scheduler's calls and the scheduler's INFO and higher lines."""
+    caplog.set_level(logging.INFO, logger=SCHEDULER_LOGGER)
+    entries: list[str] = []
+    handler = TimelineHandler(entries)
+    logger = logging.getLogger(SCHEDULER_LOGGER)
+    logger.addHandler(handler)
+    try:
+        yield entries
+    finally:
+        logger.removeHandler(handler)
+
+
+@pytest.fixture
+async def session_loop() -> asyncio.AbstractEventLoop:
+    """The session loop the async tests share, held by the thread every test runs in."""
+    return asyncio.get_running_loop()
+
+
+# --- Job definitions and options -------------------------------------------------------------
+
+
+def test_job_definitions_are_the_two_planned_jobs_in_order() -> None:
+    assert scheduler.JOB_DEFINITIONS == (
+        JobDefinition(
+            job_id="nse_equities_eod",
+            pipelines=("nse_market_statistics",),
+            day_of_week="tue-sat",
+            hour=7,
+            minute=30,
+        ),
+        JobDefinition(
+            job_id="cbk_macro",
+            pipelines=(
+                "cbk_rates_csv",
+                "cbk_inflation",
+                "cbk_fx",
+                "cbk_bonds",
+                "cbk_reserves",
+            ),
+            day_of_week="mon-fri",
+            hour=18,
+            minute=15,
+        ),
+    )
+
+
+def test_cbk_macro_runs_the_registry_cbk_pipelines() -> None:
+    """The scheduler and ``ingest cbk`` run the same five pipelines, in the same order."""
+    cbk_macro = scheduler.JOB_DEFINITIONS[1]
+    assert cbk_macro.pipelines == registry.CBK_PIPELINES == CBK_NAMES
+
+
+def test_every_scheduled_pipeline_is_registered() -> None:
+    scheduled = {name for job in scheduler.JOB_DEFINITIONS for name in job.pipelines}
+    assert scheduled == {"nse_market_statistics", *CBK_NAMES}
+    assert scheduled <= set(registry.PIPELINES)
+
+
+def test_job_defaults_coalesce_never_overlap_and_allow_an_hour_late() -> None:
+    writable_view: Any = scheduler.JOB_DEFAULTS
+    assert scheduler.JOB_DEFAULTS == {
+        "coalesce": True,
+        "max_instances": 1,
+        "misfire_grace_time": 3600,
+    }
+    assert isinstance(scheduler.JOB_DEFAULTS, MappingProxyType)
+    with pytest.raises(TypeError):
+        writable_view["coalesce"] = False
+    assert scheduler.JOB_DEFAULTS["coalesce"] is True
+
+
+# --- build_scheduler -------------------------------------------------------------------------
+
+
+def test_build_scheduler_needs_no_running_loop_and_leaves_the_scheduler_unstarted(
+    test_settings: TerminalSettings,
+) -> None:
+    with pytest.raises(RuntimeError):
+        asyncio.get_running_loop()
+
+    built = scheduler.build_scheduler(test_settings)
+
+    assert built.running is False
+    assert built.timezone == NAIROBI
+    assert [job.id for job in built.get_jobs()] == ["nse_equities_eod", "cbk_macro"]
+
+
+@pytest.mark.parametrize(
+    ("job_id", "pipelines"),
+    [
+        pytest.param("nse_equities_eod", NSE_NAMES, id="nse_equities_eod"),
+        pytest.param("cbk_macro", CBK_NAMES, id="cbk_macro"),
+    ],
+)
+def test_each_built_job_runs_its_pipelines_with_the_planned_options(
+    test_settings: TerminalSettings, job_id: str, pipelines: tuple[str, ...]
+) -> None:
+    [job] = [job for job in scheduler.build_scheduler(test_settings).get_jobs() if job.id == job_id]
+
+    assert job.name == job_id
+    assert job.func is scheduler._run_scheduled_job
+    assert job.args == (job_id, pipelines, test_settings)
+    assert job.args[2] is test_settings
+    assert job.kwargs == {}
+    assert job.coalesce is True
+    assert job.max_instances == 1
+    assert job.misfire_grace_time == 3600
+    assert isinstance(job.trigger, CronTrigger)
+    assert job.trigger.timezone == NAIROBI
+
+
+@pytest.mark.parametrize(
+    ("job_id", "expected_fire_times", "expected_weekdays"),
+    [
+        pytest.param(
+            "nse_equities_eod",
+            [
+                "2026-10-27T07:30:00+03:00",
+                "2026-10-28T07:30:00+03:00",
+                "2026-10-29T07:30:00+03:00",
+                "2026-10-30T07:30:00+03:00",
+                "2026-10-31T07:30:00+03:00",
+                "2026-11-03T07:30:00+03:00",
+            ],
+            # Monday is 0: Tuesday to Saturday, then the next Tuesday.
+            [1, 2, 3, 4, 5, 1],
+            id="nse_equities_eod-tuesday-to-saturday-0730",
+        ),
+        pytest.param(
+            "cbk_macro",
+            [
+                "2026-10-26T18:15:00+03:00",
+                "2026-10-27T18:15:00+03:00",
+                "2026-10-28T18:15:00+03:00",
+                "2026-10-29T18:15:00+03:00",
+                "2026-10-30T18:15:00+03:00",
+                "2026-11-02T18:15:00+03:00",
+            ],
+            # Monday to Friday, then the next Monday.
+            [0, 1, 2, 3, 4, 0],
+            id="cbk_macro-monday-to-friday-1815",
+        ),
+    ],
+)
+def test_built_triggers_fire_on_the_planned_days_and_times_in_nairobi(
+    test_settings: TerminalSettings,
+    job_id: str,
+    expected_fire_times: list[str],
+    expected_weekdays: list[int],
+) -> None:
+    [job] = [job for job in scheduler.build_scheduler(test_settings).get_jobs() if job.id == job_id]
+
+    times = fire_times(job.trigger, MONDAY_MIDNIGHT, len(expected_fire_times))
+
+    assert [fire.isoformat() for fire in times] == expected_fire_times
+    assert [fire.weekday() for fire in times] == expected_weekdays
+    assert all(fire.utcoffset() == timedelta(hours=3) for fire in times)
+    assert all(fire.tzinfo == NAIROBI for fire in times)
+
+
+@pytest.mark.parametrize(
+    ("zone", "first_nse_fire"),
+    [
+        pytest.param("Africa/Nairobi", "2026-10-27T07:30:00+03:00", id="africa-nairobi-default"),
+        pytest.param("UTC", "2026-10-27T07:30:00+00:00", id="utc"),
+    ],
+)
+def test_the_scheduler_and_its_triggers_take_the_zone_from_settings(
+    make_settings: SettingsFactory, zone: str, first_nse_fire: str
+) -> None:
+    built = scheduler.build_scheduler(make_settings(timezone=zone))
+    jobs = built.get_jobs()
+
+    assert built.timezone == ZoneInfo(zone)
+    assert [job.trigger.timezone for job in jobs] == [ZoneInfo(zone), ZoneInfo(zone)]
+    [first] = fire_times(jobs[0].trigger, datetime(2026, 10, 26, tzinfo=ZoneInfo(zone)), 1)
+    assert first.isoformat() == first_nse_fire
+
+
+def test_build_scheduler_constructs_the_scheduler_with_the_job_defaults_and_listener(
+    monkeypatch: pytest.MonkeyPatch, test_settings: TerminalSettings
+) -> None:
+    monkeypatch.setattr(scheduler, "AsyncIOScheduler", RecordingAsyncIOScheduler)
+
+    built = scheduler.build_scheduler(test_settings)
+
+    assert isinstance(built, RecordingAsyncIOScheduler)
+    assert built.options == {"timezone": NAIROBI, "job_defaults": JOB_OPTIONS}
+    assert type(built.options["job_defaults"]) is dict
+    assert built.listeners == [
+        (scheduler._log_job_event, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR | EVENT_JOB_MISSED),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("index", "job_id", "pipelines", "cron"),
+    [
+        pytest.param(
+            0,
+            "nse_equities_eod",
+            NSE_NAMES,
+            "cron[day_of_week='tue-sat', hour='7', minute='30']",
+            id="nse_equities_eod",
+        ),
+        pytest.param(
+            1,
+            "cbk_macro",
+            CBK_NAMES,
+            "cron[day_of_week='mon-fri', hour='18', minute='15']",
+            id="cbk_macro",
+        ),
+    ],
+)
+def test_build_scheduler_adds_each_job_with_explicit_options(
+    monkeypatch: pytest.MonkeyPatch,
+    test_settings: TerminalSettings,
+    index: int,
+    job_id: str,
+    pipelines: tuple[str, ...],
+    cron: str,
+) -> None:
+    """Every job passes ``coalesce``, ``max_instances`` and ``misfire_grace_time`` itself, so
+    none depends on APScheduler's own defaults, and replaces an existing job of its id."""
+    monkeypatch.setattr(scheduler, "AsyncIOScheduler", RecordingAsyncIOScheduler)
+
+    built = scheduler.build_scheduler(test_settings)
+
+    assert isinstance(built, RecordingAsyncIOScheduler)
+    assert len(built.added_jobs) == 2
+    args, kwargs = built.added_jobs[index]
+    func, trigger = args
+    assert func is scheduler._run_scheduled_job
+    assert isinstance(trigger, CronTrigger)
+    assert str(trigger) == cron
+    assert trigger.timezone == NAIROBI
+    assert kwargs == {
+        "id": job_id,
+        "name": job_id,
+        "args": (job_id, pipelines, test_settings),
+        "replace_existing": True,
+        "coalesce": True,
+        "max_instances": 1,
+        "misfire_grace_time": 3600,
+    }
+
+
+# --- Job event log lines ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        pytest.param(
+            JobExecutionEvent(
+                EVENT_JOB_EXECUTED, "nse_equities_eod", "default", NSE_RUN_TIME, retval=[NSE_RESULT]
+            ),
+            [
+                (
+                    logging.INFO,
+                    "job nse_equities_eod finished (scheduled for 2026-10-27 07:30:00+03:00)",
+                )
+            ],
+            id="finished",
+        ),
+        pytest.param(
+            JobExecutionEvent(EVENT_JOB_EXECUTED, "cbk_macro", "default", CBK_RUN_TIME, retval=[]),
+            [(logging.INFO, "job cbk_macro finished (scheduled for 2026-10-26 18:15:00+03:00)")],
+            id="finished-with-no-results",
+        ),
+        pytest.param(
+            JobExecutionEvent(
+                EVENT_JOB_EXECUTED, "cbk_macro", "default", CBK_RUN_TIME, retval=None
+            ),
+            [
+                (
+                    logging.WARNING,
+                    "job cbk_macro was cancelled while running "
+                    "(scheduled for 2026-10-26 18:15:00+03:00)",
+                )
+            ],
+            id="cancelled-while-running",
+        ),
+        pytest.param(
+            JobExecutionEvent(EVENT_JOB_MISSED, "nse_equities_eod", "default", NSE_RUN_TIME),
+            [
+                (
+                    logging.WARNING,
+                    "job nse_equities_eod missed its run scheduled for 2026-10-27 07:30:00+03:00 "
+                    "by more than 3600 seconds",
+                )
+            ],
+            id="missed",
+        ),
+        pytest.param(
+            JobExecutionEvent(
+                EVENT_JOB_ERROR,
+                "cbk_macro",
+                "default",
+                CBK_RUN_TIME,
+                exception=RuntimeError(f"could not connect: {SCHEDULER_SENTINEL}"),
+                traceback=(
+                    f"Traceback (most recent call last):\nRuntimeError: {SCHEDULER_SENTINEL}\n"
+                ),
+            ),
+            [
+                (
+                    logging.ERROR,
+                    "job cbk_macro raised RuntimeError (scheduled for 2026-10-26 18:15:00+03:00)",
+                )
+            ],
+            id="error-named-by-type-only",
+        ),
+        pytest.param(
+            JobEvent(EVENT_JOB_ADDED, "cbk_macro", "default"),
+            [],
+            id="other-event-not-logged",
+        ),
+    ],
+)
+def test_job_events_are_logged_once_at_their_level(
+    caplog: pytest.LogCaptureFixture, event: Any, expected: list[tuple[int, str]]
+) -> None:
+    caplog.set_level(logging.DEBUG, logger=SCHEDULER_LOGGER)
+
+    scheduler._log_job_event(event)
+
+    assert scheduler_records(caplog) == expected
+    assert SCHEDULER_SENTINEL not in caplog.text
+
+
+# --- The scheduled job callable and run_job --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("job_id", "pipelines", "fired", "results"),
+    [
+        pytest.param(
+            "nse_equities_eod",
+            NSE_NAMES,
+            "job nse_equities_eod fired: running nse_market_statistics",
+            [NSE_RESULT],
+            id="nse_equities_eod",
+        ),
+        pytest.param(
+            "cbk_macro",
+            CBK_NAMES,
+            "job cbk_macro fired: running cbk_rates_csv, cbk_inflation, cbk_fx, cbk_bonds, "
+            "cbk_reserves",
+            [RATES_RESULT, INFLATION_RESULT],
+            id="cbk_macro",
+        ),
+    ],
+)
+async def test_scheduled_job_logs_that_it_fired_before_running_its_pipelines(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    test_settings: TerminalSettings,
+    job_id: str,
+    pipelines: tuple[str, ...],
+    fired: str,
+    results: list[RunResult],
+) -> None:
+    caplog.set_level(logging.INFO, logger=SCHEDULER_LOGGER)
+    double = RunPipelinesDouble(caplog, results=results)
+    # The scheduler runs its jobs through the registry module itself, the one patched here.
+    assert vars(scheduler)["registry"] is registry
+    monkeypatch.setattr(registry, "run_pipelines", double)
+
+    returned = await scheduler._run_scheduled_job(job_id, pipelines, test_settings)
+
+    assert returned == results
+    assert double.logged_before_call == [[(logging.INFO, fired)]]
+    assert scheduler_records(caplog)[0] == (logging.INFO, fired)
+
+
+async def test_scheduled_job_cancelled_while_running_returns_none_and_withdraws_it(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    test_settings: TerminalSettings,
+) -> None:
+    """The cancellation is absorbed: the task ends normally with ``None`` and no pending
+    cancellation, which ``_log_job_event`` reports as cancelled while running."""
+    caplog.set_level(logging.INFO, logger=SCHEDULER_LOGGER)
+    double = RunPipelinesDouble(caplog, block=True)
+    monkeypatch.setattr(registry, "run_pipelines", double)
+    task = asyncio.create_task(scheduler._run_scheduled_job("cbk_macro", CBK_NAMES, test_settings))
+    await within_safety_timeout(double.started.wait())
+
+    task.cancel()
+    returned = await task
+
+    assert returned is None
+    assert task.cancelled() is False
+    assert task.cancelling() == 0
+    assert len(double.calls) == 1
+    assert scheduler_records(caplog) == [
+        (
+            logging.INFO,
+            "job cbk_macro fired: running cbk_rates_csv, cbk_inflation, cbk_fx, cbk_bonds, "
+            "cbk_reserves",
+        ),
+    ]
+
+
+async def test_run_job_runs_the_pipelines_on_the_schedule_trigger_and_logs_each_result(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    test_settings: TerminalSettings,
+) -> None:
+    caplog.set_level(logging.INFO, logger=SCHEDULER_LOGGER)
+    results = [RATES_RESULT, INFLATION_RESULT]
+    double = RunPipelinesDouble(caplog, results=results)
+    monkeypatch.setattr(registry, "run_pipelines", double)
+    names = ["cbk_rates_csv", "cbk_inflation"]
+
+    returned = await scheduler.run_job("cbk_macro", names, test_settings)
+
+    assert returned == results
+    assert double.calls == [((names, test_settings), {"trigger": "schedule"})]
+    [(call_args, _call_kwargs)] = double.calls
+    assert call_args[0] is names
+    assert call_args[1] is test_settings
+    assert scheduler_records(caplog) == [
+        (
+            logging.INFO,
+            "job cbk_macro: pipeline=cbk_rates_csv status=succeeded fetched=424 written=423 "
+            "rejected=1 run_id=5d2c7a10-8f3e-4c1b-9a6d-2e4f6a8b0c11",
+        ),
+        (
+            logging.INFO,
+            "job cbk_macro: pipeline=cbk_inflation status=failed fetched=0 written=0 "
+            "rejected=0 run_id=5d2c7a10-8f3e-4c1b-9a6d-2e4f6a8b0c12",
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("error", "logged"),
+    [
+        pytest.param(
+            ExceptionGroup(
+                "2 of 5 ingestion runs raised instead of returning a result",
+                [
+                    RuntimeError(f"run row: {SCHEDULER_SENTINEL}"),
+                    TypeError(f"constructor: {SCHEDULER_SENTINEL}"),
+                ],
+            ),
+            "job cbk_macro: 2 ingestion run(s) raised instead of returning a result "
+            "(RuntimeError, TypeError); the scheduler keeps running",
+            id="exception-group",
+        ),
+        pytest.param(
+            ValueError(f"database URL is not usable: {SCHEDULER_SENTINEL}"),
+            "job cbk_macro could not run its pipelines: ValueError; the scheduler keeps running",
+            id="ValueError",
+        ),
+        pytest.param(
+            KeyError(f"unknown pipeline {SCHEDULER_SENTINEL}"),
+            "job cbk_macro could not run its pipelines: KeyError; the scheduler keeps running",
+            id="KeyError",
+        ),
+        pytest.param(
+            TypeError(f"names: {SCHEDULER_SENTINEL}"),
+            "job cbk_macro could not run its pipelines: TypeError; the scheduler keeps running",
+            id="TypeError",
+        ),
+        pytest.param(
+            RuntimeError(f"engine: {SCHEDULER_SENTINEL}"),
+            "job cbk_macro could not run its pipelines: RuntimeError; the scheduler keeps running",
+            id="RuntimeError",
+        ),
+    ],
+)
+async def test_run_job_logs_an_error_by_type_only_and_returns_no_results(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    test_settings: TerminalSettings,
+    error: Exception,
+    logged: str,
+) -> None:
+    """No run can stop the scheduler, and no exception text or traceback reaches a log line."""
+    caplog.set_level(logging.DEBUG, logger=SCHEDULER_LOGGER)
+    double = RunPipelinesDouble(caplog, error=error)
+    monkeypatch.setattr(registry, "run_pipelines", double)
+
+    returned = await scheduler.run_job("cbk_macro", CBK_NAMES, test_settings)
+
+    assert returned == []
+    assert len(double.calls) == 1
+    assert scheduler_records(caplog) == [(logging.ERROR, logged)]
+    assert all(record.exc_info is None for record in caplog.records)
+    assert SCHEDULER_SENTINEL not in caplog.text
+
+
+async def test_run_job_lets_a_cancellation_propagate(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    test_settings: TerminalSettings,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger=SCHEDULER_LOGGER)
+    cancellation = asyncio.CancelledError()
+    monkeypatch.setattr(registry, "run_pipelines", RunPipelinesDouble(caplog, error=cancellation))
+
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await scheduler.run_job("cbk_macro", CBK_NAMES, test_settings)
+
+    assert excinfo.value is cancellation
+    assert scheduler_records(caplog) == []
+
+
+# --- Stop handlers ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "signum",
+    [pytest.param(signal.SIGINT, id="SIGINT"), pytest.param(signal.SIGTERM, id="SIGTERM")],
+)
+def test_a_stop_signal_sets_the_stop_event_and_a_second_one_is_ignored(
+    caplog: pytest.LogCaptureFixture,
+    stop_handlers_before: dict[signal.Signals, SignalHandler],
+    signum: signal.Signals,
+) -> None:
+    caplog.set_level(logging.INFO, logger=SCHEDULER_LOGGER)
+    loop = asyncio.new_event_loop()
+    try:
+        stop = asyncio.Event()
+        remove_handlers = scheduler._install_stop_handlers(loop, stop)
+        try:
+            assert all(signal.getsignal(sig) != stop_handlers_before[sig] for sig in STOP_SIGNALS)
+            raise_handled_signal(signum, stop_handlers_before[signum])
+            loop.run_until_complete(yield_until(stop.is_set, f"{signum.name} setting stop"))
+            raise_handled_signal(signum, stop_handlers_before[signum])
+            loop.run_until_complete(
+                yield_until(
+                    lambda: len(scheduler_records(caplog)) == 2, f"a second {signum.name} handled"
+                )
+            )
+            assert stop.is_set()
+        finally:
+            remove_handlers()
+        assert current_stop_handlers() == stop_handlers_before
+    finally:
+        loop.close()
+
+    assert scheduler_records(caplog) == [
+        (logging.INFO, f"received {signum.name}; stopping the scheduler"),
+        (logging.INFO, f"received {signum.name}; already stopping, waiting for in-flight runs"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "signum",
+    [pytest.param(signal.SIGINT, id="SIGINT"), pytest.param(signal.SIGTERM, id="SIGTERM")],
+)
+def test_stop_handlers_fall_back_to_signal_handlers_without_loop_support(
+    caplog: pytest.LogCaptureFixture,
+    stop_handlers_before: dict[signal.Signals, SignalHandler],
+    signum: signal.Signals,
+) -> None:
+    """Where the loop cannot add signal handlers, ``signal.signal`` handlers set the event
+    through ``call_soon_threadsafe``, and the remover reinstates the previous handlers. These
+    are set to ``SIG_IGN`` first, which is neither a scheduler handler nor a standard
+    disposition, so only an exact restoration, not a reset, leaves them in place."""
+    caplog.set_level(logging.INFO, logger=SCHEDULER_LOGGER)
+    for sig in STOP_SIGNALS:
+        signal.signal(sig, signal.SIG_IGN)
+    previous = current_stop_handlers()
+    assert all(previous[sig] != stop_handlers_before[sig] for sig in STOP_SIGNALS)
+    loop = LoopWithoutSignalHandlers()
+    stop = asyncio.Event()
+
+    remove_handlers = scheduler._install_stop_handlers(cast(asyncio.AbstractEventLoop, loop), stop)
+    try:
+        assert all(signal.getsignal(sig) != previous[sig] for sig in STOP_SIGNALS)
+        raise_handled_signal(signum, previous[signum])
+        assert stop.is_set()
+        assert loop.threadsafe_calls == [(signum.name,)]
+    finally:
+        remove_handlers()
+
+    assert current_stop_handlers() == previous
+    assert scheduler_records(caplog) == [
+        (logging.INFO, f"received {signum.name}; stopping the scheduler"),
+    ]
+
+
+# --- Waiting for in-flight jobs --------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("job_yields", "expected_logged", "expected_finished"),
+    [
+        pytest.param(
+            5,
+            [(logging.INFO, "waiting for 1 in-flight task(s) to finish recording")],
+            ["recorded"],
+            id="one-job-still-recording",
+        ),
+        pytest.param(None, [], [], id="no-job-in-flight"),
+    ],
+)
+def test_wait_for_in_flight_jobs_returns_once_the_scheduler_and_its_jobs_are_done(
+    caplog: pytest.LogCaptureFixture,
+    job_yields: int | None,
+    expected_logged: list[tuple[int, str]],
+    expected_finished: list[str],
+) -> None:
+    caplog.set_level(logging.INFO, logger=SCHEDULER_LOGGER)
+    stopping = StoppingScheduler(polls_while_running=3)
+    finished: list[str] = []
+
+    async def job_recording_its_run(yields: int) -> None:
+        for _ in range(yields):
+            await asyncio.sleep(0)
+        finished.append("recorded")
+
+    async def main() -> bool:
+        job = None if job_yields is None else asyncio.create_task(job_recording_its_run(job_yields))
+        await scheduler._wait_for_in_flight_jobs(stopping)
+        return job is None or job.done()
+
+    all_done = run_on_fresh_loop(main)
+
+    assert stopping.polls == 4
+    assert all_done is True
+    assert finished == expected_finished
+    assert scheduler_records(caplog) == expected_logged
+
+
+# --- _serve and run_forever ------------------------------------------------------------------
+
+
+def test_serve_starts_logs_each_next_run_and_stops_on_sigterm(
+    monkeypatch: pytest.MonkeyPatch,
+    test_settings: TerminalSettings,
+    timeline: list[str],
+    stop_handlers_before: dict[signal.Signals, SignalHandler],
+) -> None:
+    """A job running when SIGTERM arrives has finished recording before "scheduler stopped",
+    and the stop handlers are gone once ``_serve`` returns. Both are read while the loop is
+    still open: closing a Unix event loop removes its signal handlers itself."""
+    served = ServedScheduler(timeline, stop_handlers_before)
+    built_for: list[TerminalSettings] = []
+
+    def build(settings: TerminalSettings) -> ServedScheduler:
+        built_for.append(settings)
+        return served
+
+    async def main() -> tuple[dict[signal.Signals, SignalHandler], bool]:
+        await within_safety_timeout(scheduler._serve(test_settings))
+        return current_stop_handlers(), served.job is not None and served.job.done()
+
+    monkeypatch.setattr(scheduler, "build_scheduler", build)
+
+    handlers_once_served, job_done_once_served = run_on_fresh_loop(main)
+
+    assert built_for == [test_settings]
+    assert built_for[0] is test_settings
+    assert timeline == [
+        "start",
+        "INFO scheduler started in timezone Africa/Nairobi; it must be the only scheduler process",
+        "get_jobs",
+        "INFO job nse_equities_eod: next run at 2026-10-27 07:30:00+03:00",
+        "INFO job cbk_macro: next run at 2026-10-26 18:15:00+03:00",
+        "INFO received SIGTERM; stopping the scheduler",
+        "shutdown(wait=False)",
+        "shutdown applied: job nse_equities_eod cancelled",
+        "INFO waiting for 1 in-flight task(s) to finish recording",
+        "job nse_equities_eod recorded its run",
+        "INFO scheduler stopped",
+    ]
+    assert served.polls_after_shutdown == ServedScheduler.POLLS_WHILE_STOPPING + 1
+    assert job_done_once_served is True
+    assert handlers_once_served == stop_handlers_before
+    assert current_stop_handlers() == stop_handlers_before
+
+
+def test_serve_removes_the_stop_handlers_when_the_scheduler_cannot_start(
+    monkeypatch: pytest.MonkeyPatch,
+    test_settings: TerminalSettings,
+    timeline: list[str],
+    stop_handlers_before: dict[signal.Signals, SignalHandler],
+) -> None:
+    """The handlers are read as the error leaves ``_serve``, while the loop is still open:
+    closing a Unix event loop removes its signal handlers itself."""
+    error = RuntimeError("scheduler could not start")
+    served = ServedScheduler(timeline, stop_handlers_before, start_error=error)
+    handlers_once_raised: list[dict[signal.Signals, SignalHandler]] = []
+
+    async def main() -> None:
+        try:
+            await within_safety_timeout(scheduler._serve(test_settings))
+        finally:
+            handlers_once_raised.append(current_stop_handlers())
+
+    monkeypatch.setattr(scheduler, "build_scheduler", lambda settings: served)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        run_on_fresh_loop(main)
+
+    assert excinfo.value is error
+    assert served.handlers_at_start is not None
+    assert all(served.handlers_at_start[sig] != stop_handlers_before[sig] for sig in STOP_SIGNALS)
+    assert served.job is None
+    assert timeline == ["start"]
+    assert handlers_once_raised == [stop_handlers_before]
+    assert current_stop_handlers() == stop_handlers_before
+
+
+@pytest.mark.parametrize(
+    "pass_settings",
+    [pytest.param(False, id="default-settings"), pytest.param(True, id="given-settings")],
+)
+def test_run_forever_serves_the_settings_on_an_event_loop_of_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+    make_settings: SettingsFactory,
+    session_loop: asyncio.AbstractEventLoop,
+    stop_handlers_before: dict[signal.Signals, SignalHandler],
+    pass_settings: bool,
+) -> None:
+    """``run_forever`` runs in a thread of its own, so the current loop ``asyncio.run`` clears
+    when it returns is that thread's, never the session loop of the thread running the tests.
+    ``_serve`` is replaced, so no signal handler is installed."""
+    default_settings = make_settings()
+    given = make_settings(timezone="UTC") if pass_settings else None
+    factory_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    served: list[tuple[TerminalSettings, asyncio.AbstractEventLoop, int]] = []
+
+    def settings_factory(*args: object, **kwargs: object) -> TerminalSettings:
+        factory_calls.append((args, kwargs))
+        return default_settings
+
+    async def serve(settings: TerminalSettings) -> None:
+        served.append((settings, asyncio.get_running_loop(), threading.get_ident()))
+
+    monkeypatch.setattr(scheduler, "TerminalSettings", settings_factory)
+    monkeypatch.setattr(scheduler, "_serve", serve)
+
+    worker = run_in_new_thread(lambda: scheduler.run_forever(given))
+
+    [(served_settings, loop, served_on)] = served
+    assert served_settings is (given if given is not None else default_settings)
+    assert factory_calls == ([] if pass_settings else [((), {})])
+    assert served_on == worker
+    assert served_on != threading.get_ident()
+    assert loop.is_closed()
+    assert loop is not session_loop
+    assert session_loop.is_closed() is False
+    assert current_stop_handlers() == stop_handlers_before
+
+
+# --- Import-time drift check -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("unregistered", "named"),
+    [
+        pytest.param(("cbk_bonds",), "cbk_bonds", id="cbk_bonds"),
+        pytest.param(("nse_market_statistics",), "nse_market_statistics", id="nse"),
+        pytest.param(("cbk_reserves", "cbk_fx"), "cbk_fx, cbk_reserves", id="two-sorted"),
+    ],
+)
+def test_the_scheduler_module_refuses_to_import_with_an_unregistered_pipeline(
+    monkeypatch: pytest.MonkeyPatch, unregistered: tuple[str, ...], named: str
+) -> None:
+    """The module source runs under a throwaway name, so the imported scheduler is untouched."""
+    monkeypatch.setattr(
+        registry,
+        "PIPELINES",
+        MappingProxyType(
+            {name: spec for name, spec in registry.PIPELINES.items() if name not in unregistered}
+        ),
+    )
+    spec = importlib.util.spec_from_file_location("scheduler_drift_probe", scheduler.__file__)
+    assert spec is not None
+    assert spec.loader is not None
+    probe = importlib.util.module_from_spec(spec)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        spec.loader.exec_module(probe)
+
+    assert excinfo.value.args == (
+        f"JOB_DEFINITIONS names pipelines missing from ingestion.registry.PIPELINES: {named}",
+    )
+    assert "scheduler_drift_probe" not in sys.modules
+    assert sys.modules["opennse_terminal.ingestion.scheduler"] is scheduler

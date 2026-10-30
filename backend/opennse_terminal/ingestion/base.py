@@ -669,17 +669,28 @@ class RunRecorder:
         self._engine = engine
 
     async def start(
-        self, *, pipeline: str, trigger: RunTrigger, source_url: str | None = None
+        self,
+        *,
+        pipeline: str,
+        trigger: RunTrigger,
+        source_url: str | None = None,
+        run_id: uuid.UUID | None = None,
     ) -> uuid.UUID:
         """Insert a ``running`` row (zero counts, empty ``details``, ``started_at`` now in UTC)
         and return its id.
+
+        Args:
+            run_id: The row's id, returned as given; a new ``uuid4`` when omitted. A caller that
+                generates it knows the id even when this call raises after its insert has
+                committed (on connection release, for example), so it can still finish that row.
 
         Raises:
             ValueError: ``trigger`` is not one of the run triggers.
         """
         if trigger not in RUN_TRIGGERS:
             raise ValueError(f"unknown run trigger {trigger!r}; expected one of {RUN_TRIGGERS}")
-        run_id = uuid.uuid4()
+        if run_id is None:
+            run_id = uuid.uuid4()
         # The mapped class, not TerminalIngestionRun.__table__ (typed FromClause, which insert()
         # and update() reject under mypy --strict), targets the same table as a Core statement.
         statement = insert(TerminalIngestionRun).values(
@@ -1270,11 +1281,11 @@ async def execute_pipeline(
     A cancellation is pending while the calling task's :meth:`asyncio.Task.cancelling` count
     stays above its value when the call began; nothing here calls ``uncancel()``. It is therefore
     re-raised even when another exception replaced its ``CancelledError`` while the run unwound,
-    for example from closing the run's HTTP client: before the commit, the run is still recorded
-    ``failed`` with ``"cancelled"``, ``details.error_during_cancellation`` names the replacing
-    exception's type, and a WARNING names it by its type or reason code, never by its text. The
-    ``CancelledError`` raised leaves the count as it is, so an ``asyncio.timeout()`` around the
-    call raises ``TimeoutError``.
+    for example from releasing the run's connection or closing an HTTP client that raises: before
+    the commit, the run is still recorded ``failed`` with ``"cancelled"``,
+    ``details.error_during_cancellation`` names the replacing exception's type, and a WARNING
+    names it by its type or reason code, never by its text. The ``CancelledError`` raised leaves
+    the count as it is, so an ``asyncio.timeout()`` around the call raises ``TimeoutError``.
 
     An error writing the run row propagates, unless a cancellation is pending: the error is then
     logged at ERROR (its type only) and the cancellation re-raised. ``KeyboardInterrupt`` and

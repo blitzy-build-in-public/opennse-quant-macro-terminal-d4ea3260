@@ -8,7 +8,8 @@ The route (``api.routes.ingest``) has already bounded the request and the file s
    its own connection, so it survives the rollback of a rejected request. A request whose row
    cannot be started is logged once and answered with 500 ``internal_error``, or the cancellation
    re-raised when the request or the insert was cancelled; nothing else runs and no filing or
-   fundamentals row is written.
+   fundamentals row is written. The row's id is generated before its insert, so a row that a
+   failed insert committed anyway is still finished ``failed``, best effort.
 2. Pre-parse checks, whose read transaction is committed before the pdfplumber parse runs in a
    worker thread, so the request holds no transaction or lock while parsing; then the commit
    checks.
@@ -220,18 +221,26 @@ async def _run_to_completion(
     return task, cancel_requested
 
 
-async def _start_run(session: AsyncSession) -> tuple[RunRecorder, uuid.UUID, bool]:
+async def _start_run(
+    session: AsyncSession, details: Mapping[str, Any]
+) -> tuple[RunRecorder, uuid.UUID, bool]:
     """Insert the request's ``running`` run row; return its recorder, its id and whether the
     caller was cancelled while the row was written.
 
-    The insert runs to completion in a task of its own, so a cancellation never abandons a row
-    it has committed: the caller finishes that row before honouring the cancellation. When no
-    run id comes back, nothing can be finished (a row the insert may have committed before
-    failing stays ``running``), and exactly one record is logged. An insert that itself ended
-    cancelled is logged at WARNING as ``cancelled`` and the cancellation re-raised. A fault (the
-    audit engine cannot be resolved, or the insert fails) is logged at ERROR as
-    ``unexpected_error:<Type>``, never by its text; a cancellation received meanwhile is then
-    re-raised, and otherwise the coded 500 ``internal_error`` is raised.
+    The id is generated here and the insert runs to completion in a task of its own, so a row
+    the insert has committed is never abandoned: after a cancellation the caller finishes it
+    before honouring the cancellation, and an insert that fails, which may have committed its
+    row first (on connection release, for example), has that row finished here.
+
+    A failed start is logged once, never by the fault's text: an insert that itself ended
+    cancelled at WARNING as ``cancelled``, and a fault (the audit engine cannot be resolved, or
+    the insert fails) at ERROR as ``unexpected_error:<Type>``. The row is then finished
+    ``failed`` with that code and ``details``, best effort: a missing row (an insert that never
+    committed) is expected and not logged, any other failure to finish it is logged at ERROR by
+    its type, and neither is raised. Without an audit engine there is no recorder, so nothing is
+    finished. The cancellation is then re-raised when the insert ended cancelled or the caller
+    was cancelled during the insert or the finish; otherwise the coded 500 ``internal_error`` is
+    raised.
     """
     try:
         recorder = RunRecorder(_audit_engine(session))
@@ -240,24 +249,34 @@ async def _start_run(session: AsyncSession) -> tuple[RunRecorder, uuid.UUID, boo
             "PDF ingestion run could not be started: %s", f"unexpected_error:{type(exc).__name__}"
         )
         raise _internal_error() from None
+    run_id = uuid.uuid4()
     task, cancel_requested = await _run_to_completion(
-        recorder.start(pipeline=PDF_FILING_PIPELINE, trigger="api", source_url=None)
+        recorder.start(pipeline=PDF_FILING_PIPELINE, trigger="api", source_url=None, run_id=run_id)
     )
     error = task.exception() if not task.cancelled() else asyncio.CancelledError()
-    if error is not None:
-        # No id came back, so there is no row to finish.
-        if isinstance(error, asyncio.CancelledError):
-            # A cancellation, not a fault: logged by its code, and it stands.
-            logger.warning("PDF ingestion run could not be started: cancelled")
-            raise asyncio.CancelledError
-        logger.error(
-            "PDF ingestion run could not be started: %s",
-            f"unexpected_error:{type(error).__name__}",
-        )
-        if cancel_requested:
-            raise asyncio.CancelledError
-        raise _internal_error() from None
-    return recorder, task.result(), cancel_requested
+    if error is None:
+        return recorder, task.result(), cancel_requested
+    insert_cancelled = isinstance(error, asyncio.CancelledError)
+    if insert_cancelled:
+        # A cancellation, not a fault: logged by its code, and it stands.
+        error_message = "cancelled"
+        logger.warning("PDF ingestion run could not be started: %s", error_message)
+    else:
+        error_message = f"unexpected_error:{type(error).__name__}"
+        logger.error("PDF ingestion run could not be started: %s", error_message)
+    cancel_requested |= await _finish_run(
+        recorder,
+        run_id,
+        run_status=RunStatus.FAILED,
+        rows_fetched=0,
+        rows_written=0,
+        error_message=error_message,
+        details=details,
+        row_may_be_missing=True,
+    )
+    if insert_cancelled or cancel_requested:
+        raise asyncio.CancelledError
+    raise _internal_error() from None
 
 
 async def _finish_run(
@@ -269,9 +288,14 @@ async def _finish_run(
     rows_written: int,
     error_message: str | None,
     details: Mapping[str, Any],
+    row_may_be_missing: bool = False,
 ) -> bool:
     """Finish the run row, logging (never raising) a failure to do so; return whether the
-    caller was cancelled meanwhile."""
+    caller was cancelled meanwhile.
+
+    With ``row_may_be_missing``, for a row whose insert failed and so may never have committed,
+    finding no row with ``run_id`` (``LookupError``) is an expected outcome and is not logged.
+    """
     task, cancel_requested = await _run_to_completion(
         recorder.finish(
             run_id,
@@ -283,7 +307,7 @@ async def _finish_run(
         )
     )
     error = task.exception() if not task.cancelled() else asyncio.CancelledError()
-    if error is not None:
+    if error is not None and not (row_may_be_missing and isinstance(error, LookupError)):
         logger.error(
             "PDF ingestion run %s: recording status %s failed: %s",
             run_id,
@@ -665,9 +689,12 @@ async def ingest_pdf(
       ``details`` hold ``file_sha256``, ``ticker``, ``period_end_date``, ``document_type`` and
       ``commit``, plus ``filing_id``, ``status``, ``committed`` and ``fundamentals_id`` on
       success. When the row cannot be started (the audit engine cannot be resolved, or its
-      insert fails), no run id is obtained and no row is finished: unless the request or the
-      insert was cancelled (below), the fault is logged once at ERROR as
-      ``unexpected_error:<Type>`` and the request answered with 500 ``internal_error``.
+      insert fails), unless the request or the insert was cancelled (below), the fault is
+      logged once at ERROR as ``unexpected_error:<Type>`` and the request answered with 500
+      ``internal_error``. The row's id is generated before its insert, so a row that a failed
+      insert committed anyway is first finished ``failed`` with that code, best effort: finding
+      no row is expected and not logged, and any other failure to finish it is logged at ERROR
+      by its type, never raised.
     * An HTTP 200 upserts ``terminal_corporate_filings`` on ``file_sha256``, with or without
       ``commit``. A commit writes only ``found`` and ``derived`` items, never ``ambiguous``
       ones, COALESCE-merged so existing values are never nulled, with ``filing_id`` set and
@@ -695,9 +722,11 @@ async def ingest_pdf(
       later, and the route's parse slot is then freed; no filing or fundamentals row is written
       and the run row is finished ``failed`` with ``cancelled``. A cancellation received while
       the row is inserted finishes it ``failed`` with ``cancelled`` and then re-raises; a
-      cancelled request whose row could not be started re-raises the cancellation without one,
-      logged once: at WARNING as ``cancelled`` when the cancellation ended the insert itself,
-      otherwise at ERROR as the insert's fault.
+      cancelled request whose row could not be started re-raises the cancellation, logged
+      once: at WARNING as ``cancelled`` when the cancellation ended the insert itself,
+      otherwise at ERROR as the insert's fault, after any row that insert committed is finished
+      ``failed`` with that code. A cancellation received while such a row is finished is
+      honoured once it is: the cancellation is re-raised instead of the 500.
 
     Args:
         session: The request session; the filing and fundamentals writes share its transaction.
@@ -716,7 +745,7 @@ async def ingest_pdf(
         "document_type": form.document_type,
         "commit": form.commit,
     }
-    recorder, run_id, cancelled_while_starting = await _start_run(session)
+    recorder, run_id, cancelled_while_starting = await _start_run(session, base_details)
     rows_fetched = 0
     try:
         if cancelled_while_starting:

@@ -1581,8 +1581,8 @@ async def test_server_fault_is_answered_with_coded_internal_error_and_no_upload_
 #   ``failed`` with the error code as ``error_message`` (``unexpected_error:<Type>`` for a
 #   server fault, ``cancelled`` for a cancelled request). ``details`` hold ``file_sha256``,
 #   ``ticker``, ``period_end_date``, ``document_type`` and ``commit``, plus the outcome on
-#   success. A row that cannot be started is logged once at ERROR by the fault's type, and no
-#   row is written.
+#   success. A row that cannot be started is logged once at ERROR by the fault's type; a row
+#   that its failed insert committed anyway is finished ``failed`` with that code.
 # - Preview and commit: every success upserts ``terminal_corporate_filings`` on
 #   ``file_sha256``; a re-upload keeps the ``filing_id`` and never unsets
 #   ``committed_to_fundamentals``. Money is rounded once to 2 dp (ROUND_HALF_UP) and share
@@ -1605,7 +1605,9 @@ async def test_server_fault_is_answered_with_coded_internal_error_and_no_upload_
 # - Cancellation: a request cancelled while its run row is inserted, or before its commit,
 #   rolls back and records ``cancelled``, and one cancelled while parsing re-raises only once
 #   its parse thread has ended; one cancelled during its commit still commits and records
-#   ``succeeded``, then re-raises; one whose row could not be started re-raises without a row.
+#   ``succeeded``, then re-raises; one whose row could not be started re-raises, after finishing
+#   ``failed`` any row its insert committed (``cancelled`` when the insert itself ended
+#   cancelled).
 #
 # The request-size, magic-byte and concurrency checks (413, 415, 429) belong to the route, so
 # the endpoint tests above exercise them and this section does not.
@@ -3064,8 +3066,9 @@ async def test_run_that_cannot_be_started_is_logged_once_and_answered_as_interna
     fault: str,
 ) -> None:
     """When the run row cannot be started, because the audit engine cannot be resolved or its
-    insert fails, there is no row to finish: the fault is logged once at ERROR by its type,
-    never by its text, the request is answered with the coded 500, and nothing is written."""
+    insert is refused before writing it, there is no row to finish: the fault is logged once at
+    ERROR by its type, never by its text, the request is answered with the coded 500, and
+    nothing is written."""
     seeded = await scom_fundamentals(engine)
     monkeypatch.setattr(owner, attribute, replacement)
     form = PdfIngestForm(ticker="SCOM", period_end_date=SCOM_PERIOD, commit=True)
@@ -3094,6 +3097,62 @@ async def test_run_that_cannot_be_started_is_logged_once_and_answered_as_interna
     assert await scom_fundamentals(engine) == seeded
 
 
+async def test_run_row_committed_by_a_failing_start_is_finished_failed_and_answered_as_500(
+    monkeypatch: pytest.MonkeyPatch,
+    session: AsyncSession,
+    engine: AsyncEngine,
+    settings: TerminalSettings,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A run-row insert that commits and then raises (here as its connection is released)
+    leaves a row under the id the service generated: that row is finished ``failed`` with
+    ``unexpected_error:<Type>`` and the request's details, the fault is logged once at ERROR by
+    its type, never by its text, the request is answered with the coded 500, and no filing or
+    fundamentals row is written."""
+    seeded = await scom_fundamentals(engine)
+    real_start = RunRecorder.start
+    inserted: list[uuid.UUID] = []
+
+    async def start_failing_after_its_commit(recorder: RunRecorder, **kwargs: Any) -> uuid.UUID:
+        inserted.append(await real_start(recorder, **kwargs))
+        raise ConnectionResetError(f"connection to {LEAK_SENTINEL} reset")
+
+    monkeypatch.setattr(RunRecorder, "start", start_failing_after_its_commit)
+    form = PdfIngestForm(ticker="SCOM", period_end_date=SCOM_PERIOD, commit=True)
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(HTTPException) as excinfo:
+        await ingest_pdf(session, settings, FULL_KES_PDF, "scom.pdf", form)
+
+    assert_coded(excinfo.value, 500, "internal_error", None, INTERNAL_ERROR_MESSAGE)
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__ is True
+    assert LEAK_SENTINEL not in "".join(traceback.format_exception(excinfo.value))
+    assert LEAK_SENTINEL not in caplog.text
+    assert [
+        (record.name, record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ] == [
+        (
+            fs.logger.name,
+            logging.ERROR,
+            "PDF ingestion run could not be started: unexpected_error:ConnectionResetError",
+        )
+    ]
+    assert await filing_count(engine) == 0
+    assert await scom_fundamentals(engine) == seeded
+    [run] = await pdf_runs(engine)
+    assert [run.id] == inserted
+    assert_run(
+        run,
+        status="failed",
+        error_message="unexpected_error:ConnectionResetError",
+        rows_fetched=0,
+        rows_written=0,
+        details=run_details(sha256(FULL_KES_PDF), commit=True),
+    )
+
+
 async def test_run_row_that_cannot_be_finished_is_logged_not_raised(
     engine: AsyncEngine, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -3120,6 +3179,66 @@ async def test_run_row_that_cannot_be_finished_is_logged_not_raised(
     ] == [
         (logging.ERROR, f"PDF ingestion run {run_id}: recording status failed failed: LookupError")
     ]
+
+
+UNSTARTED_RUN_ID: Final = uuid.UUID("3d9a6c2e-81f4-4b7a-9c05-6e2f1d8b4a37")
+"""The id of a run row whose insert failed, which no row of a fresh clone carries."""
+
+
+async def failing_finish(_recorder: RunRecorder, *_args: object, **_kwargs: object) -> None:
+    """A run-row update whose pooled connection breaks."""
+    raise OSError(f"connection to {LEAK_SENTINEL} broken")
+
+
+@pytest.mark.parametrize(
+    ("finish", "logged"),
+    [
+        pytest.param(RunRecorder.finish, [], id="no_row"),
+        pytest.param(
+            failing_finish,
+            [
+                (
+                    logging.ERROR,
+                    f"PDF ingestion run {UNSTARTED_RUN_ID}: "
+                    "recording status failed failed: OSError",
+                )
+            ],
+            id="finish_fails",
+        ),
+    ],
+)
+async def test_row_whose_insert_failed_is_finished_logging_only_a_failure_other_than_no_row(
+    monkeypatch: pytest.MonkeyPatch,
+    engine: AsyncEngine,
+    caplog: pytest.LogCaptureFixture,
+    finish: object,
+    logged: list[tuple[int, str]],
+) -> None:
+    """Finishing a row whose insert failed, which may never have committed, finds no row as an
+    expected outcome and logs nothing for it; any other failure is logged at ERROR by its type,
+    never by its text. Neither is raised."""
+    monkeypatch.setattr(RunRecorder, "finish", finish)
+
+    with caplog.at_level(logging.DEBUG):
+        cancel_requested = await fs._finish_run(
+            RunRecorder(engine),
+            UNSTARTED_RUN_ID,
+            run_status=RunStatus.FAILED,
+            rows_fetched=0,
+            rows_written=0,
+            error_message="unexpected_error:ConnectionResetError",
+            details={},
+            row_may_be_missing=True,
+        )
+
+    assert cancel_requested is False
+    assert LEAK_SENTINEL not in caplog.text
+    assert [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.name == fs.logger.name
+    ] == logged
+    assert await pdf_runs(engine) == []
 
 
 # ---------------------------------------------------------------------------------------------
@@ -3274,11 +3393,11 @@ async def test_cancellation_meeting_a_run_row_never_started_is_re_raised_without
     level: int,
     message: str,
 ) -> None:
-    """A run-row insert that fails while the request is being cancelled, or that itself ends
-    cancelled, leaves no row to finish: the cancellation is re-raised rather than answered,
-    nothing is written, and one record is logged, never with the fault's text. A failed insert
-    is an ERROR naming its type; an insert that ended cancelled is a WARNING ``cancelled``, not
-    a fault."""
+    """A run-row insert that fails before writing its row while the request is being cancelled,
+    or that itself ends cancelled before writing it, leaves no row to finish: the cancellation
+    is re-raised rather than answered, nothing is written, and one record is logged, never with
+    the fault's text. A failed insert is an ERROR naming its type; an insert that ended
+    cancelled is a WARNING ``cancelled``, not a fault."""
     starting = asyncio.Event()
     release_start = asyncio.Event()
 
@@ -3308,6 +3427,93 @@ async def test_cancellation_meeting_a_run_row_never_started_is_re_raised_without
     ] == [(fs.logger.name, level, message)]
     assert await pdf_runs(engine) == []
     assert await filing_count(engine) == 0
+
+
+@pytest.mark.parametrize(
+    ("raised", "cancel_while_finishing", "level", "error_message"),
+    [
+        pytest.param(
+            asyncio.CancelledError,
+            False,
+            logging.WARNING,
+            "cancelled",
+            id="insert_itself_cancelled",
+        ),
+        pytest.param(
+            ConnectionResetError,
+            True,
+            logging.ERROR,
+            "unexpected_error:ConnectionResetError",
+            id="insert_fails_and_the_request_is_cancelled_while_its_row_is_finished",
+        ),
+    ],
+)
+async def test_cancellation_meeting_a_run_row_committed_by_a_failing_start_finishes_it_first(
+    monkeypatch: pytest.MonkeyPatch,
+    session: AsyncSession,
+    engine: AsyncEngine,
+    settings: TerminalSettings,
+    caplog: pytest.LogCaptureFixture,
+    raised: type[BaseException],
+    cancel_while_finishing: bool,
+    level: int,
+    error_message: str,
+) -> None:
+    """A run-row insert that commits and then ends cancelled or raises leaves a ``running`` row
+    under the id the service generated. Whether the insert itself ended cancelled, or it failed
+    and the request is cancelled while its row is finished, that row is finished ``failed``
+    with ``cancelled`` or the fault's code and the request's details, one record is logged,
+    never with the fault's text, nothing else is written, and the cancellation is re-raised
+    rather than answered."""
+    seeded = await scom_fundamentals(engine)
+    finishing = asyncio.Event()
+    release_finish = asyncio.Event()
+    real_start = RunRecorder.start
+    real_finish = RunRecorder.finish
+
+    async def start_ending_after_its_commit(recorder: RunRecorder, **kwargs: Any) -> uuid.UUID:
+        await real_start(recorder, **kwargs)
+        raise raised(LEAK_SENTINEL)
+
+    async def gated_finish(recorder: RunRecorder, run_id: uuid.UUID, **kwargs: Any) -> None:
+        finishing.set()
+        await release_finish.wait()
+        await real_finish(recorder, run_id, **kwargs)
+
+    monkeypatch.setattr(RunRecorder, "start", start_ending_after_its_commit)
+    monkeypatch.setattr(RunRecorder, "finish", gated_finish)
+    form = PdfIngestForm(ticker="SCOM", period_end_date=SCOM_PERIOD, commit=True)
+
+    with caplog.at_level(logging.DEBUG):
+        request = asyncio.create_task(ingest_pdf(session, settings, FULL_KES_PDF, "scom.pdf", form))
+        async with DrainedOnExit(request, release_finish):
+            await asyncio.wait_for(finishing.wait(), 30)
+            [running] = await pdf_runs(engine)
+            assert (running.status, running.finished_at) == ("running", None)
+            if cancel_while_finishing:
+                request.cancel()
+            release_finish.set()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+
+    assert LEAK_SENTINEL not in caplog.text
+    assert [
+        (record.name, record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ] == [(fs.logger.name, level, f"PDF ingestion run could not be started: {error_message}")]
+    assert await filing_count(engine) == 0
+    assert await scom_fundamentals(engine) == seeded
+    [run] = await pdf_runs(engine)
+    assert run.id == running.id
+    assert_run(
+        run,
+        status="failed",
+        error_message=error_message,
+        rows_fetched=0,
+        rows_written=0,
+        details=run_details(sha256(FULL_KES_PDF), commit=True),
+    )
 
 
 async def test_request_cancelled_while_parsing_rolls_back_and_records_cancelled(
