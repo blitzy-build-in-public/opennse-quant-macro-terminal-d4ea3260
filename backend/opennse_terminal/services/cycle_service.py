@@ -4,14 +4,14 @@ Resolves the request (window form, event dates and candidate equities), reads th
 through SQLAlchemy 2.0 async ``select()`` statements with bound parameters only, runs the pure
 :func:`~opennse_terminal.quant.backtest.run_cycle_backtest` once per event in a worker thread
 (:func:`~opennse_terminal.services.offload.compute`, which stops before the next event once the
-client has gone away), attaches the labelled projection to future or partly observed cycles, and
-rounds every output value exactly once with :func:`~opennse_terminal.quant.numeric.quantize_out`
-while building the ``schemas.cycles`` response. Every formula lives in ``quant.backtest``;
-nothing here converts to ``float``.
+client has gone away), attaches the labelled projection to partial and awaiting-data cycles when
+at least two cycles are complete, and rounds every output value exactly once with
+:func:`~opennse_terminal.quant.numeric.quantize_out` while building the ``schemas.cycles``
+response. Every formula lives in ``quant.backtest``; nothing here converts to ``float``.
 
-Only stored rows are read, seeded or ingested alike. A future event such as the 2027 election is
-answered with the descriptive projection of the completed cycles, which is computed per request
-and never written to the database; no future-dated row is ever assumed.
+Only stored rows are read, seeded or ingested alike. When at least two cycles are complete, a
+future event such as the 2027 election is answered with their descriptive projection, which is
+computed per request and never written to the database; no future-dated row is ever assumed.
 
 Each request issues a constant number of statements, whatever the number of events, and every
 read of price, session or macro history is bounded by the requested windows, so its cost does not
@@ -23,7 +23,7 @@ rows rather than ORM entities and sliced per cycle in Python. The overlay rows o
 are one statement over the cycles' observed ranges, each widened by the 62-day overlay staleness
 limit. Each statement merges the ranges that overlap or touch and reads nothing between the
 others, never the whole span from the first window to the last. A cycle whose window holds no
-data yet reads no lead-in and no price, and a request of only such cycles reads no lead-in,
+observed data reads no lead-in and no price, and a request of only such cycles reads no lead-in,
 price or overlay.
 
 Business-rule errors are coded ``HTTPException`` bodies ``{code, message, field}`` (see
@@ -535,7 +535,7 @@ def _pe_compression(
 
 
 def _projection(result: CycleBacktestResult) -> CycleProjection | None:
-    """Quantize the labelled projection of a partial or future cycle (index levels, 2 dp)."""
+    """Quantize the labelled projection of a partial or awaiting-data cycle (index levels, 2 dp)."""
     if result.projection is None:
         return None
     return CycleProjection(
@@ -643,7 +643,7 @@ async def get_backtest(
     (``currency_mismatch``), never converted.
 
     **Statuses.** ``complete`` when the candidates' data reaches ``window_end``; ``partial`` when
-    it ends inside the window; ``awaiting_data`` when the window holds no data yet (with
+    it ends inside the window; ``awaiting_data`` when the window holds no observed data (with
     ``days_until_window_start`` when the data ends before it opens); ``no_constituents`` when no
     candidate has a base close. ``partial`` and ``awaiting_data`` cycles carry a ``projection``:
     the mean of the request's complete cycles' normalized paths at each offset, labelled with its

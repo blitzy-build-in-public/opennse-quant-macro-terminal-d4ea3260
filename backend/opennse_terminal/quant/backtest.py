@@ -28,9 +28,13 @@ Normalization, per cycle, over a cohort fixed at the anchor (the first session i
 * ``cumulative_foreign_net_kes_t``, the running sum of the cohort's foreign net flow from the
   anchor.
 
-Future or partly observed events are returned as ``awaiting_data`` or ``partial``. Their
-:class:`CycleProjection` is the mean of the complete cycles' normalized paths: a descriptive
-average of past behaviour, not a forecast, and never stored.
+A cycle whose window holds no observed session (a future event's, or a past window the stored
+history does not cover) is returned as ``awaiting_data``, and one whose data ends inside its
+window as ``partial``. Such a cycle carries a :class:`CycleProjection` only when at least
+:data:`MIN_PROJECTION_BASIS` (2) of the request's cycles are complete; otherwise its projection
+is ``None`` and it is flagged ``insufficient_projection_basis``. The projection is the mean of
+the complete cycles' normalized paths: a descriptive average of past behaviour, not a forecast,
+and never stored.
 """
 
 from __future__ import annotations
@@ -110,7 +114,7 @@ MIN_PROJECTION_BASIS: Final = 2
 """Complete cycles a projection must average over."""
 
 CycleStatus = Literal["complete", "partial", "awaiting_data", "no_constituents"]
-"""Data state of one cycle: window fully observed, partly observed, not yet open, or no cohort."""
+"""Data state of one cycle: fully observed, partly observed, no in-window session, or no cohort."""
 
 MarkerMetric = Literal["pe_ratio", "price_index", "turnover_index"]
 """The point field a :class:`CycleMarkerResult` was taken from."""
@@ -699,10 +703,11 @@ def run_cycle_backtest(
 
     Returns:
         The cycle with status ``complete`` (data reaches ``window_end``), ``partial`` (data ends
-        inside the window), ``awaiting_data`` (no session inside the window yet; ``points`` empty,
-        ``markers`` and ``summary`` ``None``) or ``no_constituents`` (flag ``empty_cohort``, same
-        empty shape; ``currency_mismatch`` comes first when any candidate was excluded for its
-        currency). ``projection`` is left ``None``; see :func:`with_projection`.
+        inside the window), ``awaiting_data`` (no observed session inside the window; ``points``
+        empty, ``markers`` and ``summary`` ``None``) or ``no_constituents`` (flag
+        ``empty_cohort``, same empty shape; ``currency_mismatch`` comes first when any candidate
+        was excluded for its currency). ``projection`` is left ``None``; see
+        :func:`with_projection`.
 
     Raises:
         ValueError: If ``window`` was resolved for a different event date.

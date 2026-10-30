@@ -100,7 +100,12 @@ class WatchlistCreate(TerminalRequestModel):
 
 
 class Watchlist(TerminalResponseModel):
-    """One watchlist of the calling principal, as returned by every watchlist endpoint."""
+    """One watchlist of the calling principal.
+
+    ``GET /watchlists`` returns a list of them, ``POST /watchlists`` returns one with 201, and
+    ``PUT`` and ``DELETE /watchlists/{watchlist_id}/items/{ticker}`` return it with 200.
+    ``DELETE /watchlists/{watchlist_id}`` returns 204 with no body.
+    """
 
     id: uuid.UUID = Field(description="Watchlist identifier (UUID).")
     name: str = Field(description="Watchlist name, unique per owner.")

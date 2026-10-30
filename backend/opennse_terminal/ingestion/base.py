@@ -333,8 +333,9 @@ class RejectedRow:
     """A parsed row that failed validation or reconciliation, or that the upsert could not write.
 
     Attributes:
-        index: The row's position in the source (0-based index, or the file's line number for
-            tabular imports), as the pipeline reports it.
+        index: The row's position in the source, as the pipeline reports it: a 0-based index, or
+            a 1-based source row number (the CSV record or worksheet row of tabular imports and
+            CBK CSV files, the body row of CBK HTML tables).
         reason: A machine-readable reason code, for example ``invalid_isin``; several codes may
             be joined with ``;``.
         row: The row's raw cells or values; recorded in ``details.rejected`` through

@@ -1851,10 +1851,10 @@ function TickerCount({
  * Retry, and adding an event date from it sends a new request. Every other failure shows the API's
  * message and a Retry.
  *
- * Views: one solid line per cycle against calendar days from the event, a dashed "Projection
- * (mean of …)" line for each partial or awaiting cycle, a reference line at the event, and the
- * valuation-floor and volume-exhaustion markers, each named at the top of the chart tooltip while
- * the pointer is on its glyph; an inflation and 91/364-day T-bill overlay for a
+ * Views: one solid line per cycle against calendar days from the event, a dashed "Projection (mean
+ * of …)" line for each partial or awaiting cycle that carries a projection, a reference line at the
+ * event, and the valuation-floor and volume-exhaustion markers, each named at the top of the chart
+ * tooltip while the pointer is on its glyph; an inflation and 91/364-day T-bill overlay for a
  * selected cycle; and a summary table with status badges, returns, drawdown, P/E compression,
  * cohort sizes and flag codes.
  *

@@ -169,7 +169,7 @@ MAX_FILE_BYTES: Final = 50 * 1024 * 1024
 """Largest accepted file, in bytes (50 MiB); checked before the file is read."""
 
 MAX_ROWS: Final = 1_000_000
-"""Most rows accepted after the header line, blank rows included; a longer file or sheet fails
+"""Most rows accepted after the header row, blank rows included; a longer file or sheet fails
 with ``too_many_rows`` and is never imported in part."""
 
 SUPPORTED_SUFFIXES: Final = (".csv", ".xlsx")
@@ -401,8 +401,11 @@ class TabularRecord:
     """One data row of an import file, converted.
 
     Attributes:
-        row_number: The 1-based line of the row in the file or sheet; the header is line 1, so
-            the first data row is 2. Reported as ``RejectedRow.index``.
+        row_number: The 1-based position of the row in the file or sheet: its CSV record number
+            (each blank line counts as a record; a quoted cell spanning line breaks does not
+            start a new one) or its worksheet row number. The header is row 1, so the first data
+            row is 2. A CSV row's number is its physical line unless an earlier quoted cell spans
+            line breaks. Reported as ``RejectedRow.index``.
         values: Converted cells of the kind's columns present in the file (``None`` for empty
             cells), plus values derived during validation and reconciliation, in that order. The
             records this module builds hold a read-only compact mapping (:class:`_ValuesRow`) that
@@ -427,12 +430,13 @@ class TabularRecord:
 # Compact rows
 # ---------------------------------------------------------------------------------------------
 #
-# A file of MAX_ROWS rows becomes as many records, held from parse until the last write. As dicts,
-# with every amount a 104-byte Decimal and the raw cells a second dict keeping the parsed frame's
-# strings alive, they took about 1.7 KB per row (a 1,000,000-row price file peaked near 1.8 GiB).
-# A compact row is one tuple of cells under a layout shared by every row with the same columns:
-# a decimal is stored as its exact scaled integer, a value recurring in a column is one shared
-# object (_SHARED_VALUES_LIMIT), and the raw cells are one string per row.
+# A file of MAX_ROWS rows becomes as many records, held from parse until the last write. Held as
+# dicts, with every amount a 104-byte Decimal and the raw cells a second dict keeping the parsed
+# frame's strings alive, a record would take about 1.7 KB, so a 1,000,000-row price file would
+# peak near 1.8 GiB. Compact rows bound that cost: each is one tuple of cells under a layout
+# shared by every row with the same columns, a decimal is stored as its exact scaled integer, a
+# value recurring in a column is one shared object (_SHARED_VALUES_LIMIT), and the raw cells are
+# one string per row.
 
 _EXACT: Final = Context(
     prec=MAX_PREC,
@@ -1077,7 +1081,7 @@ def _verified_member_bytes(raw: bytes, member: zipfile.ZipInfo, source: str) -> 
 
 
 class _DoctypeDeclaredError(Exception):
-    """Raised by :class:`_PackagePartTarget` to stop parsing at a DOCTYPE declaration."""
+    """Raised by :class:`_PackagePartTarget` at a DOCTYPE declaration, to reject the part."""
 
 
 class _PackagePartTarget:
@@ -1085,9 +1089,9 @@ class _PackagePartTarget:
     element, its local name and its attributes, the way openpyxl reads a manifest or a
     relationships part, and builds no tree.
 
-    A DOCTYPE stops the parse (:class:`_DoctypeDeclaredError`) before its declarations are
-    read: DTD entities and attribute defaults are where two XML parsers can disagree, so a part
-    declaring one is not trusted to describe the package.
+    The target raises :class:`_DoctypeDeclaredError` at a DOCTYPE, so nothing the DTD declares
+    reaches the target: DTD entities and attribute defaults are where two XML parsers can
+    disagree, so a part declaring one is not trusted to describe the package.
     """
 
     def __init__(self) -> None:
@@ -1118,10 +1122,14 @@ def _package_part_children(part: bytes) -> list[tuple[str, dict[str, str]]] | No
     import xml.etree.ElementTree as ElementTree
 
     target = _PackagePartTarget()
-    # S314 asks for defusedxml. The stdlib parser is safe here: the caller caps the part's
-    # declared size at _XLSX_PACKAGE_XML_BYTES and verifies it expands to exactly that, openpyxl
-    # parses the same part whole right after, the target stops at a DOCTYPE so no entity is
-    # declared, and the bundled expat (2.9.0) limits entity amplification.
+    # S314 asks for defusedxml. The stdlib parser is used under controls this code enforces: the
+    # caller caps the part's declared size at _XLSX_PACKAGE_XML_BYTES and verifies it expands to
+    # exactly its declared size and CRC-32, so no more reaches the parser, and openpyxl parses the
+    # same part whole right after. A DOCTYPE makes the part untrusted: the target raises at the
+    # declaration, so nothing the DTD declares reaches the target and the caller grants no
+    # worksheet. Expat still finishes the bytes fed to it, with every callback suppressed, so
+    # entity expansion within them is bounded by the runtime expat's own amplification limit,
+    # not by this code.
     parser = ElementTree.XMLParser(target=target)  # noqa: S314
     try:
         parser.feed(part)
@@ -1300,13 +1308,16 @@ def _nul_stand_in(raw: bytes, source: str) -> str:
 def _read_grid(
     raw: bytes, *, suffix: str, sheet: str | None, source: str
 ) -> tuple[int, Iterator[list[str]]]:
-    """Read a CSV or ``.xlsx`` file as rows of cell texts, the header line first.
+    """Read a CSV or ``.xlsx`` file as rows of cell texts, the header row first.
 
     Every cell is read as text (``dtype=str``, no NA inference), so nothing passes through
     ``float``; Excel numeric cells arrive as pandas' shortest round-trip string (``95.75``) and
     date cells as ``YYYY-MM-DD 00:00:00``. Empty cells become ``""``. The header is read as a
     data row (``header=None``) because pandas would otherwise rename a repeated header to
-    ``name.1``, hiding the duplicate. CSV blank lines are kept, so row index + 1 is the line.
+    ``name.1``, hiding the duplicate. Each row is a CSV record, which a quoted cell can extend
+    over several lines, or a worksheet row. CSV blank lines, and empty worksheet rows above a
+    filled one, are kept, so row index + 1 is the CSV record number or the worksheet row number;
+    it is the CSV file's physical line only while no earlier quoted cell spans line breaks.
 
     pandas' C parser would cut a CSV cell at its first NUL byte, so a file holding one is parsed
     with each NUL replaced by a private-use character it does not otherwise contain
@@ -1319,7 +1330,7 @@ def _read_grid(
     cells. The whole file is read, and every limit and read error raised, before this returns.
 
     Returns:
-        The number of rows, the header line included, and an iterator that converts the frame
+        The number of rows, the header row included, and an iterator that converts the frame
         to a list of cell texts one row at a time, in file order. No grid of the whole file is
         built: the frame is the only copy of the file's cells, and it is released once the
         iterator is exhausted or dropped. A CSV file in which no line holds a cell (0 bytes, a
@@ -1565,8 +1576,8 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         self._layouts = _RowLayouts()
         # The rows upsert() found it could not write, reported by write_rejections().
         self._write_rejected: list[RejectedRow] = []
-        # By the line of each fundamentals or foreign_flows row reconcile() accepted, the rows of
-        # its key it collapsed, in line order; upsert() rejects them with that row.
+        # By the row number of each fundamentals or foreign_flows row reconcile() accepted, the
+        # rows of its key it collapsed, in row order; upsert() rejects them with that row.
         self._superseded: dict[int, list[TabularRecord]] = {}
 
     @property
@@ -1637,7 +1648,7 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         """Read the file, check the headers and convert the kind's columns of every row.
 
         The rows are taken one at a time from :func:`_read_grid`, the first as the header and the
-        rest as data rows numbered from line 2, so only the parsed frame and the records exist
+        rest as data rows numbered from row 2, so only the parsed frame and the records exist
         at once, never a grid of the whole file. Each record holds compact rows
         (:class:`TabularRecord`) whose raw cells are one new string per row, so nothing of the
         frame but the text values themselves outlives this call; a value recurring in a column is
@@ -1698,7 +1709,7 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         shared: list[dict[str, CellValue]] = [{} for _ in indexes]
         records: list[TabularRecord] = []
         blank = 0
-        # The header is line 1 and has been taken, so the first data row is line 2.
+        # The header is row 1 and has been taken, so the first data row is row 2.
         for line, row in enumerate(rows, start=2):
             texts = [row[index] if index < len(row) else "" for index in indexes]
             if all(not text.strip() for text in texts):
@@ -1739,7 +1750,7 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
 
         A cell that failed to convert is reported by its conversion code only, never also as
         ``missing_value``, ``no_values`` or ``future_date``. Rejected rows are reported with their
-        line number, the codes joined by ``;`` and their raw cells (NUL shown as U+2400). An
+        row number, the codes joined by ``;`` and their raw cells (NUL shown as U+2400). An
         accepted row whose values gained defaults or derived values is a new record whose compact
         row shares every unchanged cell; any other accepted row is returned as it is.
 
@@ -1847,9 +1858,9 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
 
         A collapsed row is neither written nor rejected while its key's surviving row is
         accepted. When the surviving row is rejected, every row it superseded is rejected too,
-        with the same reason, its own line number and its raw cells, so each file row stating a
+        with the same reason, its own row number and its raw cells, so each file row stating a
         rejected key counts toward the same thresholds as :meth:`validate`'s rejections; the
-        rejected rows are returned in line order. The superseded rows of each accepted
+        rejected rows are returned in row order. The superseded rows of each accepted
         ``fundamentals`` or ``foreign_flows`` key are kept for :meth:`upsert`, which rejects them
         with their key's row should it reject that row at write time.
         """
@@ -1951,13 +1962,13 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         - ``foreign_flows``: ``update_flows(flow_source="csv_import")``, touching only the flow
           columns. A key whose price row was deleted since :meth:`reconcile` (for example by an
           equity cascade) updates nothing; its row becomes a ``no_price_row`` rejection reported
-          by :meth:`write_rejections`, with its line number and raw cells, so it counts toward
+          by :meth:`write_rejections`, with its row number and raw cells, so it counts toward
           the shared thresholds. Their count is logged once at WARNING with the run id and
           recorded in ``details.flow_missing_keys`` (the count of keys and the first 50 keys, in
           key order).
 
         Each row :meth:`reconcile` collapsed into a key rejected here is rejected with it, for the
-        same reason, with its own line number and raw cells, and counted in the WARNING line.
+        same reason, with its own row number and raw cells, and counted in the WARNING line.
 
         Returns the number of rows inserted or updated, summed over the batches. Re-importing a
         file rewrites identical values, so the stored state is unchanged.
@@ -2045,12 +2056,12 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         return written
 
     def write_rejections(self) -> Sequence[RejectedRow]:
-        """The rows :meth:`upsert` could not write, in key order, each with its line number and
+        """The rows :meth:`upsert` could not write, in key order, each with its row number and
         raw cells: fundamentals rows whose period a concurrent writer stored in another currency
         after :meth:`reconcile` (``currency_conflict``), and foreign_flows rows whose price row
         was deleted after :meth:`reconcile` (``no_price_row``). A key's rows that
         :meth:`reconcile` collapsed are reported with it, for the same reason, the key's rows in
-        line order. They count toward the shared thresholds with the earlier stages' rejections.
+        row order. They count toward the shared thresholds with the earlier stages' rejections.
         Empty for the other kinds."""
         return tuple(self._write_rejected)
 
@@ -2061,7 +2072,7 @@ def _collapse_repeated_keys(
     """Collapse records that share a key as ``base.dedupe_by_key`` does: the **last** occurrence
     of each key wins, in the position where the key was first seen.
 
-    Returns the surviving records and, by each survivor's line number, the earlier records of its
+    Returns the surviving records and, by each survivor's row number, the earlier records of its
     key that it superseded, in file order; a key that does not repeat has no entry.
     """
     latest: dict[tuple[CellValue, ...], TabularRecord] = {}
@@ -2081,8 +2092,8 @@ def _with_superseded(
     rejected: Sequence[RejectedRow], superseded: Mapping[int, Sequence[TabularRecord]]
 ) -> list[RejectedRow]:
     """``rejected``, each surviving row preceded by the rows of its key it superseded
-    (``superseded``, by the survivor's line number), rejected for the same reason with their own
-    line numbers and raw cells, so every file row of a rejected key counts toward the shared
+    (``superseded``, by the survivor's row number), rejected for the same reason with their own
+    row numbers and raw cells, so every file row of a rejected key counts toward the shared
     thresholds."""
     expanded: list[RejectedRow] = []
     for row in rejected:

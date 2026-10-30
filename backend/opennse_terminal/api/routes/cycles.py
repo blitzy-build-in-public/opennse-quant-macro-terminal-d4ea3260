@@ -85,11 +85,13 @@ async def get_cycle_backtest(
     the window, and the inflation and Treasury bill overlays are aligned as of each session.
 
     Each cycle's ``status`` is ``complete`` (data reaches the window end), ``partial`` (data ends
-    inside the window), ``awaiting_data`` (no data in the window yet, with
-    ``days_until_window_start``) or ``no_constituents`` (no candidate has a base close). Partial
-    and awaiting-data cycles carry a ``projection``: a labelled descriptive average of the
-    request's completed cycles' normalized paths, with the cycles used in ``basis``. It is not
-    a forecast and is never stored.
+    inside the window), ``awaiting_data`` (no observed data in the window) or
+    ``no_constituents`` (no candidate has a base close). ``days_until_window_start`` is set only
+    when the data ends before the window opens, and is null otherwise. Partial and awaiting-data
+    cycles carry a ``projection`` only when at least two of the request's cycles are complete:
+    a labelled descriptive average of those completed cycles' normalized paths, with the cycles
+    used in ``basis``. It is not a forecast and is never stored. With fewer complete cycles,
+    ``projection`` is null and the cycle carries the flag ``insufficient_projection_basis``.
 
     Every parameter and bound is declared by ``BacktestParams``; ``event_dates`` and ``tickers``
     are repeatable, and an unknown parameter, alone or beside declared ones, is a standard 422

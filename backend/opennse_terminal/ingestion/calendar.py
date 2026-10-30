@@ -143,11 +143,13 @@ def _parse_verified_years(text: str, line_number: int) -> frozenset[int]:
 def parse_closures_csv(text: str) -> tuple[frozenset[int], tuple[Closure, ...]]:
     """Parse the gazetted-closures CSV into its verified years and closures.
 
-    Lines starting with ``#`` are comments, except that exactly one of them must read
-    ``# verified_years: 2026,2027`` (whitespace-tolerant, comma-separated four-digit years). The
-    first other non-blank line is the header, exactly ``date,reason,reference``. Each row holds an
-    ISO ``YYYY-MM-DD`` weekday date in a verified year, unique across the file, with a non-empty
-    reason and reference.
+    Lines whose first non-whitespace character is ``#`` are comments, and exactly one of them must
+    declare the verified years as ``# verified_years: <year>[,<year>...]``: one or more
+    comma-separated four-digit years, with whitespace allowed around ``#``, ``:`` and each year.
+    The shipped file, for example, declares ``# verified_years: 2026,2027``. The first other
+    non-blank line is the header, exactly ``date,reason,reference``. Each row holds an ISO
+    ``YYYY-MM-DD`` weekday date in a verified year, unique across the file, with a non-empty reason
+    and reference.
 
     Returns:
         The verified years, and the closures in file order.

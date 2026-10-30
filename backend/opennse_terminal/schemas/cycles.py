@@ -53,7 +53,7 @@ __all__ = [
 # ---------------------------------------------------------------------------------------------
 
 BacktestStatus = Literal["complete", "partial", "awaiting_data", "no_constituents"]
-"""Data state of one cycle: window fully observed, partly observed, not yet open, or no cohort."""
+"""Data state of one cycle: fully observed, partly observed, no in-window session, or no cohort."""
 
 MarkerMetric = Literal["pe_ratio", "price_index", "turnover_index"]
 """The :class:`CyclePoint` field a :class:`CycleMarker` was selected on."""
@@ -319,7 +319,7 @@ class CycleProjectionPoint(TerminalResponseModel):
 
 
 class CycleProjection(TerminalResponseModel):
-    """A labelled projection for a partial or future cycle.
+    """A labelled projection for a partial or awaiting-data cycle.
 
     It is the descriptive mean of the request's complete cycles' normalized paths at each
     calendar offset of the target window, each complete cycle contributing its last value at or
@@ -354,7 +354,7 @@ class CycleResult(TerminalResponseModel):
     status: BacktestStatus = Field(
         description=(
             "complete when data reaches window_end; partial when data exists in the window but "
-            "ends before window_end; awaiting_data when the window holds no data yet; "
+            "ends before window_end; awaiting_data when the window holds no observed data; "
             "no_constituents when no candidate has an actual close within 10 market sessions "
             "on or before the anchor."
         ),

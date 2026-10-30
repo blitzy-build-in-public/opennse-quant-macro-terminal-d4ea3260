@@ -150,8 +150,8 @@ def parse_fx_csv(data: bytes) -> list[MacroRecord]:
       ``ROUND_HALF_UP``, and an unreadable cell adds ``unparsable:fx_kes_usd:<text>``.
 
     A row without a rate and without errors is dropped. Every other row becomes a
-    :class:`~opennse_terminal.ingestion.cbk.MacroRecord` carrying the row's cells and file line;
-    rows with errors are rejected by validation, not here.
+    :class:`~opennse_terminal.ingestion.cbk.MacroRecord` carrying the row's cells and CSV record
+    number; rows with errors are rejected by validation, not here.
 
     Raises:
         SourceLayoutChanged: The bytes cannot be read as a CSV, or a header in

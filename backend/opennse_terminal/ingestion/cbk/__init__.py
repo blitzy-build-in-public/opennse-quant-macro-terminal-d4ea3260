@@ -298,7 +298,8 @@ class MacroRecord:
         errors: Machine-readable problems found while parsing, for example
             ``"unparsable:tbill_91d_pct:abc"``, ``"unknown_month:Foo"`` or ``"no_year"``.
         raw: The source cells, recorded in ``details.rejected`` when the record is rejected.
-        line: The 1-based source row or file line, for diagnostics.
+        line: The 1-based source row, for diagnostics: an HTML table's body row, or a CSV record
+            number as in ``CbkCsv.rows``.
 
     Parsers drop a row whose owned cells are all missing and that has no errors.
     """
@@ -331,8 +332,10 @@ class CbkCsv:
     Attributes:
         headers: The header cells, normalized with ``base.normalize_header``; pandas names blank
             and repeated headers ``unnamed: <n>`` and ``<name>.1``.
-        rows: ``(1-based file line, {normalized header: trimmed cell text})`` for each data row;
-            blank and footer rows are not included.
+        rows: ``(CSV record number, {normalized header: trimmed cell text})`` for each data row,
+            numbered from 1 with the records above the header, the header and blank records
+            counted (the file line unless an earlier quoted cell spans line breaks); blank and
+            footer rows are not included.
     """
 
     headers: tuple[str, ...]
@@ -550,12 +553,14 @@ def extract_table(html: str, expected_headers: Sequence[str]) -> HtmlTable:
 def read_cbk_csv(data: bytes, *, header_row: int = 1) -> CbkCsv:
     """Read a CBK CSV download with every cell kept as text.
 
-    ``header_row`` is the 0-based line of the header; CBK files carry a title line first, so it
-    defaults to 1 (the second line). Lines above it are skipped before parsing, which also avoids
-    pandas' tokenizer error on a title line with fewer fields. pandas reads with ``dtype=str``
+    ``header_row`` is the 0-based index of the header record; CBK files carry a one-line title
+    record first, so it defaults to 1. Records above it are skipped before parsing, which also
+    avoids pandas' tokenizer error on a title with fewer fields. pandas reads with ``dtype=str``
     and ``keep_default_na=False``, so no value ever passes through ``float``, and with
     ``index_col=False``, so a trailing comma cannot shift the columns. Blank lines are kept while
-    parsing so that each row's line number is its line in the file.
+    parsing, each as a record, so each data row is numbered by its 1-based CSV record:
+    ``header_row + 2`` plus its 0-based position below the header. That is its physical line
+    only when no earlier quoted cell spans a line break.
 
     Footer rows are dropped and are not rejections: rows whose cells are all blank, and rows
     whose first non-blank cell starts with ``Source`` or ``Note`` (any case), such as "Source:
@@ -563,7 +568,7 @@ def read_cbk_csv(data: bytes, *, header_row: int = 1) -> CbkCsv:
 
     Raises:
         SourceLayoutChanged: The bytes are not UTF-8 or Windows-1252 text, there is no header
-            line, or pandas cannot tokenize the file.
+            record, or pandas cannot tokenize the file.
         ValueError: ``header_row`` is negative.
     """
     if header_row < 0:
@@ -634,8 +639,8 @@ def validate_macro_records(
     A record is rejected when its ``observation_date`` is ``None``, it carries parse ``errors``,
     it has a value for a column without bounds (``unexpected_column:<column>``), or a value lies
     outside its inclusive ``[low, high]`` bound (``out_of_range:<column>:<value>``). Several
-    reasons are joined with ``;``; ``RejectedRow.index`` is the record's source line, or its
-    0-based position when the line is unknown.
+    reasons are joined with ``;``; ``RejectedRow.index`` is the record's 1-based source row
+    (``MacroRecord.line``), or its 0-based position when that is unknown.
 
     Bounds are sanity limits, wide enough for the source's full published history, that catch
     parse, scale and column-shift errors rather than unusual genuine values. The shared run

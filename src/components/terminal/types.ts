@@ -611,7 +611,7 @@ export interface FlowsResponse {
 // Cycles (schemas/cycles.py): GET /cycles/backtest
 // ---------------------------------------------------------------------------------------------
 
-/** Data state of one cycle: fully observed, partly observed, not yet open, or no cohort. */
+/** Data state of one cycle: fully observed, partly observed, no in-window session, or no cohort. */
 export type BacktestStatus = "complete" | "partial" | "awaiting_data" | "no_constituents";
 
 /** The {@link CyclePoint} field a {@link CycleMarker} was selected on. */
@@ -729,7 +729,10 @@ export interface CycleResult {
    * unavailable anchor P/E) stays null throughout, with the matching code in `flags`.
    */
   anchor_date: string | null;
-  /** Calendar days until the window opens, for an `awaiting_data` cycle; null otherwise. */
+  /**
+   * Calendar days from `data_available_through` to `window_start`, set only when the data ends
+   * before the window opens; null otherwise.
+   */
   days_until_window_start: number | null;
   /** Sorted tickers of the cohort, fixed at the anchor. */
   constituents: string[];
@@ -744,7 +747,11 @@ export interface CycleResult {
   markers: CycleMarkers | null;
   /** Pre-event, post-event, drawdown and P/E compression figures. */
   summary: CycleSummary | null;
-  /** Mean path of the complete cycles, for `partial` and `awaiting_data` cycles. */
+  /**
+   * Mean path of the complete cycles, for `partial` and `awaiting_data` cycles; null for
+   * `complete` and `no_constituents` cycles, and null with the flag
+   * `insufficient_projection_basis` when fewer than two cycles of the request are complete.
+   */
   projection: CycleProjection | null;
   /** Reason codes, for example `zero_anchor_capitalization` or `insufficient_projection_basis`. */
   flags: string[];

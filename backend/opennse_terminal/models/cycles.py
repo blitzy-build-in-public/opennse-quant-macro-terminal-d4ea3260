@@ -29,9 +29,11 @@ class TerminalCycle(TerminalBase):
 
     ``label`` is returned as ``CycleResult.label``.
 
-    Future events are valid. An event whose window has no observed data yet is reported as
-    ``awaiting_data``, and one whose data ends inside the window as ``partial``; both carry a
-    projection averaged from the completed cycles, which is never stored.
+    Future events are valid. An event whose window has no observed data is reported as
+    ``awaiting_data``, and one whose data ends inside the window as ``partial``. Either carries a
+    projection averaged from the completed cycles only when at least two cycles of the request
+    are complete; otherwise its projection is null with the flag
+    ``insufficient_projection_basis``. A projection is never stored.
 
     There is no ``updated_at``: rows are reference data that writers insert and never update.
     """
