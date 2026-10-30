@@ -488,7 +488,8 @@ BASE_VOLUMES: Final[Mapping[str, int]] = MappingProxyType(
 
 # --- SYNTHETIC --- parameters of the geometric Brownian motion behind each mock price path
 ANNUAL_DRIFT: Final = Decimal("0.06")
-"""Annual drift of the log price, as a fraction."""
+"""Annual drift ``mu`` of the geometric Brownian motion price process, as a fraction; the log
+price drifts at ``mu - sigma^2 / 2`` per year."""
 VOLATILITY: Final[Mapping[str, Decimal]] = MappingProxyType(
     {
         "SCOM": Decimal("0.25"),

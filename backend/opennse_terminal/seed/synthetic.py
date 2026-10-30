@@ -977,7 +977,8 @@ def generate_macro() -> tuple[SeedMacroRow, ...]:
     """Generate the 177 seeded month-end macro rows, 2012-01-31 to 2026-09-30.
 
     Each indicator interpolates linearly by calendar days between its yearly ``MACRO_KNOTS``, its
-    ``MACRO_FIXED_POINTS`` and its 2026-09-30 attachment value, adds uniform noise in
+    ``MACRO_FIXED_POINTS`` and its 2026-09-30 ``MACRO_ANCHOR`` value (the attachment's figure, or
+    CBK's published September 2026 Central Bank Rate for ``cbr_rate_pct``), adds uniform noise in
     ``[-0.15, 0.15)`` except on exact points, rounds to 2 dp and is clamped to ``MACRO_BOUNDS``.
     Then, in order: inflation from 2024-02-29 to 2026-07-31 is capped at 6.70; T-bills are ordered
     (``182d = max(182d, 91d)``, ``364d = max(364d, 182d)``); and the fixed points and the anchor
