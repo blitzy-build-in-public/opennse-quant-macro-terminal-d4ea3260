@@ -4,6 +4,7 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent, MouseEvent, ReactElement } from "react";
 import {
   CartesianGrid,
+  DefaultZIndexes,
   Line,
   LineChart,
   ReferenceDot,
@@ -12,10 +13,21 @@ import {
   Tooltip,
   XAxis,
   YAxis,
+  ZIndexLayer,
+  usePlotArea,
+  useXAxisScale,
+  useYAxisScale,
 } from "recharts";
 
-import { AXIS_TICK, CHART_COLORS, PROJECTION_DASH, SERIES_PALETTE } from "./lib/chartTheme";
+import {
+  AXIS_TICK,
+  CHART_COLORS,
+  NEUTRAL_SERIES_PALETTE,
+  PROJECTION_DASH,
+  SERIES_PALETTE,
+} from "./lib/chartTheme";
 import { EMPTY_VALUE, formatDate, formatDecimal, formatInteger, toChartNumber } from "./lib/format";
+import type { DecimalKind } from "./lib/format";
 import { useTerminalQuery } from "./lib/useTerminalQuery";
 import { WidgetFrame } from "./shared/WidgetFrame";
 import { SECTION_HEADING_CLASS } from "./shared/headingAndTileClasses";
@@ -28,6 +40,7 @@ import type {
   CycleProjectionPoint,
   CycleResult,
   DecimalString,
+  MarkerMetric,
   TerminalWidgetProps,
   WidgetState,
 } from "./types";
@@ -89,6 +102,10 @@ interface ChartSeries {
   key: string;
   cycle: CycleResult;
   color: string;
+  /** `strokeWidth` of the observed line, from {@link seriesStrokeWidth}. */
+  strokeWidth: number;
+  /** `strokeWidth` of the dashed projection line, half a pixel thinner than the observed one. */
+  projectionStrokeWidth: number;
   observed: ObservedRow[];
   /** Projection rows for the current metric; null when no projection line is drawn. */
   projection: ProjectionRow[] | null;
@@ -134,6 +151,25 @@ interface MarkerShapeProps {
   cy?: number;
 }
 
+/** A marker's true pixel centre on the main chart: its session's day and plotted value. */
+interface MarkerAnchor {
+  key: string;
+  x: number;
+  y: number;
+}
+
+/** Where a marker's glyph is drawn: its true pixel centre and the glyph's vertical shift. */
+interface MarkerGlyphPlacement extends MarkerAnchor {
+  /** Pixels from the true `y` to the glyph's centre; 0 leaves the glyph on its session. */
+  dy: number;
+}
+
+/** The top and bottom pixel rows of the main chart's plot area. */
+interface PlotRows {
+  top: number;
+  bottom: number;
+}
+
 /** Where keyboard focus goes once a removed chip's focused Remove button has unmounted. */
 type ChipFocusTarget = { kind: "remove"; date: string } | { kind: "date-input" };
 
@@ -154,6 +190,19 @@ const EVENT_DATE_BOUNDS: Readonly<Record<WindowPreset, { min: string; max: strin
   "12m": { min: "0002-01-01", max: "9998-12-31" },
 };
 const MARKER_RADIUS = 5;
+/**
+ * Half the side of the square a marker glyph covers, stroke included: the diamond's vertices sit
+ * `MARKER_RADIUS + 1` from its centre and their 2px mitred stroke reaches √2 px beyond them.
+ */
+const MARKER_GLYPH_HALF_EXTENT = MARKER_RADIUS + 2.5;
+/** Clear space kept between two marker glyphs. */
+const MARKER_GLYPH_GAP = 2;
+/** The vertical step between a glyph's candidate positions: its covered side plus the gap. */
+const MARKER_LAYOUT_STEP = 2 * MARKER_GLYPH_HALF_EXTENT + MARKER_GLYPH_GAP;
+/** How many steps up and down a glyph may move to clear the glyphs placed before it. */
+const MARKER_LAYOUT_MAX_STEPS = 8;
+/** Radius of the dot that keeps a moved glyph's true session marked on its line. */
+const MARKER_ANCHOR_RADIUS = 2;
 
 const WINDOW_OPTIONS: ReadonlyArray<{ value: WindowPreset; label: string; testId: string }> = [
   { value: "180d", label: "±180 days", testId: "cycle-window-180d" },
@@ -192,23 +241,66 @@ const METRIC_OPTIONS: ReadonlyArray<{
   },
 ];
 
+// Both kinds share the neutral slate-100 fill and differ by shape; each plotted marker is outlined
+// in its cycle's colour, so no marker fill repeats a cycle line's colour.
 const MARKER_META: Record<MarkerKind, { label: string; testId: string; fill: string }> = {
   valuation_floor: {
     label: "Valuation floor",
     testId: "marker-valuation-floor",
-    fill: CHART_COLORS.warning,
+    fill: CHART_COLORS.markerFill,
   },
   volume_exhaustion: {
     label: "Volume exhaustion",
     testId: "marker-volume-exhaustion",
-    fill: CHART_COLORS.accent,
+    fill: CHART_COLORS.markerFill,
   },
 };
 
-const OVERLAY_SERIES: ReadonlyArray<{ field: OverlayField; label: string; color: string }> = [
-  { field: "inflation_yoy_pct", label: "12-month inflation", color: CHART_COLORS.negative },
-  { field: "tbill_91d_pct", label: "91-day T-bill", color: CHART_COLORS.accent },
-  { field: "tbill_364d_pct", label: "364-day T-bill", color: CHART_COLORS.positive },
+/** The user-facing label and `formatDecimal` kind of each metric that can select a marker. */
+const MARKER_METRIC_META: Record<MarkerMetric, { label: string; kind: DecimalKind }> = {
+  pe_ratio: { label: "P/E", kind: "ratio" },
+  price_index: { label: "Price index", kind: "index" },
+  turnover_index: { label: "Turnover index", kind: "index" },
+};
+
+/** The `stroke-linecap` of a drawn line: `round` turns a short dash pattern into dots. */
+type StrokeLinecap = "butt" | "round";
+
+/** The `strokeWidth` of every overlay line. */
+const OVERLAY_STROKE_WIDTH = 2;
+
+// The overlay lines take the neutral slate shades, never a cycle colour, and since those differ
+// only in lightness each line also has its own pattern: solid, dashed, dotted. None uses
+// PROJECTION_DASH, which marks projections on the main chart.
+const OVERLAY_SERIES: ReadonlyArray<{
+  field: OverlayField;
+  label: string;
+  color: string;
+  /** `strokeDasharray`; undefined for a solid line. */
+  dash: string | undefined;
+  linecap: StrokeLinecap;
+}> = [
+  {
+    field: "inflation_yoy_pct",
+    label: "12-month inflation",
+    color: NEUTRAL_SERIES_PALETTE[0],
+    dash: undefined,
+    linecap: "butt",
+  },
+  {
+    field: "tbill_91d_pct",
+    label: "91-day T-bill",
+    color: NEUTRAL_SERIES_PALETTE[1],
+    dash: "5 3",
+    linecap: "butt",
+  },
+  {
+    field: "tbill_364d_pct",
+    label: "364-day T-bill",
+    color: NEUTRAL_SERIES_PALETTE[2],
+    dash: "1 3",
+    linecap: "round",
+  },
 ];
 
 const STATUS_BADGES: Record<BacktestStatus, { text: string; className: string }> = {
@@ -274,14 +366,27 @@ const SECTION_HEADER_CLASS = "flex flex-wrap items-baseline justify-between gap-
 // gets the same keyboard focus ring as the other controls. Its `<g tabindex="-1">` layers are
 // never keyboard-reachable but a mouse click can focus them, so neither they nor a mouse-focused
 // surface draws an outline.
+// Forced-colours mode does not repaint the `fill` and `stroke` attributes Recharts writes, so they
+// would keep their slate and palette colours on the system `Canvas`. Under `forced-colors: active`
+// every SVG `<text>` (tick values, axis labels, the "Event" label) is filled with `CanvasText`;
+// axis, tick, reference and tooltip-cursor lines are stroked with `CanvasText` and grid lines with
+// `GrayText`. Series curves, the marker groups (`g[data-testid^='marker-']`, each a title and its
+// glyph), the moved markers' leaders and anchor dots (one `g[data-marker-connectors]` layer beneath
+// every marker group) and the overlay's hover dots keep their colours, which identify each series,
+// and are cased in `CanvasText` by four 1px `drop-shadow()`s, so every coloured shape is edged by
+// the system text colour, the one colour guaranteed to contrast with `Canvas`. Each rule sits
+// inside `forced-colors:`, so normal rendering is unchanged.
 const MAIN_CHART_CLASS =
-  "h-80 w-full [&_.recharts-surface:focus-visible]:outline-2 [&_.recharts-surface:focus-visible]:outline-offset-2 [&_.recharts-surface:focus-visible]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none";
+  "h-80 w-full [&_.recharts-surface:focus-visible]:outline-2 [&_.recharts-surface:focus-visible]:outline-offset-2 [&_.recharts-surface:focus-visible]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none forced-colors:[&_text]:fill-[CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:stroke-[color:GrayText] forced-colors:[&_.recharts-line-curve]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_g[data-testid^='marker-']]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_g[data-marker-connectors]]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
 const OVERLAY_CHART_CLASS =
-  "h-48 w-full [&_.recharts-surface:focus-visible]:outline-2 [&_.recharts-surface:focus-visible]:outline-offset-2 [&_.recharts-surface:focus-visible]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none";
+  "h-48 w-full [&_.recharts-surface:focus-visible]:outline-2 [&_.recharts-surface:focus-visible]:outline-offset-2 [&_.recharts-surface:focus-visible]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none forced-colors:[&_text]:fill-[CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:stroke-[color:GrayText] forced-colors:[&_.recharts-line-curve]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_.recharts-active-dot]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
 const LEGEND_CLASS = "m-0 flex list-none flex-wrap gap-x-4 gap-y-1 p-0 text-xs text-slate-300";
 const LEGEND_ITEM_CLASS = "inline-flex items-center gap-1.5";
-const SWATCH_CLASS = "h-2 w-5 shrink-0";
-const MARKER_SWATCH_CLASS = "h-3 w-3 shrink-0";
+// Line and marker swatches get the plotted shapes' forced-colours `CanvasText` casing.
+const SWATCH_CLASS =
+  "h-2 w-5 shrink-0 forced-colors:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
+const MARKER_SWATCH_CLASS =
+  "h-3 w-3 shrink-0 forced-colors:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
 const SELECT_CLASS =
   "m-0 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-100 [color-scheme:dark] hover:border-slate-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const SELECT_LABEL_CLASS = "inline-flex items-center gap-2 text-xs text-slate-400";
@@ -303,6 +408,10 @@ const NOWRAP_CLASS = "whitespace-nowrap";
 const TD_NUMERIC_CLASS = "whitespace-nowrap px-2 py-1.5 text-end align-top tabular-nums text-slate-200";
 // Flag codes wrap between codes; a code breaks only when it alone is wider than the column.
 const TD_FLAGS_CLASS = "min-w-[11rem] break-words px-2 py-1.5 align-top text-slate-500";
+// The Cycle cell leads with the cycle's line swatch, centred on the label's 1rem text-xs line, so
+// a row is identifiable by the same colour as its line on the main chart.
+const CYCLE_CELL_CLASS = "flex items-start gap-1.5";
+const CYCLE_SWATCH_SLOT_CLASS = "flex h-4 shrink-0 items-center";
 const CYCLE_LABEL_CLASS = "block font-medium text-slate-100";
 const CYCLE_DATE_CLASS = "block text-slate-400";
 // A cohort count with tickers is a disclosure that lists them in place, so they are reachable by
@@ -323,6 +432,13 @@ const TOOLTIP_ROW_CLASS = "flex items-center justify-between gap-3";
 const TOOLTIP_NAME_CLASS = "inline-flex items-center gap-1.5";
 const TOOLTIP_META_CLASS = "text-slate-400";
 const TOOLTIP_VALUE_CLASS = "tabular-nums font-medium text-slate-100";
+// A marker row sits beneath its cycle's row: its glyph is centred in a slot as wide as the line
+// swatch above, so its text starts where the cycle's label does.
+const TOOLTIP_MARKER_ROW_CLASS = "flex items-center gap-1.5";
+const TOOLTIP_MARKER_SLOT_CLASS = "flex w-5 shrink-0 justify-center";
+// The marker under the pointer leads the tooltip, set off from the day's rows by a rule.
+const TOOLTIP_HOVERED_MARKER_CLASS =
+  "m-0 flex items-center gap-1.5 border-b border-slate-700 pb-1.5 font-medium text-slate-100";
 
 const CHART_MARGIN = { top: 12, right: 16, bottom: 4, left: 4 };
 const AXIS_LABEL_STYLE = { fill: CHART_COLORS.axis, fontSize: 11 };
@@ -338,6 +454,25 @@ function isIndexMetric(metric: Metric): metric is IndexMetric {
 /** The palette colour of the cycle at `index`, by its position in the response. */
 function seriesColor(index: number): string {
   return SERIES_PALETTE[index % SERIES_PALETTE.length] ?? CHART_COLORS.accent;
+}
+
+/** How many leading {@link SERIES_PALETTE} entries are its 400 shades, drawn at the base width. */
+const BASE_TONE_SERIES = 4;
+const BASE_SERIES_STROKE_WIDTH = 2;
+const DARK_TONE_SERIES_STROKE_WIDTH = 3;
+/** How much thinner a projection line is than its cycle's observed line. */
+const PROJECTION_STROKE_INSET = 0.5;
+
+/**
+ * The observed-line `strokeWidth` of the cycle at `index`, by its position in the response: 2px
+ * for the cycles in the palette's 400 shades, 3px for the fifth to eighth cycles in its 600
+ * shades, so those differ from the first four in weight as well as tone while every observed
+ * line stays solid.
+ */
+function seriesStrokeWidth(index: number): number {
+  return index % SERIES_PALETTE.length < BASE_TONE_SERIES
+    ? BASE_SERIES_STROKE_WIDTH
+    : DARK_TONE_SERIES_STROKE_WIDTH;
 }
 
 /** Whether `iso` is `YYYY-MM-DD` naming a real Gregorian calendar day, checked on its digits. */
@@ -580,12 +715,87 @@ function projectionName(basis: readonly string[]): string {
     : "Projection";
 }
 
-/** The `<title>` of a marker, for example "Valuation floor (pe_ratio 8.12) on 15 Mar 2013". */
-function markerTitle(kind: MarkerKind, marker: CycleMarker): string {
-  const valueKind = marker.metric === "pe_ratio" ? "ratio" : "index";
-  const value = formatDecimal(marker.value, valueKind, { unit: false });
-  const session = formatDate(marker.trade_date);
-  return `${MARKER_META[kind].label} (${marker.metric} ${value}) on ${session}`;
+/**
+ * The selecting metric of a marker, in the user's terms (`P/E 10.55×`, `Turnover index 35.92`):
+ * its label and its value formatted by `formatDecimal` with that metric's unit. A metric this
+ * build does not know is shown by its API name as an index level.
+ */
+function markerMetricText(marker: CycleMarker): string {
+  const meta: { label: string; kind: DecimalKind } | undefined = MARKER_METRIC_META[marker.metric];
+  const label = meta?.label ?? String(marker.metric);
+  return `${label} ${formatDecimal(marker.value, meta?.kind ?? "index")}`;
+}
+
+/**
+ * The `<title>` of a plotted marker, naming its cycle as displayed, kind, selecting metric and
+ * value, and session, for example "2013 Cycle: Valuation floor, P/E 10.55×, 28 Feb 2013".
+ */
+function markerTitle(spec: MarkerSpec): string {
+  const kindLabel = MARKER_META[spec.kind].label;
+  const session = formatDate(spec.marker.trade_date);
+  const cycleLabel = displayLabel(spec.cycle.label);
+  return `${cycleLabel}: ${kindLabel}, ${markerMetricText(spec.marker)}, ${session}`;
+}
+
+/**
+ * The area two marker glyphs centred at `a` and `b` share, each glyph counted as a square of side
+ * {@link MARKER_LAYOUT_STEP} (its covered side plus the gap); 0 when they are clear of each other.
+ */
+function glyphOverlapArea(a: { x: number; y: number }, b: { x: number; y: number }): number {
+  const width = MARKER_LAYOUT_STEP - Math.abs(a.x - b.x);
+  const height = MARKER_LAYOUT_STEP - Math.abs(a.y - b.y);
+  return width > 0 && height > 0 ? width * height : 0;
+}
+
+/**
+ * The vertical pixel offset of each marker glyph, by marker key, that keeps every glyph clear of
+ * the others, so no marker hides another and each one's title and tooltip can be reached.
+ * {@link useMarkerGlyphLayout} runs it inside the chart for both the glyphs and their leaders.
+ *
+ * Glyphs are placed one at a time in `anchors` order, so the same markers always get the same
+ * layout. A glyph keeps its true x, the marked session's day, and moves only vertically. Its
+ * candidate offsets are 0, −S, +S, −2S, +2S, … up to {@link MARKER_LAYOUT_MAX_STEPS} steps each
+ * way, where S is {@link MARKER_LAYOUT_STEP}; the first whose glyph overlaps none placed before it
+ * is taken. A moved glyph must also stay inside `rows`; the true position is always a candidate,
+ * because the axis domain already extends to every marker. When every candidate overlaps, the one
+ * with the least total overlap area is taken, the earliest on a tie.
+ *
+ * @param anchors Each marker's key and true pixel centre, in placement order.
+ * @param rows The plot area's top and bottom pixel rows, or null when unknown.
+ * @returns Pixels to add to each marker's true y; 0 leaves the glyph on its session.
+ */
+function layoutMarkerGlyphs(
+  anchors: readonly MarkerAnchor[],
+  rows: PlotRows | null,
+): Map<string, number> {
+  const offsets = new Map<string, number>();
+  const placed: Array<{ x: number; y: number }> = [];
+  for (const anchor of anchors) {
+    let chosen: number | null = null;
+    let fallback = 0;
+    let fallbackOverlap = Number.POSITIVE_INFINITY;
+    for (let step = 0; step <= 2 * MARKER_LAYOUT_MAX_STEPS && chosen === null; step += 1) {
+      const magnitude = Math.ceil(step / 2) * MARKER_LAYOUT_STEP;
+      const dy = step % 2 === 1 ? -magnitude : magnitude;
+      const centre = { x: anchor.x, y: anchor.y + dy };
+      const outsidePlot =
+        dy !== 0 &&
+        rows !== null &&
+        (centre.y - MARKER_GLYPH_HALF_EXTENT < rows.top ||
+          centre.y + MARKER_GLYPH_HALF_EXTENT > rows.bottom);
+      if (outsidePlot) continue;
+      const overlap = placed.reduce((total, other) => total + glyphOverlapArea(centre, other), 0);
+      if (overlap === 0) chosen = dy;
+      else if (overlap < fallbackOverlap) {
+        fallback = dy;
+        fallbackOverlap = overlap;
+      }
+    }
+    const dy = chosen ?? fallback;
+    placed.push({ x: anchor.x, y: anchor.y + dy });
+    offsets.set(anchor.key, dy);
+  }
+  return offsets;
 }
 
 /** The resolved window, as echoed by the server. */
@@ -630,6 +840,7 @@ function buildChartModel(cycles: readonly CycleResult[], metric: Metric): ChartM
   cycles.forEach((cycle, index) => {
     const key = `${index}-${cycle.event_date}`;
     const color = seriesColor(index);
+    const strokeWidth = seriesStrokeWidth(index);
     const observed = cycle.points.map(
       (point): ObservedRow => ({
         kind: "observed",
@@ -653,7 +864,16 @@ function buildChartModel(cycles: readonly CycleResult[], metric: Metric): ChartM
       );
       name = projectionName(cycle.projection.basis);
     }
-    series.push({ key, cycle, color, observed, projection, projectionName: name });
+    series.push({
+      key,
+      cycle,
+      color,
+      strokeWidth,
+      projectionStrokeWidth: strokeWidth - PROJECTION_STROKE_INSET,
+      observed,
+      projection,
+      projectionName: name,
+    });
 
     if (cycle.markers === null) return;
     for (const kind of MARKER_KINDS) {
@@ -689,9 +909,10 @@ function drawsSegment(rows: readonly (ObservedRow | ProjectionRow)[] | null): bo
 /**
  * The `<desc>` of the main chart, naming only what `model` draws: solid observed lines, dashed
  * projection lines, circles for valuation floors and diamonds for volume exhaustion, in the
- * singular where exactly one of a kind is drawn. A line with fewer than two coordinates for the
- * plotted metric is not counted, since it draws nothing; markers are counted on their own, since
- * a `ReferenceDot` draws whether or not its cycle's line does.
+ * singular where exactly one of a kind is drawn, and that each marker is outlined in its cycle's
+ * colour. A line with fewer than two coordinates for the plotted metric is not counted, since it
+ * draws nothing; markers are counted on their own, since a `ReferenceDot` draws whether or not
+ * its cycle's line does.
  */
 function describeMainChart(model: ChartModel): string {
   const observed = model.series.filter((item) => drawsSegment(item.observed)).length;
@@ -710,10 +931,15 @@ function describeMainChart(model: ChartModel): string {
   else if (floors > 1) marks.push("circles mark valuation floors");
   if (exhaustions === 1) marks.push("the diamond marks volume exhaustion");
   else if (exhaustions > 1) marks.push("diamonds mark volume exhaustion");
+  // Marker fills are shared, so the outline is what ties a marker to its cycle.
+  const outline =
+    floors + exhaustions === 1
+      ? ", outlined in its cycle's colour"
+      : ", each marker outlined in its cycle's colour";
 
   const clauses = [lines, marks]
     .filter((group) => group.length > 0)
-    .map((group) => group.join(" and "));
+    .map((group) => group.join(" and ") + (group === marks ? outline : ""));
   if (clauses.length === 0) {
     return "No line or marker is drawn for this metric in this window.";
   }
@@ -734,8 +960,20 @@ function formatRowValue(row: ObservedRow | ProjectionRow, metric: Metric): strin
 // Presentational pieces
 // ---------------------------------------------------------------------------------------------
 
-/** A decorative line swatch matching a chart stroke; dashed for projections. */
-function LineSwatch({ color, dashed = false }: { color: string; dashed?: boolean }): ReactElement {
+/** The stroke of the chart line a {@link LineSwatch} stands for. */
+interface LineSwatchProps {
+  /** `stroke` colour. */
+  color: string;
+  /** `strokeWidth` in pixels. Default 2. */
+  width?: number;
+  /** `strokeDasharray`, such as `PROJECTION_DASH` for a projection; omitted for a solid line. */
+  dash?: string;
+  /** `strokeLinecap`: `round` for a dotted pattern. Default `butt`. */
+  linecap?: StrokeLinecap;
+}
+
+/** A decorative line swatch drawn with the same stroke, width and pattern as its chart line. */
+function LineSwatch({ color, width = 2, dash, linecap = "butt" }: LineSwatchProps): ReactElement {
   return (
     <svg viewBox="0 0 20 8" aria-hidden="true" focusable="false" className={SWATCH_CLASS}>
       <line
@@ -744,16 +982,19 @@ function LineSwatch({ color, dashed = false }: { color: string; dashed?: boolean
         x2="20"
         y2="4"
         stroke={color}
-        strokeWidth="2"
-        strokeDasharray={dashed ? PROJECTION_DASH : undefined}
+        strokeWidth={width}
+        strokeDasharray={dash}
+        strokeLinecap={linecap}
       />
     </svg>
   );
 }
 
 /**
- * A marker glyph centred on (`cx`, `cy`): an amber circle for the valuation floor and a sky
- * diamond for volume exhaustion, so the two kinds differ in shape as well as colour.
+ * A marker glyph centred on (`cx`, `cy`), outlined in `stroke`: a circle for the valuation floor
+ * and a diamond for volume exhaustion. Both kinds share the neutral slate-100 fill, so they differ
+ * by shape, and a plotted marker's outline carries its cycle's colour without its fill ever
+ * matching a cycle line.
  */
 function MarkerGlyph({
   kind,
@@ -781,32 +1022,170 @@ function MarkerGlyph({
   );
 }
 
-/** A decorative legend swatch of a marker kind. */
+/**
+ * A decorative legend swatch of a marker kind: its glyph outlined in its own fill, since the
+ * outline of a plotted marker varies with its cycle and only the shape and fill are shared.
+ */
 function MarkerSwatch({ kind }: { kind: MarkerKind }): ReactElement {
   return (
     <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" className={MARKER_SWATCH_CLASS}>
-      <MarkerGlyph kind={kind} cx={8} cy={8} stroke={CHART_COLORS.text} />
+      <MarkerGlyph kind={kind} cx={8} cy={8} stroke={MARKER_META[kind].fill} />
     </svg>
   );
 }
 
 /**
- * The `ReferenceDot` shape of a marker: its glyph outlined in the cycle's colour, with a `<title>`
- * naming the kind, the selecting metric and value, and the session.
+ * The pixel layout of the main chart's markers, by marker key: each marker's true pixel centre,
+ * from the chart's axis scales, and the vertical shift {@link layoutMarkerGlyphs} gives its glyph
+ * inside the plot area. A marker whose day or value has no finite pixel is left out. Both
+ * {@link PlacedMarker} and {@link MarkerConnectors} read it, so a glyph and its leader always
+ * agree. It must run inside the chart.
+ *
+ * @param markers Every marker of the main chart, in placement order.
+ * @returns Each marker's placement by key, or null while the chart has no axis scales.
  */
-function markerShape(spec: MarkerSpec): (props: MarkerShapeProps) => ReactElement<SVGElement> {
+function useMarkerGlyphLayout(
+  markers: readonly MarkerSpec[],
+): ReadonlyMap<string, MarkerGlyphPlacement> | null {
+  const xScale = useXAxisScale();
+  const yScale = useYAxisScale();
+  const plotArea = usePlotArea();
+  return useMemo(() => {
+    if (xScale === undefined || yScale === undefined) return null;
+    const anchors: MarkerAnchor[] = [];
+    for (const item of markers) {
+      const x = xScale(item.marker.offset_days);
+      const y = yScale(item.y);
+      if (x !== undefined && y !== undefined && Number.isFinite(x) && Number.isFinite(y)) {
+        anchors.push({ key: item.key, x, y });
+      }
+    }
+    const rows =
+      plotArea === undefined ? null : { top: plotArea.y, bottom: plotArea.y + plotArea.height };
+    const offsets = layoutMarkerGlyphs(anchors, rows);
+    return new Map(
+      anchors.map((anchor): [string, MarkerGlyphPlacement] => [
+        anchor.key,
+        { ...anchor, dy: offsets.get(anchor.key) ?? 0 },
+      ]),
+    );
+  }, [xScale, yScale, plotArea, markers]);
+}
+
+/** Props of {@link PlacedMarker}. */
+interface PlacedMarkerProps {
+  /** The marker drawn. */
+  spec: MarkerSpec;
+  /** Every marker of the main chart, in placement order, this one included. */
+  markers: readonly MarkerSpec[];
+  /** The marked session's true pixel centre, as `ReferenceDot` computed it. */
+  cx: number;
+  cy: number;
+  /** Called with the marker's key when the pointer enters its glyph, and with null on leaving. */
+  onHover: (key: string | null) => void;
+}
+
+/**
+ * One marker of the main chart, rendered by its `ReferenceDot` inside the chart: its glyph at the
+ * marked session's day, moved vertically only as far as {@link useMarkerGlyphLayout} needs to
+ * clear every other glyph. Without axis scales the glyph stays at its true point.
+ *
+ * The marker's `<g data-testid data-event-date>` holds only the `<title>` that names it, as its
+ * first child, and the glyph. A moved glyph's leader and anchor dot are drawn by
+ * {@link MarkerConnectors} in a layer beneath every marker group, so no leader or dot ever paints
+ * over a glyph. The group reports the pointer entering and leaving its glyph through `onHover`, so
+ * the chart tooltip can name the marker under the pointer whichever day the pointer's x selects.
+ */
+function PlacedMarker({ spec, markers, cx, cy, onHover }: PlacedMarkerProps): ReactElement {
+  const dy = useMarkerGlyphLayout(markers)?.get(spec.key)?.dy ?? 0;
   const meta = MARKER_META[spec.kind];
-  const title = markerTitle(spec.kind, spec.marker);
+  return (
+    <g
+      data-testid={meta.testId}
+      data-event-date={spec.cycle.event_date}
+      onPointerEnter={() => onHover(spec.key)}
+      onPointerLeave={() => onHover(null)}
+    >
+      <title>{markerTitle(spec)}</title>
+      <MarkerGlyph kind={spec.kind} cx={cx} cy={cy + dy} stroke={spec.color} />
+    </g>
+  );
+}
+
+/** Props of {@link MarkerConnectors}. */
+interface MarkerConnectorsProps {
+  /** Every marker of the main chart, in placement order, as its `ReferenceDot`s receive them. */
+  markers: readonly MarkerSpec[];
+}
+
+/**
+ * The connectors of the main chart's moved markers. For each glyph {@link useMarkerGlyphLayout}
+ * moves off its session, a 1px leader in the cycle's colour runs from the true session to the
+ * glyph's centre, and a small dot of that colour marks the session on its line. Every leader is
+ * drawn before every dot, so no leader crosses another marker's dot.
+ *
+ * They share one decorative `<g data-marker-connectors>` in a z-index layer just below the
+ * `ReferenceDot`s (and above every line and axis), so each leader and dot lies beneath every
+ * marker glyph, and a glyph covers the end of its own leader whatever its shape. The group
+ * ignores the pointer, so it never takes a marker's hover. Nothing is drawn while no glyph is
+ * moved.
+ */
+function MarkerConnectors({ markers }: MarkerConnectorsProps): ReactElement | null {
+  const layout = useMarkerGlyphLayout(markers);
+  const moved: Array<{ spec: MarkerSpec; placement: MarkerGlyphPlacement }> = [];
+  for (const spec of markers) {
+    const placement = layout?.get(spec.key);
+    if (placement !== undefined && placement.dy !== 0) moved.push({ spec, placement });
+  }
+  if (moved.length === 0) return null;
+  return (
+    <ZIndexLayer zIndex={DefaultZIndexes.scatter - 1}>
+      <g data-marker-connectors="" aria-hidden="true" pointerEvents="none">
+        {moved.map(({ spec, placement }) => (
+          <line
+            key={spec.key + "-leader"}
+            data-event-date={spec.cycle.event_date}
+            data-marker-kind={spec.kind}
+            x1={placement.x}
+            y1={placement.y}
+            x2={placement.x}
+            y2={placement.y + placement.dy}
+            stroke={spec.color}
+            strokeWidth={1}
+          />
+        ))}
+        {moved.map(({ spec, placement }) => (
+          <circle
+            key={spec.key + "-anchor"}
+            data-event-date={spec.cycle.event_date}
+            data-marker-kind={spec.kind}
+            cx={placement.x}
+            cy={placement.y}
+            r={MARKER_ANCHOR_RADIUS}
+            fill={spec.color}
+          />
+        ))}
+      </g>
+    </ZIndexLayer>
+  );
+}
+
+/**
+ * The `ReferenceDot` shape of a marker: a {@link PlacedMarker}, its glyph outlined in the cycle's
+ * colour and placed clear of every other marker in `markers`, with a `<title>` naming the cycle,
+ * the kind, the selecting metric and value, and the session. `onHover` receives the marker's key
+ * when the pointer enters its glyph and null when it leaves.
+ */
+function markerShape(
+  spec: MarkerSpec,
+  markers: readonly MarkerSpec[],
+  onHover: (key: string | null) => void,
+): (props: MarkerShapeProps) => ReactElement<SVGElement> {
   return function drawMarker({ cx, cy }: MarkerShapeProps): ReactElement<SVGElement> {
     if (cx === undefined || cy === undefined || !Number.isFinite(cx) || !Number.isFinite(cy)) {
       return <g />;
     }
-    return (
-      <g data-testid={meta.testId} data-event-date={spec.cycle.event_date}>
-        <title>{title}</title>
-        <MarkerGlyph kind={spec.kind} cx={cx} cy={cy} stroke={spec.color} />
-      </g>
-    );
+    return <PlacedMarker spec={spec} markers={markers} cx={cx} cy={cy} onHover={onHover} />;
   };
 }
 
@@ -815,73 +1194,165 @@ interface CycleChartTooltipProps {
   label?: string | number;
   series: readonly ChartSeries[];
   metric: Metric;
+  /** The marker whose glyph is under the pointer, or null when the pointer is on none. */
+  hoveredMarker: MarkerSpec | null;
 }
+
+/** A main-chart tooltip row: a cycle's or projection's value, or a marker on the session above. */
+type CycleTooltipEntry =
+  | {
+      type: "line";
+      key: string;
+      name: string;
+      color: string;
+      width: number;
+      row: ObservedRow | ProjectionRow;
+    }
+  | {
+      type: "marker";
+      key: string;
+      kind: MarkerKind;
+      eventDate: string;
+      color: string;
+      text: string;
+    };
 
 /**
  * Main-chart tooltip: for the hovered offset, each cycle's own session at or before it and each
  * drawn projection's value there. Rows are resolved from the series rather than from Recharts'
  * payload, which pairs lines that have their own `data` by array index when a line has no row at
- * exactly the hovered offset, and would show an unrelated session.
+ * exactly the hovered offset, and would show an unrelated session. When a cycle's session is its
+ * valuation floor or volume exhaustion, a row beneath it names the marker with its glyph and
+ * selecting value ("Valuation floor · P/E 10.55×").
+ *
+ * A marker glyph spans several days, so the hovered offset, taken from the pointer's x, is often
+ * not the marked session. While the pointer is on a glyph, `hoveredMarker` is that marker, and a
+ * line directly under the title names it with its glyph and its full `<title>` text ("2017 Cycle:
+ * Valuation floor, P/E 7.85×, 4 Aug 2017"), so hovering any part of a marker identifies it. The
+ * tooltip is then drawn even when no row falls at or before the hovered offset.
  */
 function CycleChartTooltip({
   active,
   label,
   series,
   metric,
+  hoveredMarker,
 }: CycleChartTooltipProps): ReactElement | null {
   const x = tooltipOffset(label);
   if (active !== true || x === null) return null;
 
-  const entries: Array<{
-    key: string;
-    name: string;
-    color: string;
-    row: ObservedRow | ProjectionRow;
-  }> = [];
+  const entries: CycleTooltipEntry[] = [];
   for (const item of series) {
     const observed = rowAtOrBefore(item.observed, x);
     if (observed !== undefined) {
       entries.push({
+        type: "line",
         key: item.key + "-observed",
         name: displayLabel(item.cycle.label),
         color: item.color,
+        width: item.strokeWidth,
         row: observed,
       });
+      for (const kind of MARKER_KINDS) {
+        const marker = item.cycle.markers?.[kind] ?? null;
+        if (
+          marker !== null &&
+          marker.offset_days === observed.point.offset_days &&
+          marker.trade_date === observed.point.trade_date
+        ) {
+          entries.push({
+            type: "marker",
+            key: `${item.key}-${kind}`,
+            kind,
+            eventDate: item.cycle.event_date,
+            color: item.color,
+            text: `${MARKER_META[kind].label} \u00b7 ${markerMetricText(marker)}`,
+          });
+        }
+      }
     }
     if (item.projection !== null) {
       const projected = rowAtOrBefore(item.projection, x);
       if (projected !== undefined) {
         entries.push({
+          type: "line",
           key: item.key + "-projection",
           name: "Projection \u00b7 " + displayLabel(item.cycle.label),
           color: item.color,
+          width: item.projectionStrokeWidth,
           row: projected,
         });
       }
     }
   }
-  if (entries.length === 0) return null;
+  if (entries.length === 0 && hoveredMarker === null) return null;
 
   return (
     <div className={TOOLTIP_CLASS}>
       <p className={TOOLTIP_TITLE_CLASS}>Day {formatOffset(x)} from event</p>
-      <ul className={TOOLTIP_LIST_CLASS}>
-        {entries.map((entry) => (
-          <li key={entry.key} className={TOOLTIP_ROW_CLASS}>
-            <span className={TOOLTIP_NAME_CLASS}>
-              <LineSwatch color={entry.color} dashed={entry.row.kind === "projection"} />
-              <span>{entry.name}</span>
-              <span className={TOOLTIP_META_CLASS}>
-                {entry.row.kind === "observed"
-                  ? formatDate(entry.row.point.trade_date) + " \u00b7 "
-                  : ""}
-                {formatOffset(entry.row.x) + " d"}
-              </span>
-            </span>
-            <span className={TOOLTIP_VALUE_CLASS}>{formatRowValue(entry.row, metric)}</span>
-          </li>
-        ))}
-      </ul>
+      {hoveredMarker !== null ? (
+        <p
+          data-testid="cycle-tooltip-hovered-marker"
+          data-event-date={hoveredMarker.cycle.event_date}
+          className={TOOLTIP_HOVERED_MARKER_CLASS}
+        >
+          <span className={TOOLTIP_MARKER_SLOT_CLASS}>
+            <svg
+              viewBox="0 0 16 16"
+              aria-hidden="true"
+              focusable="false"
+              className={MARKER_SWATCH_CLASS}
+            >
+              <MarkerGlyph kind={hoveredMarker.kind} cx={8} cy={8} stroke={hoveredMarker.color} />
+            </svg>
+          </span>
+          <span>{markerTitle(hoveredMarker)}</span>
+        </p>
+      ) : null}
+      {entries.length > 0 ? (
+        <ul className={TOOLTIP_LIST_CLASS}>
+          {entries.map((entry) =>
+            entry.type === "marker" ? (
+              <li
+                key={entry.key}
+                data-testid="cycle-tooltip-marker"
+                data-event-date={entry.eventDate}
+                className={TOOLTIP_MARKER_ROW_CLASS}
+              >
+                <span className={TOOLTIP_MARKER_SLOT_CLASS}>
+                  <svg
+                    viewBox="0 0 16 16"
+                    aria-hidden="true"
+                    focusable="false"
+                    className={MARKER_SWATCH_CLASS}
+                  >
+                    <MarkerGlyph kind={entry.kind} cx={8} cy={8} stroke={entry.color} />
+                  </svg>
+                </span>
+                <span>{entry.text}</span>
+              </li>
+            ) : (
+              <li key={entry.key} className={TOOLTIP_ROW_CLASS}>
+                <span className={TOOLTIP_NAME_CLASS}>
+                  <LineSwatch
+                    color={entry.color}
+                    width={entry.width}
+                    dash={entry.row.kind === "projection" ? PROJECTION_DASH : undefined}
+                  />
+                  <span>{entry.name}</span>
+                  <span className={TOOLTIP_META_CLASS}>
+                    {entry.row.kind === "observed"
+                      ? formatDate(entry.row.point.trade_date) + " \u00b7 "
+                      : ""}
+                    {formatOffset(entry.row.x) + " d"}
+                  </span>
+                </span>
+                <span className={TOOLTIP_VALUE_CLASS}>{formatRowValue(entry.row, metric)}</span>
+              </li>
+            ),
+          )}
+        </ul>
+      ) : null}
     </div>
   );
 }
@@ -908,7 +1379,12 @@ function OverlayTooltip({ active, label, rows }: OverlayTooltipProps): ReactElem
         {OVERLAY_SERIES.map((overlay) => (
           <li key={overlay.field} className={TOOLTIP_ROW_CLASS}>
             <span className={TOOLTIP_NAME_CLASS}>
-              <LineSwatch color={overlay.color} />
+              <LineSwatch
+                color={overlay.color}
+                width={OVERLAY_STROKE_WIDTH}
+                dash={overlay.dash}
+                linecap={overlay.linecap}
+              />
               <span>{overlay.label}</span>
             </span>
             <span className={TOOLTIP_VALUE_CLASS}>
@@ -1128,7 +1604,8 @@ function TickerCount({
  *
  * Views: one solid line per cycle against calendar days from the event, a dashed "Projection
  * (mean of …)" line for each partial or awaiting cycle, a reference line at the event, and the
- * valuation-floor and volume-exhaustion markers; an inflation and 91/364-day T-bill overlay for a
+ * valuation-floor and volume-exhaustion markers, each named at the top of the chart tooltip while
+ * the pointer is on its glyph; an inflation and 91/364-day T-bill overlay for a
  * selected cycle; and a summary table with status badges, returns, drawdown, P/E compression,
  * cohort sizes and flag codes.
  *
@@ -1167,6 +1644,9 @@ export function CycleBacktester({
   const [overlayEventDate, setOverlayEventDate] = useState<string | null>(null);
   const [customDate, setCustomDate] = useState("");
   const [chipError, setChipError] = useState<string | null>(null);
+  // The key of the main-chart marker whose glyph is under the pointer. Set and cleared only by
+  // the glyph's pointer handlers, the chart's mouse leave and the controls that change the chart.
+  const [hoveredMarkerKey, setHoveredMarkerKey] = useState<string | null>(null);
   // The label of every event date a response has named, by date, recorded whenever the events
   // change, so a re-added stored date keeps its label while the new result loads.
   const [knownLabels, setKnownLabels] = useState<Readonly<Record<string, string>>>({});
@@ -1208,12 +1688,21 @@ export function CycleBacktester({
   const cycles = data?.cycles;
   const chips = eventDates ?? cycles?.map((cycle) => cycle.event_date) ?? [];
   const chartModel = useMemo(() => buildChartModel(cycles ?? [], metric), [cycles, metric]);
+  // A key the current chart no longer draws names no marker, so it is never shown.
+  const hoveredMarker =
+    hoveredMarkerKey === null
+      ? null
+      : (chartModel.markers.find((spec) => spec.key === hoveredMarkerKey) ?? null);
 
   // The overlay shows the chosen cycle while it still has points, otherwise the first that does.
+  // Its swatch takes the cycle's colour by its position among all cycles, as on the main chart,
+  // not among the candidates.
   const overlay = useMemo(() => {
-    const candidates = (cycles ?? []).filter((cycle) => cycle.points.length > 0);
+    const allCycles = cycles ?? [];
+    const candidates = allCycles.filter((cycle) => cycle.points.length > 0);
     const selected =
       candidates.find((cycle) => cycle.event_date === overlayEventDate) ?? candidates[0];
+    const selectedIndex = selected === undefined ? -1 : allCycles.indexOf(selected);
     const rows = (selected?.points ?? []).map(
       (point): OverlayRow => ({
         x: point.offset_days,
@@ -1223,10 +1712,11 @@ export function CycleBacktester({
         point,
       }),
     );
-    return { candidates, selected, rows };
+    return { candidates, selected, selectedIndex, rows };
   }, [cycles, overlayEventDate]);
   const overlayCandidates = overlay.candidates;
   const overlayCycle = overlay.selected;
+  const overlayCycleIndex = overlay.selectedIndex;
   const overlayRows = overlay.rows;
 
   // Runs once the removed chip and its focused Remove button have unmounted.
@@ -1250,6 +1740,20 @@ export function CycleBacktester({
     );
   }
 
+  // A glyph removed or redrawn while the pointer rests on it, as when a keyboard control changes
+  // the chart, never receives pointerleave; each control that changes the chart therefore clears
+  // the hovered marker, so a marker drawn again later is not named until the pointer enters it.
+  // `handleWindowChange` below does the same when it applies a new preset.
+  function handleMetricChange(value: Metric): void {
+    setMetric(value);
+    setHoveredMarkerKey(null);
+  }
+
+  function handleRetry(): void {
+    setHoveredMarkerKey(null);
+    refetch();
+  }
+
   function handleRemoveChip(event: MouseEvent<HTMLButtonElement>, date: string): void {
     const position = chips.indexOf(date);
     // The last chip stays, so an explicit empty list is never sent.
@@ -1268,6 +1772,7 @@ export function CycleBacktester({
     setEventDates(remaining);
     setKnownLabels(withCycleLabels(knownLabels, cycles));
     setChipError(null);
+    setHoveredMarkerKey(null);
     // A removed date no longer blocks the refused switch, so re-adding it never revives the
     // refusal; the refusal ends with its last date.
     setWindowBlock((block) => {
@@ -1316,6 +1821,7 @@ export function CycleBacktester({
     setKnownLabels(withCycleLabels(knownLabels, cycles));
     setCustomDate("");
     setChipError(null);
+    setHoveredMarkerKey(null);
   }
 
   // A switch is refused while a selected date lies outside the new preset's range, since the
@@ -1334,6 +1840,7 @@ export function CycleBacktester({
       setWindowPreset(preset);
       // An add-date message names the previous window's range.
       setChipError(null);
+      setHoveredMarkerKey(null);
     }
   }
 
@@ -1372,7 +1879,7 @@ export function CycleBacktester({
               type="button"
               data-testid={option.testId}
               aria-pressed={metric === option.value}
-              onClick={() => setMetric(option.value)}
+              onClick={() => handleMetricChange(option.value)}
               className={metric === option.value ? TOGGLE_ACTIVE_CLASS : TOGGLE_CLASS}
             >
               {option.label}
@@ -1525,6 +2032,7 @@ export function CycleBacktester({
                 margin={CHART_MARGIN}
                 title={(metricOption?.label ?? "") + " of each cycle by days from the event"}
                 desc={mainChartDescription}
+                onMouseLeave={() => setHoveredMarkerKey(null)}
               >
                 <CartesianGrid stroke={CHART_COLORS.grid} strokeDasharray="3 3" />
                 <XAxis
@@ -1571,6 +2079,7 @@ export function CycleBacktester({
                       label={props.label}
                       series={chartModel.series}
                       metric={metric}
+                      hoveredMarker={hoveredMarker}
                     />
                   )}
                 />
@@ -1596,7 +2105,7 @@ export function CycleBacktester({
                       name={displayLabel(item.cycle.label)}
                       type="linear"
                       stroke={item.color}
-                      strokeWidth={2}
+                      strokeWidth={item.strokeWidth}
                       dot={false}
                       activeDot={false}
                       connectNulls
@@ -1612,7 +2121,7 @@ export function CycleBacktester({
                     name={item.projectionName ?? "Projection"}
                     type="linear"
                     stroke={item.color}
-                    strokeWidth={1.5}
+                    strokeWidth={item.projectionStrokeWidth}
                     strokeDasharray={PROJECTION_DASH}
                     dot={false}
                     activeDot={false}
@@ -1621,7 +2130,13 @@ export function CycleBacktester({
                   />
                 ))}
                 {/* Recharts 3 has no `isFront`: a ReferenceDot's default z-index (600) already
-                    draws it above every Line (400). */}
+                    draws it above every Line (400). Each dot sits at its marker's true session;
+                    its shape lays out all the markers, in cycle then kind order, and moves this
+                    glyph vertically only as far as needed to clear the others, so coincident
+                    markers never hide each other. The leaders back to the moved glyphs' sessions
+                    are drawn by MarkerConnectors in the layer just below (599), beneath every
+                    glyph. */}
+                <MarkerConnectors markers={chartModel.markers} />
                 {chartModel.markers.map((spec) => (
                   <ReferenceDot
                     key={spec.key}
@@ -1629,7 +2144,7 @@ export function CycleBacktester({
                     y={spec.y}
                     r={MARKER_RADIUS}
                     ifOverflow="extendDomain"
-                    shape={markerShape(spec)}
+                    shape={markerShape(spec, chartModel.markers, setHoveredMarkerKey)}
                   />
                 ))}
               </LineChart>
@@ -1648,7 +2163,7 @@ export function CycleBacktester({
               data-event-date={item.cycle.event_date}
               className={LEGEND_ITEM_CLASS}
             >
-              <LineSwatch color={item.color} />
+              <LineSwatch color={item.color} width={item.strokeWidth} />
               <span>{displayLabel(item.cycle.label)}</span>
               {item.observed.length === 0 ? (
                 <span className={TOOLTIP_META_CLASS}>
@@ -1664,7 +2179,11 @@ export function CycleBacktester({
               data-event-date={item.cycle.event_date}
               className={LEGEND_ITEM_CLASS}
             >
-              <LineSwatch color={item.color} dashed />
+              <LineSwatch
+                color={item.color}
+                width={item.projectionStrokeWidth}
+                dash={PROJECTION_DASH}
+              />
               <span>
                 {item.projectionName}{" "}
                 <span className={TOOLTIP_META_CLASS}>
@@ -1690,6 +2209,9 @@ export function CycleBacktester({
                 <span className={TOOLTIP_META_CLASS}>(lowest turnover index)</span>
               </span>
             </li>
+            <li className={TOOLTIP_META_CLASS}>
+              Each marker is outlined in its cycle&apos;s colour
+            </li>
           </ul>
         ) : null}
         {hasAnyProjection ? (
@@ -1708,6 +2230,10 @@ export function CycleBacktester({
           {overlayCycle !== undefined ? (
             <span className={SELECT_LABEL_CLASS}>
               <label htmlFor={overlaySelectId}>Overlay cycle</label>
+              <LineSwatch
+                color={seriesColor(overlayCycleIndex)}
+                width={seriesStrokeWidth(overlayCycleIndex)}
+              />
               <select
                 id={overlaySelectId}
                 data-testid="cycle-overlay-select"
@@ -1777,7 +2303,9 @@ export function CycleBacktester({
                       name={overlay.label}
                       type="linear"
                       stroke={overlay.color}
-                      strokeWidth={1.5}
+                      strokeWidth={OVERLAY_STROKE_WIDTH}
+                      strokeDasharray={overlay.dash}
+                      strokeLinecap={overlay.linecap}
                       dot={false}
                       connectNulls
                       isAnimationActive={false}
@@ -1789,7 +2317,12 @@ export function CycleBacktester({
             <ul aria-label="Overlay series" className={LEGEND_CLASS}>
               {OVERLAY_SERIES.map((overlay) => (
                 <li key={overlay.field} className={LEGEND_ITEM_CLASS}>
-                  <LineSwatch color={overlay.color} />
+                  <LineSwatch
+                    color={overlay.color}
+                    width={OVERLAY_STROKE_WIDTH}
+                    dash={overlay.dash}
+                    linecap={overlay.linecap}
+                  />
                   <span>{overlay.label}</span>
                 </li>
               ))}
@@ -1862,13 +2395,22 @@ export function CycleBacktester({
                   className={TR_CLASS}
                 >
                   <th scope="row" className={TH_ROW_CLASS}>
-                    <span className={CYCLE_LABEL_CLASS}>{displayLabel(cycle.label)}</span>
-                    {labelNamesDate(cycle.label, cycle.event_date) ? null : (
-                      <>
-                        {" "}
-                        <span className={CYCLE_DATE_CLASS}>{formatDate(cycle.event_date)}</span>
-                      </>
-                    )}
+                    <span className={CYCLE_CELL_CLASS}>
+                      <span className={CYCLE_SWATCH_SLOT_CLASS}>
+                        <LineSwatch color={seriesColor(index)} width={seriesStrokeWidth(index)} />
+                      </span>
+                      <span>
+                        <span className={CYCLE_LABEL_CLASS}>{displayLabel(cycle.label)}</span>
+                        {labelNamesDate(cycle.label, cycle.event_date) ? null : (
+                          <>
+                            {" "}
+                            <span className={CYCLE_DATE_CLASS}>
+                              {formatDate(cycle.event_date)}
+                            </span>
+                          </>
+                        )}
+                      </span>
+                    </span>
                   </th>
                   <td className={TD_WRAP_CLASS}>
                     <span className={NOWRAP_CLASS}>
@@ -1926,7 +2468,7 @@ export function CycleBacktester({
       title="Election & cycle backtester"
       state={state}
       error={error}
-      onRetry={refetch}
+      onRetry={handleRetry}
       className={className}
       skeletonClassName="h-96"
       controls={controls}
