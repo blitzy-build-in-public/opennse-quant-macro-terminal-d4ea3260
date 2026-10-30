@@ -132,8 +132,10 @@ const LEGEND_NOTE_CLASS = "m-0 text-slate-400";
 // The note on its own, when no chart (and so no legend) is drawn.
 const STANDALONE_NOTE_CLASS = "m-0 text-xs text-slate-400";
 // Columns follow the widget's own width rather than the viewport, so the cards keep room for a
-// full KES amount whether a host places the widget in a narrow column or across the page.
-const TOTALS_CLASS = "m-0 grid grid-cols-[repeat(auto-fit,minmax(12rem,1fr))] gap-2";
+// full KES amount whether a host places the widget in a narrow column or across the page. A track
+// never exceeds the widget's width, so with large text in a narrow card the single column
+// narrows to the card instead of overflowing it.
+const TOTALS_CLASS = "m-0 grid grid-cols-[repeat(auto-fit,minmax(min(100%,12rem),1fr))] gap-2";
 // Each total is a KPI tile shared with the other widgets; its value wraps a long KES amount
 // inside a narrow tile, and only the tone colour is this widget's own.
 const TOTAL_VALUE_POSITIVE_CLASS = `${KPI_VALUE_CLASS} text-emerald-300`;
@@ -156,10 +158,11 @@ const READOUT_CLASS = "pointer-events-none";
 const TOOLTIP_CLASS =
   "visible flex flex-col gap-1.5 rounded border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-300";
 const TOOLTIP_TITLE_CLASS = "m-0 font-medium text-slate-100";
-// Columns follow the widget's own width rather than the viewport, as the totals' do. Each value
-// has its own line beneath its label, so the panel keeps its height from one session to the next.
+// Columns follow the widget's own width rather than the viewport, as the totals' do, and a track
+// never exceeds the panel's width. Each value has its own line beneath its label, so the panel
+// keeps its height from one session to the next.
 const TOOLTIP_LIST_CLASS =
-  "m-0 grid grid-cols-[repeat(auto-fit,minmax(9rem,1fr))] gap-x-3 gap-y-1.5";
+  "m-0 grid grid-cols-[repeat(auto-fit,minmax(min(100%,9rem),1fr))] gap-x-3 gap-y-1.5";
 const TOOLTIP_ENTRY_CLASS = "flex min-w-0 flex-col";
 const TOOLTIP_TERM_CLASS = "text-slate-400";
 // `[overflow-wrap:anywhere]` lets a long KES amount wrap inside a narrow card, as the totals' do.

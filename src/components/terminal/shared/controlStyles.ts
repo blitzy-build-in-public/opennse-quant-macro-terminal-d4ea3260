@@ -7,8 +7,10 @@
  * its own complete tokens, but never builds a token from fragments, so Tailwind 3's `content`
  * glob and Tailwind 4's `@source` scan both find every class. Only the default palette is used.
  *
- * - Every control type has one size, in every widget: text fields, selects, secondary and toggle
- *   buttons and chips are 26px tall, ticker buttons 24px, and the chip remove button 24px square.
+ * - Every control type has one size, in every widget: at the default text size, text fields,
+ *   selects, secondary and toggle buttons and chips are 26px tall, ticker buttons 24px, and the
+ *   chip remove button 24px square. Sizes are set in rem, so every control grows with the user's
+ *   text size instead of clipping its text.
  * - Field borders are slate-500, which keeps at least 3:1 non-text contrast against the slate-900
  *   card (about 3.7:1) and the slate-950 field fill (about 4.2:1).
  * - Focus is a sky-400 outline at a 2px offset (the chip remove button draws it inside its own
@@ -23,16 +25,24 @@
  */
 
 /* BLITZY [A11Y]: every widget, the IPO sandbox and the anomaly feed included, uses these compact
-   sizes: text fields, selects, secondary and toggle buttons and chips 26px tall, ticker buttons
-   24px tall and the chip remove button 24px square. That is at or above WCAG 2.2 AA's 24px target
-   minimum and below the 44px guideline, so dense filter rows, toolbars and lists stay readable.
-   Flagged for designer review. */
+   sizes at the default text size: text fields, selects, secondary and toggle buttons and chips
+   26px tall, ticker buttons 24px tall and the chip remove button 24px square. That is at or above
+   WCAG 2.2 AA's 24px target minimum and below the 44px guideline, so dense filter rows, toolbars
+   and lists stay readable. Every size grows with a larger text setting, so a control's text keeps
+   its full height when resized to 200% (WCAG 2.1 SC 1.4.4). Flagged for designer review. */
 
 /** Label of a text field or select: 12px medium slate-300, about 12:1 on the slate-900 card. */
 export const FIELD_LABEL_CLASS = "text-xs font-medium text-slate-300";
 
 /**
- * Compact text input or select, 26px tall with a slate-500 border on a slate-950 fill.
+ * Compact text input or select with a slate-500 border on a slate-950 fill, 26px tall at the
+ * default text size.
+ *
+ * The height is a minimum, never fixed: 1.5rem plus the 2px border, which a text input also
+ * reaches with its 0.125rem vertical padding around a 1.25rem `text-sm` line. Both are in rem, so
+ * with larger text the field grows instead of clipping its text, and inputs, selects and date
+ * fields stay one height, that of {@link SECONDARY_BUTTON_CLASS}, so a row's bottom edges align
+ * at any text size (50px at 200%).
  *
  * Hover lightens the border to slate-400 and a press to slate-300, only while the field is
  * enabled. `aria-invalid="true"` turns the border rose-400, and its hover and press shades stay
@@ -45,7 +55,7 @@ export const FIELD_LABEL_CLASS = "text-xs font-medium text-slate-300";
  * them for the forced palette, so a light palette never gets a white icon on its white Canvas.
  */
 export const TEXT_FIELD_CLASS =
-  "h-[26px] rounded border border-slate-500 bg-slate-950 px-2 text-sm text-slate-100 [color-scheme:dark] forced-colors:[color-scheme:light_dark] placeholder:text-slate-400 enabled:hover:border-slate-400 enabled:active:border-slate-300 aria-[invalid=true]:border-rose-400 aria-[invalid=true]:enabled:hover:border-rose-300 aria-[invalid=true]:enabled:active:border-rose-200 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "min-h-[calc(1.5rem+2px)] rounded border border-slate-500 bg-slate-950 px-2 py-0.5 text-sm text-slate-100 [color-scheme:dark] forced-colors:[color-scheme:light_dark] placeholder:text-slate-400 enabled:hover:border-slate-400 enabled:active:border-slate-300 aria-[invalid=true]:border-rose-400 aria-[invalid=true]:enabled:hover:border-rose-300 aria-[invalid=true]:enabled:active:border-rose-200 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 
 /**
  * Secondary text button, 26px tall: slate-100 text on slate-800, stepping to slate-700 on hover

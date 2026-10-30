@@ -44,8 +44,12 @@ const NO_STORED_VALUE = "No value stored for this indicator";
 
 // Every class below is a complete static string, so Tailwind's source scan and a host's `@source`
 // directive or `content` glob find each one. `m-0` on the list elements cancels the user-agent
-// `dl`/`dd` margins in a host that ships no CSS reset.
-const GRID_CLASS = "m-0 grid grid-cols-2 gap-3 md:grid-cols-4";
+// `dl`/`dd` margins in a host that ships no CSS reset. Below the `md` breakpoint the tiles form
+// two equal columns (a 40% track minimum never fits a third) while each keeps at least 6.5rem,
+// and a single column, never wider than the card, once it would not: with a large text setting
+// on a narrow screen, a tile's longest word ("KES/USD") would otherwise overflow it.
+const GRID_CLASS =
+  "m-0 grid grid-cols-[repeat(auto-fill,minmax(min(100%,max(6.5rem,40%)),1fr))] gap-3 md:grid-cols-4";
 // Tiles, labels and values build on the KPI classes shared with the other widgets.
 // In two-column tiles on narrow screens, `text-balance` wraps "USD 7,850.00 m" as "USD" /
 // "7,850.00 m" rather than leaving the unit alone on its own line.

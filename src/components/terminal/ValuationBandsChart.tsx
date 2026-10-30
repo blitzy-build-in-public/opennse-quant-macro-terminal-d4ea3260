@@ -124,8 +124,10 @@ const TOOLTIP_CLASS =
 const TOOLTIP_VALUE_CLASS = "font-medium tabular-nums text-slate-100";
 // Auto-filling columns reflow with the widget's own width, whatever the host's layout or viewport.
 // Each statistic is a KPI tile shared with the other widgets; an 8rem track keeps the widest
-// value, a 100.00% percentile, on one line inside its tile.
-const STATS_CLASS = "m-0 grid grid-cols-[repeat(auto-fill,minmax(8rem,1fr))] gap-2";
+// value, a 100.00% percentile, on one line inside its tile. A track never exceeds the widget's
+// width, so with large text in a narrow card the single column narrows to the card instead of
+// overflowing it.
+const STATS_CLASS = "m-0 grid grid-cols-[repeat(auto-fill,minmax(min(100%,8rem),1fr))] gap-2";
 const STAT_VALUE_CLASS = `${KPI_VALUE_CLASS} text-slate-100`;
 const FLAGS_CLASS = "flex flex-wrap gap-1";
 const FLAG_CLASS = "rounded bg-slate-800 px-1.5 py-0.5 font-mono text-xs text-slate-400";

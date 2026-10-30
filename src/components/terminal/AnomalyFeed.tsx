@@ -85,8 +85,13 @@ const ITEM_CLASS =
   "flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-s-2 border-slate-800 border-s-transparent forced-colors:border-s-4 forced-colors:border-s-[color:Canvas] py-1 last:border-b-0";
 const ITEM_SELECTED_CLASS =
   "flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-s-2 border-slate-800 border-s-sky-400 forced-colors:border-s-4 forced-colors:border-s-[color:Highlight] bg-slate-800 py-1 last:border-b-0";
-const ITEM_LEAD_CLASS = "flex min-w-0 items-center gap-2";
-const ITEM_FIGURES_CLASS = "ms-auto flex items-center gap-3 text-end tabular-nums";
+// The lead (ticker, date and badge) and the figures (amounts and z) each keep one line while it
+// fits and otherwise wrap their own parts (`flex-wrap`), and neither is wider than the row
+// (`min-w-0`), so with a large text setting in a narrow card every part stays in view without
+// sideways scrolling.
+const ITEM_LEAD_CLASS = "flex min-w-0 flex-wrap items-center gap-2";
+const ITEM_FIGURES_CLASS =
+  "ms-auto flex min-w-0 flex-wrap items-center gap-3 text-end tabular-nums";
 // The button is the shared compact ticker button of `shared/controlStyles`, the same 24px, 12px
 // medium monospace button as EquityScreener's table tickers; only scroll-my-1 is added here, for
 // the scroll region above. Its look matches plain text apart from colour, even in a host without a
@@ -106,8 +111,10 @@ const TICKER_BUTTON_SELECTED_CLASS = `${SHARED_TICKER_BUTTON_SELECTED_CLASS} scr
 const TICKER_TEXT_CLASS =
   "inline-flex min-h-6 min-w-16 items-center px-1 font-mono text-xs font-medium text-slate-100";
 const DATE_CLASS = "min-w-20 whitespace-nowrap text-xs text-slate-400";
-const VALUE_CLASS = "block text-sm text-slate-100";
-const MEAN_CLASS = "block text-xs text-slate-400";
+// `[overflow-wrap:anywhere]` lets an amount too long for a narrow row, such as a KES turnover with
+// a large text setting, wrap inside its digits instead of widening the row, in Tailwind 3 and 4.
+const VALUE_CLASS = "block text-sm text-slate-100 [overflow-wrap:anywhere]";
+const MEAN_CLASS = "block text-xs text-slate-400 [overflow-wrap:anywhere]";
 const Z_CLASS = "whitespace-nowrap text-sm font-semibold text-slate-50";
 
 /**

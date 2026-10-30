@@ -413,14 +413,18 @@ function missingWatchlistNotice(name: string | undefined): string {
 // `content` glob find each one. Only the default palette is used. Focus indicators are outlines,
 // which forced-colors mode keeps. Labels, fields, Reset, Retry and the ticker buttons use the
 // shared control classes of `shared/controlStyles`, so they match the other widgets' controls.
-// 11.5rem keeps the longest select text ("Watchlists unavailable") unclipped beside its arrow.
-const FILTER_GRID_CLASS = "grid grid-cols-[repeat(auto-fill,minmax(11.5rem,1fr))] gap-3";
+// 11.5rem keeps the longest select text ("Watchlists unavailable") unclipped beside its arrow;
+// a track never exceeds the panel's width, so with large text on a narrow panel the single
+// column narrows to the panel instead of overflowing the page.
+const FILTER_GRID_CLASS =
+  "grid grid-cols-[repeat(auto-fill,minmax(min(100%,11.5rem),1fr))] gap-3";
 const FIELD_CLASS = "flex min-w-0 flex-col gap-1";
 /* BLITZY [A11Y]: filter inputs, selects, Reset and Retry are 26px tall and the table buttons at
    least 24px, the compact density of the card's other controls: at or above WCAG 2.2 AA's 24px
    target minimum, below the 44px guideline, so 16 columns stay readable. Flagged for designer
    review. */
-// Selects and text inputs share one explicit height, so a filter row's bottom edges align.
+// Selects and text inputs share one minimum height, which grows with the text size, so a filter
+// row's bottom edges align at any text size.
 const INPUT_CLASS = `${TEXT_FIELD_CLASS} w-full min-w-0`;
 // The watchlist selector is the shared field too. It ends a clipped list name with an ellipsis,
 // so it reads as truncated; the selector's title and the context line carry the full name.
@@ -571,7 +575,9 @@ const FLAG_CLASS =
 const NO_RESULT_NOTE_CLASS = "text-sm text-slate-400";
 
 const SUMMARY_SECTION_CLASS = "flex flex-col gap-2";
-const SUMMARY_NOTE_CLASS = "text-xs text-slate-400";
+// `break-words` breaks a word longer than the note's line, "(eligible/constituents):" with a large
+// text setting in a narrow card, inside itself instead of letting it run past the card's edge.
+const SUMMARY_NOTE_CLASS = "text-xs text-slate-400 break-words";
 const ELIGIBLE_CLASS = "ms-1 text-xs text-slate-400";
 
 /** Props of {@link MetricCell}. */

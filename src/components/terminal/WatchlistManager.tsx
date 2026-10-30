@@ -116,14 +116,18 @@ const SKELETON_HEIGHT_CLASS =
   "h-[14.625rem] min-[327px]:h-[13.625rem] min-[392px]:h-[11.625rem] min-[690px]:h-[9.625rem] min-[1280px]:h-[11.625rem]";
 const LIST_ITEM_CLASS = "rounded border border-slate-800 bg-slate-950 p-3";
 // The list header keeps its actions top-right whatever the name's length. The title grows from a
-// zero basis (`flex-1`) with no minimum width (`min-w-0`), so a long or unbroken name wraps inside
-// it instead of claiming the whole line, and the actions never shrink (`shrink-0`). `flex-wrap`
-// only moves the actions to their own row when the header is narrower than the actions themselves.
+// zero basis (`flex-1`) with a minimum of 4.5rem, or the whole header if narrower
+// (`min-w-[min(100%,4.5rem)]`), so a long or unbroken name wraps inside it instead of claiming the
+// whole line, and the actions never shrink (`shrink-0`). `flex-wrap` moves the actions to their
+// own row only when the title would get less than that minimum beside them, as in a narrow card
+// with a large text setting, so the name is never squeezed to a few letters. 4.5rem still leaves
+// Confirm and Cancel beside the title at the default text size on a 320px screen. The actions are
+// never wider than the header (`max-w-full`), and Confirm and Cancel wrap within it.
 const LIST_HEADER_CLASS = "flex flex-wrap items-start justify-between gap-2";
-const LIST_TITLE_CLASS = "min-w-0 flex-1";
+const LIST_TITLE_CLASS = "min-w-[min(100%,4.5rem)] flex-1";
 const LIST_NAME_CLASS = "text-sm font-medium text-slate-100 break-words";
 const LIST_META_CLASS = "text-xs text-slate-400";
-const LIST_ACTIONS_CLASS = "flex shrink-0 items-center gap-2";
+const LIST_ACTIONS_CLASS = "flex max-w-full shrink-0 flex-wrap items-center gap-2";
 const CHIPS_CLASS = "mt-2 flex flex-wrap gap-1.5";
 const NO_TICKERS_CLASS = "mt-2 text-xs text-slate-400";
 const CHIP_ICON_CLASS = "size-3";

@@ -296,18 +296,28 @@ const FOCUS_CLASS =
 const RANGE_CLASS =
   "block h-11 w-full cursor-pointer rounded accent-sky-400 enabled:hover:accent-sky-300 enabled:active:accent-sky-200 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-sky-400";
 const TEXT_INPUT_CLASS = `mt-1 block w-full tabular-nums ${TEXT_FIELD_CLASS}`;
+// The preset selector, in the card header, is the shared text field. It drops below its label, and
+// narrows to the card, when the two do not fit one line (a narrow card with a large text setting).
+// A name clipped by the narrowed select ends in an ellipsis, so it reads as truncated; the
+// workspace heading beneath carries the full name.
+const PRESET_SELECTOR_CLASS = "flex min-w-0 max-w-full flex-wrap items-center gap-2";
+const PRESET_SELECT_CLASS = `${TEXT_FIELD_CLASS} min-w-0 max-w-full text-ellipsis`;
 // The layout follows the widget's own width, never the viewport's: a host may place the widget in
 // a narrow card on a wide screen, and Tailwind 3 has no container-query variants without a plugin.
 // The inputs column starts at 24rem and the output column takes the rest while it keeps at least
 // 28rem; otherwise the output wraps beneath the inputs and both span the widget. The card and
 // advanced-input grids fit as many tracks as their own width allows, the cards at most three (a
-// fourth 30% track never fits). A card track is at least 12rem, so an 18px KES amount of up to
-// 11 integer digits (tens of billions) wraps only between "KES" and the number, never inside it.
+// fourth 30% track never fits). A card track is at least 12rem wherever the grid is that wide, so
+// an 18px KES amount of up to 11 integer digits (tens of billions) wraps only between "KES" and
+// the number, never inside it. No track of either grid exceeds the grid's own width, so with
+// large text in a narrow card the single column narrows to the card instead of overflowing it.
 const WORKSPACE_CLASS = "flex flex-wrap gap-6";
 const INPUTS_COLUMN_CLASS = "flex min-w-0 grow basis-96 flex-col gap-6";
 const OUTPUT_COLUMN_CLASS = "flex min-w-[min(100%,28rem)] grow-[999] basis-0 flex-col gap-6";
-const ADVANCED_GRID_CLASS = "mt-2 grid grid-cols-[repeat(auto-fill,minmax(11rem,1fr))] gap-3";
-const CARD_GRID_CLASS = "grid grid-cols-[repeat(auto-fill,minmax(max(12rem,30%),1fr))] gap-3";
+const ADVANCED_GRID_CLASS =
+  "mt-2 grid grid-cols-[repeat(auto-fill,minmax(min(100%,11rem),1fr))] gap-3";
+const CARD_GRID_CLASS =
+  "grid grid-cols-[repeat(auto-fill,minmax(min(100%,max(12rem,30%)),1fr))] gap-3";
 const OUTPUT_CLASS =
   "flex min-w-0 flex-col gap-4 motion-safe:transition-opacity motion-safe:duration-200 motion-safe:ease-out";
 // The loaded workspace's height and the first valuation output's height (cards, chart and matrix),
@@ -855,7 +865,9 @@ function SliderControl({
   const errorId = `${inputId}-error`;
   return (
     <div>
-      <div className="flex items-baseline justify-between gap-2">
+      {/* The value drops beneath its label when the two do not fit one line, as a KES amount
+          does in a narrow card with a large text setting, rather than overflowing the card. */}
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
         <label htmlFor={inputId} className={FIELD_LABEL_CLASS}>
           {spec.label}
         </label>
@@ -1492,7 +1504,7 @@ export function IpoValuationSandbox({
 
   const presetSelector =
     scenario !== undefined && scenarios.length > 1 ? (
-      <div className="flex items-center gap-2">
+      <div className={PRESET_SELECTOR_CLASS}>
         <label htmlFor={selectId} className={FIELD_LABEL_CLASS}>
           Preset
         </label>
@@ -1501,7 +1513,7 @@ export function IpoValuationSandbox({
           data-testid="ipo-scenario-select"
           value={scenario.id}
           onChange={(event) => setSelectedId(event.target.value)}
-          className={TEXT_FIELD_CLASS}
+          className={PRESET_SELECT_CLASS}
         >
           {scenarios.map((item) => (
             <option key={item.id} value={item.id}>

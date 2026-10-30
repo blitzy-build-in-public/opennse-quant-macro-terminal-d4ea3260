@@ -68,7 +68,10 @@ export interface WidgetFrameProps {
   skeletonClassName?: string;
   /** Extra classes merged onto the root element. */
   className?: string;
-  /** Controls placed at the right of the header, such as toggles. */
+  /**
+   * Controls placed at the right of the header, such as toggles. They move beneath the title when
+   * the header is too narrow for both, as in a narrow card with a large text setting.
+   */
   actions?: ReactNode;
   /**
    * Content rendered between the header and the body in every state, so filters and presets stay
@@ -115,9 +118,16 @@ export interface PartialCoverageNoteProps {
 // root is the focus target Retry hands focus to, so it carries the same outline ring as Retry.
 const ROOT_CLASS =
   "rounded-lg border border-slate-800 bg-slate-900 p-4 font-sans text-slate-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
-const HEADER_CLASS = "mb-3 flex items-center justify-between gap-2";
-const TITLE_CLASS = "text-sm font-semibold text-slate-200";
-const ACTIONS_CLASS = "flex items-center gap-2";
+// The actions sit beside the title while the title keeps at least 8rem (or the whole header, if
+// narrower) beside them: the title takes the room the actions leave (`flex-1`), wrapping inside it
+// when it is longer. `flex-wrap` moves the actions beneath the title once that room would be less,
+// as in a narrow card with a large text setting, so the title is never squeezed to a few letters
+// and nothing widens the card past its column. The actions never exceed the header's width
+// (`min-w-0 max-w-full`) and wrap among themselves, so a wide control inside them, such as a
+// select capped at `max-w-full`, narrows to the card.
+const HEADER_CLASS = "mb-3 flex flex-wrap items-center justify-between gap-2";
+const TITLE_CLASS = "min-w-[min(100%,8rem)] flex-1 text-sm font-semibold text-slate-200";
+const ACTIONS_CLASS = "flex min-w-0 max-w-full flex-wrap items-center gap-2";
 const CONTROLS_CLASS = "mb-3";
 // The pulse runs only when the user has not asked for reduced motion.
 const SKELETON_CLASS = "motion-safe:animate-pulse rounded bg-slate-800";
