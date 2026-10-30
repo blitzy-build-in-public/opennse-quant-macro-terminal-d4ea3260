@@ -4,6 +4,7 @@ import { useId, useRef, useState } from "react";
 import type { ReactElement, ReactNode } from "react";
 
 import { EMPTY_VALUE, compareDecimal, formatDecimal } from "./lib/format";
+import { SECTION_HEADING_CLASS } from "./shared/headingAndTileClasses";
 import type { DecimalString, SensitivityCell, SensitivityMatrixData } from "./types";
 
 /**
@@ -323,7 +324,7 @@ export function SensitivityMatrix({
   return (
     <div data-testid="terminal-sensitivity-matrix" className={rootClass}>
       {/* The visible description; screen readers get the same text once, as the caption. */}
-      <p aria-hidden="true" className="pb-2 text-start text-sm font-medium text-slate-300">
+      <p aria-hidden="true" className={`${SECTION_HEADING_CLASS} pb-2 text-start`}>
         {CAPTION_TEXT}
       </p>
       <div role="region" aria-labelledby={captionId} tabIndex={0} className={SCROLL_REGION_CLASS}>

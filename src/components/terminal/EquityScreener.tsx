@@ -15,6 +15,7 @@ import {
 import type { DecimalKind } from "./lib/format";
 import { useTerminalQuery } from "./lib/useTerminalQuery";
 import { FieldErrorText, WidgetFrame } from "./shared/WidgetFrame";
+import { SECTION_HEADING_CLASS } from "./shared/headingAndTileClasses";
 import type {
   DecimalString,
   ScreenerFilters,
@@ -369,7 +370,6 @@ const FLAG_CLASS = "rounded bg-slate-800 px-1 py-0.5 font-mono text-xs text-slat
 const MESSAGE_CELL_CLASS = "px-2 py-4 text-center text-sm text-slate-400";
 
 const SUMMARY_SECTION_CLASS = "flex flex-col gap-2";
-const SUMMARY_HEADING_CLASS = "text-sm font-semibold text-slate-200";
 const SUMMARY_NOTE_CLASS = "text-xs text-slate-400";
 const ELIGIBLE_CLASS = "ms-1 text-xs text-slate-400";
 
@@ -1120,7 +1120,7 @@ export function EquityScreener({
         </div>
         {response !== undefined ? (
           <div className={SUMMARY_SECTION_CLASS}>
-            <h3 id={summaryHeadingId} className={SUMMARY_HEADING_CLASS}>
+            <h3 id={summaryHeadingId} className={SECTION_HEADING_CLASS}>
               Sector summary
             </h3>
             <p className={SUMMARY_NOTE_CLASS}>

@@ -6,6 +6,7 @@ import { EMPTY_VALUE, compareDecimal, formatDate, formatDecimal } from "./lib/fo
 import type { DecimalKind } from "./lib/format";
 import { useTerminalQuery } from "./lib/useTerminalQuery";
 import { WidgetFrame } from "./shared/WidgetFrame";
+import { KPI_LABEL_CLASS, KPI_TILE_CLASS, KPI_VALUE_CLASS } from "./shared/headingAndTileClasses";
 import type {
   DecimalString,
   IndicatorSnapshot,
@@ -45,12 +46,11 @@ const NO_STORED_VALUE = "No value stored for this indicator";
 // directive or `content` glob find each one. `m-0` on the list elements cancels the user-agent
 // `dl`/`dd` margins in a host that ships no CSS reset.
 const GRID_CLASS = "m-0 grid grid-cols-2 gap-3 md:grid-cols-4";
-const TILE_CLASS = "flex min-w-0 flex-col gap-1 rounded bg-slate-800 p-3";
+// Tiles, labels and values build on the KPI classes shared with the other widgets.
 // In two-column tiles on narrow screens, `text-balance` wraps "USD 7,850.00 m" as "USD" /
 // "7,850.00 m" rather than leaving the unit alone on its own line.
-const LABEL_CLASS = "text-xs text-slate-400 text-balance break-words";
-const VALUE_CLASS =
-  "m-0 text-lg font-semibold tabular-nums text-slate-100 text-balance break-words";
+const LABEL_CLASS = `${KPI_LABEL_CLASS} text-balance break-words`;
+const VALUE_CLASS = `${KPI_VALUE_CLASS} text-slate-100 text-balance`;
 // Neutral colour for every direction: a rise is good news for reserves but not for inflation, so
 // the direction is carried by the arrow and the sign, never by a colour.
 const CHANGE_CLASS = "m-0 flex flex-wrap items-baseline gap-1 text-xs tabular-nums text-slate-300";
@@ -62,7 +62,8 @@ type ChangeDirection = "up" | "down" | "flat";
 const DIRECTION_MARK: Record<ChangeDirection, string> = {
   up: "\u25b2",
   down: "\u25bc",
-  flat: "\u2022",
+  // As wide as the arrows (the same Geometric Shapes block), so a zero change stays visibly marked.
+  flat: "\u25ac",
 };
 
 /** The tiles are empty when no indicator column holds a value. */
@@ -157,7 +158,7 @@ function AsOfText({ asOf }: { asOf: string | null }): ReactElement {
 /** One KPI tile: label, latest value, change against the previous value, and its date. */
 function IndicatorTile({ item }: { item: IndicatorSnapshot }): ReactElement {
   return (
-    <div data-testid={"macro-tile-" + item.key} className={TILE_CLASS}>
+    <div data-testid={"macro-tile-" + item.key} className={KPI_TILE_CLASS}>
       <dt className={LABEL_CLASS}>{item.label}</dt>
       <ValueText item={item} />
       <ChangeText item={item} />

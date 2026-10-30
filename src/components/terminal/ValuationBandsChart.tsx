@@ -25,6 +25,7 @@ import {
 } from "./lib/format";
 import { useTerminalQuery } from "./lib/useTerminalQuery";
 import { WidgetFrame } from "./shared/WidgetFrame";
+import { KPI_LABEL_CLASS, KPI_TILE_CLASS, KPI_VALUE_CLASS } from "./shared/headingAndTileClasses";
 import type {
   BandMetric,
   BandStats,
@@ -109,9 +110,10 @@ const TOOLTIP_CLASS =
   "rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-300 shadow-lg";
 const TOOLTIP_VALUE_CLASS = "font-medium tabular-nums text-slate-100";
 // Auto-filling columns reflow with the widget's own width, whatever the host's layout or viewport.
-const STATS_CLASS = "grid grid-cols-[repeat(auto-fill,minmax(7rem,1fr))] gap-x-4 gap-y-2";
-const STAT_TERM_CLASS = "text-xs text-slate-400";
-const STAT_VALUE_CLASS = "text-sm font-medium tabular-nums text-slate-100";
+// Each statistic is a KPI tile shared with the other widgets; an 8rem track keeps the widest
+// value, a 100.00% percentile, on one line inside its tile.
+const STATS_CLASS = "m-0 grid grid-cols-[repeat(auto-fill,minmax(8rem,1fr))] gap-2";
+const STAT_VALUE_CLASS = `${KPI_VALUE_CLASS} text-slate-100`;
 const FLAGS_CLASS = "flex flex-wrap gap-1";
 const FLAG_CLASS = "rounded bg-slate-800 px-1.5 py-0.5 font-mono text-xs text-slate-400";
 
@@ -313,13 +315,13 @@ function StatsStrip({ stats }: { stats: BandStats }): ReactElement {
   return (
     <dl className={STATS_CLASS}>
       {STAT_ITEMS.map((item) => (
-        <div key={item.name} data-testid={"bands-stat-" + item.name}>
-          <dt className={STAT_TERM_CLASS}>{item.label}</dt>
+        <div key={item.name} data-testid={"bands-stat-" + item.name} className={KPI_TILE_CLASS}>
+          <dt className={KPI_LABEL_CLASS}>{item.label}</dt>
           <dd className={STAT_VALUE_CLASS}>{formatDecimal(stats[item.name], item.kind)}</dd>
         </div>
       ))}
-      <div data-testid="bands-stat-observations">
-        <dt className={STAT_TERM_CLASS}>Observations</dt>
+      <div data-testid="bands-stat-observations" className={KPI_TILE_CLASS}>
+        <dt className={KPI_LABEL_CLASS}>Observations</dt>
         <dd className={STAT_VALUE_CLASS}>{formatInteger(stats.observations)}</dd>
       </div>
     </dl>

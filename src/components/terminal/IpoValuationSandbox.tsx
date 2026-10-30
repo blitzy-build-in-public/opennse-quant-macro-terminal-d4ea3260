@@ -29,6 +29,12 @@ import {
 import type { DecimalKind, DecimalRangeRule } from "./lib/format";
 import { useTerminalQuery } from "./lib/useTerminalQuery";
 import { FieldErrorText, WidgetFrame } from "./shared/WidgetFrame";
+import {
+  KPI_LABEL_CLASS,
+  KPI_TILE_CLASS,
+  KPI_VALUE_CLASS,
+  SECTION_HEADING_CLASS,
+} from "./shared/headingAndTileClasses";
 import type {
   DecimalString,
   IpoScenario,
@@ -265,8 +271,8 @@ type LocalErrors = Partial<Record<InputField, string>>;
 // the preset selector are 44px tall (h-11), the minimum touch target, since no design source
 // sets a smaller one. Focus indicators are outlines, which forced-colors mode keeps. Hover and
 // press lighten a control (an invalid input stays rose) only while it is enabled; a disabled one
-// dims and shows a not-allowed cursor.
-const SECTION_HEADING_CLASS = "text-xs font-semibold uppercase tracking-wide text-slate-300";
+// dims and shows a not-allowed cursor. Section headings and output cards take the classes shared
+// with the other widgets from ./shared/headingAndTileClasses.
 const LABEL_CLASS = "text-xs font-medium text-slate-300";
 const FOCUS_CLASS =
   "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
@@ -284,17 +290,15 @@ const SELECT_CLASS = `h-11 rounded border border-slate-700 bg-slate-950 px-2 tex
 // The inputs column starts at 24rem and the output column takes the rest while it keeps at least
 // 28rem; otherwise the output wraps beneath the inputs and both span the widget. The card and
 // advanced-input grids fit as many tracks as their own width allows, the cards at most three (a
-// fourth 30% track never fits).
+// fourth 30% track never fits). A card track is at least 12rem, so an 18px KES amount of up to
+// 11 integer digits (tens of billions) wraps only between "KES" and the number, never inside it.
 const WORKSPACE_CLASS = "flex flex-wrap gap-6";
 const INPUTS_COLUMN_CLASS = "flex min-w-0 grow basis-96 flex-col gap-6";
 const OUTPUT_COLUMN_CLASS = "flex min-w-[min(100%,28rem)] grow-[999] basis-0 flex-col gap-6";
 const ADVANCED_GRID_CLASS = "mt-2 grid grid-cols-[repeat(auto-fill,minmax(11rem,1fr))] gap-3";
-const CARD_GRID_CLASS = "grid grid-cols-[repeat(auto-fill,minmax(max(9rem,30%),1fr))] gap-3";
+const CARD_GRID_CLASS = "grid grid-cols-[repeat(auto-fill,minmax(max(12rem,30%),1fr))] gap-3";
 const OUTPUT_CLASS =
   "flex min-w-0 flex-col gap-4 motion-safe:transition-opacity motion-safe:duration-200 motion-safe:ease-out";
-const CARD_CLASS = "min-w-0 rounded border border-slate-800 bg-slate-950 p-3";
-const CARD_PRIMARY_VALUE_CLASS = "mt-1 text-lg font-semibold tabular-nums break-words";
-const CARD_VALUE_CLASS = "mt-1 text-sm font-medium tabular-nums break-words";
 // Keyboard focus on the chart's `<svg tabindex="0">` gets the controls' sky outline. A mouse click
 // focuses the svg or one of Recharts' internal layers (tabindex -1) without :focus-visible, and
 // that focus draws no ring.
@@ -778,8 +782,6 @@ interface OutputCardProps {
   label: string;
   value: string;
   testId?: string;
-  /** Larger type for the headline per-share values. */
-  primary?: boolean;
   /** Text colour class of the value; slate when omitted. */
   toneClassName?: string;
   /** Pointer tooltip, and screen-reader text, explaining a missing value. */
@@ -790,17 +792,16 @@ function OutputCard({
   label,
   value,
   testId,
-  primary = false,
   toneClassName = "text-slate-100",
   explanation,
 }: OutputCardProps): ReactElement {
   return (
-    <div className={CARD_CLASS}>
-      <dt className="text-xs text-slate-400">{label}</dt>
+    <div className={KPI_TILE_CLASS}>
+      <dt className={KPI_LABEL_CLASS}>{label}</dt>
       <dd
         data-testid={testId}
         title={explanation}
-        className={`${primary ? CARD_PRIMARY_VALUE_CLASS : CARD_VALUE_CLASS} ${toneClassName}`}
+        className={`${KPI_VALUE_CLASS} ${toneClassName}`}
       >
         {value}
         {explanation === undefined ? null : <span className="sr-only">: {explanation}</span>}
@@ -833,19 +834,16 @@ function ValuationOutput({ result, isRecalculating }: ValuationOutputProps): Rea
             label="Blended fair value"
             testId="ipo-blended-fair-value"
             value={formatDecimal(response.blended_fair_value_per_share_kes, "per_share")}
-            primary
           />
           <OutputCard
             label="DCF fair value"
             testId="ipo-dcf-fair-value"
             value={formatDecimal(response.dcf.fair_value_per_share_kes, "per_share")}
-            primary
           />
           <OutputCard
             label="Comparables fair value"
             testId="ipo-comps-fair-value"
             value={formatDecimal(compsValue, "per_share")}
-            primary
             explanation={
               compsValue === null ? (compsFlags === "" ? "Not computable" : compsFlags) : undefined
             }
@@ -854,14 +852,12 @@ function ValuationOutput({ result, isRecalculating }: ValuationOutputProps): Rea
             label={upsideComparison === -1 ? "Downside vs offer" : "Upside vs offer"}
             testId="ipo-upside"
             value={formatDecimal(response.upside_pct, "pct", { signed: true })}
-            primary
             toneClassName={toneClass(upsideComparison)}
           />
           <OutputCard
             label="Implied EV/EBITDA at offer"
             testId="ipo-implied-ev-ebitda"
             value={formatDecimal(response.implied_ev_ebitda_at_offer, "ratio")}
-            primary
           />
           <OutputCard
             label="Implied market cap at offer"
@@ -1144,8 +1140,11 @@ function SandboxWorkspace({
         </div>
 
         <div className={OUTPUT_COLUMN_CLASS}>
-          <section aria-labelledby={valuationHeadingId} className="flex flex-col gap-3">
-            <div className="flex min-h-5 items-center justify-between gap-2">
+          {/* The heading row is as tall as the 16px heading, and its content follows 8px below,
+              as the Assumptions heading's does, so both columns' headings and first rows line
+              up. The status text is 16px tall too, so it shifts nothing when it appears. */}
+          <section aria-labelledby={valuationHeadingId} className="flex flex-col gap-2">
+            <div className="flex items-baseline justify-between gap-2">
               <h3
                 ref={valuationHeadingRef}
                 id={valuationHeadingId}

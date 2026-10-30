@@ -18,6 +18,7 @@ import { AXIS_TICK, CHART_COLORS, PROJECTION_DASH, SERIES_PALETTE } from "./lib/
 import { EMPTY_VALUE, formatDate, formatDecimal, formatInteger, toChartNumber } from "./lib/format";
 import { useTerminalQuery } from "./lib/useTerminalQuery";
 import { WidgetFrame } from "./shared/WidgetFrame";
+import { SECTION_HEADING_CLASS } from "./shared/headingAndTileClasses";
 import type {
   BacktestResponse,
   BacktestStatus,
@@ -268,7 +269,6 @@ const BODY_FETCHING_CLASS =
   "flex flex-col gap-5 opacity-60 motion-safe:transition-opacity motion-safe:duration-200 motion-safe:ease-out";
 const SECTION_CLASS = "m-0 flex min-w-0 flex-col gap-2";
 const SECTION_HEADER_CLASS = "flex flex-wrap items-baseline justify-between gap-2";
-const SECTION_TITLE_CLASS = "m-0 text-xs font-semibold uppercase tracking-wide text-slate-400";
 // Recharts 3 makes each chart's `<svg class="recharts-surface">` a tabindex 0 application, so it
 // gets the same keyboard focus ring as the other controls. Its `<g tabindex="-1">` layers are
 // never keyboard-reachable but a mouse click can focus them, so neither they nor a mouse-focused
@@ -1146,7 +1146,7 @@ export function CycleBacktester({
     <div className={isFetching ? BODY_FETCHING_CLASS : BODY_CLASS} aria-busy={isFetching}>
       <section aria-labelledby={mainTitleId} className={SECTION_CLASS}>
         <div className={SECTION_HEADER_CLASS}>
-          <h3 id={mainTitleId} className={SECTION_TITLE_CLASS}>
+          <h3 id={mainTitleId} className={SECTION_HEADING_CLASS}>
             {metricOption?.label ?? ""} by days from event
           </h3>
           {data !== undefined ? (
@@ -1331,7 +1331,7 @@ export function CycleBacktester({
 
       <section aria-labelledby={overlayTitleId} className={SECTION_CLASS}>
         <div className={SECTION_HEADER_CLASS}>
-          <h3 id={overlayTitleId} className={SECTION_TITLE_CLASS}>
+          <h3 id={overlayTitleId} className={SECTION_HEADING_CLASS}>
             Inflation and T-bill overlay
           </h3>
           {overlayCycle !== undefined ? (
@@ -1430,7 +1430,7 @@ export function CycleBacktester({
       </section>
 
       <section aria-labelledby={summaryTitleId} className={SECTION_CLASS}>
-        <h3 id={summaryTitleId} className={SECTION_TITLE_CLASS}>
+        <h3 id={summaryTitleId} className={SECTION_HEADING_CLASS}>
           Cycle summary
         </h3>
         <div

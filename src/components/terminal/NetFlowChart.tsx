@@ -27,6 +27,7 @@ import {
 } from "./lib/format";
 import { useTerminalQuery } from "./lib/useTerminalQuery";
 import { WidgetFrame } from "./shared/WidgetFrame";
+import { KPI_LABEL_CLASS, KPI_TILE_CLASS, KPI_VALUE_CLASS } from "./shared/headingAndTileClasses";
 import type {
   DecimalString,
   FlowPoint,
@@ -108,16 +109,11 @@ const STANDALONE_NOTE_CLASS = "m-0 text-xs text-slate-400";
 // Columns follow the widget's own width rather than the viewport, so the cards keep room for a
 // full KES amount whether a host places the widget in a narrow column or across the page.
 const TOTALS_CLASS = "m-0 grid grid-cols-[repeat(auto-fit,minmax(12rem,1fr))] gap-2";
-const TOTAL_ITEM_CLASS =
-  "flex min-w-0 flex-col gap-0.5 rounded border border-slate-800 bg-slate-950 px-3 py-2";
-const TOTAL_LABEL_CLASS = "text-xs text-slate-400";
-// `[overflow-wrap:anywhere]` lets a long KES amount wrap inside a narrow card in Tailwind 3 and 4.
-const TOTAL_VALUE_POSITIVE_CLASS =
-  "m-0 text-sm font-semibold tabular-nums text-emerald-300 [overflow-wrap:anywhere]";
-const TOTAL_VALUE_NEGATIVE_CLASS =
-  "m-0 text-sm font-semibold tabular-nums text-rose-300 [overflow-wrap:anywhere]";
-const TOTAL_VALUE_NEUTRAL_CLASS =
-  "m-0 text-sm font-semibold tabular-nums text-slate-100 [overflow-wrap:anywhere]";
+// Each total is a KPI tile shared with the other widgets; its value wraps a long KES amount
+// inside a narrow tile, and only the tone colour is this widget's own.
+const TOTAL_VALUE_POSITIVE_CLASS = `${KPI_VALUE_CLASS} text-emerald-300`;
+const TOTAL_VALUE_NEGATIVE_CLASS = `${KPI_VALUE_CLASS} text-rose-300`;
+const TOTAL_VALUE_NEUTRAL_CLASS = `${KPI_VALUE_CLASS} text-slate-100`;
 const FLAGS_CLASS = "m-0 flex list-none flex-wrap gap-1.5 p-0";
 const FLAG_CODE_CLASS = "rounded bg-slate-800 px-1.5 py-0.5 font-mono text-xs text-slate-400";
 // Mirrors TOOLTIP_CONTENT_STYLE (slate-900 surface, slate-700 border, slate-300 text, 12px) with
@@ -287,20 +283,20 @@ function FlowTooltip({ active, payload }: TooltipContentProps): ReactElement | n
 function FlowTotalsStrip({ totals }: { totals: FlowTotals }): ReactElement {
   return (
     <dl className={TOTALS_CLASS} data-testid="flows-totals">
-      <div className={TOTAL_ITEM_CLASS}>
-        <dt className={TOTAL_LABEL_CLASS}>Foreign net</dt>
+      <div className={KPI_TILE_CLASS}>
+        <dt className={KPI_LABEL_CLASS}>Foreign net</dt>
         <dd className={signedValueClass(totals.foreign_net_kes)} data-testid="flows-total-foreign">
           {formatDecimal(totals.foreign_net_kes, "kes", { signed: true })}
         </dd>
       </div>
-      <div className={TOTAL_ITEM_CLASS}>
-        <dt className={TOTAL_LABEL_CLASS}>Local net (est.)</dt>
+      <div className={KPI_TILE_CLASS}>
+        <dt className={KPI_LABEL_CLASS}>Local net (est.)</dt>
         <dd className={signedValueClass(totals.local_net_kes)} data-testid="flows-total-local">
           {formatDecimal(totals.local_net_kes, "kes", { signed: true })}
         </dd>
       </div>
-      <div className={TOTAL_ITEM_CLASS}>
-        <dt className={TOTAL_LABEL_CLASS}>Foreign net % of turnover</dt>
+      <div className={KPI_TILE_CLASS}>
+        <dt className={KPI_LABEL_CLASS}>Foreign net % of turnover</dt>
         <dd
           className={signedValueClass(totals.foreign_net_pct_of_turnover)}
           data-testid="flows-total-pct"
@@ -308,8 +304,8 @@ function FlowTotalsStrip({ totals }: { totals: FlowTotals }): ReactElement {
           {formatDecimal(totals.foreign_net_pct_of_turnover, "pct", { signed: true })}
         </dd>
       </div>
-      <div className={TOTAL_ITEM_CLASS}>
-        <dt className={TOTAL_LABEL_CLASS}>Sessions with data</dt>
+      <div className={KPI_TILE_CLASS}>
+        <dt className={KPI_LABEL_CLASS}>Sessions with data</dt>
         <dd className={TOTAL_VALUE_NEUTRAL_CLASS} data-testid="flows-sessions">
           {formatInteger(totals.sessions_with_data)} / {formatInteger(totals.sessions_in_range)}
         </dd>
