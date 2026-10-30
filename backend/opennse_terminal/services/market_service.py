@@ -945,10 +945,12 @@ async def get_sector_heatmap(
     is null on the market row. A sector without a qualifying constituent, or whose qualifying
     constituents have zero starting capitalization, has a null cell. Sectors are sorted by name.
 
-    Only equities listed in KES take part: summing capitalizations across currencies would mix
-    units, and nothing is converted. With fewer than two boundaries every list is empty; with no
-    price row at all ``as_of`` is today's date in ``settings.timezone`` (Africa/Nairobi when no
-    settings are given). Raises no coded error.
+    Only equities listed in KES contribute capitalization, to their sector and to the market:
+    summing capitalizations across currencies would mix units, and nothing is converted. Every
+    sector in the universe still has a row, so a sector without a KES-listed qualifying
+    constituent has null cells with 0 constituents. With fewer than two boundaries every list is
+    empty; with no price row at all ``as_of`` is today's date in ``settings.timezone``
+    (Africa/Nairobi when no settings are given). Raises no coded error.
     """
     resolved, has_prices = await _resolve_as_of(session, as_of, settings)
     empty = SectorHeatmapResponse(
@@ -962,25 +964,26 @@ async def get_sector_heatmap(
         return empty
 
     equities = await load_equities(session)
-    members = [equity for equity in equities if equity.currency == ANALYTICS_CURRENCY]
-    if len(members) < len(equities):
+    kes_tickers = [equity.ticker for equity in equities if equity.currency == ANALYTICS_CURRENCY]
+    if len(kes_tickers) < len(equities):
         logger.debug(
-            "sector heatmap leaves out %d equities not listed in %s",
-            len(equities) - len(members),
+            "sector heatmap takes no capitalization from %d equities not listed in %s",
+            len(equities) - len(kes_tickers),
             ANALYTICS_CURRENCY,
         )
-    prices = await _load_closes_near(
-        session, [equity.ticker for equity in members], boundaries, CLOSE_MAX_AGE_DAYS
-    )
+    prices = await _load_closes_near(session, kes_tickers, boundaries, CLOSE_MAX_AGE_DAYS)
     result = sector_returns(
         [
+            # Prices are read for KES-listed tickers only. A member without prices never
+            # qualifies, so an equity listed in another currency adds to no sum, yet its sector
+            # keeps its row, with null cells when no KES-listed constituent qualifies.
             HeatmapMember(
                 ticker=equity.ticker,
                 sector=equity.sector,
                 shares_outstanding=equity.shares_outstanding,
                 prices=prices.get(equity.ticker, []),
             )
-            for equity in members
+            for equity in equities
         ],
         boundaries,
     )

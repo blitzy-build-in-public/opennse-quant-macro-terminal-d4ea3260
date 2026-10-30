@@ -2401,7 +2401,8 @@ async def test_trailing_slash_path_is_a_404_without_a_host_built_redirect(
 #   ``ev_not_meaningful_for_banks``; filters inclusive on the quantized values, a null metric
 #   failing any filter on it; sorting with nulls last and ties by ticker in either order; sector
 #   aggregates over the whole universe, independent of the filters.
-# - **Heatmap**: the last session on or before each month-end or Friday; only KES equities.
+# - **Heatmap**: the last session on or before each month-end or Friday; only KES equities
+#   contribute, and every sector keeps a row.
 # - **Valuation bands**: ``requested_start`` is ``as_of`` minus the lookback, coverage is partial
 #   when data starts more than 7 days later, and ``stats`` exist only for ``status = "ok"``. A
 #   sector has a daily value only on the sessions on which a member traded, so a one-member
@@ -4044,6 +4045,45 @@ async def test_equity_not_listed_in_kes_is_never_converted(
     assert (sector.status, sector.flags) == ("ok", ["currency_mismatch"])
     assert sector.stats is not None
     assert sector.stats.current == banking.pe
+
+
+async def test_sector_listed_only_outside_kes_keeps_a_heatmap_row_of_null_cells(
+    session: AsyncSession, settings: TerminalSettings
+) -> None:
+    """With EABL, the only Manufacturing & Allied counter, switched to USD on this clone, the
+    heatmap still has all 4 sector rows. Manufacturing & Allied has no KES-listed constituent, so
+    each of its cells has no return, no relative return and 0 constituents. The market row covers
+    the other 7 counters, and every other sector keeps its constituents (Banking 5, Energy &
+    Petroleum 1, Telecommunications 1) and the returns it had before the switch."""
+    before = await ms.get_sector_heatmap(session, periods=2, settings=settings)
+    await session.execute(
+        update(TerminalEquity).where(TerminalEquity.ticker == "EABL").values(currency="USD")
+    )
+    await session.commit()
+
+    heatmap = await ms.get_sector_heatmap(session, periods=2, settings=settings)
+
+    assert heatmap.period_ends == [date(2026, 8, 31), LATEST]
+    assert [row.sector for row in heatmap.sectors] == SORTED_SECTORS
+    assert [cell.period_end for cell in heatmap.market] == heatmap.period_ends
+    for cell in heatmap.market:
+        assert cell.return_pct is not None
+        assert (cell.relative_return_pct, cell.constituents) == (None, 7)
+    rows = {row.sector: row.cells for row in heatmap.sectors}
+    assert [
+        (cell.period_end, cell.return_pct, cell.relative_return_pct, cell.constituents)
+        for cell in rows.pop(MANUFACTURING)
+    ] == [(date(2026, 8, 31), None, None, 0), (LATEST, None, None, 0)]
+    members = {"Banking": 5, "Energy & Petroleum": 1, "Telecommunications": 1}
+    assert list(rows) == list(members)
+    returns_before = {row.sector: [cell.return_pct for cell in row.cells] for row in before.sectors}
+    for sector, cells in rows.items():
+        assert [cell.period_end for cell in cells] == heatmap.period_ends
+        assert [cell.return_pct for cell in cells] == returns_before[sector]
+        for cell in cells:
+            assert cell.constituents == members[sector]
+            assert cell.return_pct is not None
+            assert cell.relative_return_pct is not None
 
 
 # ---------------------------------------------------------------------------------------------
