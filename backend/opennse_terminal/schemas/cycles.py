@@ -372,7 +372,9 @@ class CycleResult(TerminalResponseModel):
     days_until_window_start: int | None = Field(
         description=(
             "Calendar days from data_available_through to window_start, set for an "
-            "awaiting_data cycle whose data ends before the window opens; null otherwise."
+            "awaiting_data cycle whose data ends before the window opens; when no candidate has "
+            "data (data_available_through is null), counted from the market's latest session of "
+            "any ticker instead. Null otherwise."
         ),
     )
     constituents: list[str] = Field(

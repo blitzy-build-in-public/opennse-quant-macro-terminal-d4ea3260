@@ -113,7 +113,11 @@ const DRAFT_DEBOUNCE_MS = 400;
 const DEFAULT_SORT: ScreenerSort = "market_cap_kes";
 const DEFAULT_ORDER: SortOrder = "desc";
 
-/** Empty-state copy when the filters exclude every counter of a universe that has data. */
+/**
+ * Shown in place of the counter table when the filters exclude every counter of a universe that
+ * has data. The widget stays ready, so the sector summary beneath it, which the filters do not
+ * narrow, stays on screen.
+ */
 const NO_MATCH_MESSAGE = "No counters match these filters";
 
 /** The screener's nullable metrics, each explained by its own flag codes when null. */
@@ -181,10 +185,6 @@ const COUNTER_COLUMNS: readonly CounterColumn[] = [
 // ---------------------------------------------------------------------------------------------
 // Filter state helpers (pure)
 // ---------------------------------------------------------------------------------------------
-
-function isSet(value: string | undefined): boolean {
-  return value !== undefined && value !== "";
-}
 
 /** The numeric drafts that show `filters`' values, empty where a filter is unset. */
 function draftsFrom(filters: ScreenerFilters): Drafts {
@@ -264,19 +264,6 @@ function withSort(filters: ScreenerFilters, column: ScreenerSort): ScreenerFilte
     order = column === "ticker" ? "asc" : "desc";
   }
   return { ...filters, sort: column, order };
-}
-
-/**
- * Whether a filter that narrows the rows is set, so that an empty result over a universe with
- * data reads as "no counters match" rather than as data not loaded yet.
- */
-function hasActiveFilter(filters: ScreenerFilters): boolean {
-  return (
-    isSet(filters.sector) ||
-    isSet(filters.watchlist_id) ||
-    NUMERIC_FILTERS.some(({ key }) => isSet(filters[key])) ||
-    filters.anomalies_only === true
-  );
 }
 
 /**
@@ -573,8 +560,10 @@ const COUNTER_FLAG_LIST_CLASS =
 // list has room for it.
 const FLAG_CLASS =
   "min-w-0 break-words rounded bg-slate-800 px-1 py-0.5 font-mono text-xs text-slate-300";
-// Shown in place of the counter table, outside its sideways scroll, with the frame's empty copy
-// style, so it starts at the card's content edge however wide the table would be.
+// The notes shown in place of the counter table when it has no rows to show (no counter matches
+// the filters, or the first request failed on a filter), outside its sideways scroll, with the
+// frame's empty copy style, so they start at the card's content edge however wide the table
+// would be.
 const NO_RESULT_NOTE_CLASS = "text-sm text-slate-400";
 
 const SUMMARY_SECTION_CLASS = "flex flex-col gap-2";
@@ -931,16 +920,19 @@ function SectorAggregateRow({ aggregate }: { aggregate: SectorAggregate }): Reac
   );
 }
 
-/** A screener response with the filters it answered. */
-interface AnsweredFilters {
-  response: ScreenerResponse | undefined;
-  filters: ScreenerFilters;
-}
-
 /** The caller's last `watchlists` array, with its {@link watchlistsSignature}. */
 interface CallerWatchlists {
   signature: string | null;
   lists: Watchlist[] | undefined;
+}
+
+/**
+ * Whether a screener response has no data at all: neither rows nor sector aggregates. The
+ * aggregates cover the whole universe whatever the filters, so they are missing only when no
+ * prices are loaded; rows missing beside them mean the filters excluded every counter.
+ */
+function hasNoData(response: ScreenerResponse): boolean {
+  return response.rows.length === 0 && response.sector_aggregates.length === 0;
 }
 
 /** Whether the request failed on specific request fields, which are shown beside their inputs. */
@@ -962,12 +954,14 @@ const useBrowserLayoutEffect = typeof window === "undefined" ? useEffect : useLa
  *
  * Selects and the checkbox apply at once. Numeric filters apply 400 ms after typing stops, or on
  * Enter or blur; their text is trimmed and then sent as typed, with no numeric conversion, so
- * values stay exact decimals. A result without rows shows the frame's empty state: "No counters
- * match these filters" when the filters it answered excluded every counter of a universe that has
- * data, and the default seeder copy when no data is loaded. Errors tied to a request field, such
- * as `min_exceeds_max` on `min_pe`, appear beneath that field while the last result stays on
- * screen (its rows dimmed, or its empty state); before any result has loaded, a note asking for
- * the errors to be corrected takes the table's place. Any other failure shows the frame's error
+ * values stay exact decimals. The frame's empty state, with its default seeder copy, is shown
+ * only for a result with neither rows nor sector data, which means no data is loaded. A result
+ * whose filters excluded every counter stays ready: "No counters match these filters" takes the
+ * counter table's place, and the sector summary stays beneath it, since the filters do not narrow
+ * it. Errors tied to a request field, such as `min_exceeds_max` on `min_pe`, appear beneath that
+ * field while the last result stays on screen, dimmed (or the empty state, when it had no data);
+ * before any result has loaded, a note asking for the errors to be corrected takes the place of
+ * the counter table and the sector summary. Any other failure shows the frame's error
  * state with Retry. The filter panel is rendered in every state, so filters stay usable when
  * nothing matches. The watchlist selector lists the calling principal's watchlists from
  * `GET /watchlists` and refreshes them whenever it is focused. That request is independent of the
@@ -1010,28 +1004,17 @@ export function EquityScreener({
     setApplied((current) => applyDrafts(current, drafts));
   }, [drafts]);
 
-  // The filters the shown response answered. A new query aborts the request it supersedes, so a
-  // response always answers the filters current when it arrives, and they are recorded during
-  // that render. Until a refetch settles, the previous response stays on screen under filters
-  // that may have changed since, such as a cleared watchlist or a Reset, so its empty copy is
-  // judged by the filters it answered: a "no match" never turns into the empty-database copy
-  // meanwhile.
-  const [answered, setAnswered] = useState<AnsweredFilters>(() => ({
-    response: undefined,
-    filters: applied,
-  }));
   const screener = useTerminalQuery<ScreenerResponse>({
     path: "/market/screener",
     query: screenerQuery(applied),
     apiBaseUrl,
     getHeaders,
-    // No rows is the empty state whatever the filters; the frame renders the filter panel in
-    // every state, so the filters stay usable and the empty copy below names the cause.
-    isEmpty: (response) => response.rows.length === 0,
+    // Only a response without rows and without sector data is empty, so the frame's default
+    // seeder copy names the cause. A filtered response without rows stays ready, keeping the
+    // sector summary on screen. The frame renders the filter panel in every state, so the
+    // filters stay usable either way.
+    isEmpty: hasNoData,
   });
-  if (screener.data !== answered.response) {
-    setAnswered({ response: screener.data, filters: applied });
-  }
   const watchlists = useTerminalQuery<Watchlist[]>({ path: "/watchlists", apiBaseUrl, getHeaders });
   // Set once a retry of the watchlist request is asked for, so the list's own Retry stays mounted
   // (as "Retrying…") while a retry of a list that never loaded is in flight.
@@ -1140,22 +1123,15 @@ export function EquityScreener({
     ([field]) => !INPUT_FIELDS.has(field),
   );
   const response = screener.data;
-  // A field error keeps the last result on screen beside the inputs: its rows, dimmed, or its
-  // empty state. Before any result has loaded, the ready body asks for the errors to be fixed.
+  // A field error keeps the last result on screen beside the inputs, dimmed: its rows, or its
+  // no-match note, with the sector summary either way. Only a last result without any data keeps
+  // the empty state. Before any result has loaded, the ready body asks for the errors to be fixed.
   let state: WidgetState = screener.state;
   if (screener.state === "error" && hasFieldErrors) {
-    state = response !== undefined && response.rows.length === 0 ? "empty" : "ready";
+    state = response !== undefined && hasNoData(response) ? "empty" : "ready";
   }
   const rows = response?.rows ?? [];
   const aggregates = response?.sector_aggregates ?? [];
-  // The empty copy names the cause of the empty result on screen. `sector_aggregates` covers the
-  // whole universe whatever the filters, so sector data without rows under a narrowing filter
-  // means the filters excluded every counter, while no sector data means nothing is loaded yet
-  // (the default seeder copy). The filters are those the shown response answered, so clearing
-  // them from a no-match result keeps the no-match copy until the new rows arrive.
-  const shownFilters = response === answered.response ? answered.filters : applied;
-  const emptyMessage =
-    aggregates.length > 0 && hasActiveFilter(shownFilters) ? NO_MATCH_MESSAGE : undefined;
   const sectors = sectorOptions(response?.sector_aggregates, applied.sector);
   const activeSort = applied.sort ?? DEFAULT_SORT;
   const activeOrder = applied.order ?? DEFAULT_ORDER;
@@ -1469,7 +1445,6 @@ export function EquityScreener({
       onRetry={handleRetry}
       className={className}
       skeletonClassName={SKELETON_HEIGHT_CLASS}
-      emptyMessage={emptyMessage}
       controls={controls}
     >
       <div className={dimmed ? BODY_DIMMED_CLASS : BODY_CLASS} aria-busy={screener.isFetching}>
@@ -1493,6 +1468,13 @@ export function EquityScreener({
           // Ready without a result only after a field error on the first request: there are no
           // counters to show, so the note takes the table's place rather than a full-width cell.
           <p className={NO_RESULT_NOTE_CLASS}>Correct the filter errors above to load counters</p>
+        ) : rows.length === 0 ? (
+          // The filters excluded every counter. The note takes the table's place, and the count
+          // above announces "0 counters"; the sector summary below is not narrowed by the
+          // filters, so it stays.
+          <p data-testid="screener-no-match" className={NO_RESULT_NOTE_CLASS}>
+            {NO_MATCH_MESSAGE}
+          </p>
         ) : (
           <div className={SCROLL_FRAME_CLASS}>
             <div

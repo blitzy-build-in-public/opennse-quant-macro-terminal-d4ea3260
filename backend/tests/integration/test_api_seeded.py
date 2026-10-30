@@ -1366,6 +1366,38 @@ async def test_backtest_serves_the_requested_events_window_and_candidates(
             assert cycle["flags"] == ["insufficient_projection_basis"]
 
 
+async def test_backtest_of_tickers_outside_the_sector_reports_empty_cohorts(
+    client: httpx.AsyncClient,
+) -> None:
+    """SCOM is not a bank, so ``tickers=SCOM`` with ``sector=Banking`` leaves no candidate: 200
+    with no candidates and a null ``data_available_through``. The 2013, 2017 and 2022 windows
+    hold seeded sessions, so they are ``no_constituents`` with ``empty_cohort``, anchored at their
+    first session (each window's start, a weekday), with no points, markers or summary. The 2027
+    window opens 2027-02-11, 134 days after the last seeded session 2026-09-30: it awaits data,
+    without a projection because no cycle is complete."""
+    body = await get_json(client, "/cycles/backtest", {"tickers": "SCOM", "sector": "Banking"})
+
+    assert (body["candidates"], body["data_available_through"]) == ([], None)
+    assert [
+        (
+            cycle["label"],
+            cycle["status"],
+            cycle["anchor_date"],
+            cycle["days_until_window_start"],
+            cycle["flags"],
+        )
+        for cycle in body["cycles"]
+    ] == [
+        ("2013 Cycle", "no_constituents", "2012-09-05", None, ["empty_cohort"]),
+        ("2017 Cycle", "no_constituents", "2017-02-09", None, ["empty_cohort"]),
+        ("2022 Cycle", "no_constituents", "2022-02-10", None, ["empty_cohort"]),
+        (FUTURE_CYCLE, "awaiting_data", None, 134, ["insufficient_projection_basis"]),
+    ]
+    for cycle in body["cycles"]:
+        assert cycle["constituents"] == cycle["excluded_constituents"] == cycle["points"] == []
+        assert (cycle["markers"], cycle["summary"], cycle["projection"]) == (None, None, None)
+
+
 # Sessions of the crafted counters below, all seeded weekdays; Monday 2026-06-01 is not one.
 FEB_LEAD_IN: Final[list[date]] = [date(2026, 2, day) for day in (5, 6, 9, 10)]
 FEB_WINDOW: Final[list[date]] = [date(2026, 2, day) for day in (11, 12, 13, 16, 17, 18, 19, 20)]
@@ -4924,6 +4956,13 @@ async def test_boundary_dates_build_the_overview_without_raising(
 #   latest date, sessions, lead-ins, prices). No statement reads ``terminal_daily_prices``
 #   without a predicate, the history between distant events is never read, and a cycle whose
 #   window holds no data reads no lead-in and no price row.
+# - **No candidate data.** When no candidate has a stored price (tickers and a sector sharing no
+#   equity, or candidates without price rows), two ``terminal_daily_prices`` statements beyond
+#   the candidates' latest date serve every window: the market's latest session (an index-served
+#   ``max``, the one read without a predicate) and the sessions inside the windows up to it. A
+#   window holding one is ``no_constituents`` with ``empty_cohort``, anchored at its first market
+#   session; any other awaits data, counted down from the market's latest session. No lead-in,
+#   price, fundamentals or overlay row is read.
 # - **Bounded overlay read.** One statement reads the overlay rows over each observed cycle's
 #   ``[window_start - 62 days, last observed session]``, overlapping or adjacent ranges merged,
 #   so the history between distant events is never read; a request with no observed cycle
@@ -5112,6 +5151,149 @@ async def test_awaiting_data_request_reads_no_lead_in_prices_or_overlays(
     assert reads_of(statements, " LIMIT ") == []
     assert reads_of(statements, PRICE_READ) == []
     assert reads_of(statements, MACRO_READ) == []
+
+
+LATEST_READ = "SELECT max(terminal_daily_prices.trade_date) "
+
+DEFAULT_WINDOWS_WITH_DATA: Final[list[tuple[date, date]]] = [
+    (date(2012, 9, 5), date(2013, 8, 31)),
+    (date(2017, 2, 9), date(2018, 2, 4)),
+    (date(2022, 2, 10), date(2023, 2, 5)),
+]
+"""The +-180-day windows of 2013, 2017 and 2022; 2027's opens after the last seeded session."""
+
+
+def daily_price_read_kind(sql: str) -> str:
+    """What a ``terminal_daily_prices`` read of a backtest without candidate data is: the
+    candidates' latest date (``candidates_latest``), the market's (``market_latest``) or the
+    sessions inside the windows (``sessions``); any other read, such as a lead-in or a price
+    read, is returned as its SQL."""
+    if sql.startswith(LATEST_READ):
+        if "WHERE terminal_daily_prices.ticker IN " in sql:
+            return "candidates_latest"
+        return "market_latest"
+    if sql.startswith(SESSION_READ) and " LIMIT " not in sql:
+        return "sessions"
+    return sql
+
+
+@pytest.mark.parametrize(
+    ("unpriced", "request_args", "candidates", "reads", "session_reads", "statuses", "days_until"),
+    [
+        pytest.param(
+            (),
+            {"tickers": ["SCOM"], "sector": "Banking"},
+            [],
+            ["market_latest", "sessions"],
+            [DEFAULT_WINDOWS_WITH_DATA],
+            ["no_constituents", "no_constituents", "no_constituents", "awaiting_data"],
+            [None, None, None, 134],
+            id="tickers_outside_the_sector_180_days",
+        ),
+        pytest.param(
+            (),
+            {"tickers": ["SCOM"], "sector": "Banking", "pre_months": 12, "post_months": 12},
+            [],
+            ["market_latest", "sessions"],
+            [
+                [
+                    (date(2012, 3, 4), date(2014, 3, 4)),
+                    (date(2016, 8, 8), date(2018, 8, 8)),
+                    (date(2021, 8, 9), date(2023, 8, 9)),
+                    (date(2026, 8, 10), LATEST),
+                ]
+            ],
+            ["no_constituents"] * 4,
+            [None] * 4,
+            id="tickers_outside_the_sector_twelve_months",
+        ),
+        pytest.param(
+            ("SCOM",),
+            {"tickers": ["SCOM"]},
+            ["SCOM"],
+            ["candidates_latest", "market_latest", "sessions"],
+            [DEFAULT_WINDOWS_WITH_DATA],
+            ["no_constituents", "no_constituents", "no_constituents", "awaiting_data"],
+            [None, None, None, 134],
+            id="candidate_without_prices",
+        ),
+        pytest.param(
+            None,
+            {},
+            sorted(SEEDED_TICKERS),
+            ["candidates_latest", "market_latest"],
+            [],
+            ["awaiting_data"] * 4,
+            [None] * 4,
+            id="empty_price_table",
+        ),
+    ],
+)
+async def test_backtest_without_candidate_data_is_judged_on_the_market_sessions(
+    seeded_database: SeededDatabase,
+    session: AsyncSession,
+    settings: TerminalSettings,
+    unpriced: tuple[str, ...] | None,
+    request_args: dict[str, Any],
+    candidates: list[str],
+    reads: list[str],
+    session_reads: list[list[tuple[date, date]]],
+    statuses: list[str],
+    days_until: list[int | None],
+) -> None:
+    """No candidate has a stored price, so ``data_available_through`` is null: SCOM is not a
+    bank, so ``tickers=SCOM`` with ``sector=Banking`` leaves no candidate; or SCOM's (``unpriced``)
+    or every ticker's (``None``) price rows are deleted from this clone first.
+
+    Every window holding a market session is ``no_constituents``, flagged ``empty_cohort``,
+    anchored at its first session of the full stored calendar and excluding every candidate. Over
+    +-180 days the 2027 window opens 2027-02-11, 134 days after the market's last session
+    2026-09-30, so it awaits data, without a projection since no cycle is complete; over +-12
+    months it opens 2026-08-10 and holds sessions. Without any price row every window awaits data
+    without a countdown. The ``terminal_daily_prices`` reads are the candidates' latest date when
+    there is a candidate, the market's latest session (an index-served ``max``) and, when the
+    market has data, one statement for the sessions inside every window up to it; no lead-in,
+    price, fundamentals or overlay row is read."""
+    deletion = delete(TerminalDailyPrice)
+    if unpriced is not None:
+        deletion = deletion.where(TerminalDailyPrice.ticker.in_(unpriced))
+    await session.execute(deletion)
+    await session.commit()
+
+    with captured_statements(seeded_database.engine) as statements:
+        response = await cs.get_backtest(session, settings, **request_args)
+
+    assert (response.candidates, response.data_available_through) == (candidates, None)
+    assert [cycle.status for cycle in response.cycles] == statuses
+    assert [cycle.days_until_window_start for cycle in response.cycles] == days_until
+    full_calendar = await ms.load_market_sessions(session)
+    for cycle in response.cycles:
+        in_window = [day for day in full_calendar if cycle.window_start <= day <= cycle.window_end]
+        assert (cycle.constituents, cycle.points) == ([], [])
+        assert (cycle.markers, cycle.summary, cycle.projection) == (None, None, None)
+        if cycle.status == "no_constituents":
+            assert (cycle.anchor_date, cycle.excluded_constituents, cycle.flags) == (
+                in_window[0],
+                candidates,
+                ["empty_cohort"],
+            )
+        else:
+            assert in_window == []
+            assert (cycle.anchor_date, cycle.excluded_constituents, cycle.flags) == (
+                None,
+                [],
+                ["insufficient_projection_basis"],
+            )
+
+    daily_price_reads = reads_of(statements, "FROM terminal_daily_prices")
+    assert [daily_price_read_kind(sql) for sql, _ in daily_price_reads] == reads
+    assert [
+        list(zip(params[::2], params[1::2], strict=True))
+        for _, params in reads_of(statements, SESSION_READ)
+    ] == session_reads
+    assert reads_of(statements, PRICE_READ) == []
+    assert reads_of(statements, MACRO_READ) == []
+    assert reads_of(statements, "FROM terminal_fundamentals") == []
 
 
 EIGHT_EVENTS: Final[list[date]] = [

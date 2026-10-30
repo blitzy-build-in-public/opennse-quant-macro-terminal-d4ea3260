@@ -30,11 +30,14 @@ Normalization, per cycle, over a cohort fixed at the anchor (the first session i
 
 A cycle whose window holds no observed session (a future event's, or a past window the stored
 history does not cover) is returned as ``awaiting_data``, and one whose data ends inside its
-window as ``partial``. Such a cycle carries a :class:`CycleProjection` only when at least
-:data:`MIN_PROJECTION_BASIS` (2) of the request's cycles are complete; otherwise its projection
-is ``None`` and it is flagged ``insufficient_projection_basis``. The projection is the mean of
-the complete cycles' normalized paths: a descriptive average of past behaviour, not a forecast,
-and never stored.
+window as ``partial``. When no candidate has data at all, as for a ticker list and a sector that
+share no equity, each window is judged on the market's observed sessions instead: one holding a
+session is ``no_constituents`` (an empty cohort while data exists in the window, flagged
+``empty_cohort``), any other ``awaiting_data``. A partial or awaiting-data cycle carries a
+:class:`CycleProjection` only when at least :data:`MIN_PROJECTION_BASIS` (2) of the request's
+cycles are complete; otherwise its projection is ``None`` and it is flagged
+``insufficient_projection_basis``. The projection is the mean of the complete cycles' normalized
+paths: a descriptive average of past behaviour, not a forecast, and never stored.
 """
 
 from __future__ import annotations
@@ -632,7 +635,9 @@ def _awaiting_data(
 ) -> CycleBacktestResult:
     """A cycle with no observed session inside its window.
 
-    ``days_until_window_start`` is set when the data ends before the window opens.
+    ``data_available_through`` is the end of the data the window is judged on: the candidates',
+    or the market's when no candidate has data. ``days_until_window_start`` is set, in calendar
+    days, when that data ends before the window opens.
     """
     days_until: int | None = None
     if data_available_through is not None and data_available_through < window.window_start:
@@ -647,6 +652,62 @@ def _awaiting_data(
     )
 
 
+def _no_constituents(
+    event: CycleEvent,
+    window: CycleWindow,
+    anchor: date,
+    excluded: list[str],
+    currency_excluded: bool,
+) -> CycleBacktestResult:
+    """A cycle whose window holds data while its cohort is empty.
+
+    It keeps its ``anchor`` and ``excluded`` tickers, has no points, markers or summary, and is
+    flagged ``empty_cohort``, after ``currency_mismatch`` when a candidate was excluded for its
+    listing currency.
+    """
+    return CycleBacktestResult(
+        label=event.label,
+        event_date=event.event_date,
+        window_start=window.window_start,
+        window_end=window.window_end,
+        status="no_constituents",
+        anchor_date=anchor,
+        excluded_constituents=excluded,
+        flags=["currency_mismatch", "empty_cohort"] if currency_excluded else ["empty_cohort"],
+    )
+
+
+def _without_candidate_data(
+    event: CycleEvent,
+    window: CycleWindow,
+    candidates: Sequence[BacktestCandidate],
+    sessions: Sequence[date],
+    market_data_through: date | None,
+) -> CycleBacktestResult:
+    """A cycle none of whose candidates has data, judged on the market's observed sessions.
+
+    When one of ``sessions`` lies between ``window_start`` and the earlier of ``window_end`` and
+    ``market_data_through``, data exists in the window while the cohort is necessarily empty: the
+    cycle is ``no_constituents``, anchored at the first such session, with every candidate
+    excluded. Otherwise it is ``awaiting_data``, counted down from ``market_data_through`` when
+    the market's data ends before the window opens. With no market data either
+    (``market_data_through`` is ``None``) it is ``awaiting_data`` without a countdown.
+    """
+    if market_data_through is None:
+        return _awaiting_data(event, window, None)
+    start = bisect_left(sessions, window.window_start)
+    end = bisect_right(sessions, min(window.window_end, market_data_through))
+    if start >= end:
+        return _awaiting_data(event, window, market_data_through)
+    return _no_constituents(
+        event,
+        window,
+        sessions[start],
+        sorted(candidate.ticker for candidate in candidates),
+        any(candidate.currency != ANALYTICS_CURRENCY for candidate in candidates),
+    )
+
+
 def run_cycle_backtest(
     event: CycleEvent,
     window: CycleWindow,
@@ -655,6 +716,7 @@ def run_cycle_backtest(
     macro_rows: Sequence[MacroRow],
     *,
     data_available_through: date | None,
+    market_data_through: date | None = None,
     lag_days: int = DEFAULT_FUNDAMENTALS_LAG_DAYS,
 ) -> CycleBacktestResult:
     """Backtest one event over ``window``.
@@ -690,24 +752,35 @@ def run_cycle_backtest(
 
     :func:`with_projection` may append ``insufficient_projection_basis``.
 
+    When no candidate has data (``data_available_through`` is ``None``, as for a ticker list and
+    a sector that share no equity), no cohort can form, and the window is judged on the market's
+    observed sessions up to ``market_data_through`` instead: ``no_constituents`` anchored at the
+    first market session in the window when it holds one, with every candidate excluded, and
+    ``awaiting_data`` otherwise. The candidates' rows and ``macro_rows`` are then not read.
+
     Args:
         event: The event and its label.
         window: Its resolved window (see :func:`resolve_window`).
         candidates: Equities that may join the cohort, each with ascending actual rows.
         sessions: Ascending, distinct observed market sessions, starting at least
-            :data:`MA_SESSIONS` sessions before ``window.window_start``.
+            :data:`MA_SESSIONS` sessions before ``window.window_start``; when no candidate has
+            data, only those inside the window are consulted.
         macro_rows: Macro observations, ascending by ``observation_date``.
-        data_available_through: Latest trade date among the candidates; ``None`` when there is
-            no data.
+        data_available_through: Latest trade date among the candidates; ``None`` when no
+            candidate has data.
+        market_data_through: Latest observed market session of any ticker, consulted only when
+            ``data_available_through`` is ``None``; ``None`` (the default) when the market holds
+            no data either, so the cycle is ``awaiting_data`` without a countdown.
         lag_days: Publication lag applied to fiscal-year fundamentals.
 
     Returns:
         The cycle with status ``complete`` (data reaches ``window_end``), ``partial`` (data ends
         inside the window), ``awaiting_data`` (no observed session inside the window; ``points``
-        empty, ``markers`` and ``summary`` ``None``) or ``no_constituents`` (flag
-        ``empty_cohort``, same empty shape; ``currency_mismatch`` comes first when any candidate
-        was excluded for its currency). ``projection`` is left ``None``; see
-        :func:`with_projection`.
+        empty, ``markers`` and ``summary`` ``None``; ``days_until_window_start`` in calendar
+        days when the data, the market's if no candidate has any, ends before the window opens)
+        or ``no_constituents`` (flag ``empty_cohort``, same empty shape; ``currency_mismatch``
+        comes first when any candidate was excluded for its currency). ``projection`` is left
+        ``None``; see :func:`with_projection`.
 
     Raises:
         ValueError: If ``window`` was resolved for a different event date.
@@ -718,7 +791,7 @@ def run_cycle_backtest(
             f"{event.event_date.isoformat()}"
         )
     if data_available_through is None:
-        return _awaiting_data(event, window, None)
+        return _without_candidate_data(event, window, candidates, sessions, market_data_through)
     start = bisect_left(sessions, window.window_start)
     end = bisect_right(sessions, min(window.window_end, data_available_through))
     if start >= end:
@@ -728,16 +801,7 @@ def run_cycle_backtest(
     earliest_base = sessions[max(0, start - BASE_CLOSE_MAX_SESSIONS)]
     members, excluded, currency_excluded = _select_cohort(candidates, anchor, earliest_base)
     if not members:
-        return CycleBacktestResult(
-            label=event.label,
-            event_date=event.event_date,
-            window_start=window.window_start,
-            window_end=window.window_end,
-            status="no_constituents",
-            anchor_date=anchor,
-            excluded_constituents=excluded,
-            flags=["currency_mismatch", "empty_cohort"] if currency_excluded else ["empty_cohort"],
-        )
+        return _no_constituents(event, window, anchor, excluded, currency_excluded)
 
     days = sessions[start:end]
     member_closes = [_closes_by_day(member, days) for member in members]

@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import cast
+from typing import Final, cast
 
 import pytest
 
@@ -39,6 +39,7 @@ from opennse_terminal.quant.backtest import (
     CycleMarkersResult,
     CyclePointResult,
     CycleProjection,
+    CycleStatus,
     CycleWindow,
     MarkerMetric,
     ProjectionPoint,
@@ -1829,3 +1830,98 @@ def test_no_session_inside_the_window_is_awaiting_data(
     assert result.points == []
     assert result.markers is None
     assert result.summary is None
+
+
+UNPRICED_PAIR: Final[list[BacktestCandidate]] = [candidate("X", 100, []), candidate("Y", 50, [])]
+"""X and Y listed in KES with no price row at all, so ``data_available_through`` is ``None``."""
+
+
+@pytest.mark.parametrize(
+    ("candidates", "sessions", "market_data_through", "expected"),
+    [
+        pytest.param(
+            [],
+            WINDOW_DAYS,
+            DATA_THROUGH,
+            ("no_constituents", ANCHOR, None, [], ["empty_cohort"]),
+            id="no-candidate-market-session-in-window",
+        ),
+        pytest.param(
+            UNPRICED_PAIR,
+            SESSIONS,
+            date(2022, 8, 12),
+            ("no_constituents", ANCHOR, None, ["X", "Y"], ["empty_cohort"]),
+            id="unpriced-candidates-market-ends-inside-window",
+        ),
+        pytest.param(
+            [candidate("Y", 50, []), candidate("X", 100, [], currency="USD")],
+            SESSIONS,
+            DATA_THROUGH,
+            ("no_constituents", ANCHOR, None, ["X", "Y"], ["currency_mismatch", "empty_cohort"]),
+            id="unpriced-candidate-listed-in-usd",
+        ),
+        pytest.param(
+            UNPRICED_PAIR,
+            weekdays(date(2022, 6, 27), date(2022, 7, 22)),
+            date(2022, 7, 22),
+            ("awaiting_data", None, 8, [], []),
+            id="market-ends-before-window",
+        ),
+        pytest.param(
+            UNPRICED_PAIR,
+            weekdays(date(2022, 6, 27), date(2022, 7, 29)),
+            date(2022, 7, 30),
+            ("awaiting_data", None, None, [], []),
+            id="market-ends-on-a-non-session-window-start",
+        ),
+        pytest.param(
+            UNPRICED_PAIR,
+            [],
+            None,
+            ("awaiting_data", None, None, [], []),
+            id="no-market-data-at-all",
+        ),
+    ],
+)
+def test_without_candidate_data_the_window_is_judged_on_the_market_sessions(
+    candidates: list[BacktestCandidate],
+    sessions: list[date],
+    market_data_through: date | None,
+    expected: tuple[CycleStatus, date | None, int | None, list[str], list[str]],
+) -> None:
+    """No candidate has data (``data_available_through`` is ``None``): none at all, as for
+    tickers and a sector sharing no equity, or X and Y without a single price row. The standard
+    window (2022-07-30 .. 2022-08-19) is then judged on the market's sessions up to
+    ``market_data_through``; ``expected`` is ``(status, anchor, days until the window opens,
+    excluded tickers, flags)``.
+
+    While a market session lies in the window, the cohort is empty while data exists there:
+    ``no_constituents`` anchored at the first such session, Mon 2022-08-01, every candidate
+    excluded (sorted) and flagged ``empty_cohort``, after ``currency_mismatch`` when X is listed
+    in USD; that holds when the market data ends inside the window (Fri 2022-08-12) too. With no
+    market session in the window it is ``awaiting_data``: counted down from the market's last
+    session, Fri 2022-07-22, to the window start, 8 days; not counted down when the market data
+    ends on the window start (Sat 2022-07-30, not a session) or there is no market data."""
+    status, anchor, days_until, excluded, flags = expected
+
+    result = run_cycle_backtest(
+        EVENT,
+        WINDOW,
+        candidates,
+        sessions,
+        [],
+        data_available_through=None,
+        market_data_through=market_data_through,
+    )
+
+    assert result == CycleBacktestResult(
+        label="2022 Cycle",
+        event_date=date(2022, 8, 9),
+        window_start=date(2022, 7, 30),
+        window_end=date(2022, 8, 19),
+        status=status,
+        anchor_date=anchor,
+        days_until_window_start=days_until,
+        excluded_constituents=excluded,
+        flags=flags,
+    )

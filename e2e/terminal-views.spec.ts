@@ -3826,9 +3826,18 @@ test.describe("Custom watchlists and screener (/screener)", () => {
       sort: "pe",
       order: "desc",
     });
-    await expect(screener).toHaveAttribute("data-state", "empty", {
-      timeout: SLOW_READY_TIMEOUT,
-    });
+    // No counter matches, so a note takes the counter table's place while the widget stays ready.
+    // The sector summary is computed over every counter whatever the filters, so it stays.
+    await expectSettledRows(screener, 0);
+    await expect(screener.getByTestId("screener-no-match")).toBeVisible();
+    await expect(screener.getByTestId("screener-no-match")).toHaveText(
+      "No counters match these filters",
+    );
+    await expect(screener.getByTestId("sector-aggregate-row")).toHaveCount(4);
+    const banking = withAttributes(screener, "sector-aggregate-row", { "data-sector": "Banking" });
+    await expect(banking.locator('[data-column="ev_ebitda"] [data-part="value"]')).toHaveText(
+      EMPTY_VALUE,
+    );
 
     const reset = page.waitForResponse(
       (response) => isScreenerUrl(response.url()) && new URL(response.url()).search === "",
@@ -4097,7 +4106,8 @@ test.describe("Widget empty, error and Retry states", () => {
       pagePath: "/screener",
       endpoint: `${API_PREFIX}/market/screener`,
       readyTimeout: SLOW_READY_TIMEOUT,
-      // No sector data either, so the copy is the default rather than the no-match message.
+      // Empty only without rows and without sector data, which shows the default copy; rows
+      // alone missing leave the widget ready with its no-match note and sector summary.
       emptyBody: (real) => ({ ...real, count: 0, rows: [], sector_aggregates: [] }),
       emptyCopy: DEFAULT_EMPTY_COPY,
       retainedControls: [

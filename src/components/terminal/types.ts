@@ -744,7 +744,8 @@ export interface CycleResult {
   anchor_date: string | null;
   /**
    * Calendar days from `data_available_through` to `window_start`, set only when the data ends
-   * before the window opens; null otherwise.
+   * before the window opens; when no candidate has data (`data_available_through` is null),
+   * counted from the market's latest session of any ticker instead. Null otherwise.
    */
   days_until_window_start: number | null;
   /** Sorted tickers of the cohort, fixed at the anchor. */

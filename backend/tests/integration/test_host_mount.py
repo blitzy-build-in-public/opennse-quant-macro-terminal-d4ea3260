@@ -11,7 +11,10 @@ transaction through SAVEPOINTs, so every write rolls back after its test. The te
   ``TerminalUploadRoute`` class, and the host's routes, middleware, exception handlers and
   startup and shutdown hooks are left as the host declared them;
 - the host's session and principal overrides serve the screener and own the watchlist it creates;
-- a host session with no default bind, configured only through ``binds``, answers ``/health``;
+- a host session with no default bind, configured only through ``binds`` or a custom routing
+  ``get_bind``, serves all 16 terminal operations, ``/health`` and backtests that read the
+  lead-ins of several windows in one statement included, and answers those backtests exactly as
+  a default-bound session does;
 - a principal override raising 401 blocks every terminal operation while the host's own routes
   still answer 200, also for a malformed, over-nested or oversized JSON body: the host's 401
   precedes every body verdict, and for an admitted caller the verdict comes after the principal
@@ -73,7 +76,7 @@ from fastapi.routing import APIRoute, iter_route_contexts
 from pydantic import AfterValidator, ValidationError
 from pydantic_core import PydanticCustomError
 from sqlalchemy import Select, Table, TextClause, func, select
-from sqlalchemy.engine import URL, make_url
+from sqlalchemy.engine import URL, Connection, Engine, make_url
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,
@@ -82,6 +85,8 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.orm import Mapper, Session
+from sqlalchemy.sql import ClauseElement
 
 import opennse_terminal
 from helpers.pdf_builder import build_pdf, text_page
@@ -568,6 +573,184 @@ async def test_binds_only_host_session_answers_health(
 
     assert health.status_code == 200, health.text
     assert health.json() == {"status": "ok", "database": "ok", "version": __version__}
+
+
+# A host's custom routing ``Session``, as in SQLAlchemy's documented custom-partitioning pattern:
+# it subclasses ``Session`` and overrides ``get_bind(mapper=None, clause=None, **kw)``, routing on
+# ``mapper.class_``. Such a session has neither a default bind nor ``binds``, so the terminal
+# reaches its database through it only when every statement it executes names the target model's
+# ``Mapper`` (or its ``terminal_`` table as the clause), as SQLAlchemy's own ORM statements do.
+
+
+class RoutingSession(Session):
+    """Routes the terminal's models to ``terminal_bind`` by mapper, or by table as the clause.
+
+    Anything else falls through to ``Session.get_bind``, which, with no default bind and no
+    ``binds``, raises ``UnboundExecutionError``.
+    """
+
+    def __init__(self, *, terminal_bind: Engine | Connection, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.terminal_bind = terminal_bind
+
+    def get_bind(  # type: ignore[override]
+        self,
+        mapper: Mapper[Any] | None = None,
+        clause: ClauseElement | None = None,
+        **kw: Any,
+    ) -> Engine | Connection:
+        if mapper is not None and issubclass(mapper.class_, TerminalBase):
+            return self.terminal_bind
+        if isinstance(clause, Table) and clause.name.startswith("terminal_"):
+            return self.terminal_bind
+        return super().get_bind(mapper, clause=clause, **kw)
+
+
+HostSessionOptions = Callable[[AsyncConnection], dict[str, Any]]
+"""Builds the configuration of a host session with no default bind onto the per-test connection:
+a ``binds`` mapping, or a routing ``sync_session_class`` with its ``terminal_bind``."""
+
+HOST_SESSION_BACKTESTS: Final[tuple[tuple[dict[str, Any], list[str]], ...]] = (
+    ({}, ["complete", "complete", "complete", "awaiting_data"]),
+    ({"event_dates": ["2017-08-08", "2022-08-09"]}, ["complete", "complete"]),
+    ({"pre_months": 12, "post_months": 12}, ["complete", "complete", "complete", "partial"]),
+    (
+        {"tickers": "SCOM", "sector": "Banking"},
+        ["no_constituents", "no_constituents", "no_constituents", "awaiting_data"],
+    ),
+)
+"""``GET /cycles/backtest`` queries and the statuses of their cycles. In the first three several
+windows hold data, so the lead-ins of all of them are read in one ``UNION``; in the last no
+candidate remains, so the windows are judged on the market's latest session and sessions."""
+
+
+@pytest.mark.parametrize(
+    ("tag", "session_options"),
+    [
+        pytest.param(
+            "base class binds",
+            lambda conn: {"binds": {TerminalBase: conn}},
+            id="base_class_binds",
+        ),
+        pytest.param(
+            "per model binds",
+            lambda conn: {
+                "binds": {mapper.class_: conn for mapper in TerminalBase.registry.mappers}
+            },
+            id="per_model_binds",
+        ),
+        pytest.param(
+            "per table binds",
+            lambda conn: {
+                "binds": {table: conn for table in TerminalBase.metadata.tables.values()}
+            },
+            id="per_table_binds",
+        ),
+        pytest.param(
+            "routing get_bind",
+            lambda conn: {
+                "sync_session_class": RoutingSession,
+                "terminal_bind": conn.sync_connection,
+            },
+            id="routing_get_bind",
+        ),
+    ],
+)
+async def test_host_session_without_a_default_bind_serves_every_operation(
+    host_app: HostApp,
+    host_client: httpx.AsyncClient,
+    db_connection: AsyncConnection,
+    quickmart_assumptions: dict[str, object],
+    statement_pdf: Callable[..., bytes],
+    tag: str,
+    session_options: HostSessionOptions,
+) -> None:
+    """A host session with no default bind, configured only through ``binds`` (keyed by the
+    terminal's base class, by every mapped class or by every table) or through a custom
+    ``get_bind`` routing on the mapper or table, serves all 16 terminal operations with their
+    success status: the reads, a PDF preview, and the creation, item changes and deletion of a
+    watchlist of its own. Backtests whose windows hold data in several places, or that leave no
+    candidate, answer exactly as through the host's default-bound session."""
+    default_session_provider = host_app.app.dependency_overrides[get_terminal_session]
+    host_sessionmaker = async_sessionmaker(
+        **session_options(db_connection), join_transaction_mode="create_savepoint"
+    )
+
+    async def host_session_without_default_bind() -> AsyncIterator[AsyncSession]:
+        async with host_sessionmaker() as session:
+            assert session.sync_session.bind is None
+            yield session
+
+    host_app.app.dependency_overrides[get_terminal_session] = host_session_without_default_bind
+
+    responses: dict[tuple[str, str], httpx.Response] = {}
+
+    async def call(method: str, template: str, path: str, **options: Any) -> httpx.Response:
+        response = await host_client.request(method, f"{TERMINAL_PREFIX}{path}", **options)
+        responses[(method, template)] = response
+        return response
+
+    pdf = statement_pdf("KES", tag=f"host session {tag}")
+    reads: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {
+        ("GET", "/health"): ("/health", {}),
+        ("GET", "/macro/overview"): ("/macro/overview", {}),
+        ("GET", "/market/screener"): ("/market/screener", {}),
+        ("GET", "/market/sector-heatmap"): ("/market/sector-heatmap", {}),
+        ("GET", "/market/valuation-bands"): (
+            "/market/valuation-bands",
+            {"params": {"ticker": "SCOM"}},
+        ),
+        ("GET", "/market/anomalies"): ("/market/anomalies", {}),
+        ("GET", "/market/flows"): ("/market/flows", {}),
+        ("GET", "/cycles/backtest"): ("/cycles/backtest", {}),
+        ("GET", "/ipo/scenarios"): ("/ipo/scenarios", {}),
+        ("POST", "/ipo/valuation"): ("/ipo/valuation", {"json": quickmart_assumptions}),
+        ("POST", "/ingest/pdf"): (
+            "/ingest/pdf",
+            {
+                "files": {"file": ("statement.pdf", pdf, "application/pdf")},
+                "data": {"commit": "false"},
+            },
+        ),
+        ("GET", "/watchlists"): ("/watchlists", {}),
+    }
+    for (method, template), (path, options) in reads.items():
+        await call(method, template, path, **options)
+    created = await call(
+        "POST", "/watchlists", "/watchlists", json={"name": f"Host {tag}", "tickers": ["SCOM"]}
+    )
+    assert created.status_code == 201, created.text
+    watchlist = f"/watchlists/{created.json()['id']}"
+    added = await call("PUT", "/watchlists/{watchlist_id}/items/{ticker}", f"{watchlist}/items/KCB")
+    removed = await call(
+        "DELETE", "/watchlists/{watchlist_id}/items/{ticker}", f"{watchlist}/items/KCB"
+    )
+    await call("DELETE", "/watchlists/{watchlist_id}", watchlist)
+    assert set(responses) == {(method, path) for method, path, _name in EXPECTED_OPERATIONS}
+
+    success_status = {("POST", "/watchlists"): 201, ("DELETE", "/watchlists/{watchlist_id}"): 204}
+    failures = [
+        f"{method} {template}: {response.status_code} {response.text[:200]}"
+        for (method, template), response in responses.items()
+        if response.status_code != success_status.get((method, template), 200)
+    ]
+    assert not failures, "terminal operations failed on the host's session:\n" + "\n".join(failures)
+    assert responses[("GET", "/market/screener")].json()["count"] == 8
+    assert responses[("POST", "/ingest/pdf")].json()["committed"] is False
+    assert (added.json()["tickers"], removed.json()["tickers"]) == (["KCB", "SCOM"], ["SCOM"])
+
+    without_default_bind: list[Any] = []
+    for params, statuses in HOST_SESSION_BACKTESTS:
+        response = await host_client.get(f"{TERMINAL_PREFIX}/cycles/backtest", params=params)
+        assert response.status_code == 200, f"{params}: {response.text[:200]}"
+        assert [cycle["status"] for cycle in response.json()["cycles"]] == statuses, params
+        without_default_bind.append(response.json())
+
+    host_app.app.dependency_overrides[get_terminal_session] = default_session_provider
+    for (params, _statuses), body in zip(HOST_SESSION_BACKTESTS, without_default_bind, strict=True):
+        response = await host_client.get(f"{TERMINAL_PREFIX}/cycles/backtest", params=params)
+        assert response.status_code == 200, f"{params}: {response.text[:200]}"
+        assert response.json() == body, params
 
 
 # ---------------------------------------------------------------------------------------------

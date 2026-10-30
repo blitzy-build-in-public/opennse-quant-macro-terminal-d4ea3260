@@ -24,7 +24,10 @@ are one statement over the cycles' observed ranges, each widened by the 62-day o
 limit. Each statement merges the ranges that overlap or touch and reads nothing between the
 others, never the whole span from the first window to the last. A cycle whose window holds no
 observed data reads no lead-in and no price, and a request of only such cycles reads no lead-in,
-price or overlay.
+price or overlay. When no candidate has a stored price, as for tickers and a sector that share no
+equity, every window is judged on the market alone: one statement reads the latest session of
+any ticker and one the sessions inside the windows up to it, and no lead-in, price, fundamentals
+or overlay row is read.
 
 Business-rule errors are coded ``HTTPException`` bodies ``{code, message, field}`` (see
 :class:`~opennse_terminal.schemas.common.ErrorDetail`). The module registers no exception handlers
@@ -36,6 +39,7 @@ from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Sequence
 from datetime import date, timedelta
 from decimal import Decimal
+from itertools import chain
 from typing import Final
 
 from fastapi import HTTPException
@@ -80,6 +84,7 @@ from opennse_terminal.schemas.cycles import (
 from opennse_terminal.services.market_service import (
     ensure_sector,
     ensure_ticker,
+    latest_trade_date,
     load_equities,
     load_fundamentals_rows,
     load_price_rows_in_ranges,
@@ -274,7 +279,9 @@ async def _sessions_before_each(
     One statement for every day of the non-empty ``days``: a backward ``DISTINCT trade_date``
     query with ``LIMIT count`` per day, joined by ``UNION`` when there are several, so only those
     lead-ins are read however much history precedes them; every session before a day is included
-    when fewer than ``count`` exist. Returns their distinct dates, ascending.
+    when fewer than ``count`` exist. Returns their distinct dates, ascending. The statement runs
+    on the bind the session gives ``terminal_daily_prices``, so a host session configured only
+    through ``binds`` or a custom ``get_bind`` serves it like any other read.
     """
     lead_ins = [
         select(TerminalDailyPrice.trade_date)
@@ -287,8 +294,43 @@ async def _sessions_before_each(
     stmt: Select[tuple[date]] | CompoundSelect[tuple[date]] = (
         lead_ins[0] if len(lead_ins) == 1 else union(*lead_ins)
     )
-    result = await session.execute(stmt)
+    # A UNION carries neither the mapper nor the table of its queries to the session, so a
+    # session with no default bind, configured only through ``binds`` or a custom ``get_bind``,
+    # would find no bind for it. It is therefore resolved as a query of TerminalDailyPrice, whose
+    # mapper and table match ``binds`` keyed by TerminalBase, a mapped class or a table, and reach
+    # a custom ``get_bind`` as an ORM query's would. A session with only a default bind still
+    # uses that bind.
+    result = await session.execute(
+        stmt,
+        bind_arguments={
+            "mapper": TerminalDailyPrice.__mapper__,
+            "clause": TerminalDailyPrice.__table__,
+        },
+    )
     return sorted(set(result.scalars().all()))
+
+
+async def _window_sessions(
+    session: AsyncSession, windows: Sequence[CycleWindow], data_through: date | None
+) -> list[list[date]]:
+    """The observed market sessions inside each of ``windows``, ascending.
+
+    A window's sessions run from ``window_start`` to ``window_end`` or ``data_through``, whichever
+    is earlier. One statement reads those of every window that can hold one, over their ranges
+    merged where they overlap or touch; no statement runs when none can, or when ``data_through``
+    is ``None``, and each window then gets an empty list.
+    """
+    if data_through is None:
+        return [[] for _ in windows]
+    spans = [(window.window_start, min(window.window_end, data_through)) for window in windows]
+    observable = [(start, last_day) for start, last_day in spans if last_day >= start]
+    if not observable:
+        return [[] for _ in windows]
+    calendar = await _sessions_in_ranges(session, _merge_ranges(observable))
+    return [
+        calendar[bisect_left(calendar, start) : bisect_right(calendar, last_day)]
+        for start, last_day in spans
+    ]
 
 
 async def _cycle_sessions(
@@ -305,37 +347,26 @@ async def _cycle_sessions(
     and reads no lead-in: its cycle is then ``awaiting_data``.
 
     Two statements serve every window, whatever their number. The first reads the in-window
-    sessions of every window that can hold data, over their ranges merged where they overlap or
-    touch (no statement when none can). The second reads the lead-ins of the windows that hold a
-    session, one backward query per distinct window start (no statement when none does). A
-    window's lead-in is the last :data:`_LEAD_SESSIONS` sessions before its start among both
-    results: its own backward query returns exactly those, and every other date read is an
-    observed session as well.
+    sessions of every window that can hold data (:func:`_window_sessions`). The second reads the
+    lead-ins of the windows that hold a session, one backward query per distinct window start (no
+    statement when none does). A window's lead-in is the last :data:`_LEAD_SESSIONS` sessions
+    before its start among both results: its own backward query returns exactly those, and every
+    other date read is an observed session as well.
     """
-    if data_available_through is None:
-        return [[] for _ in windows]
-    spans = [
-        (window.window_start, min(window.window_end, data_available_through)) for window in windows
-    ]
-    observable = [(start, last_day) for start, last_day in spans if last_day >= start]
-    if not observable:
-        return [[] for _ in windows]
-    calendar = await _sessions_in_ranges(session, _merge_ranges(observable))
-    in_window = [
-        calendar[bisect_left(calendar, start) : bisect_right(calendar, last_day)]
-        for start, last_day in spans
-    ]
-    starts = sorted({start for (start, _), days in zip(spans, in_window, strict=True) if days})
+    in_window = await _window_sessions(session, windows, data_available_through)
+    starts = sorted(
+        {window.window_start for window, days in zip(windows, in_window, strict=True) if days}
+    )
     if not starts:
         return in_window
     lead_ins = await _sessions_before_each(session, starts, _LEAD_SESSIONS)
-    known = sorted({*calendar, *lead_ins})
+    known = sorted({*chain.from_iterable(in_window), *lead_ins})
     cycle_sessions: list[list[date]] = []
-    for (start, _), days in zip(spans, in_window, strict=True):
+    for window, days in zip(windows, in_window, strict=True):
         if not days:
             cycle_sessions.append([])
             continue
-        before = bisect_left(known, start)
+        before = bisect_left(known, window.window_start)
         cycle_sessions.append([*known[max(0, before - _LEAD_SESSIONS) : before], *days])
     return cycle_sessions
 
@@ -645,10 +676,15 @@ async def get_backtest(
     **Statuses.** ``complete`` when the candidates' data reaches ``window_end``; ``partial`` when
     it ends inside the window; ``awaiting_data`` when the window holds no observed data (with
     ``days_until_window_start`` when the data ends before it opens); ``no_constituents`` when no
-    candidate has a base close. ``partial`` and ``awaiting_data`` cycles carry a ``projection``:
-    the mean of the request's complete cycles' normalized paths at each offset, labelled with its
-    ``basis``, descriptive rather than a forecast and never stored. With fewer than 2 complete
-    cycles it is null and the cycle is flagged ``insufficient_projection_basis``.
+    candidate has a base close. When no candidate has any stored price, for example ``tickers``
+    and a ``sector`` that share no equity (``candidates`` is then empty), the response's
+    ``data_available_through`` is null and each window is judged on the market's observed
+    sessions: ``no_constituents`` (flag ``empty_cohort``, anchored at the first market session in
+    the window, every candidate excluded) when it holds one, otherwise ``awaiting_data``, counted
+    down from the market's latest session. ``partial`` and ``awaiting_data`` cycles carry a
+    ``projection``: the mean of the request's complete cycles' normalized paths at each offset,
+    labelled with its ``basis``, descriptive rather than a forecast and never stored. With fewer
+    than 2 complete cycles it is null and the cycle is flagged ``insufficient_projection_basis``.
 
     **Computation.** After the reads, each cycle is backtested in a worker thread, one cycle at a
     time, so the event loop keeps serving other requests. ``abandoned``, when given, is awaited
@@ -694,18 +730,29 @@ async def get_backtest(
     candidate_tickers = [equity.ticker for equity in equities]
 
     data_available_through = await _data_available_through(session, candidate_tickers)
-    cycle_sessions = await _cycle_sessions(session, windows, data_available_through)
-    fundamentals = await load_fundamentals_rows(session, candidate_tickers)
-    macro_rows = await _load_overlay_rows(
-        session,
-        _merge_ranges(
-            (_days_before(window.window_start, OVERLAY_MAX_STALENESS_DAYS), observed[-1])
-            for window, observed in zip(windows, cycle_sessions, strict=True)
-            if observed
-        ),
-    )
-
-    cycle_prices = await _load_cycle_prices(session, candidate_tickers, cycle_sessions)
+    if data_available_through is None:
+        # No candidate has a stored price, so no window can hold a cohort, and each is judged on
+        # the market's observed sessions alone (no_constituents or awaiting_data): its latest
+        # session of any ticker and the sessions inside the windows up to it. No lead-in, price,
+        # fundamentals or overlay row is read.
+        market_data_through = await latest_trade_date(session)
+        cycle_sessions = await _window_sessions(session, windows, market_data_through)
+        fundamentals: dict[str, list[FundamentalsRow]] = {}
+        macro_rows: list[MacroRow] = []
+        cycle_prices: list[dict[str, list[PriceRow]]] = [{} for _ in windows]
+    else:
+        market_data_through = None
+        cycle_sessions = await _cycle_sessions(session, windows, data_available_through)
+        fundamentals = await load_fundamentals_rows(session, candidate_tickers)
+        macro_rows = await _load_overlay_rows(
+            session,
+            _merge_ranges(
+                (_days_before(window.window_start, OVERLAY_MAX_STALENESS_DAYS), observed[-1])
+                for window, observed in zip(windows, cycle_sessions, strict=True)
+                if observed
+            ),
+        )
+        cycle_prices = await _load_cycle_prices(session, candidate_tickers, cycle_sessions)
 
     results: list[CycleBacktestResult] = []
     for event, window, observed, prices in zip(
@@ -721,6 +768,7 @@ async def get_backtest(
                 observed,
                 macro_rows,
                 data_available_through=data_available_through,
+                market_data_through=market_data_through,
                 lag_days=settings.fundamentals_lag_days,
             )
         )
