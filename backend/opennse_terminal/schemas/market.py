@@ -657,16 +657,13 @@ class AnomalyItem(TerminalResponseModel):
     metric: Literal["volume", "turnover"] = Field(description="The metric that spiked.")
     value: Decimal = Field(
         description=(
-            "The metric on trade_date: shares for volume, or for turnover the value traded in the "
-            "equity's listing currency (KES by default); a non-KES equity's turnover is scored "
-            "and returned as stored, not converted to KES."
+            "The metric on trade_date: shares for volume, or for turnover the value traded in "
+            "KES. Turnover is scored only for equities listed in KES; a non-KES equity's "
+            "turnover is never scored, returned or converted."
         ),
     )
     rolling_mean: Decimal = Field(
-        description=(
-            "Mean of the prior window, in value's unit (shares, or the listing currency for "
-            "turnover)."
-        ),
+        description="Mean of the prior window, in value's unit (shares, or KES for turnover).",
     )
     rolling_stdev: Decimal = Field(
         description="Sample standard deviation of the prior window, in value's unit.",
@@ -691,7 +688,8 @@ class AnomaliesResponse(TerminalResponseModel):
     items: list[AnomalyItem] = Field(
         description=(
             "Spikes whose unrounded Z-score is >= threshold, sorted by trade_date descending, "
-            "then z_score descending."
+            "then z_score descending: volume spikes of every equity, turnover spikes of equities "
+            "listed in KES only."
         ),
     )
 
@@ -757,7 +755,12 @@ class FlowsResponse(TerminalResponseModel):
         description="ok, or no_flow_data when no session in the range has flow data.",
     )
     flags: list[str] = Field(
-        default_factory=list, description="Reason codes for null or qualified values."
+        default_factory=list,
+        description=(
+            "Reason codes: no_flow_data when no session in the range has flow data, and "
+            "currency_mismatch when a constituent not listed in KES was left out of the sums "
+            "(never converted)."
+        ),
     )
     coverage_pct: Decimal = Field(
         description=(

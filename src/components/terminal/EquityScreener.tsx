@@ -473,10 +473,11 @@ const SCROLL_REGION_CLASS =
   "relative overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 // The sector summary's scroller is also an inline-size container, so its sticky sector names can
 // be capped against the scroller's visible width (`cqi`) rather than the table's (see
-// SUMMARY_SECTOR_TEXT_CLASS). Without a container, as in a Tailwind 3 host lacking container
-// queries, `cqi` resolves against the small viewport, which still caps the column.
+// SUMMARY_SECTOR_TEXT_CLASS). The arbitrary property `[container-type:inline-size]` makes it a
+// container in Tailwind 3 and Tailwind 4 hosts alike; Tailwind 3 has no `@container` utility
+// without a plugin.
 const SUMMARY_SCROLL_REGION_CLASS =
-  "@container relative overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
+  "[container-type:inline-size] relative overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 // Each scroller sits in a positioned frame with an edge fade over its inline end, shown while
 // columns lie beyond that edge (see useOverflowEnd), since overlay scrollbars give no cue. The
 // fade blends the card surface (slate-900) in over 2rem and ignores the pointer, so the cells
@@ -807,8 +808,10 @@ function CounterRow({ row, onSelectTicker, selected }: CounterRowProps): ReactEl
       <td data-column="volume" className={NUMERIC_CELL_CLASS}>
         {formatInteger(row.volume)}
       </td>
+      {/* Turnover is in the row's listing currency, never converted, so the row's own code
+          labels the exact digits; the "kes" kind only groups them here. */}
       <td data-column="turnover_kes" className={NUMERIC_CELL_CLASS}>
-        {formatDecimal(row.turnover_kes, "kes")}
+        {`${row.currency} ${formatDecimal(row.turnover_kes, "kes", { unit: false })}`}
       </td>
       <ZScoreCell
         metric="volume_z"
@@ -982,26 +985,26 @@ function useOverflowEnd(): [(node: HTMLElement | null) => void, boolean] {
  * and flag tooltips; and the sector summary from `sector_aggregates`.
  *
  * Selects and the checkbox apply at once. Numeric filters apply 400 ms after typing stops, or on
- * Enter or blur; their text is sent exactly as typed, so values stay exact decimals. A result
- * without rows shows the frame's empty state: "No counters match these filters" when the filters
- * it answered excluded every counter of a universe that has data, and the default seeder copy
- * when no data is loaded. Errors tied to a request field, such as `min_exceeds_max` on `min_pe`,
- * appear beneath that field while the last result stays on screen (its rows dimmed, or its empty
- * state); before any result has loaded, a note asking for the errors to be corrected takes the
- * table's place. Any other failure shows the frame's error state with Retry. The filter panel is
- * rendered in every state, so filters stay usable when nothing matches. The watchlist selector
- * lists the calling principal's watchlists from `GET /watchlists` and refreshes them whenever it
- * is focused. That request is independent of the counters: if it fails before any list has
- * loaded, the selector is disabled and a message with its own Retry appears beneath it while the
- * counters stay usable, and a list that loaded earlier stays selectable after a later failure.
- * The options and every list name shown come from that request alone. Lists passed as
- * `watchlists` only signal a change: an array with new content fetches the watchlists again, and
- * an applied list it drops from the previous array was deleted by the caller, so the filter is
- * cleared at once. Each newer payload is then compared with the one before: an applied watchlist
- * it no longer holds is cleared, and one whose tickers changed has its counters fetched again
- * while the previous rows stay dimmed. A screener request answered with `watchlist_not_found`
- * clears the filter as well and never shows its identifier. Every clearing returns to all
- * counters with a notice naming the list when known.
+ * Enter or blur; their text is trimmed and then sent as typed, with no numeric conversion, so
+ * values stay exact decimals. A result without rows shows the frame's empty state: "No counters
+ * match these filters" when the filters it answered excluded every counter of a universe that has
+ * data, and the default seeder copy when no data is loaded. Errors tied to a request field, such
+ * as `min_exceeds_max` on `min_pe`, appear beneath that field while the last result stays on
+ * screen (its rows dimmed, or its empty state); before any result has loaded, a note asking for
+ * the errors to be corrected takes the table's place. Any other failure shows the frame's error
+ * state with Retry. The filter panel is rendered in every state, so filters stay usable when
+ * nothing matches. The watchlist selector lists the calling principal's watchlists from
+ * `GET /watchlists` and refreshes them whenever it is focused. That request is independent of the
+ * counters: if it fails before any list has loaded, the selector is disabled and a message with
+ * its own Retry appears beneath it while the counters stay usable, and a list that loaded earlier
+ * stays selectable after a later failure. The options and every list name shown come from that
+ * request alone. Lists passed as `watchlists` only signal a change: an array with new content
+ * fetches the watchlists again, and an applied list it drops from the previous array was deleted
+ * by the caller, so the filter is cleared at once. Each newer payload is then compared with the
+ * one before: an applied watchlist it no longer holds is cleared, and one whose tickers changed
+ * has its counters fetched again while the previous rows stay dimmed. A screener request answered
+ * with `watchlist_not_found` clears the filter as well and never shows its identifier. Every
+ * clearing returns to all counters with a notice naming the list when known.
  */
 export function EquityScreener({
   apiBaseUrl,

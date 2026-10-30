@@ -1128,7 +1128,7 @@ function SandboxWorkspace({
 
   const controllerRef = useRef<AbortController | null>(null);
   const sequenceRef = useRef(0);
-  const retryButtonRef = useRef<HTMLButtonElement>(null);
+  const retryButtonRef = useRef<HTMLButtonElement | null>(null);
   const valuationHeadingRef = useRef<HTMLHeadingElement>(null);
   // Set when the general error is cleared, and with it the Retry button, while that button holds
   // focus: by a settled request, or without one when the inputs or the API return to the result
@@ -1435,8 +1435,11 @@ function scenariosEmpty(scenarios: IpoScenario[]): boolean {
  * sensitivity matrix and the preset's risk notes.
  *
  * There is no client-side valuation code: every figure is the server's `Decimal` result, shown
- * from its exact string. Inputs are strings end to end (slider positions are integer step counts
- * serialized with BigInt arithmetic), and amounts are KES.
+ * from its exact string. Inputs are held as text, and decimal fields travel as exact decimal
+ * strings (slider positions are integer step counts serialized with BigInt arithmetic; decimal
+ * text inputs are sent as typed). `forecast_years`, `shares_outstanding` and `shares_offered` are
+ * sent as JSON integers that the local check has bounded to at most 10^12, below 2^53, so they
+ * stay exact; amounts are KES.
  *
  * The root carries `data-testid="terminal-ipo-valuation-sandbox"` and `data-state` from the
  * presets request; a rejected valuation shows field errors beneath the inputs and keeps the root

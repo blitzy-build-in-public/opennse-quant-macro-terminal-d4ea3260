@@ -32,6 +32,7 @@ from opennse_terminal.schemas.common import (
     Ticker,
     ValidationErrorItem,
     ValidationErrorResponse,
+    json_safe_input,
 )
 from opennse_terminal.schemas.cycles import (
     DEFAULT_WINDOW_DAYS,
@@ -263,4 +264,5 @@ __all__ = [
     "YieldCurve",
     "YieldCurvePoint",
     "YieldCurveSnapshot",
+    "json_safe_input",
 ]

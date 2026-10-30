@@ -220,10 +220,11 @@ docker/                  postgres-init.sql (creates opennse_test)
 - Values are rounded once, at the response boundary, with `ROUND_HALF_UP`: 2 decimal places for
   KES, prices, ratios, percentages and Z-scores, 6 for discount factors.
 - JSON carries decimals as strings, already rounded (`"offer_price_kes": "7.50"`). Requests accept a
-  number or a string of plain ASCII decimal text (`"7.50"`, `"-3"`, `".5"`, `"7.5e0"`); a string
-  with whitespace, `_` separators or non-ASCII digits is refused with the standard 422 entry
-  `decimal_parsing`. The widgets format the string itself and convert to a number only for chart
-  coordinates.
+  number or a string of plain ASCII decimal text (`"7.50"`, `"-3"`, `".5"`, `"7.5e0"`). A JSON
+  number is decoded as an exact decimal, never through a binary float, so it is judged exactly as
+  the same value written as a string. A string with whitespace, `_` separators or non-ASCII digits
+  is refused with the standard 422 entry `decimal_parsing`. The widgets format the string itself
+  and convert to a number only for chart coordinates.
 - Share counts and volumes are JSON integers of at most 10^12, so they stay exact in JavaScript.
   Request share counts and `forecast_years` accept only a JSON integer: a boolean, string or float
   is the standard 422 entry `int_type`.
@@ -555,8 +556,13 @@ Every run is recorded in `terminal_ingestion_runs` and ends with one of these st
 
 Exit code 2 means invalid arguments, or from `seed` a schema not at head; `seed` exits 1 for its
 own invalid arguments. 130 means interrupted by Ctrl-C, and 143 terminated by SIGTERM during
-`ingest`, `import` or `seed`: uncommitted changes are rolled back and the run is recorded `failed`
-with `error_message` "cancelled". A run left `running` by a process that was killed outright
+`ingest`, `import` or `seed`. After 130 or 143 the interrupted run is rolled back and recorded
+`failed` with `error_message` "cancelled" when the cancellation came before its data commit. An
+`ingest` or `import` commit already under way completes and its committed status stands, with
+`details.after_commit_error` set. A `seed` run keeps its `succeeded` row and its data only if its
+commit had reached the server, and is otherwise rolled back and recorded `failed` ("cancelled") as
+well. The exit code therefore does not say whether data was written: the run's
+`terminal_ingestion_runs` row does. A run left `running` by a process that was killed outright
 (SIGKILL, out of memory) is recorded `failed` with `error_message` "abandoned" by the next run of
 the same pipeline.
 

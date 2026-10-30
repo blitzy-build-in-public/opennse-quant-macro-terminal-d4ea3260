@@ -3,9 +3,10 @@
 Every quant module takes these plain records rather than ORM rows, so formulas stay free of I/O and
 are testable with literals. Units follow the database columns they mirror:
 
-* ``*_kes`` fields are whole Kenyan shillings (KES, the default currency), never thousands; a
-  non-KES ticker's :class:`PriceRow` close, turnover and foreign net flow are in its listing
-  currency, never converted;
+* ``*_kes`` fields are whole units of their record's currency, never thousands and never
+  converted: Kenyan shillings (KES, the default currency), except that a non-KES ticker's
+  :class:`PriceRow` close, turnover and foreign net flow are in its listing currency and a
+  non-KES :class:`FundamentalsRow`'s amounts are in its ``currency``;
 * ``*_pct`` fields are percentage points, so ``Decimal("6.80")`` means 6.80%;
 * volumes are integer share counts.
 
@@ -103,7 +104,7 @@ class FundamentalsRow:
         ebitda_kes: Earnings before interest, tax, depreciation and amortisation.
         total_debt_kes: Borrowings at period end.
         cash_and_equivalents_kes: Cash and cash equivalents at period end.
-        dps_kes: Dividend per share, in KES per share.
+        dps_kes: Dividend per share, in ``currency`` per share (KES by default), never converted.
         revenue_kes: Revenue for the period.
     """
 

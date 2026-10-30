@@ -23,10 +23,13 @@ client has gone away and raise :class:`~opennse_terminal.services.offload.Reques
 Units: KES amounts are whole shillings, multiples are ratios (x), yields, returns and changes are
 percentage points, volumes are shares and Z-scores are standard deviations. Closes (per share)
 and turnover are in the equity's listing currency (``currency``, KES by default), read and
-returned as stored and never converted, so the screener and the anomaly feed carry a non-KES
-equity's close and turnover in its own currency. Market cap, EPS, P/E, P/B, EV/EBITDA, dividend
-yield and their sector aggregates are computed in KES only: the quant layer refuses a non-KES
-equity outright, and a KES equity's fundamentals not in KES (its market cap stands), both with
+returned as stored and never converted, so the screener carries a non-KES equity's close and
+turnover in its own currency, named by the row's ``currency``. Market cap, EPS, P/E, P/B,
+EV/EBITDA, dividend yield and their sector aggregates are computed in KES only: the quant layer
+refuses a non-KES equity outright, and a KES equity's fundamentals not in KES (its market cap
+stands), both with ``currency_mismatch``. The anomaly feed, whose items name no currency, scores
+volume for every equity but turnover only for equities listed in KES, so its turnover is always
+KES; and net flows sum the KES-listed constituents only, leaving any other out with
 ``currency_mismatch``.
 
 Business-rule errors are coded ``HTTPException`` bodies ``{code, message, field}`` (see
@@ -428,10 +431,11 @@ async def load_fundamentals_rows(
 ) -> dict[str, list[FundamentalsRow]]:
     """Return every reported period per ticker, ascending by ``period_end_date``.
 
-    Rows of both period types are returned with their ``currency``;
-    :func:`~opennse_terminal.quant.asof.fundamentals_as_of` keeps fiscal years only and applies
-    the publication lag, and the valuation refuses a row not in KES. Amounts are whole KES and
-    ``dps_kes`` is KES per share.
+    Rows of both period types and every currency are returned with their ``currency``; amounts
+    are whole units of it (KES by default), never thousands and never converted, and ``dps_kes``
+    is the dividend per share in it. :func:`~opennse_terminal.quant.asof.fundamentals_as_of`
+    keeps fiscal years only and applies the publication lag; the valuation and the backtester
+    refuse a row not in KES with ``currency_mismatch``.
 
     Args:
         session: An async session on the terminal database; it is only read.
@@ -1261,8 +1265,8 @@ def _anomaly_item(
         ticker=ticker,
         trade_date=point.trade_date,
         metric=metric,
-        # A volume is an integral Decimal of shares and stays exact; turnover is at 2 dp in the
-        # equity's listing currency (KES by default), as stored and never converted.
+        # A volume is an integral Decimal of shares and stays exact; turnover is at 2 dp in KES,
+        # because get_anomalies scores turnover only for equities listed in KES.
         value=point.value if metric == "volume" else quantize_out(point.value, "money"),
         rolling_mean=quantize_out(point.rolling_mean, "money"),
         rolling_stdev=quantize_out(point.rolling_stdev, "money"),
@@ -1314,18 +1318,20 @@ async def get_anomalies(
     the ``2 x window`` market sessions before it (sessions without a row are skipped, never
     zero-filled), and kept when its unrounded Z-score is at or above ``threshold``. Negative
     Z-scores are never anomalies. ``value``, ``rolling_mean`` and ``rolling_stdev`` are in the
-    metric's unit (shares for volume; for turnover, the equity's listing currency, KES by
-    default, as stored and never converted); the mean and deviation are at 2 dp and ``z_score``
-    is in standard deviations at 2 dp.
+    metric's unit (shares for volume, KES for turnover); the mean and deviation are at 2 dp and
+    ``z_score`` is in standard deviations at 2 dp.
 
-    Candidates are every equity whatever its currency, or ``ticker``, or the equities of
-    ``sector``; with both, the ticker only if it belongs to the sector. Items sort by
+    Candidates are every equity, or ``ticker``, or the equities of ``sector``; with both, the
+    ticker only if it belongs to the sector. Volume is scored for every candidate whatever its
+    currency. Turnover is scored only for candidates listed in KES: an item names no currency,
+    so a non-KES equity's turnover, stored in its own currency, is never scored, returned or
+    converted, and ``metric="turnover"`` for such a ticker gives no items. Items sort by
     ``trade_date`` descending, then ``z_score`` descending, then ticker. An empty price table
     gives no items.
 
-    Each ticker's volume and turnover series is scored in a worker thread, one series at a time,
-    after the reads. ``abandoned``, when given, is awaited before each series, so an abandoned
-    request stops within one series.
+    Each ticker's volume series, and its turnover series where scored, runs in a worker thread,
+    one series at a time, after the reads. ``abandoned``, when given, is awaited before each
+    series, so an abandoned request stops within one series.
 
     Errors: 404 ``unknown_ticker`` or ``unknown_sector``.
 
@@ -1345,18 +1351,37 @@ async def get_anomalies(
 
     sessions = await _last_sessions(session, latest, lookback_sessions + 2 * window)
     first_target = sessions[-lookback_sessions:][0]
+    series_metrics = _anomaly_metrics(metric)
+    candidates: list[TerminalEquity]
     tickers: list[str] | None
     if equity is not None:
+        candidates = [equity]
         tickers = [equity.ticker]
     elif sector is not None:
-        tickers = [member.ticker for member in await load_equities(session, sector=sector)]
+        candidates = await load_equities(session, sector=sector)
+        tickers = [member.ticker for member in candidates]
     else:
+        candidates = await load_equities(session)
         tickers = None
+    # Turnover is an amount in the listing currency and an item names no currency, so only a
+    # KES-listed equity's turnover is scored, never a converted one; volume, in shares, is scored
+    # for every candidate. A ticker missing from the candidates is refused turnover the same way.
+    turnover_tickers = {
+        candidate.ticker for candidate in candidates if candidate.currency == ANALYTICS_CURRENCY
+    }
+    if "turnover" in series_metrics and len(turnover_tickers) < len(candidates):
+        logger.debug(
+            "anomaly feed scores no turnover for %d equities not listed in %s",
+            len(candidates) - len(turnover_tickers),
+            ANALYTICS_CURRENCY,
+        )
     prices = await load_price_rows(session, tickers, sessions[0], latest)
 
     items: list[AnomalyItem] = []
     for name, rows in prices.items():
-        for series in _anomaly_metrics(metric):
+        for series in series_metrics:
+            if series == "turnover" and name not in turnover_tickers:
+                continue
             items.extend(
                 await compute(
                     abandoned,
@@ -1404,11 +1429,18 @@ async def get_flows(
     ``as_of`` is the latest stored ``trade_date``, ``end`` is ``as_of`` and ``start`` is ``end``
     minus 365 calendar days; with no price row at all, ``as_of`` is today's date in
     ``settings.timezone`` (Africa/Nairobi when no settings are given). For each market session
-    in ``[start, end]``: foreign net flow (KES) summed over the constituents with flow data,
-    local net flow = -foreign (the zero-sum identity), the running sum from ``start``, the sum
-    over the last ``rolling_window`` sessions, and the foreign net flow as a percentage of the
-    same constituents' turnover. ``coverage_pct`` is sessions with flow data over sessions in
-    the range (%). With no flow data, ``status`` is ``no_flow_data`` and ``totals`` is null.
+    in ``[start, end]``: foreign net flow (KES) summed over the KES-listed constituents with
+    flow data, local net flow = -foreign (the zero-sum identity), the running sum from
+    ``start``, the sum over the last ``rolling_window`` sessions, and the foreign net flow as a
+    percentage of the same constituents' turnover (KES). ``coverage_pct`` is sessions with flow
+    data over sessions in the range (%). With no flow data, ``status`` is ``no_flow_data`` and
+    ``totals`` is null.
+
+    Only constituents listed in KES are summed, because flow and turnover are stored in each
+    equity's listing currency and nothing is converted. A constituent listed in another currency
+    is left out, never converted, and ``flags`` adds ``currency_mismatch``; a subject without a
+    KES-listed constituent therefore has ``no_flow_data``, null totals, coverage 0.00 and a null
+    flow on every session. Sessions remain the observed market calendar of every ticker.
 
     The series is computed in a worker thread after the reads. ``abandoned``, when given, is
     awaited before that starts.
@@ -1428,18 +1460,27 @@ async def get_flows(
             "Give a ticker or a sector, not both; give neither for the whole market.",
             "sector",
         )
-    tickers: list[str] | None
+    equities: list[TerminalEquity]
     if ticker is not None:
         equity = await ensure_ticker(session, ticker)
         subject = equity.ticker
-        tickers = [equity.ticker]
+        equities = [equity]
     elif sector is not None:
         await ensure_sector(session, sector)
         subject = sector
-        tickers = [member.ticker for member in await load_equities(session, sector=sector)]
+        equities = await load_equities(session, sector=sector)
     else:
         subject = MARKET_SUBJECT
-        tickers = None
+        equities = await load_equities(session)
+    admitted = [listed.ticker for listed in equities if listed.currency == ANALYTICS_CURRENCY]
+    refused = len(admitted) < len(equities)
+    if refused:
+        logger.debug(
+            "net flows of %s leave out %d equities not listed in %s",
+            subject,
+            len(equities) - len(admitted),
+            ANALYTICS_CURRENCY,
+        )
 
     resolved, _has_prices = await _resolve_as_of(session, as_of, settings)
     range_end = end if end is not None else resolved
@@ -1452,7 +1493,7 @@ async def get_flows(
             "start",
         )
     sessions = await load_market_sessions(session, range_start, range_end)
-    prices = await load_price_rows(session, tickers, range_start, range_end)
+    prices = await load_price_rows(session, admitted, range_start, range_end)
     result = await compute(
         abandoned,
         net_flow_series,
@@ -1461,6 +1502,9 @@ async def get_flows(
         rolling_window=rolling_window,
     )
 
+    flags = list(result.flags)
+    if refused:
+        flags.append("currency_mismatch")
     totals = result.totals
     return FlowsResponse(
         subject=subject,
@@ -1468,7 +1512,7 @@ async def get_flows(
         start=range_start,
         end=range_end,
         status=result.status,
-        flags=list(result.flags),
+        flags=flags,
         coverage_pct=quantize_out(result.coverage_pct, "pct"),
         totals=(
             None

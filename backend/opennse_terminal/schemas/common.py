@@ -13,7 +13,9 @@ FastAPI, SQLAlchemy, the models or the services. It holds:
 * bounded request aliases (:data:`RequestDecimal`, :data:`Kes`, :data:`ShareCount`, ...);
 * :class:`NoQueryParams`, the query-parameter model of an endpoint that declares none;
 * the shared response shapes :class:`CoverageMeta`, :class:`SeriesPoint` and
-  :class:`HealthResponse`.
+  :class:`HealthResponse`;
+* :func:`json_safe_input`, the copy of a rejected input or request body in which every value
+  FastAPI's JSON encoding cannot render is spelled as a string.
 
 Pydantic serializes every ``Decimal`` as a JSON string and keeps its exponent, so
 ``Decimal("7.50")`` becomes ``"7.50"``. Services quantize each value once, with
@@ -66,11 +68,13 @@ __all__ = [
     "Ticker",
     "ValidationErrorItem",
     "ValidationErrorResponse",
+    "json_safe_input",
 ]
 
 
-def _contains_non_finite(value: object) -> bool:
-    """Whether ``value`` is a NaN or infinite float, or a dict or list holding one at any depth.
+def _contains_unrenderable(value: object) -> bool:
+    """Whether ``value`` is a NaN or infinite float, a ``Decimal`` or ``bytes``, or a dict or
+    list holding one at any depth: a value FastAPI's 422 handler cannot render as sent.
 
     The walk is iterative, so a deeply nested input cannot exhaust the interpreter stack.
     """
@@ -80,6 +84,8 @@ def _contains_non_finite(value: object) -> bool:
         if isinstance(node, float):
             if not math.isfinite(node):
                 return True
+        elif isinstance(node, Decimal | bytes):
+            return True
         elif isinstance(node, dict):
             pending.extend(node.values())
         elif isinstance(node, list):
@@ -88,10 +94,12 @@ def _contains_non_finite(value: object) -> bool:
 
 
 def _json_safe_scalar_or_shell(value: object) -> object:
-    """One level of :func:`_json_safe_input`.
+    """One level of :func:`json_safe_input`.
 
     Returns an empty dict or list for a dict or list, the JSON literal spelling (``"NaN"``,
-    ``"Infinity"`` or ``"-Infinity"``) for a non-finite float, and ``value`` itself otherwise.
+    ``"Infinity"`` or ``"-Infinity"``) for a non-finite float, the exact decimal string for a
+    ``Decimal``, the UTF-8 text for ``bytes`` (U+FFFD for each invalid sequence), and ``value``
+    itself otherwise.
     """
     if isinstance(value, dict):
         return {}
@@ -101,16 +109,29 @@ def _json_safe_scalar_or_shell(value: object) -> object:
         if math.isnan(value):
             return "NaN"
         return "Infinity" if value > 0 else "-Infinity"
+    if isinstance(value, Decimal):
+        # Never int() or float(): Decimal("1E+999999") would become a million-digit int and a
+        # 400-digit fraction an infinite float, and float() drops digits of any other.
+        return str(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
     return value
 
 
-def _json_safe_input(value: object) -> object:
-    """A copy of ``value`` with every non-finite float spelled as its JSON literal string.
+def json_safe_input(value: object) -> object:
+    """A copy of ``value`` in which every value FastAPI's JSON encoding cannot render is a string.
 
     NaN becomes ``"NaN"``, positive infinity ``"Infinity"`` and negative infinity
-    ``"-Infinity"``, at any depth inside dicts and lists; every other value, dict key and list
-    position is kept. The copy is built iteratively, so a deeply nested input cannot exhaust the
-    interpreter stack, and ``value`` itself is never modified.
+    ``"-Infinity"``; a ``Decimal`` becomes its exact decimal string, such as
+    ``"30.000000000000000001"`` or ``"1E+999999"``; ``bytes`` become their UTF-8 text, with
+    U+FFFD for each invalid sequence. This holds at any depth inside dicts and lists; every other
+    value, dict key and list position is kept. The copy is built iteratively, so a deeply nested
+    input cannot exhaust the interpreter stack, and ``value`` itself is never modified.
+
+    It renders the rejected inputs of :class:`TerminalRequestModel`'s errors, and the request
+    body that ``TerminalJsonRoute`` hands a host's ``RequestValidationError`` handler as
+    ``exc.body``, which that handler can then encode with ``jsonable_encoder`` or
+    ``JSONResponse`` alone.
     """
     root = _json_safe_scalar_or_shell(value)
     pending: list[tuple[object, object]] = [(value, root)]
@@ -140,33 +161,47 @@ class TerminalRequestModel(BaseModel):
     code. Pure check functions such as ``quant.dcf.assumption_violations`` and the services or
     routes test them instead and raise the coded 422 described by :class:`ErrorDetail`.
 
-    The one model-level hook, :meth:`_render_non_finite_inputs`, checks no rule and adds no
-    error. FastAPI decodes a JSON body with the standard library, which reads the literals
-    ``NaN``, ``Infinity`` and ``-Infinity``, and a number that overflows such as ``1e999999``, as
-    non-finite floats. Pydantic rejects them, but FastAPI's standard 422 handler serializes each
-    error's ``input`` with ``allow_nan=False`` and would fail with a 500 instead. The hook only
-    rewrites such an input as the string of its JSON literal, so the rejection reaches the client
-    as FastAPI's standard 422 list.
+    The one model-level hook, :meth:`_make_error_inputs_renderable`, checks no rule and adds no
+    error. Pydantic rejects three kinds of input that FastAPI's standard 422 handler, which
+    encodes each error's ``input`` with its ``jsonable_encoder`` and then ``allow_nan=False``,
+    cannot render as sent:
+
+    * a NaN or infinite float, which fails with a 500. The JSON decoder reads the literals
+      ``NaN``, ``Infinity`` and ``-Infinity`` as such floats, and on a plain ``APIRoute`` also a
+      number that overflows, such as ``1e999999``;
+    * a ``Decimal``, which the encoder turns into an int or a float. On the terminal's
+      ``TerminalJsonRoute`` every JSON number with a fraction or an exponent decodes as an exact
+      ``Decimal``, so ``1e999999`` would become a million-digit int (seconds of CPU, then a 500),
+      a 400-digit fraction an infinite float (a 500), and ``30.000000000000000001`` the float
+      ``30.0``, which its own ``le`` 30.00 message contradicts;
+    * ``bytes``, the raw body FastAPI validates when a request declares no JSON media type,
+      which the encoder decodes as strict UTF-8 and fails with a 500 on an invalid byte.
+
+    The hook only rewrites such an input as a string (:func:`json_safe_input`), so the
+    rejection reaches the client as FastAPI's standard 422 list.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     @model_validator(mode="wrap")
     @classmethod
-    def _render_non_finite_inputs(cls, data: Any, handler: ModelWrapValidatorHandler[Self]) -> Self:
-        """Validate ``data`` unchanged, making a rejected non-finite JSON number renderable.
+    def _make_error_inputs_renderable(
+        cls, data: Any, handler: ModelWrapValidatorHandler[Self]
+    ) -> Self:
+        """Validate ``data`` unchanged, making every rejected input renderable as JSON.
 
         Valid input returns the validated model and invalid input raises a ``ValidationError``
         with the same errors (type, location, message and context) as without the hook. Only
-        when an error's ``input`` holds a NaN or infinite float, at any depth inside dicts and
-        lists, are the errors raised again with each input copied by :func:`_json_safe_input`;
-        those errors then carry no documentation URL, which FastAPI's 422 list omits anyway.
+        when an error's ``input`` holds a NaN or infinite float, a ``Decimal`` or ``bytes``, at
+        any depth inside dicts and lists, are the errors raised again with each input copied by
+        :func:`json_safe_input`; those errors then carry no documentation URL, which FastAPI's
+        422 list omits anyway.
         """
         try:
             return handler(data)
         except ValidationError as exc:
             errors = exc.errors(include_url=False)
-            if not any(_contains_non_finite(error["input"]) for error in errors):
+            if not any(_contains_unrenderable(error["input"]) for error in errors):
                 raise
             # Every error is rebuilt as a custom error that carries its type, rendered message
             # and context verbatim. Rebuilding a pydantic-core error from its type string would
@@ -176,7 +211,7 @@ class TerminalRequestModel(BaseModel):
                 {
                     "type": PydanticCustomError(error["type"], error["msg"], error.get("ctx")),
                     "loc": error["loc"],
-                    "input": _json_safe_input(error["input"]),
+                    "input": json_safe_input(error["input"]),
                 }
                 for error in errors
             ]
@@ -294,11 +329,13 @@ class ValidationErrorItem(TerminalResponseModel):
     input: Any = Field(
         default=None,
         description=(
-            "The rejected value itself; a NaN or infinite number appears as the string NaN, "
-            "Infinity or -Infinity. For a field missing from a supplied object, the containing "
-            'object as sent, for example {"tickers": []} for a watchlist body without name. '
-            "Null when a whole parameter, such as the PDF file field, or the whole body is "
-            "absent; {} for an undecodable JSON body."
+            "The rejected value itself. A JSON number with a fraction or an exponent appears as "
+            'its exact decimal string, for example "30.000000000000000001"; a NaN or infinite '
+            "number as the string NaN, Infinity or -Infinity; a body sent without a JSON media "
+            "type as its text, with each invalid UTF-8 sequence replaced by U+FFFD. For a field "
+            "missing from a supplied object, the containing object as sent, for example "
+            '{"tickers": []} for a watchlist body without name. Null when a whole parameter, such '
+            "as the PDF file field, or the whole body is absent; {} for an undecodable JSON body."
         ),
     )
     ctx: dict[str, Any] = Field(
@@ -424,8 +461,9 @@ def _require_canonical_decimal_text(value: object) -> object:
     ``"\\u0667.\\u0665\\u0660"`` would validate as 7.50. A string passes only when it is canonical
     decimal text, or an ASCII spelling of NaN or Infinity, which the decimal validator refuses as
     ``finite_number``. Any other string is refused as ``decimal_parsing``, the decimal validator's
-    own error for text it cannot read. Numbers, ``Decimal`` values and every other type pass
-    unchanged, so the decimal validator converts or refuses them as before: a JSON boolean, for
+    own error for text it cannot read. Numbers, ``Decimal`` values (a JSON number with a fraction
+    or an exponent arrives as one on the terminal's JSON routes) and every other type pass
+    unchanged to the decimal validator, which converts or refuses them: a JSON boolean, for
     example, is ``decimal_type``.
     """
     if (

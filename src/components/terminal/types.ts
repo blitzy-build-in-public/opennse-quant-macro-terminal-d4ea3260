@@ -524,12 +524,12 @@ export interface AnomalyItem {
   /** The metric that spiked. */
   metric: "volume" | "turnover";
   /**
-   * The metric on `trade_date`: shares for volume, or for turnover the value traded in the
-   * equity's listing currency (KES by default); a non-KES equity's turnover is scored and
-   * returned as stored, never converted to KES.
+   * The metric on `trade_date`: shares for volume, or for turnover the value traded in KES.
+   * Turnover is scored only for equities listed in KES; a non-KES equity's turnover is never
+   * scored, returned or converted.
    */
   value: DecimalString;
-  /** Mean of the prior window, in `value`'s unit (shares, or the listing currency for turnover). */
+  /** Mean of the prior window, in `value`'s unit (shares, or KES for turnover). */
   rolling_mean: DecimalString;
   /** Sample standard deviation of the prior window, in `value`'s unit. */
   rolling_stdev: DecimalString;
@@ -545,7 +545,10 @@ export interface AnomaliesResponse {
   window: number;
   /** Spike threshold used, in standard deviations. */
   threshold: DecimalString;
-  /** Spikes whose unrounded Z-score is ≥ threshold. */
+  /**
+   * Spikes whose unrounded Z-score is ≥ threshold: volume spikes of every equity, turnover spikes
+   * of equities listed in KES only.
+   */
   items: AnomalyItem[];
 }
 
@@ -596,7 +599,11 @@ export interface FlowsResponse {
   end: string;
   /** `ok`, or `no_flow_data` when no session in the range has flow data. */
   status: FlowsStatus;
-  /** Reason codes for null or qualified values. */
+  /**
+   * Reason codes: `no_flow_data` when no session in the range has flow data, and
+   * `currency_mismatch` when a constituent not listed in KES was left out of the sums (never
+   * converted).
+   */
   flags: string[];
   /** Sessions with flow data over market sessions in range, %. */
   coverage_pct: DecimalString;

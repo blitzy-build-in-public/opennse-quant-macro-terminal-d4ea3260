@@ -66,8 +66,8 @@ class TerminalWatchlist(TerminalBase):
 
     ``UNIQUE (owner_key, name)`` (``uq_terminal_watchlists_owner_key``) backs the 409
     ``watchlist_name_taken`` response and the seeder's conflict lookup on (``owner_key``,
-    ``name``). The seeder creates "NSE Core 8" for owner ``local`` holding all eight seeded
-    tickers.
+    ``name``). The seeder creates "NSE Core 8" for the configured ``default_owner_key``
+    (``local`` by default), holding all eight seeded tickers.
 
     ``updated_at`` refreshes through ``onupdate`` only when a column of this row changes. Adding or
     removing an item changes only ``terminal_watchlist_items``, so the service sets

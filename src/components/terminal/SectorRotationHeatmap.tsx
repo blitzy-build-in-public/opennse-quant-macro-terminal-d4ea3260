@@ -106,11 +106,12 @@ const TOGGLE_CLASS = `${TOGGLE_BUTTON_CLASS} aria-disabled:pointer-events-none a
 const TOGGLE_PRESSED_CLASS = `${TOGGLE_BUTTON_PRESSED_CLASS} aria-disabled:pointer-events-none aria-disabled:opacity-50`;
 // The scroller is a keyboard-focusable region, so the periods can be scrolled without a pointer,
 // and an inline-size container, so content inside it can be sized against its visible width
-// (`cqi`) rather than the table's. `relative` makes it the containing block of the absolutely
-// positioned `sr-only` caption and "No data" spans, which would otherwise escape the overflow
-// clip and widen the host page.
+// (`cqi`) rather than the table's. The container is declared with the arbitrary property
+// `[container-type:inline-size]` because Tailwind 3 has no `@container` utility without a plugin.
+// `relative` makes it the containing block of the absolutely positioned `sr-only` caption and
+// "No data" spans, which would otherwise escape the overflow clip and widen the host page.
 const SCROLL_CLASS =
-  "@container relative overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
+  "[container-type:inline-size] relative overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 const TABLE_CLASS = "w-full border-collapse text-xs tabular-nums";
 // The table's description: the visible text above the scroll region, and the screen-reader-only
 // caption that names both the table and the region. A visible caption box is as wide as its
@@ -141,11 +142,13 @@ const STICKY_HEADER_TEXT_CLASS = "block max-w-[calc(45cqi_-_1rem_-_1px)] break-w
 const CELL_CLASS = "whitespace-nowrap border border-slate-900 px-2 py-1.5 text-end";
 // The market row is set apart from the sectors by a heavier rule above it. It is the table's
 // total row, so its header is deliberately heavier and brighter than the sector row headers; it
-// shares the sector column's capped, wrapping text and its divider.
+// shares the sector column's capped, wrapping text and its divider. The rule uses the top-edge
+// `border-t-*` utilities because the block-start border utilities exist only in Tailwind 4; in
+// the table's horizontal writing mode the block start is the top edge, in either direction.
 const MARKET_HEADER_CLASS =
-  "sticky start-0 z-10 border-bs-2 border-bs-slate-600 bg-slate-900 px-2 py-1.5 text-start font-semibold text-slate-100 after:pointer-events-none after:absolute after:inset-y-0 after:end-0 after:w-px after:bg-slate-700";
+  "sticky start-0 z-10 border-t-2 border-t-slate-600 bg-slate-900 px-2 py-1.5 text-start font-semibold text-slate-100 after:pointer-events-none after:absolute after:inset-y-0 after:end-0 after:w-px after:bg-slate-700";
 const MARKET_CELL_CLASS =
-  "whitespace-nowrap border border-slate-900 border-bs-2 border-bs-slate-600 px-2 py-1.5 text-end font-semibold";
+  "whitespace-nowrap border border-slate-900 border-t-2 border-t-slate-600 px-2 py-1.5 text-end font-semibold";
 const LEGEND_CLASS = "mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-slate-400";
 const LEGEND_LIST_CLASS = "flex flex-wrap items-center gap-x-3 gap-y-1";
 const LEGEND_ITEM_CLASS = "flex items-center gap-1";

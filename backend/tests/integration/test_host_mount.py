@@ -24,9 +24,10 @@ transaction through SAVEPOINTs, so every write rolls back after its test. The te
 The contracts a host inherits through ``include_router`` and through the settings and sessions it
 supplies are proved in sections of their own below, each without PostgreSQL: hostile JSON request
 bodies within 64 KiB get one of the two 422 shapes, an undecodable one FastAPI's ``json_invalid``
-entry, and larger ones the coded 413 ``request_too_large`` without being decoded; ``GET /health``
-answers a coded 503 once its database round trip outlives its bound; the health service's
-``SELECT 1`` probe answers ok, or a coded 503 that names only the failure's type;
+entry, and larger ones the coded 413 ``request_too_large`` without being decoded, while a host's
+``RequestValidationError`` handler receives every rejected body in a form it can encode;
+``GET /health`` answers a coded 503 once its database round trip outlives its bound; the health
+service's ``SELECT 1`` probe answers ok, or a coded 503 that names only the failure's type;
 ``TerminalSettings`` bounds its durations and PDF upload limits and keeps ``database_url`` out of
 its repr; and the session module names a database only by its credential-free label. Two more
 such sections sit beside the checks they extend: after the route table, a bare host app's OpenAPI
@@ -65,6 +66,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute, iter_route_contexts
@@ -1918,12 +1920,20 @@ async def test_cancelled_upload_stops_its_parse_and_frees_its_slot_promptly(
 # Two layers make every rejected JSON body within the bound answer with FastAPI's standard 422
 # list:
 #
-# * ``TerminalRequestModel``'s wrap hook re-spells a rejected NaN or infinite float input as its
-#   JSON literal (``"NaN"``, ``"Infinity"``, ``"-Infinity"``), which FastAPI's default handler
-#   can serialize. It applies on any route class, so both route classes are tested.
-# * ``TerminalJsonRoute`` turns every decoding failure of the standard-library JSON decoder
-#   (deep nesting, over-long integer literals, invalid UTF-8, unpaired surrogates) into
-#   FastAPI's own ``json_invalid`` entry instead of a 400 with a string ``detail``.
+# * ``TerminalRequestModel``'s wrap hook re-spells, as a string FastAPI's default handler can
+#   serialize, every rejected input it cannot render as sent: a NaN or infinite float as its
+#   JSON literal (``"NaN"``, ``"Infinity"``, ``"-Infinity"``), a ``Decimal`` as its exact
+#   decimal string, and ``bytes``, the raw body of a request sent without a JSON media type, as
+#   UTF-8 text with U+FFFD for each invalid sequence. It applies on any route class, so both route
+#   classes are tested.
+# * ``TerminalJsonRoute`` decodes a JSON number with a fraction or an exponent as an exact
+#   ``Decimal``, so it is judged exactly as the same value written as a decimal string; the
+#   plain route, which decodes it as a binary float, is the control. It also turns every
+#   decoding failure of the standard-library JSON decoder (deep nesting, over-long integer
+#   literals, number exponents beyond the decimal range, invalid UTF-8, unpaired surrogates) into
+#   FastAPI's own ``json_invalid`` entry instead of a 400 with a string ``detail``. A host's
+#   ``RequestValidationError`` handler receives the rejected body with each value FastAPI's
+#   encoder cannot render spelled as the 422 list spells it.
 #
 # ``TerminalJsonRoute`` also bounds the body to 64 KiB: a larger one, declared by its
 # ``Content-Length`` or counted while it is read, is the coded 413 ``request_too_large``. Every
@@ -1979,6 +1989,9 @@ STRING_TYPE_MSG = "Input should be a valid string"
 JSON_NESTING_ERROR = "JSON nesting exceeds the 200-level limit"
 LONE_SURROGATE_ERROR = "JSON text contains an unpaired UTF-16 surrogate"
 INTEGER_LIMIT_ERROR = "Integer literal exceeds the 4300-digit limit"
+DECIMAL_RANGE_ERROR = "Number literal exponent exceeds the decimal range"
+MAX_DIGITS_MSG = "Decimal input should have no more than 28 digits in total"
+MODEL_ATTRIBUTES_MSG = "Input should be a valid dictionary or object to extract fields from"
 
 
 def quickmart_raw(**raw_values: str) -> bytes:
@@ -2062,8 +2075,6 @@ async def post_raw(client: httpx.AsyncClient, path: str, body: bytes) -> httpx.R
             ("NaN", "NaN"),
             ("Infinity", "Infinity"),
             ("-Infinity", "-Infinity"),
-            ("1e999999", "Infinity"),
-            ("-1e999999", "-Infinity"),
         )
     ]
     + [
@@ -2249,7 +2260,6 @@ CONTEXT_FREE_MESSAGES: Final[dict[str, str]] = {
             id="shares_outstanding_digit_string",
         ),
         pytest.param("forecast_years", '"5"', [], "int_type", "5", id="forecast_years_string"),
-        pytest.param("forecast_years", "5.0", [], "int_type", 5.0, id="forecast_years_float"),
         pytest.param(
             "offer_price_kes",
             '"\\u0667.\\u0665\\u0660"',
@@ -2318,8 +2328,8 @@ async def test_non_canonical_number_returns_standard_422(
     error_type: str,
     rejected: object,
 ) -> None:
-    """A JSON boolean, string or float is not a share count or forecast horizon, and a decimal
-    string with non-ASCII digits, whitespace or ``_`` separators is not a decimal."""
+    """A JSON boolean or string is not a share count or forecast horizon, and a decimal string
+    with non-ASCII digits, whitespace or ``_`` separators is not a decimal."""
     response = await post_raw(body_client, prefix + IPO, quickmart_raw(**{member: raw}))
 
     assert response.status_code == 422
@@ -2364,6 +2374,253 @@ async def test_canonical_spellings_value_like_the_preset(
     assert preset.status_code == response.status_code == 200
     assert response.json()["blended_fair_value_per_share_kes"] == "6.82"
     assert response.json() == preset.json()
+
+
+# ---------------------------------------------------------------------------------------------
+# JSON numbers on TerminalJsonRoute: exact decimals, judged exactly as their decimal strings
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("members", "status_code", "code", "field"),
+    [
+        pytest.param(
+            {"primary_proceeds_kes": "3750000000.00000001"},
+            422,
+            "primary_exceeds_offer_size",
+            "primary_proceeds_kes",
+            id="primary_just_over_offer_size",
+        ),
+        pytest.param(
+            {"primary_proceeds_kes": "3750000000.00"}, 200, None, None, id="primary_at_offer_size"
+        ),
+        pytest.param(
+            {"wacc_pct": "8.000000000000000001", "terminal_growth_pct": "8"},
+            200,
+            None,
+            None,
+            id="wacc_just_above_terminal_growth",
+        ),
+        pytest.param(
+            {"wacc_pct": "8", "terminal_growth_pct": "8"},
+            422,
+            "wacc_not_above_terminal_growth",
+            "wacc_pct",
+            id="wacc_equal_to_terminal_growth",
+        ),
+        # The standard list entry itself is asserted in the decoded-form test below.
+        pytest.param({"wacc_pct": "30.000000000000000001"}, 422, None, None, id="wacc_over_bound"),
+    ],
+)
+async def test_json_number_is_judged_exactly_as_its_decimal_string(
+    body_client: httpx.AsyncClient,
+    members: dict[str, str],
+    status_code: int,
+    code: str | None,
+    field: str | None,
+) -> None:
+    """A JSON number keeps every digit through the bounds and the cross-field checks, so it gets
+    exactly the answer of the same value sent as a decimal string, even where a binary float
+    would round it onto or off a limit."""
+    as_numbers = quickmart_raw(**members)
+    as_strings = quickmart_raw(**{name: json.dumps(raw) for name, raw in members.items()})
+
+    numeric = await post_raw(body_client, JSON_ROUTE_PREFIX + IPO, as_numbers)
+    textual = await post_raw(body_client, JSON_ROUTE_PREFIX + IPO, as_strings)
+
+    assert numeric.status_code == status_code, numeric.text
+    assert (numeric.status_code, numeric.json()) == (textual.status_code, textual.json())
+    if code is not None:
+        detail = numeric.json()["detail"]
+        assert (detail["code"], detail["field"]) == (code, field)
+
+
+@pytest.mark.parametrize(
+    ("prefix", "path", "body", "expected"),
+    [
+        # The plain route decodes a fraction or an exponent as a binary float: the control.
+        pytest.param(
+            PLAIN_PREFIX,
+            IPO,
+            quickmart_raw(offer_price_kes=literal),
+            {
+                "type": "finite_number",
+                "loc": ["body", "offer_price_kes"],
+                "msg": FINITE_NUMBER_MSG,
+                "input": spelled,
+            },
+            id=f"APIRoute-offer_price_kes_{literal}",
+        )
+        for literal, spelled in (("1e999999", "Infinity"), ("-1e999999", "-Infinity"))
+    ]
+    + [
+        pytest.param(
+            PLAIN_PREFIX,
+            IPO,
+            quickmart_raw(forecast_years="5.0"),
+            {
+                "type": "int_type",
+                "loc": ["body", "forecast_years"],
+                "msg": INT_TYPE_MSG,
+                "input": 5.0,
+            },
+            id="APIRoute-forecast_years_5.0",
+        ),
+    ]
+    + [
+        pytest.param(
+            JSON_ROUTE_PREFIX,
+            IPO,
+            quickmart_raw(offer_price_kes=literal),
+            {
+                "type": "decimal_max_digits",
+                "loc": ["body", "offer_price_kes"],
+                "msg": MAX_DIGITS_MSG,
+                "input": spelled,
+                "ctx": {"max_digits": 28},
+            },
+            id=f"TerminalJsonRoute-offer_price_kes_{name}",
+        )
+        for name, literal, spelled in (
+            ("1e999999", "1e999999", "1E+999999"),
+            ("-1e999999", "-1e999999", "-1E+999999"),
+            ("1e999999999999999999", "1e999999999999999999", "1E+999999999999999999"),
+            ("400_digit_fraction", "9" * 400 + ".5", "9" * 400 + ".5"),
+        )
+    ]
+    + [
+        pytest.param(
+            JSON_ROUTE_PREFIX,
+            IPO,
+            quickmart_raw(forecast_years="5.0"),
+            {
+                "type": "int_type",
+                "loc": ["body", "forecast_years"],
+                "msg": INT_TYPE_MSG,
+                "input": "5.0",
+            },
+            id="TerminalJsonRoute-forecast_years_5.0",
+        ),
+        pytest.param(
+            JSON_ROUTE_PREFIX,
+            IPO,
+            quickmart_raw(wacc_pct="30.000000000000000001"),
+            {
+                "type": "less_than_equal",
+                "loc": ["body", "wacc_pct"],
+                "msg": "Input should be less than or equal to 30.00",
+                "input": "30.000000000000000001",
+                "ctx": {"le": 30.0},
+            },
+            id="TerminalJsonRoute-wacc_pct_just_over_30",
+        ),
+        pytest.param(
+            JSON_ROUTE_PREFIX,
+            WATCHLISTS,
+            b'{"name": 1e999999}',
+            {
+                "type": "string_type",
+                "loc": ["body", "name"],
+                "msg": STRING_TYPE_MSG,
+                "input": "1E+999999",
+            },
+            id="TerminalJsonRoute-watchlist_name_1e999999",
+        ),
+        pytest.param(
+            JSON_ROUTE_PREFIX,
+            WATCHLISTS,
+            b'{"name": "ok", "tickers": [1.5]}',
+            {
+                "type": "string_type",
+                "loc": ["body", "tickers", 0],
+                "msg": STRING_TYPE_MSG,
+                "input": "1.5",
+            },
+            id="TerminalJsonRoute-watchlist_ticker_1.5",
+        ),
+    ],
+)
+async def test_rejected_number_is_echoed_as_it_was_decoded(
+    body_client: httpx.AsyncClient, prefix: str, path: str, body: bytes, expected: dict[str, Any]
+) -> None:
+    """A rejected fraction or exponent is echoed as the float a plain route decodes, and on
+    ``TerminalJsonRoute`` as the exact decimal string, at once: never as the million-digit
+    integer, infinite float or rounded float that FastAPI's encoder would make of a ``Decimal``.
+    """
+    started = time.monotonic()
+    response = await post_raw(body_client, prefix + path, body)
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 422, response.text
+    assert response.json() == {"detail": [expected]}
+    assert elapsed < 2.0
+
+
+# ---------------------------------------------------------------------------------------------
+# Bodies without a JSON media type: FastAPI validates the raw bytes, echoed as UTF-8 text
+# ---------------------------------------------------------------------------------------------
+
+NON_JSON_MEDIA = [
+    pytest.param({"content-type": "application/octet-stream"}, id="octet_stream"),
+    pytest.param({"content-type": "text/plain"}, id="text_plain"),
+    pytest.param({}, id="no_content_type"),
+]
+
+
+@pytest.mark.parametrize(
+    "host_refuses", [pytest.param(False, id="admitted"), pytest.param(True, id="host_401")]
+)
+@pytest.mark.parametrize("prefix", BOTH_PREFIXES)
+@pytest.mark.parametrize("path", [IPO, WATCHLISTS])
+@pytest.mark.parametrize("headers", NON_JSON_MEDIA)
+@pytest.mark.parametrize(
+    ("body", "echoed"),
+    [
+        pytest.param(b"\xff", "\ufffd", id="invalid_utf8"),
+        pytest.param(b'{"name": "Banks"}', '{"name": "Banks"}', id="utf8_text"),
+    ],
+)
+async def test_body_without_json_media_type_returns_standard_422(
+    headers: dict[str, str],
+    path: str,
+    prefix: str,
+    host_refuses: bool,
+    body: bytes,
+    echoed: str,
+) -> None:
+    """FastAPI does not decode a body that declares a non-JSON media type, or none, and
+    validates its raw bytes instead: the standard 422 entry echoes them as UTF-8 text, with
+    U+FFFD for each invalid sequence, never a 500. A principal override that raises 401 still
+    answers first."""
+
+    async def host_rejects_caller() -> TerminalPrincipal:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="host says no")
+
+    app = build_app()
+    if host_refuses:
+        app.dependency_overrides[get_terminal_principal] = host_rejects_caller
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://terminal.test") as http:
+        response = await http.post(prefix + path, content=body, headers=headers)
+
+    # The client adds no media type of its own to a body sent without one.
+    assert response.request.headers.get("content-type") == headers.get("content-type")
+    if host_refuses:
+        assert response.status_code == 401, response.text
+        assert response.json() == {"detail": "host says no"}
+    else:
+        assert response.status_code == 422, response.text
+        assert response.json() == {
+            "detail": [
+                {
+                    "type": "model_attributes_type",
+                    "loc": ["body"],
+                    "msg": MODEL_ATTRIBUTES_MSG,
+                    "input": echoed,
+                }
+            ]
+        }
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2421,6 +2678,20 @@ async def test_canonical_spellings_value_like_the_preset(
             11,
             "Invalid utf-8 text: invalid continuation byte",
             id="watchlist_invalid_utf8",
+        ),
+        pytest.param(
+            IPO,
+            quickmart_raw(offer_price_kes="1e99999999999999999999"),
+            0,
+            DECIMAL_RANGE_ERROR,
+            id="offer_price_kes_exponent_above_decimal_range",
+        ),
+        pytest.param(
+            IPO,
+            quickmart_raw(offer_price_kes="1e-99999999999999999999"),
+            0,
+            DECIMAL_RANGE_ERROR,
+            id="offer_price_kes_exponent_below_decimal_range",
         ),
         pytest.param(
             WATCHLISTS,
@@ -2489,6 +2760,72 @@ async def test_host_validation_handler_receives_undecodable_body() -> None:
 
     assert response.status_code == 418
     assert response.json() == {"host_errors": ["json_invalid"], "body": nested_array(10_000)}
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "headers", "echoed"),
+    [
+        pytest.param(
+            WATCHLISTS,
+            b'{"name": 1e999999}',
+            JSON_HEADERS,
+            {"name": "1E+999999"},
+            id="decimal_exponent",
+        ),
+        pytest.param(
+            IPO,
+            quickmart_raw(wacc_pct="30.000000000000000001"),
+            JSON_HEADERS,
+            {**QUICKMART, "wacc_pct": "30.000000000000000001"},
+            id="decimal_fraction",
+        ),
+        pytest.param(WATCHLISTS, b'{"name": NaN}', JSON_HEADERS, {"name": "NaN"}, id="nan"),
+        pytest.param(
+            WATCHLISTS,
+            b"\xff",
+            {"content-type": "application/octet-stream"},
+            "\ufffd",
+            id="invalid_utf8_octet_stream",
+        ),
+        pytest.param(
+            WATCHLISTS,
+            b'{"name": "\xed\xa0\x80',
+            JSON_HEADERS,
+            '{"name": "\ufffd',
+            id="undecodable_raw_surrogate",
+        ),
+        pytest.param(
+            WATCHLISTS, b'{"tickers": []}', JSON_HEADERS, {"tickers": []}, id="strings_only"
+        ),
+    ],
+)
+async def test_host_validation_handler_can_encode_the_rejected_body(
+    path: str, body: bytes, headers: dict[str, str], echoed: object
+) -> None:
+    """A host handler written as FastAPI documents it, echoing ``exc.body`` through
+    ``jsonable_encoder``, answers at once with the body as the 422 list spells its values: never
+    the seconds of CPU and 500 that a raw ``Decimal``, NaN, ``bytes`` or surrogate would cost."""
+    app = build_app()
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content=jsonable_encoder({"detail": exc.errors(), "body": exc.body}),
+        )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://terminal.test") as http:
+        started = time.monotonic()
+        response = await http.post(JSON_ROUTE_PREFIX + path, content=body, headers=headers)
+        elapsed = time.monotonic() - started
+
+    assert response.status_code == 422, response.text
+    assert response.json()["body"] == echoed
+    assert response.json()["detail"]
+    assert elapsed < 2.0
 
 
 # ---------------------------------------------------------------------------------------------

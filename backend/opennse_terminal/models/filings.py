@@ -41,7 +41,8 @@ DOCUMENT_TYPES: Final[tuple[str, ...]] = ("annual_report", "interim_report", "pr
 """Kinds of uploaded document; ``annual_report`` is the endpoint's default."""
 
 FILING_STATUSES: Final[tuple[str, ...]] = ("extracted", "partial", "no_items")
-"""Extraction outcome: every requested item found or derived, some missing, or none found."""
+"""Extraction outcome: no requested item ``not_found``, some ``not_found``, or all ``not_found``.
+Only ``not_found`` items are counted; an ``ambiguous`` item counts as neither found nor missing."""
 
 
 def _in_list_check(column: str, values: tuple[str, ...]) -> str:

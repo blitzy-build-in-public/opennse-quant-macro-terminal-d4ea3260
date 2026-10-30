@@ -18,11 +18,12 @@ Overrides are keyed by function identity, so the aliases below wrap these exact 
 has no user model, user lookup, token parsing or auth table, only the opaque principal subject.
 
 :class:`TerminalJsonRoute` is the route class of every terminal sub-router that binds a JSON body.
-It bounds the body to :data:`JSON_BODY_MAX_BYTES` (413 ``request_too_large``) and answers every
-undecodable body with FastAPI's ``json_invalid`` 422, and it raises either verdict only after the
-router-level and host dependencies have run. The order is host dependencies (the principal), then
-the body verdict, then validation, so a host principal override that raises 401 answers 401
-whatever the body holds.
+It bounds the body to :data:`JSON_BODY_MAX_BYTES` (413 ``request_too_large``), decodes each JSON
+number with a fraction or an exponent as an exact ``Decimal`` rather than a binary float, and
+answers every undecodable body with FastAPI's ``json_invalid`` 422; it raises either verdict only
+after the router-level and host dependencies have run. The order is host dependencies (the
+principal), then the body verdict, then validation, so a host principal override that raises 401
+answers 401 whatever the body holds.
 
 Annotations here are evaluated at runtime (no ``from __future__ import annotations``), because
 FastAPI reads the ``Annotated`` dependency metadata of every alias used in a route signature.
@@ -34,6 +35,7 @@ import logging
 import sys
 from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from typing import Annotated, Any, Final
 
@@ -46,7 +48,7 @@ from starlette.types import Message, Receive
 
 from opennse_terminal.config import TerminalSettings
 from opennse_terminal.db.session import session_factory
-from opennse_terminal.schemas.common import ErrorDetail
+from opennse_terminal.schemas.common import ErrorDetail, json_safe_input
 
 __all__ = [
     "JSON_BODY_MAX_BYTES",
@@ -202,6 +204,16 @@ def _has_lone_surrogate(text: str) -> bool:
     return False
 
 
+def _utf8_encodable(text: str) -> str:
+    """``text`` with U+FFFD in place of each surrogate code point, so UTF-8 can carry it.
+
+    One character replaces one, so a decoder position in ``text`` still names the same place.
+    """
+    if not _has_lone_surrogate(text):
+        return text
+    return "".join("\ufffd" if "\ud800" <= char <= "\udfff" else char for char in text)
+
+
 def _undecodable_reason(value: object) -> str | None:
     """Why a decoded JSON body cannot be answered as a JSON 422, or ``None`` when it can.
 
@@ -229,7 +241,10 @@ def _json_invalid_error(exc: json.JSONDecodeError) -> RequestValidationError:
 
     The single ``json_invalid`` entry sits at ``loc = ("body", <position>)`` with the decoder's
     message as ``ctx.error``, and ``body`` holds the decoded text, so FastAPI's default handler
-    and a host's ``RequestValidationError`` handler receive exactly what FastAPI would raise.
+    and a host's ``RequestValidationError`` handler receive what FastAPI would raise. The one
+    difference: the decoder reads the raw bytes of a surrogate as a surrogate code point, which
+    no UTF-8 response can carry, so each one in ``body`` is U+FFFD and a host handler that
+    echoes the body can send it.
     """
     error = RequestValidationError(
         [
@@ -241,7 +256,7 @@ def _json_invalid_error(exc: json.JSONDecodeError) -> RequestValidationError:
                 "ctx": {"error": exc.msg},
             }
         ],
-        body=exc.doc,
+        body=_utf8_encodable(exc.doc),
     )
     error.__cause__ = exc
     return error
@@ -289,12 +304,16 @@ class _TerminalJsonRequest(Request):
     * nesting too deep for the decoder (``RecursionError``), or deeper than
       :data:`_MAX_JSON_NESTING` levels, and strings holding an unpaired surrogate
       (see :func:`_undecodable_reason`);
-    * an integer literal longer than ``sys.get_int_max_str_digits()`` digits (``ValueError``).
+    * an integer literal longer than ``sys.get_int_max_str_digits()`` digits (``ValueError``);
+    * a number literal whose exponent lies beyond the range of the ``decimal`` module, such as
+      ``1e99999999999999999999`` (``decimal.InvalidOperation``).
 
     Every ``JSONDecodeError`` is then recorded on the request as FastAPI's own ``json_invalid``
     verdict (:func:`_json_invalid_error`) instead of being raised, and :meth:`json` returns a
     private placeholder. :func:`_raise_body_verdict` raises the verdict once the host
-    dependencies have run. Every other body decodes exactly as before.
+    dependencies have run. Every other body is returned decoded, each number with a fraction or
+    an exponent as an exact ``Decimal`` rather than a binary float, so a JSON number validates
+    exactly as the same value written as a decimal string does.
     """
 
     async def json(self) -> Any:
@@ -307,36 +326,49 @@ class _TerminalJsonRequest(Request):
             return _UNDECODABLE_BODY
 
     async def _decode_json(self) -> Any:
-        """Return the decoded JSON body, or raise ``json.JSONDecodeError`` for any failure."""
+        """Return the decoded JSON body, or raise ``json.JSONDecodeError`` for any failure.
+
+        A number with a fraction or an exponent decodes as an exact ``Decimal``; an integer as
+        an ``int``, and ``NaN``, ``Infinity`` and ``-Infinity`` as floats. A decoded body is
+        cached on the request, as Starlette's own ``json`` caches it.
+        """
+        if hasattr(self, "_json"):
+            return self._json
+        body = await self.body()
         try:
-            decoded = await super().json()
+            decoded = json.loads(body, parse_float=Decimal)
         except json.JSONDecodeError:
             raise
         except UnicodeDecodeError as exc:
             # A subclass of ValueError, so it is handled before the integer-limit branch.
-            body = await self.body()
             raise json.JSONDecodeError(
                 f"Invalid {exc.encoding} text: {exc.reason}",
                 body.decode(exc.encoding, "replace"),
                 len(body[: exc.start].decode(exc.encoding, "replace")),
             ) from exc
         except RecursionError as exc:
-            body = await self.body()
             raise json.JSONDecodeError(
                 _JSON_NESTING_MESSAGE, body.decode("utf-8", "replace"), 0
             ) from exc
         except ValueError as exc:
             # The decoder's only other ValueError: int() refusing a literal over the digit limit.
-            body = await self.body()
             raise json.JSONDecodeError(
                 f"Integer literal exceeds the {sys.get_int_max_str_digits()}-digit limit",
                 body.decode("utf-8", "replace"),
                 0,
             ) from exc
+        except InvalidOperation as exc:
+            # An ArithmeticError, not a ValueError: Decimal() refusing an exponent beyond the
+            # decimal module's range, as in 1e99999999999999999999 or 1e-99999999999999999999.
+            raise json.JSONDecodeError(
+                "Number literal exponent exceeds the decimal range",
+                body.decode("utf-8", "replace"),
+                0,
+            ) from exc
         reason = _undecodable_reason(decoded)
         if reason is not None:
-            body = await self.body()
             raise json.JSONDecodeError(reason, body.decode("utf-8", "replace"), 0)
+        self._json = decoded
         return decoded
 
 
@@ -500,11 +532,20 @@ class TerminalJsonRoute(APIRoute):
       answered 413 ``{"detail": {"code": "request_too_large", "message", "field": null}}``: it is
       never read when its ``Content-Length`` says so (or is not a decimal integer), and otherwise
       its read stops at the bound (see :func:`_bounded_body_request`).
-    * **Decoding.** Every JSON decoding failure (deep nesting, an over-long integer literal,
-      invalid UTF-8 or an unpaired surrogate) is answered with FastAPI's standard 422 list, one
-      ``json_invalid`` entry at ``loc = ["body", <position>]`` whose ``ctx.error`` names the
-      cause, instead of a 400 with a string ``detail`` (see :class:`_TerminalJsonRequest`). A
-      host's ``RequestValidationError`` handler still receives it.
+    * **Decoding.** A JSON number with a fraction or an exponent decodes as an exact
+      ``Decimal``, never through a binary float, so ``3750000000.00000001`` keeps every digit
+      for the bounds and cross-field checks; an integer decodes as an ``int``. Every JSON
+      decoding failure (deep nesting, an over-long integer literal, a number exponent beyond the
+      decimal range, invalid UTF-8 or an unpaired surrogate) is answered with FastAPI's standard
+      422 list, one ``json_invalid`` entry at ``loc = ["body", <position>]`` whose ``ctx.error``
+      names the cause, instead of a 400 with a string ``detail`` (see
+      :class:`_TerminalJsonRequest`). A host's ``RequestValidationError`` handler still
+      receives it. On every such error of the route, ``exc.body`` holds a body the handler can
+      encode with ``jsonable_encoder`` or ``JSONResponse``: the decoded text of an undecodable
+      body (see :func:`_json_invalid_error`), ``None`` for an absent one, and otherwise the
+      decoded body with every value a JSON encoder cannot render (a ``Decimal``, a NaN or
+      infinite float, the raw ``bytes`` of a body sent without a JSON media type) spelled as the
+      422 list spells it (see :func:`~opennse_terminal.schemas.common.json_safe_input`).
     * **Order.** Neither verdict is raised while FastAPI reads the body. Both are recorded on the
       request and raised by :func:`_raise_body_verdict`, which the class appends to the route's
       own dependencies. The order is therefore host dependencies (the principal, and any a host's
@@ -512,10 +553,12 @@ class TerminalJsonRoute(APIRoute):
       validation. A host principal override that raises 401 answers 401 for a malformed or
       oversized body, an oversized body is never decoded, and a refused body opens no session.
 
-    A body within the bound that decodes is validated exactly as before, and a route that binds
-    no body is served as before. ``include_router`` preserves the route class and the route's
-    dependencies, so the behaviour travels with ``terminal_router`` into a host; it registers no
-    middleware or exception handler, and the appended dependency adds no OpenAPI parameter.
+    A body within the bound that decodes, its numbers decoded as above, goes to FastAPI's
+    standard validation of the endpoint's parameters, and a route that binds no body is handed
+    to FastAPI's handler with its body unread. ``include_router`` preserves the route class and
+    the route's dependencies, so the behaviour travels with ``terminal_router`` into a host; it
+    registers no middleware or exception handler, and the appended dependency adds no OpenAPI
+    parameter.
     """
 
     def __init__(
@@ -538,7 +581,8 @@ class TerminalJsonRoute(APIRoute):
 
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
         """Wrap FastAPI's handler so that it reads the body through ``_TerminalJsonRequest``,
-        bounded by :data:`JSON_BODY_MAX_BYTES` on a route that binds a body."""
+        bounded by :data:`JSON_BODY_MAX_BYTES` on a route that binds a body, whose
+        ``RequestValidationError`` is raised again with a JSON-safe ``body``."""
         # Built here, synchronously: FastAPI resolves an included route's context during this
         # call, so deferring it to request time would lose that context.
         handler = super().get_route_handler()
@@ -551,6 +595,17 @@ class TerminalJsonRoute(APIRoute):
             return terminal_json_handler
 
         async def bounded_json_handler(request: Request) -> Response:
-            return await handler(await _bounded_body_request(request))
+            try:
+                return await handler(await _bounded_body_request(request))
+            except RequestValidationError as exc:
+                # FastAPI's error carries the body as decoded, with Decimal values, NaN or
+                # infinite floats, or the raw bytes of a body without a JSON media type.
+                # JSONResponse refuses each of them; jsonable_encoder rounds a Decimal to a float,
+                # spends seconds turning 1E+999999 into an int, keeps NaN for JSONResponse to
+                # refuse, and fails on bytes that are not valid UTF-8.
+                # The same error is raised again with a JSON-safe copy; the json_invalid
+                # verdict's decoded text and an absent body (None) come back from it unchanged.
+                exc.body = json_safe_input(exc.body)
+                raise
 
         return bounded_json_handler

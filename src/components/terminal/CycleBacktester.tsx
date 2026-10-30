@@ -404,8 +404,10 @@ const ADD_ROW_CLASS = "flex flex-wrap items-center gap-2";
 // while that stop is focused neither the host input (:focus, :focus-visible) nor the
 // pseudo-element itself matches a focus pseudo-class, so the pseudo-element is given the sky-400
 // ring from the host's state: focus within the input (:focus-within) but not on its month, day
-// or year fields (which match :focus) is on the picker stop.
-const DATE_INPUT_CLASS = `${TEXT_FIELD_CLASS} data-[empty=true]:text-slate-400 [&::-webkit-calendar-picker-indicator]:cursor-pointer [&::-webkit-calendar-picker-indicator]:rounded-sm [&:focus-within:not(:focus)::-webkit-calendar-picker-indicator]:outline-2 [&:focus-within:not(:focus)::-webkit-calendar-picker-indicator]:outline-offset-0 [&:focus-within:not(:focus)::-webkit-calendar-picker-indicator]:outline-solid [&:focus-within:not(:focus)::-webkit-calendar-picker-indicator]:outline-sky-400`;
+// or year fields (which match :focus) is on the picker stop. The ring's solid style is the
+// arbitrary property `[outline-style:solid]` because Tailwind 3 has no `outline-solid` and its
+// `outline-2` sets only the width.
+const DATE_INPUT_CLASS = `${TEXT_FIELD_CLASS} data-[empty=true]:text-slate-400 [&::-webkit-calendar-picker-indicator]:cursor-pointer [&::-webkit-calendar-picker-indicator]:rounded-sm [&:focus-within:not(:focus)::-webkit-calendar-picker-indicator]:outline-2 [&:focus-within:not(:focus)::-webkit-calendar-picker-indicator]:outline-offset-0 [&:focus-within:not(:focus)::-webkit-calendar-picker-indicator]:[outline-style:solid] [&:focus-within:not(:focus)::-webkit-calendar-picker-indicator]:outline-sky-400`;
 const CHIP_ERROR_CLASS = "m-0 text-xs text-rose-400";
 // While a new window or event set is fetched, the previous result stays mounted and is dimmed.
 const BODY_CLASS = "flex flex-col gap-5";

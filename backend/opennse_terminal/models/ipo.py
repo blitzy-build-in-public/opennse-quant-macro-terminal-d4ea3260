@@ -53,12 +53,8 @@ class TerminalIpoScenario(TerminalBase):
 
     ``risk_scenarios`` is a JSON array of ``{"title", "description"}`` objects.
 
-    The seeder writes the Quickmart Supermarket preset (sector "Retail & Consumer Goods",
-    ``source = 'seed'``) with: offer 7.50; stake sold 50.0; primary proceeds 0.00; shares
-    outstanding after the offer 1,000,000,000 and offered 500,000,000; base revenue
-    45,000,000,000; base EBITDA 2,025,000,000; net debt 4,000,000,000; WACC 18.00; revenue growth
-    10.00; terminal growth 5.00; margin expansion 0.50; tax 30.00; capex 2.00; D&A 1.50;
-    NWC -3.00; peer EV/EBITDA 6.00; DCF weight 50; forecast years 5.
+    The seeder writes the Quickmart Supermarket preset (``source = 'seed'``), whose values are
+    listed only in ``seed.reference_data.QUICKMART_PRESET``.
     """
 
     __tablename__ = "terminal_ipo_scenarios"

@@ -8,10 +8,12 @@
  *   - a relative specifier passes only if it resolves inside `src/components/terminal/`, at any
  *     nesting depth;
  *   - a non-relative specifier passes only if it is `react`, `react-dom` or `recharts`, or a
- *     subpath of one of them (`react/jsx-runtime`) with no `.`, `..` or empty segment. `next`,
- *     `next/*`, `@/…` aliases, host packages and data libraries are rejected;
- *   - `import()` and `require()` must take a string literal, since any other argument can name
- *     any module.
+ *     subpath of one of them (`react/jsx-runtime`) with no `.`, `..` or interior empty segment
+ *     (`react//x`); a single trailing slash (`react/`) is allowed. `next`, `next/*`, `@/…`
+ *     aliases, host packages and data libraries are rejected;
+ *   - `import()`, `require()` in every form (`module.require()`, `new require()`) and AMD
+ *     `define()` dependencies must be string literals, since any other argument can name any
+ *     module.
  * A violation prints the file, the specifier, the resolved path and its reason
  * (`outside-terminal-folder`, `disallowed-package` or `non-literal-specifier`). A file TypeScript
  * cannot parse prints `cannot parse` with the diagnostic, because it may hide imports.
@@ -58,10 +60,11 @@ const NON_LITERAL_NOTE = "(non-literal specifier; the resolved path cannot be de
 const MISSING_ARGUMENT_NOTE = "(no specifier argument; the resolved path cannot be determined)";
 
 /**
- * `call` is set only on an `import()` or `require()` whose first argument is not a string
- * literal; `specifier` then holds that argument's source text, or "" when there is no argument.
+ * `call` is set only on an `import()` or `require()` (in any form) whose first argument is not a
+ * string literal, or on an AMD `define()` dependency that is not one; `specifier` then holds that
+ * expression's source text, or "" when a call has no argument.
  * @typedef {"import" | "reference-path" | "reference-types"} SpecifierKind
- * @typedef {"import" | "require"} SpecifierCall
+ * @typedef {"import" | "require" | "define"} SpecifierCall
  * @typedef {{
  *   specifier: string,
  *   pos: number,
@@ -234,23 +237,184 @@ function listParseErrors(sourceFile) {
 }
 
 /**
+ * The expression a wrapper evaluates to, at any depth: parentheses (a JSDoc cast in a `.js` file
+ * is one), `as`, `satisfies`, `!`, a `<T>` assertion and the comma operator, whose value is its
+ * last operand (`(0, require)`), are removed, so none of them can hide a specifier or a callee.
+ * @param {import("typescript").Expression} expression
+ * @returns {import("typescript").Expression}
+ */
+function skipWrappers(expression) {
+  if (
+    ts.isParenthesizedExpression(expression) ||
+    ts.isAsExpression(expression) ||
+    ts.isSatisfiesExpression(expression) ||
+    ts.isNonNullExpression(expression) ||
+    ts.isTypeAssertionExpression(expression)
+  ) {
+    return skipWrappers(expression.expression);
+  }
+  if (
+    ts.isBinaryExpression(expression) &&
+    expression.operatorToken.kind === ts.SyntaxKind.CommaToken
+  ) {
+    return skipWrappers(expression.right);
+  }
+  return expression;
+}
+
+/**
+ * @param {import("typescript").Node | undefined} node
+ * @returns {node is import("typescript").StringLiteral
+ *   | import("typescript").NoSubstitutionTemplateLiteral} true for a specifier written as a
+ *   string literal or a template literal without substitutions
+ */
+function isStringToken(node) {
+  return (
+    node !== undefined && (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node))
+  );
+}
+
+/**
+ * True for a callee that loads a CommonJS module, behind any wrapper: `require`, a `.require` or
+ * `?.require` member of any object (`module.require`), or a `["require"]` element
+ * (`module["require"]`). `require.resolve` is a member of `require`, not a `.require` member, so
+ * it does not match.
+ * @param {import("typescript").Expression} callee
+ * @returns {boolean}
+ */
+function isRequireCallee(callee) {
+  const inner = skipWrappers(callee);
+  if (ts.isIdentifier(inner)) return inner.text === "require";
+  if (ts.isPropertyAccessExpression(inner)) {
+    return ts.isIdentifier(inner.name) && inner.name.text === "require";
+  }
+  if (ts.isElementAccessExpression(inner)) {
+    const key = skipWrappers(inner.argumentExpression);
+    return isStringToken(key) && key.text === "require";
+  }
+  return false;
+}
+
+/**
+ * True for a `define()` argument that cannot be an AMD dependency array at run time: a function,
+ * class, object or regex literal (the factory or the module's value), or a primitive literal.
+ * @param {import("typescript").Expression} expression already unwrapped (see skipWrappers)
+ * @returns {boolean}
+ */
+function cannotBeDependencyArray(expression) {
+  return (
+    ts.isFunctionExpression(expression) ||
+    ts.isArrowFunction(expression) ||
+    ts.isClassExpression(expression) ||
+    ts.isObjectLiteralExpression(expression) ||
+    ts.isLiteralExpression(expression) ||
+    ts.isTemplateExpression(expression) ||
+    expression.kind === ts.SyntaxKind.TrueKeyword ||
+    expression.kind === ts.SyntaxKind.FalseKeyword ||
+    expression.kind === ts.SyntaxKind.NullKeyword
+  );
+}
+
+/**
  * Module specifiers found by parsing the source into an AST. This backs up `ts.preProcessFile`,
  * whose token scanner does not report `export * as ns from "x"`, `export type * as ns from "x"`
- * or `import defer * as ns from "x"` in TypeScript 5.9; without it those forms would bypass the
- * boundary.
+ * or `import defer * as ns from "x"` in TypeScript 5.9, lists a `require()` or `define()`
+ * specifier only when its string token directly follows the `(` or `[`, and misreads the rest of
+ * a line after a quote in a regex literal or JSX text. So the AST lists by itself every form
+ * preProcessFile lists, and the scanner's context loss cannot hide one:
+ *   - import and export declarations, `import x = require()`, `import()` calls and types;
+ *   - `require()` in every form: bare, as a `.require` member of any object (`module.require()`),
+ *     as `module["require"]()`, called with `new`, or behind a wrapped callee (`(0, require)()`);
+ *   - AMD `define()` dependencies, after an optional module name. The factory is the last
+ *     argument, so it names no module unless it is an array literal (`define(["x"])`); see
+ *     recordDefine. A `.define` member call (`window.define()`) has the string literals of its
+ *     dependency arrays listed, as preProcessFile lists them, and nothing else, because
+ *     `customElements.define()` shares the name;
+ *   - `declare module "x"` in a module file, which augments module "x".
+ * A specifier behind any wrapper (see skipWrappers) is unwrapped. An `import()` or `require()`
+ * argument, or a global `define()` dependency, that is not a string literal is reported as
+ * non-literal, because it can name any module.
  * @param {import("typescript").SourceFile} sourceFile
- * @returns {SpecifierRef[]} positions of the first character of each specifier's text
+ * @returns {SpecifierRef[]} positions of the first character of each specifier's text, or of a
+ *   non-literal expression
  */
 function listAstSpecifiers(sourceFile) {
   /** @type {SpecifierRef[]} */
   const found = [];
+  // In a script file `declare module "x"` declares an ambient module and is skipped.
+  const isModuleFile = ts.isExternalModule(sourceFile);
   /** @param {import("typescript").Node | undefined} literal */
   const record = (literal) => {
-    if (literal && (ts.isStringLiteral(literal) || ts.isNoSubstitutionTemplateLiteral(literal))) {
-      // +1 skips the opening quote, so `pos` is the specifier's first character.
+    if (isStringToken(literal)) {
+      // +1 skips the opening quote, so `pos` is the specifier's first character, where the
+      // same specifier listed by preProcessFile points.
       const pos = literal.getStart(sourceFile) + 1;
       found.push({ specifier: literal.text, pos, kind: "import" });
     }
+  };
+  /**
+   * A computed or missing specifier can name any module, so it is reported rather than
+   * skipped. preProcessFile does not list these.
+   * @param {import("typescript").Expression | undefined} expression
+   * @param {SpecifierCall} call
+   * @param {number} missingPos where a missing argument would start
+   */
+  const reportNonLiteral = (expression, call, missingPos) => {
+    found.push({
+      // Whitespace is collapsed so a multi-line argument still prints on one line.
+      specifier: expression ? expression.getText(sourceFile).replace(/\s+/g, " ") : "",
+      pos: expression ? expression.getStart(sourceFile) : missingPos,
+      kind: "import",
+      call,
+    });
+  };
+  /**
+   * @param {import("typescript").Expression | undefined} argument
+   * @param {SpecifierCall} call
+   * @param {number} missingPos where a missing argument would start
+   */
+  const recordArgument = (argument, call, missingPos) => {
+    const inner = argument && skipWrappers(argument);
+    if (isStringToken(inner)) {
+      record(inner);
+    } else {
+      reportNonLiteral(argument, call, missingPos);
+    }
+  };
+  /**
+   * AMD `define(name?, dependencies?, factory)`. The factory (a function, or the module's value)
+   * is required, so the last argument names no module unless it is an array literal, as in the
+   * dependency-only forms `define(["x"])` and `define("name", ["x"])`: `define(factory)` and
+   * `define("name", factory)` list nothing. An earlier argument has its elements listed when it
+   * is an array literal and is skipped when it cannot be a dependency array at run time (the
+   * module's name, a string, or an inline factory; see cannotBeDependencyArray). Any other
+   * earlier argument (an identifier, call or member) may hold the dependency array at run time
+   * and is reported as non-literal. That includes a computed first argument of a two-argument
+   * call (`define(name, factory)`), which may be the array rather than the name.
+   * @param {import("typescript").CallExpression} node
+   * @param {boolean} isGlobal false for a `.define` member call, whose non-literal arguments
+   *   and elements are not reported
+   */
+  const recordDefine = (node, isGlobal) => {
+    const args = node.arguments;
+    args.forEach((argument, index) => {
+      const inner = skipWrappers(argument);
+      if (ts.isArrayLiteralExpression(inner)) {
+        for (const element of inner.elements) {
+          // A hole (`[, "x"]`) names no module.
+          if (ts.isOmittedExpression(element)) continue;
+          const dependency = skipWrappers(element);
+          if (isStringToken(dependency)) {
+            record(dependency);
+          } else if (isGlobal) {
+            // A spread or computed element can name any module.
+            reportNonLiteral(element, "define", element.getStart(sourceFile));
+          }
+        }
+      } else if (isGlobal && index < args.length - 1 && !cannotBeDependencyArray(inner)) {
+        reportNonLiteral(argument, "define", argument.getStart(sourceFile));
+      }
+    });
   };
   /** @param {import("typescript").Node} node */
   const visit = (node) => {
@@ -260,32 +424,33 @@ function listAstSpecifiers(sourceFile) {
       ts.isImportEqualsDeclaration(node) &&
       ts.isExternalModuleReference(node.moduleReference)
     ) {
-      record(node.moduleReference.expression);
+      const { expression } = node.moduleReference;
+      recordArgument(expression, "require", expression.getStart(sourceFile));
+    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      // `arguments.pos` is the offset just after `(`.
+      recordArgument(node.arguments[0], "import", node.arguments.pos);
     } else if (
-      ts.isCallExpression(node) &&
-      (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
-        (ts.isIdentifier(node.expression) && node.expression.text === "require"))
+      (ts.isCallExpression(node) || ts.isNewExpression(node)) &&
+      isRequireCallee(node.expression)
     ) {
-      const argument = node.arguments[0];
-      const isLiteral =
-        argument !== undefined &&
-        (ts.isStringLiteral(argument) || ts.isNoSubstitutionTemplateLiteral(argument));
-      if (isLiteral) {
-        record(argument);
-      } else {
-        // A computed or missing specifier can name any module, so it is reported rather than
-        // skipped. preProcessFile does not list these calls.
-        found.push({
-          // Whitespace is collapsed so a multi-line argument still prints on one line.
-          specifier: argument ? argument.getText(sourceFile).replace(/\s+/g, " ") : "",
-          // `arguments.pos` is the offset just after `(`.
-          pos: argument ? argument.getStart(sourceFile) : node.arguments.pos,
-          kind: "import",
-          call: node.expression.kind === ts.SyntaxKind.ImportKeyword ? "import" : "require",
-        });
+      // `new require` without parentheses has no argument list.
+      const args = node.arguments;
+      recordArgument(args?.[0], "require", args ? args.pos : node.getEnd());
+    } else if (ts.isCallExpression(node)) {
+      const callee = skipWrappers(node.expression);
+      if (ts.isIdentifier(callee) && callee.text === "define") {
+        recordDefine(node, true);
+      } else if (
+        ts.isPropertyAccessExpression(callee) &&
+        ts.isIdentifier(callee.name) &&
+        callee.name.text === "define"
+      ) {
+        recordDefine(node, false);
       }
     } else if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) {
       record(node.argument.literal);
+    } else if (ts.isModuleDeclaration(node) && ts.isStringLiteral(node.name) && isModuleFile) {
+      record(node.name);
     }
     // forEachChild stops at the first truthy callback result, so visit must return nothing.
     ts.forEachChild(node, visit);
@@ -323,13 +488,16 @@ function listStringLiteralStarts(sourceFile) {
 /**
  * Every specifier the file pulls in, from `ts.preProcessFile` (AAP 0.4.4) merged with the AST
  * backstop. `importedFiles` covers import/export-from, side-effect and type-only imports, dynamic
- * `import()` anywhere (type positions included), `import x = require()`, `require()` and module
- * augmentations. `/// <reference path>` and `/// <reference types>` are kept as their own kinds.
- * Ambient `declare module` names in a script file are declarations, not imports, and are skipped.
+ * `import()` anywhere (type positions included), `import x = require()`, `require()`,
+ * `module.require()`, AMD `define()` dependencies and module augmentations. `/// <reference
+ * path>` and `/// <reference types>` are kept as their own kinds. Ambient `declare module` names
+ * in a script file are declarations, not imports, and are skipped.
  * preProcessFile's token scanner has no regex or JSX context, so it reads a regex literal's body
- * and JSX text as code and lists an `import "x"` or `require("x")` written there. preProcessFile
- * stays the lister; the AST only confirms that an `importedFiles` hit starts a real string token
- * (`listStringLiteralStarts`), and a hit that does not is dropped.
+ * and JSX text as code: it lists an `import "x"` or `require("x")` written there, and after a
+ * quote there it misreads the rest of the line. preProcessFile stays the lister, and the AST
+ * covers both faults: an `importedFiles` hit that does not start a real string token
+ * (`listStringLiteralStarts`) is dropped, and `listAstSpecifiers` lists every form itself, so a
+ * specifier the scanner misread is still checked. A specifier both list is reported once.
  * @param {import("typescript").SourceFile} sourceFile
  * @returns {SpecifierRef[]} sorted by position; `pos` is the first character of the specifier
  */
@@ -957,7 +1125,7 @@ const SELF_TEST_CASES = [
     reason: REASON_OUTSIDE,
   },
   {
-    name: "module.require() in a CommonJS file (listed by preProcessFile only)",
+    name: "module.require() in a CommonJS file",
     file: "lib/x.cjs",
     source: 'module.exports = module.require("next/router");\n',
     expect: "reject",
@@ -965,7 +1133,7 @@ const SELF_TEST_CASES = [
     reason: REASON_PACKAGE,
   },
   {
-    name: "AMD define() dependency (listed by preProcessFile only)",
+    name: "AMD define() dependency",
     file: "lib/x.js",
     source: 'define(["next/link"], function () {});\n',
     expect: "reject",
@@ -973,7 +1141,7 @@ const SELF_TEST_CASES = [
     reason: REASON_PACKAGE,
   },
   {
-    name: "AMD define() dependency after a module name (listed by preProcessFile only)",
+    name: "AMD define() dependency after a module name",
     file: "lib/x.js",
     source: 'define("widget", ["next/link"], function () {});\n',
     expect: "reject",
@@ -981,14 +1149,15 @@ const SELF_TEST_CASES = [
     reason: REASON_PACKAGE,
   },
   {
-    name: "new require() (listed by preProcessFile only)",
+    name: "new require()",
     file: "lib/x.js",
     source: 'export const head = new require("next/head");\n',
     expect: "reject",
     specifier: "next/head",
     reason: REASON_PACKAGE,
   },
-  // Wrapped specifiers: preProcessFile lists the string token, whatever expression wraps it.
+  // Wrapped specifiers: the AST unwraps them, and preProcessFile lists a string token that
+  // directly follows the call's `(` or `[`.
   {
     name: "module.require() of a host package behind an as assertion",
     file: "lib/x.ts",
@@ -1037,6 +1206,187 @@ const SELF_TEST_CASES = [
     specifier: "next/link",
     reason: REASON_PACKAGE,
   },
+  // Loads preProcessFile does not list, because no string token directly follows the call's `(`;
+  // the AST unwraps the argument or the callee and lists the specifier itself.
+  ...[
+    ["module.require() in parentheses", "lib/x.js", 'module.require(("next/link"))'],
+    [
+      "module.require() behind a <string> assertion",
+      "lib/x.ts",
+      'module.require(<string>"next/link")',
+    ],
+    [
+      "module.require() behind a JSDoc cast",
+      "lib/x.js",
+      'module.require(/** @type {string} */ ("next/link"))',
+    ],
+    [
+      "module.require() behind nested parentheses, satisfies and !",
+      "lib/x.ts",
+      'module.require((("next/link") satisfies string)!)',
+    ],
+    ["require() in parentheses", "lib/x.js", 'require(("next/link"))'],
+    ["import() in parentheses", "X.tsx", 'import(("next/link"))'],
+    ['module["require"]()', "lib/x.js", 'module["require"]("next/link")'],
+    ["parenthesized module.require callee", "lib/x.js", '(module.require)("next/link")'],
+    ["require callee behind a comma operator", "lib/x.js", '(0, require)("next/link")'],
+  ].map(
+    ([name, file, call]) =>
+      /** @type {SelfTestCase} */ ({
+        name,
+        file,
+        source: `export const link = ${call};\n`,
+        expect: "reject",
+        specifier: "next/link",
+        reason: REASON_PACKAGE,
+      }),
+  ),
+  // A quote in a regex literal or JSX text makes preProcessFile's scanner misread the rest of its
+  // line; the AST still lists every specifier there.
+  ...[
+    [
+      "module.require() after a regex holding a quote",
+      "lib/x.ts",
+      'const x = /"/; export const a = module.require("next/link");\n',
+    ],
+    [
+      "module.require() after JSX text holding an apostrophe",
+      "X.tsx",
+      "export const A = () => <p>it's</p>; export const b = module.require(\"next/link\");\n",
+    ],
+    [
+      "new require() after a regex holding a quote",
+      "lib/x.ts",
+      'const x = /"/; export const a = new require("next/link");\n',
+    ],
+    [
+      "AMD define() dependency after a regex holding a quote",
+      "lib/x.js",
+      'const x = /"/; define(["next/link"], function () {});\n',
+    ],
+    [
+      "AMD define() dependency after a module name and a regex holding a quote",
+      "lib/x.js",
+      'const x = /"/; define("w", ["next/link"], function () {});\n',
+    ],
+    [
+      "AMD define() of dependencies only after a regex holding a quote",
+      "lib/x.js",
+      'const x = /"/; define(["next/link"]);\n',
+    ],
+    [
+      "AMD define() of dependencies only after a module name and a regex holding a quote",
+      "lib/x.js",
+      'const x = /"/; define("w", ["next/link"]);\n',
+    ],
+    [
+      "window.define() dependency after a regex holding a quote",
+      "lib/x.js",
+      'const x = /"/; window.define(["next/link"], function () {});\n',
+    ],
+    [
+      "module augmentation after a regex holding a quote",
+      "lib/x.ts",
+      'const r = /"/; declare module "next/link" { export const y: number; }\nexport {};\n',
+    ],
+  ].map(
+    ([name, file, source]) =>
+      /** @type {SelfTestCase} */ ({
+        name,
+        file,
+        source,
+        expect: "reject",
+        specifier: "next/link",
+        reason: REASON_PACKAGE,
+      }),
+  ),
+  // Computed loads and dependencies: each can name any module.
+  ...[
+    [
+      "module.require() of a variable",
+      "lib/x.ts",
+      "export function load(m: string) {\n  return module.require(m);\n}\n",
+      "m",
+    ],
+    [
+      "new require() of a variable",
+      "lib/x.js",
+      "export function load(m) {\n  return new require(m);\n}\n",
+      "m",
+    ],
+    [
+      "import = require() of a variable",
+      "lib/x.ts",
+      "declare const m: string;\nimport x = require(m);\nexport { x };\n",
+      "m",
+    ],
+    [
+      "AMD define() with computed dependencies",
+      "lib/x.js",
+      "const deps = [];\ndefine(deps, function () {});\n",
+      "deps",
+    ],
+    [
+      "AMD define() with computed dependencies after a module name",
+      "lib/x.js",
+      'const deps = [];\ndefine("w", deps, function () {});\n',
+      "deps",
+    ],
+    [
+      "AMD define() with a computed dependency",
+      "lib/x.js",
+      'const dep = "./format";\ndefine([dep], function () {});\n',
+      "dep",
+    ],
+    [
+      "AMD define() with spread dependencies",
+      "lib/x.js",
+      "const deps = [];\ndefine([...deps], function () {});\n",
+      "...deps",
+    ],
+  ].map(
+    ([name, file, source, specifier]) =>
+      /** @type {SelfTestCase} */ ({
+        name,
+        file,
+        source,
+        expect: "reject",
+        specifier,
+        reason: REASON_NON_LITERAL,
+      }),
+  ),
+  // AMD and custom-element calls that load nothing from outside the folder.
+  ...[
+    [
+      "AMD define() of folder modules after a module name",
+      "X.js",
+      'define("w", ["./lib/format"], function (format) {\n  return format;\n});\n',
+    ],
+    [
+      "AMD define() whose factory requires a sibling",
+      "lib/x.js",
+      'define(function (require) {\n  return require("./format");\n});\n',
+    ],
+    [
+      "AMD define() of a referenced factory",
+      "lib/x.js",
+      "function factory() {\n  return { value: 42 };\n}\ndefine(factory);\n",
+    ],
+    [
+      "AMD define() of a referenced factory after a module name",
+      "lib/x.js",
+      'function factory() {\n  return { value: 42 };\n}\ndefine("widget", factory);\n',
+    ],
+    [
+      "customElements.define() of a custom element",
+      "lib/x.js",
+      'class Widget extends HTMLElement {}\ncustomElements.define("terminal-widget", Widget);\n',
+    ],
+  ].map(
+    ([name, file, source]) =>
+      /** @type {SelfTestCase} */ ({ name, file, source, expect: "accept" }),
+  ),
+
   {
     name: "JSX component in a .jsx file",
     file: "X.jsx",
@@ -1160,8 +1510,10 @@ const HELP = [
   "at any depth, on resolved paths rather than specifier patterns:",
   `  - a relative specifier passes only if it resolves inside ${TERMINAL_REL}/;`,
   `  - a non-relative specifier passes only if it is ${ALLOWED_PACKAGES.join(", ")} or a subpath`,
-  "    of one of them (react/jsx-runtime) with no '.', '..' or empty segment;",
-  "  - import() and require() must take a string literal.",
+  "    of one of them (react/jsx-runtime) with no '.', '..' or interior empty segment (react//x);",
+  "    a single trailing slash (react/) is allowed;",
+  "  - import(), require() in every form (module.require(), new require()) and AMD define()",
+  "    dependencies must be string literals.",
   "A violation prints <file>:<line>:<col>, the specifier, the resolved path and its reason",
   `(${REASON_OUTSIDE}, ${REASON_PACKAGE} or ${REASON_NON_LITERAL}). A file TypeScript`,
   "cannot parse prints <file>:<line>:<col>  cannot parse: <diagnostic>, as it may hide imports.",

@@ -158,7 +158,9 @@ def net_flow_series(
     sessions and constituents without published flow are left out, never treated as zero.
 
     Args:
-        rows: The subject set's price rows in the range, in any order. Rows dated on a day that
+        rows: The subject set's price rows in the range, in any order. Every row's flow and
+            turnover must be in one currency, KES, because they are summed as they are: the
+            service passes the rows of KES-listed constituents only. Rows dated on a day that
             is not in ``sessions`` are ignored, as are rows whose ``foreign_net_flow_kes`` is
             ``None`` (their turnover is left out with them).
         sessions: The observed market sessions of the range, strictly ascending.
@@ -198,8 +200,11 @@ def net_flow_series(
     sessions_with_data = 0
     total_turnover = ZERO
     # Running sum and running count of sessions with data after each point. A rolling window's
-    # sum is the difference of two running sums, which is exact because Decimal addition and
-    # subtraction are exact within the 28-digit context, and keeps the series linear in length.
+    # sum is the difference of two running sums, which keeps the series linear in length. That
+    # difference is the exact window sum while every running sum and window sum fits the
+    # 28-significant-digit context, which for amounts of at most 2 dp means magnitudes below
+    # 10^26. Beyond that, each addition and the subtraction round half-even to 28 digits like
+    # any Decimal sum, and the difference can then differ from re-summing the window.
     cumulative_path: list[Decimal] = []
     data_count_path: list[int] = []
     for index, day in enumerate(sessions):

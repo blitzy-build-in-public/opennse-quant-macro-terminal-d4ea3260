@@ -138,7 +138,7 @@ def build_alembic_config(
 
 
 def head_revision() -> str:
-    """Return the single head revision of the packaged history (``"terminal_0002"`` today).
+    """Return the single head revision, discovered from the packaged revision scripts.
 
     Reads only the script directory and never touches a database. Raises ``RuntimeError`` when
     the history has no head or several heads. The seeder compares

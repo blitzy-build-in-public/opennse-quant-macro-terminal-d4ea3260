@@ -1,14 +1,14 @@
 """Ingestion pipelines: full runs on PostgreSQL, the pipeline framework and the upsert writers.
 
-The full runs cover NSE statuses, run locks and price/flow provenance. The only source they
-exercise is the public NSE market-statistics page ("Equity Statistics" tab),
-replayed from the recorded fixtures under ``fixtures/nse/`` by :class:`FixtureFetcher` in place of
-the Playwright browser session: the rendered page shell with its 13 ``#filtersectors`` options and
-the price-list link ``27-OCT-26.pdf``, plus every sector's rendered table. The production checks
-(at least 10 sector options, at least 40 rows) therefore run unchanged. Operator CSV files are
-loaded with the product's own importer (``import_file``). Nothing reaches the network: respx
-serves the single ``robots.txt`` request of each run, and its default ``assert_all_mocked``
-rejects any other request.
+The NSE full runs cover statuses, run locks and price/flow provenance. Their only scraped source
+is the public NSE market-statistics page ("Equity Statistics" tab), replayed from the
+reconstructed 2026-10-27 scenario fixtures under ``fixtures/nse/`` by :class:`FixtureFetcher` in
+place of the Playwright browser session: the rendered page shell with its 13 ``#filtersectors``
+options and the price-list link ``27-OCT-26.pdf``, plus every sector's rendered table. The
+production checks (at least 10 sector options, at least 40 rows) therefore run unchanged.
+Operator CSV files are loaded with the product's own importer (``import_file``). Nothing reaches
+the network: respx serves the single ``robots.txt`` request of each run, and its default
+``assert_all_mocked`` rejects any other request.
 
 Every full-run test gets a fresh seeded clone (``seeded_database``). An outer rollback
 transaction cannot wrap these runs, because each one holds its own advisory-lock connection and
@@ -173,7 +173,7 @@ NAIROBI: Final = ZoneInfo("Africa/Nairobi")
 NOW: Final = datetime(2026, 10, 28, 7, 30, tzinfo=NAIROBI)
 """The scheduled 07:30 run whose expected session, 2026-10-27, is the fixture's link date."""
 SESSION: Final = date(2026, 10, 27)
-"""The session the recorded page shows (``27-OCT-26.pdf``)."""
+"""The session the reconstructed scenario fixtures show (``27-OCT-26.pdf``)."""
 SEEDED_LAST_SESSION: Final = date(2026, 9, 30)
 """The seeder's final synthetic session."""
 
@@ -215,6 +215,9 @@ ROBOTS_DISALLOW_PAGE: Final = "User-agent: *\nDisallow: /market-statistics/\n"
 
 WAIT_SECONDS: Final = 10.0
 """Bound on every wait for a blocked run, so a lock test never hangs."""
+BOUND_VALUE_MARKER: Final = "SECRET-BOUND-VALUE-MARKER"
+"""A value bound into a failing statement: only the exception's text could carry it into a run
+row."""
 
 _PRICE_COLUMNS: Final = (
     TerminalDailyPrice.ticker,
@@ -266,7 +269,8 @@ class SeededClone(Protocol):
 
 
 class FixtureFetcher:
-    """Replays the recorded page and sector fragments as one browser session's snapshot.
+    """Replays the reconstructed scenario fixtures, the page shell and its sector fragments, as
+    one browser session's snapshot.
 
     Implements the market-statistics ``Fetcher`` protocol. The snapshot is assembled when the
     fetcher is built, so a fixture that breaks its contract (the dropdown's option values must be
@@ -275,7 +279,7 @@ class FixtureFetcher:
     Args:
         load: Reads a fixture by its path under ``fixtures/`` (the ``fixture_text`` fixture).
         slugs: The sector options kept, in dropdown order; the other options are removed from the
-            page shell and their tables are not captured.
+            page shell and their tables are left out of the snapshot.
         transform: Applied to each sector fragment's HTML, for example to change its values.
         entered: Set as soon as a fetch starts.
         release: When given, each fetch waits for it after setting ``entered``; this is where the
@@ -293,7 +297,7 @@ class FixtureFetcher:
     ) -> None:
         unknown = [slug for slug in slugs if slug not in SLUGS]
         if unknown:
-            raise ValueError(f"not a recorded sector option: {unknown}")
+            raise ValueError(f"not a sector option of the fixture page: {unknown}")
         shell = load("nse/page_shell.html")
         soup = BeautifulSoup(shell, "lxml")
         dropdown = soup.select_one("#filtersectors")
@@ -343,6 +347,38 @@ class ExplodingParsePipeline(MarketStatisticsPipeline):
 
     def parse(self, raw: MarketStatisticsSnapshot) -> list[NseQuote]:
         raise RuntimeError("fixture parser failure")
+
+
+class ConstraintViolatingUpsertPipeline(MarketStatisticsPipeline):
+    """A market-statistics run whose upsert writes the session's prices, then executes an INSERT
+    that violates ``terminal_equities``' share-count CHECK with :data:`BOUND_VALUE_MARKER` bound,
+    on the run's own connection inside the locked data transaction.
+
+    Attributes:
+        raised: The ``IntegrityError`` that INSERT raised, kept so a test can confirm its text
+            quotes the statement and the marker before checking the run row carries neither.
+    """
+
+    raised: IntegrityError | None = None
+
+    async def upsert(
+        self, conn: AsyncConnection, records: Sequence[NseQuote], run_id: uuid.UUID
+    ) -> int:
+        written = await super().upsert(conn, records, run_id)
+        try:
+            await conn.execute(
+                postgresql.insert(TerminalEquity).values(
+                    ticker="ZZZZ",
+                    company_name=BOUND_VALUE_MARKER,
+                    sector="Banking",
+                    shares_outstanding=-1,
+                    source="csv_import",
+                )
+            )
+        except IntegrityError as error:
+            self.raised = error
+            raise
+        return written
 
 
 def bump_seeded_volumes(html: str, delta: int = 1000) -> str:
@@ -476,6 +512,14 @@ def assert_nse_row(row: dict[str, Any], *, volume: int, close: str) -> None:
     assert (row["open_price"], row["high_price"], row["low_price"]) == (None, None, None)
     assert row["turnover_kes"] == Decimal(volume) * expected_close
     assert row["turnover_estimated"] is True
+
+
+def assert_no_statement_text(error_message: str | None, details: Mapping[str, Any]) -> None:
+    """Neither a run's ``error_message`` nor its ``details`` (as JSON) carries
+    :data:`BOUND_VALUE_MARKER`, a SQL statement or SQLAlchemy's parameter listing."""
+    recorded = json.dumps({"error_message": error_message, "details": details}, default=str)
+    for leaked in (BOUND_VALUE_MARKER, "INSERT", "[SQL", "[parameters"):
+        assert leaked not in recorded
 
 
 # --- Full runs and statuses -------------------------------------------------------------------
@@ -730,6 +774,44 @@ async def test_row_whose_rounded_turnover_overflows_is_rejected_and_the_run_part
     assert recorded["details"]["rejected"] == result.details["rejected"]
 
 
+async def test_database_error_is_recorded_by_its_type_without_its_statement_or_values(
+    seeded_database: SeededClone,
+    fixture_text: Callable[[str], str],
+    robots: respx.MockRouter,
+) -> None:
+    """A constraint violation in the upsert fails the run and rolls back the prices already
+    written. The run row names the error by its type only: the statement, its bound values and
+    PostgreSQL's message, which quotes the failing row, stay out of ``error_message`` and
+    ``details``."""
+    pipeline = ConstraintViolatingUpsertPipeline(
+        seeded_database.settings, fetcher=FixtureFetcher(fixture_text), now=lambda: NOW
+    )
+
+    result = await run(pipeline, seeded_database)
+
+    # The error's own text quotes the statement, its parameters and the marker.
+    assert pipeline.raised is not None
+    raised = str(pipeline.raised)
+    assert "INSERT INTO terminal_equities" in raised
+    assert "[parameters" in raised
+    assert BOUND_VALUE_MARKER in raised.partition("[SQL")[0]
+    assert BOUND_VALUE_MARKER in raised.partition("[parameters")[2]
+
+    assert result.status is RunStatus.FAILED
+    assert result.error_message == "unexpected_error:IntegrityError"
+    assert result.rows_written == 0
+    recorded = await run_row(seeded_database, result.run_id)
+    assert (recorded["status"], recorded["error_message"]) == (
+        RunStatus.FAILED.value,
+        "unexpected_error:IntegrityError",
+    )
+    assert recorded["rows_written"] == 0
+    assert recorded["details"]["exception"] == "IntegrityError"
+    assert recorded["finished_at"] is not None
+    assert_no_statement_text(recorded["error_message"], recorded["details"])
+    assert await prices_on(seeded_database, SESSION) == {}
+
+
 # --- Transaction-scoped advisory lock ---------------------------------------------------------
 
 
@@ -779,7 +861,7 @@ async def test_lock_released_after_parser_raises(
     failed = await run(exploding, seeded_database)
 
     assert failed.status is RunStatus.FAILED
-    assert failed.error_message == "RuntimeError: fixture parser failure"
+    assert failed.error_message == "unexpected_error:RuntimeError"
     assert failed.rows_written == 0
     assert await prices_on(seeded_database, SESSION) == {}
 
@@ -2117,6 +2199,20 @@ def test_no_new_data_keeps_its_own_copy_of_the_evidence() -> None:
 # --- classify_exception ---------------------------------------------------------------------
 
 
+def _sentinel_integrity_error() -> IntegrityError:
+    """The error a constraint-violating INSERT raises: its text quotes the statement, its bound
+    parameters and the driver's message, each carrying :data:`BOUND_VALUE_MARKER`."""
+    return IntegrityError(
+        "INSERT INTO terminal_equities (ticker, company_name) VALUES ($1::VARCHAR, $2::VARCHAR)",
+        {"ticker": "ZZZZ", "company_name": BOUND_VALUE_MARKER},
+        Exception(
+            'new row for relation "terminal_equities" violates check constraint '
+            '"ck_terminal_equities_shares_outstanding_range"\n'
+            f"DETAIL:  Failing row contains (ZZZZ, {BOUND_VALUE_MARKER}, -1)."
+        ),
+    )
+
+
 @pytest.mark.parametrize(
     ("exc", "status", "message"),
     [
@@ -2163,15 +2259,23 @@ def test_no_new_data_keeps_its_own_copy_of_the_evidence() -> None:
         pytest.param(
             ValueError("could not convert '12,3x'"),
             RunStatus.FAILED,
-            "ValueError: could not convert '12,3x'",
+            "unexpected_error:ValueError",
             id="unexpected-value-error",
         ),
-        pytest.param(KeyError("ticker"), RunStatus.FAILED, "KeyError: 'ticker'", id="key-error"),
+        pytest.param(
+            KeyError("ticker"), RunStatus.FAILED, "unexpected_error:KeyError", id="key-error"
+        ),
         pytest.param(
             IngestionError("unmapped subclass"),
             RunStatus.FAILED,
-            "IngestionError: unmapped subclass",
+            "unexpected_error:IngestionError",
             id="bare-ingestion-error",
+        ),
+        pytest.param(
+            _sentinel_integrity_error(),
+            RunStatus.FAILED,
+            "unexpected_error:IntegrityError",
+            id="sqlalchemy-error-with-sql-and-bound-parameters",
         ),
     ],
 )
@@ -2202,7 +2306,11 @@ _LONG = "x" * 2_500
         pytest.param(
             FetchFailed(CSV_URL, _LONG), f"fetch failed for {CSV_URL}: {_LONG}", id="fetch-failed"
         ),
-        pytest.param(RuntimeError(_LONG), f"RuntimeError: {_LONG}", id="unexpected"),
+        pytest.param(
+            type(_LONG, (RuntimeError,), {})("message"),
+            f"unexpected_error:{_LONG}",
+            id="unexpected-with-a-long-type-name",
+        ),
     ],
 )
 def test_classify_exception_truncates_messages_to_2000_characters(
@@ -3306,10 +3414,18 @@ async def test_empty_parse_succeeds_without_calling_upsert(settings: TerminalSet
         pytest.param(
             RuntimeError("parser exploded"),
             RunStatus.FAILED,
-            "RuntimeError: parser exploded",
+            "unexpected_error:RuntimeError",
             {"exception": "RuntimeError"},
             (logging.ERROR, "failed: RuntimeError"),
             id="unexpected",
+        ),
+        pytest.param(
+            _sentinel_integrity_error(),
+            RunStatus.FAILED,
+            "unexpected_error:IntegrityError",
+            {"exception": "IntegrityError"},
+            (logging.ERROR, "failed: IntegrityError"),
+            id="sqlalchemy-error-with-sql-and-bound-parameters",
         ),
     ],
 )
@@ -3341,6 +3457,7 @@ async def test_fetch_exception_becomes_the_run_status_with_its_evidence(
     assert update.params["status"] == status.value
     assert update.params["error_message"] == message
     assert update.params["details"] == result.details
+    assert_no_statement_text(update.params["error_message"], update.params["details"])
 
     records = _warnings_and_errors(caplog)
     if logged is None:
@@ -3370,7 +3487,7 @@ async def test_exception_after_parsing_keeps_the_fetched_count_and_writes_nothin
     result = await _execute(pipeline, engine, _HttpDouble())
 
     assert result.status is RunStatus.FAILED
-    assert result.error_message == "RuntimeError: unique violation"
+    assert result.error_message == "unexpected_error:RuntimeError"
     # Written rows are counted only once the data transaction has committed.
     assert (result.rows_fetched, result.rows_written, result.rows_rejected) == (3, 0, 0)
     (data,) = engine.data_connections
@@ -3747,7 +3864,7 @@ async def test_cancellation_during_the_commit_lets_it_finish_and_keeps_the_commi
 @pytest.mark.parametrize(
     ("cancel", "message"),
     [
-        pytest.param(False, "RuntimeError: commit failed", id="error"),
+        pytest.param(False, "unexpected_error:RuntimeError", id="error"),
         pytest.param(True, "cancelled", id="error-while-cancelled"),
     ],
 )
@@ -4460,8 +4577,9 @@ async def test_every_literal_fetch_failed_reason_of_the_ingestion_package_is_log
 #   column with a Python default.
 # - **Macro and fundamentals merges.** Each written column becomes
 #   ``COALESCE(EXCLUDED.c, stored c)`` and ``source_by_field`` is merged with ``||``, so only the
-#   columns a writer supplies change value and provenance (seeded columns stay ``"seed"``);
-#   ``updated_at`` is refreshed and re-runs change nothing. A fundamentals row in another currency
+#   columns a writer supplies change value and provenance (seeded columns stay ``"seed"``). A
+#   re-run leaves the data values and ``source_by_field`` provenance unchanged, apart from
+#   ``updated_at``, which each later transaction refreshes. A fundamentals row in another currency
 #   is skipped; ``period_type`` defaults to ``FY`` and ``currency`` to KES; ``filing_id`` is
 #   replaced only when given.
 # - **Generic upserts.** ``do_nothing`` never touches a stored row, so a re-run inserts 0;

@@ -71,12 +71,12 @@ depends_on: str | Sequence[str] | None = ${py_literal(depends_on)}
 
 
 def upgrade() -> None:
-    """Apply this revision; create only ``terminal_``-prefixed objects."""
+    """Apply this revision's schema changes; touch only ``terminal_``-prefixed objects."""
     ${upgrades if upgrades else "pass"}
 
 
 def downgrade() -> None:
-    """Revert exactly what ``upgrade()`` created, in reverse dependency order; never touch
+    """Reverse exactly what ``upgrade()`` changed, in reverse order; never touch
     non-``terminal_`` objects.
     """
     ${downgrades if downgrades else "pass"}

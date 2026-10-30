@@ -7,7 +7,9 @@ examples and exit codes. The database comes from ``TERMINAL_DATABASE_URL`` (or `
 nothing); ``1`` failed and rolled back, or invalid arguments or settings; ``2`` the schema is not
 at the packaged migration head ("run `opennse-terminal migrate upgrade head` first"); ``130``
 interrupted by Ctrl-C, or ``143`` terminated by SIGTERM, with any uncommitted seed transaction
-rolled back and a started run recorded ``failed`` ("cancelled").
+rolled back. A started run that the cancellation reached before its commit is then recorded
+``failed`` ("cancelled"); one whose commit had reached the server keeps its ``succeeded`` run row
+and its data (see :func:`seed`).
 
 What is written. The records of :func:`opennse_terminal.seed.synthetic.generate_all`, in nine
 reference, history and watchlist tables: the eight attachment counters, their synthetic daily
@@ -541,9 +543,10 @@ async def seed(
         await session.flush()
         await session.commit()
     except asyncio.CancelledError:
-        # Ctrl-C (asyncio.run) or SIGTERM (cli.run_terminable) cancelled the seed. The running row
-        # was part of the rolled-back transaction, so the run is recorded afresh, then the
-        # cancellation propagates.
+        # Ctrl-C (asyncio.run) or SIGTERM (cli.run_terminable) cancelled the seed. Unless the
+        # commit had reached the server, the running row was part of the rolled-back transaction,
+        # so the run is recorded afresh; a committed succeeded row stays, and recording over it
+        # conflicts and is logged at ERROR. Either way the cancellation then propagates.
         await _record_cancellation(session, run_id=run_id, started_at=started_at)
         logger.warning(
             "seed run %s was cancelled; its uncommitted changes were rolled back", run_id
@@ -635,9 +638,12 @@ async def run_seed(settings: TerminalSettings, *, url_source: str = "settings.da
     carry SQL parameters such as ``default_owner_key``.
 
     The engine is disposed whenever it was created. ``asyncio.CancelledError`` and
-    ``KeyboardInterrupt`` are not caught: they propagate after that disposal, a cancelled run
-    having been recorded ``failed`` ("cancelled") by :func:`seed`. A coroutine, so code that
-    already runs an event loop (such as test fixtures) awaits it.
+    ``KeyboardInterrupt`` are not caught: they propagate after that disposal, with a started run
+    as :func:`seed` left it: ``failed`` ("cancelled") when the cancellation came before its
+    commit, otherwise ``succeeded`` with its data committed. A cancellation after :func:`seed`
+    returned, while its session closes or the engine is disposed, leaves that committed run as it
+    is and records nothing more. A coroutine, so code that already runs an event loop (such as
+    test fixtures) awaits it.
     """
     try:
         engine = build_engine(settings)
@@ -729,11 +735,12 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
 
     ``0`` seeded, and after ``-h``/``--help``; ``1`` failed and rolled back, or invalid arguments
     or settings; ``2`` the schema is not at head; ``130`` interrupted by Ctrl-C and ``143``
-    terminated by SIGTERM, each reported in one line on stderr rather than a traceback, after a
-    started run was recorded ``failed`` ("cancelled"). It never raises ``SystemExit``: argparse's
-    exits for ``--help`` and usage errors become the returned code, so ``opennse-terminal seed``
-    and other in-process callers always receive an int. ``prog`` is passed to
-    :func:`build_parser`.
+    terminated by SIGTERM, each reported in one line on stderr rather than a traceback; a started
+    run is then ``failed`` ("cancelled") when the cancellation came before its commit, and
+    otherwise stays ``succeeded`` with its data committed (see :func:`seed`). It never raises
+    ``SystemExit``: argparse's exits for ``--help`` and usage errors become the returned code, so
+    ``opennse-terminal seed`` and other in-process callers always receive an int. ``prog`` is
+    passed to :func:`build_parser`.
 
     Runs :func:`run_seed` through ``opennse_terminal.cli.run_terminable`` (``asyncio.run``, with
     SIGTERM cancelling the seed as Ctrl-C does when called from the main thread with SIGTERM's
@@ -770,8 +777,9 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
         return run_terminable(run_seed(settings, url_source=url_source))
     except KeyboardInterrupt:
         # asyncio.run cancels the seed on Ctrl-C and then raises KeyboardInterrupt. The seed
-        # transaction commits only at the very end, so nothing partial is kept, and seed() has
-        # recorded the run failed ("cancelled").
+        # transaction commits only at the very end, so nothing partial is kept: seed() has
+        # recorded the run failed ("cancelled") unless its commit had already reached the server,
+        # which leaves the run succeeded with all its data.
         print(_INTERRUPTED_MESSAGE, file=sys.stderr)
         return _EXIT_INTERRUPTED
     except TerminatedError:

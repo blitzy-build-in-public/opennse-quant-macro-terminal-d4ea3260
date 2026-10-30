@@ -296,12 +296,13 @@ async def get_anomalies(
     ``2 x window`` market sessions before it; sessions without a row are skipped, never
     zero-filled. A row is a spike when its unrounded Z-score is at or above ``threshold``
     (default 2.0); negative Z-scores never are. ``value``, ``rolling_mean`` and ``rolling_stdev``
-    are in shares for volume and, for turnover, in the equity's listing currency (KES by
-    default), as stored and never converted to KES; ``z_score`` is in standard deviations,
+    are in shares for volume and in KES for turnover; ``z_score`` is in standard deviations,
     rounded to 2 dp after the spike test. Items sort by ``trade_date`` descending, then
-    ``z_score`` descending. Candidates are every equity whatever its currency, or ``ticker``, or
-    the equities of ``sector``. Every parameter and bound is declared by ``AnomaliesParams``, the
-    threshold as a ``Decimal``; an unknown parameter is a standard 422.
+    ``z_score`` descending. Candidates are every equity, or ``ticker``, or the equities of
+    ``sector``: volume is scored for each of them, turnover only for those listed in KES, so a
+    non-KES equity's turnover is never scored, returned or converted. Every parameter and bound
+    is declared by ``AnomaliesParams``, the threshold as a ``Decimal``; an unknown parameter is
+    a standard 422.
     """
     try:
         return await market_service.get_anomalies(
@@ -333,12 +334,14 @@ async def get_flows(
     """Return the daily foreign and local net flows of a ticker, a sector or the whole market.
 
     Give at most one of ``ticker`` and ``sector``; neither means the whole market. Foreign net
-    flow (KES) sums the constituents with flow data on each market session, and local net flow
-    is its negative (aggregate buys equal aggregate sells). The series adds the running sum from
-    ``start``, the sum over the last ``rolling_window`` (default 20) sessions, and the foreign
-    net flow as a percentage of the same constituents' turnover. ``coverage_pct`` is the share
-    of sessions with flow data, in percent; with none, ``status`` is ``no_flow_data`` and
-    ``totals`` is null. Every parameter and bound is declared by ``FlowsParams``; an unknown
+    flow (KES) sums the KES-listed constituents with flow data on each market session, and local
+    net flow is its negative (aggregate buys equal aggregate sells). The series adds the running
+    sum from ``start``, the sum over the last ``rolling_window`` (default 20) sessions, and the
+    foreign net flow as a percentage of the same constituents' turnover. ``coverage_pct`` is the
+    share of sessions with flow data, in percent; with none, ``status`` is ``no_flow_data`` and
+    ``totals`` is null. A constituent listed in another currency is left out, never converted,
+    and ``flags`` adds ``currency_mismatch``, so a subject without a KES-listed constituent has
+    ``no_flow_data``. Every parameter and bound is declared by ``FlowsParams``; an unknown
     parameter is a standard 422.
     """
     # settings is passed so that the no-data fallback as_of uses the configured (or host

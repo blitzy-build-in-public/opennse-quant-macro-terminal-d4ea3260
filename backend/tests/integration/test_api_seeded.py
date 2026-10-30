@@ -3547,6 +3547,43 @@ async def test_anomaly_feed_filters_by_subject_metric_threshold_and_lookback(
     assert [item for item in found if item in planted] == planted
 
 
+@pytest.mark.parametrize("metric", ["turnover", "both"])
+@pytest.mark.parametrize(
+    ("ticker", "kes_turnover_spikes"),
+    [
+        pytest.param(None, {("SCOM", date(2026, 9, 15)), ("KCB", date(2026, 9, 24))}, id="market"),
+        pytest.param("eabl", set(), id="ticker"),
+    ],
+)
+async def test_anomaly_feed_scores_no_turnover_of_an_equity_not_listed_in_kes(
+    session: AsyncSession,
+    ticker: str | None,
+    kes_turnover_spikes: set[tuple[str, date]],
+    metric: AnomalyMetric,
+) -> None:
+    """With EABL switched to USD on this clone, the feed loses exactly EABL's turnover items,
+    its 2026-09-29 turnover spike among them, and converts nothing. EABL's volume, in shares, is
+    still scored, so ``both`` keeps the planted 2026-09-29 volume spike, and every turnover spike
+    of a KES-listed equity stays, SCOM 2026-09-15 and KCB 2026-09-24 in the market feed."""
+    before = await ms.get_anomalies(session, metric=metric, ticker=ticker)
+    assert ("EABL", date(2026, 9, 29), "turnover") in {
+        (item.ticker, item.trade_date, item.metric) for item in before.items
+    }
+
+    await session.execute(
+        update(TerminalEquity).where(TerminalEquity.ticker == "EABL").values(currency="USD")
+    )
+    await session.commit()
+    after = await ms.get_anomalies(session, metric=metric, ticker=ticker)
+
+    assert after.items == [
+        item for item in before.items if (item.ticker, item.metric) != ("EABL", "turnover")
+    ]
+    found = {(item.ticker, item.trade_date, item.metric) for item in after.items}
+    assert (("EABL", date(2026, 9, 29), "volume") in found) == (metric == "both")
+    assert kes_turnover_spikes <= {(name, day) for name, day, kind in found if kind == "turnover"}
+
+
 # ---------------------------------------------------------------------------------------------
 # Market service: GET /market/flows
 # ---------------------------------------------------------------------------------------------
@@ -3681,6 +3718,100 @@ async def test_flows_start_after_end_is_a_coded_422(
     with pytest.raises(HTTPException) as excinfo:
         await ms.get_flows(session, start=start, end=end)
     assert_coded(excinfo.value, 422, "start_after_end", "start", message)
+
+
+@pytest.mark.parametrize(
+    ("subject", "flags"),
+    [
+        pytest.param(
+            {"ticker": "SBIC"}, ["no_flow_data", "currency_mismatch"], id="non_kes_ticker"
+        ),
+        pytest.param({"sector": "Banking"}, ["currency_mismatch"], id="sector_with_non_kes"),
+        pytest.param({}, ["currency_mismatch"], id="market_with_non_kes"),
+        pytest.param({"ticker": "SCOM"}, [], id="kes_ticker"),
+    ],
+)
+async def test_flows_sum_only_constituents_listed_in_kes(
+    session: AsyncSession, settings: TerminalSettings, subject: dict[str, str], flags: list[str]
+) -> None:
+    """With SBIC switched to USD on this clone its flows are refused, never converted, and the
+    series still has the 254 sessions of the observed market calendar. SBIC alone leaves no KES
+    constituent: ``no_flow_data`` plus ``currency_mismatch``, coverage 0.00, null totals and a
+    null flow on every session. Banking and the market are flagged ``currency_mismatch`` and
+    equal their all-KES flows minus SBIC's, session by session and in total; stored amounts have
+    2 dp, so the differences are exact. SCOM, listed in KES, is unchanged and unflagged."""
+    baseline = await ms.get_flows(session, settings=settings, **subject)
+    sbic = await ms.get_flows(session, settings=settings, ticker="SBIC")
+    assert (sbic.flags, sbic.coverage_pct) == ([], Decimal("100.00"))
+    await session.execute(
+        update(TerminalEquity).where(TerminalEquity.ticker == "SBIC").values(currency="USD")
+    )
+    await session.commit()
+
+    response = await ms.get_flows(session, settings=settings, **subject)
+
+    assert response.flags == flags
+    assert (response.subject, response.as_of, response.start, response.end) == (
+        baseline.subject,
+        LATEST,
+        date(2025, 9, 30),
+        LATEST,
+    )
+    days = [point.trade_date for point in baseline.series]
+    assert len(days) == 254
+    assert [point.trade_date for point in response.series] == days
+    if "currency_mismatch" not in flags:
+        assert response == baseline
+        return
+    if "no_flow_data" in flags:
+        assert (response.status, response.coverage_pct, response.totals) == (
+            "no_flow_data",
+            Decimal("0.00"),
+            None,
+        )
+        for point in response.series:
+            assert (
+                point.foreign_net_kes,
+                point.local_net_kes,
+                point.rolling_foreign_net_kes,
+                point.turnover_kes,
+                point.foreign_net_pct_of_turnover,
+                point.cumulative_foreign_net_kes,
+            ) == (None, None, None, None, None, Decimal("0.00"))
+        return
+
+    assert (response.status, response.coverage_pct) == ("ok", Decimal("100.00"))
+    turnover_total = Decimal(0)
+    for point, whole, own in zip(response.series, baseline.series, sbic.series, strict=True):
+        assert whole.foreign_net_kes is not None and own.foreign_net_kes is not None
+        assert whole.turnover_kes is not None and own.turnover_kes is not None
+        foreign = whole.foreign_net_kes - own.foreign_net_kes
+        turnover = whole.turnover_kes - own.turnover_kes
+        turnover_total += turnover
+        assert (point.foreign_net_kes, point.local_net_kes, point.turnover_kes) == (
+            foreign,
+            -foreign,
+            turnover,
+        )
+        assert point.foreign_net_pct_of_turnover == quantize_out(foreign * 100 / turnover, "pct")
+        assert point.cumulative_foreign_net_kes == (
+            whole.cumulative_foreign_net_kes - own.cumulative_foreign_net_kes
+        )
+        if whole.rolling_foreign_net_kes is None or own.rolling_foreign_net_kes is None:
+            assert point.rolling_foreign_net_kes is None
+        else:
+            assert point.rolling_foreign_net_kes == (
+                whole.rolling_foreign_net_kes - own.rolling_foreign_net_kes
+            )
+    assert baseline.totals is not None and sbic.totals is not None
+    totals = response.totals
+    assert totals is not None
+    foreign_total = baseline.totals.foreign_net_kes - sbic.totals.foreign_net_kes
+    assert (totals.foreign_net_kes, totals.local_net_kes) == (foreign_total, -foreign_total)
+    assert totals.foreign_net_pct_of_turnover == quantize_out(
+        foreign_total * 100 / turnover_total, "pct"
+    )
+    assert (totals.sessions_with_data, totals.sessions_in_range) == (254, 254)
 
 
 # ---------------------------------------------------------------------------------------------

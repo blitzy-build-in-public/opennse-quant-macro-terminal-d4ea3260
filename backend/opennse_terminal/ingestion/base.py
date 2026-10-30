@@ -1,58 +1,19 @@
 """Shared ingestion framework: the pipeline contract, the run recorder and the run executor.
 
-Every source module (the public NSE market-statistics web table, the CBK statistical releases,
-PDF filings and CSV/Excel files) implements :class:`Pipeline`, and :func:`execute_pipeline` runs
-it the same way: fetch -> parse -> validate -> reconcile -> upsert -> record.
+The source pipelines (the public NSE market-statistics web table, the five CBK statistical
+releases and CSV/Excel imports) implement :class:`Pipeline`, and :func:`execute_pipeline` runs
+each the same way: fetch -> parse -> validate -> reconcile -> upsert in one data transaction
+holding the run's advisory lock, with the run recorded in ``terminal_ingestion_runs`` on a
+separate connection. :func:`execute_pipeline` documents the run contract (lifecycle, locking,
+committed outcome and cancellation), :class:`RunStatus` the final statuses, and
+:func:`classify_exception` the status and ``error_message`` each exception records.
 
-Run lifecycle (one call of :func:`execute_pipeline`):
-
-1. :class:`RunRecorder` inserts a ``terminal_ingestion_runs`` row with status ``running`` in its
-   own short transaction, so the run stays visible whatever happens to the data.
-2. One dedicated connection opens the data transaction *before* fetching, sets
-   ``idle_in_transaction_session_timeout = '30min'`` and takes the transaction-scoped advisory
-   lock ``pg_try_advisory_xact_lock(hashtext('terminal:' || <run name>))``. A held lock ends the
-   run ``failed`` with "lock held". PostgreSQL releases the lock when the transaction ends: on
-   commit, on rollback after an exception, and on cancellation or process death when the
-   connection closes. The lock is never taken at session level nor twice on one connection.
-   Holding it, the run records every earlier row of its run name still ``running`` as
-   ``failed`` with ``error_message`` "abandoned" (:meth:`RunRecorder.mark_abandoned`, on a
-   separate connection): their process died without recording them, for example on SIGKILL.
-3. Fetching, parsing, validation, reconciliation and the upsert all happen inside that
-   transaction, one stage after another; any exception rolls everything back. ``parse`` and
-   ``validate`` run in a worker thread, so decoding a large file never blocks the event loop.
-   The shared thresholds are applied before the upsert, and again before the commit when the
-   upsert reports rows it could not write (:meth:`Pipeline.write_rejections`).
-4. The run row is updated with its final status, counts, ``error_message`` and ``details`` on a
-   separate connection, so run-record writes never release or extend the lock. The status is the
-   data transaction's confirmed outcome: once the commit has returned, a later cleanup error or
-   cancellation does not turn the run ``failed``. The commit and both run-row writes run to
-   completion even when the run is cancelled meanwhile, so a started run never stays
-   ``running``.
-
-Final statuses:
-
-=====================  ==========================================================  ============
-Status                 Condition                                                   Data written
-=====================  ==========================================================  ============
-``succeeded``          all parsed rows valid                                       yes
-``partial``            up to 10% of parsed rows rejected; ``details.rejected``     valid rows
-                       holds the first 50
-``no_new_data``        the source has not advanced (:class:`NoNewData`)            no
-``layout_changed``     headers, table or file link missing or different, fewer     no
-                       rows than ``min_rows``, or more than 10% rejected
-                       (:class:`SourceLayoutChanged`; ``details.expected`` and
-                       ``details.found`` record the comparison)
-``blocked_by_robots``  ``robots.txt`` disallows the URL (:class:`RobotsDisallowed`)  no
-``ambiguous_session``  the trading session of a snapshot cannot be established     no
-                       (:class:`AmbiguousSession`; the evidence goes into
-                       ``details``)
-``failed``             network failure after retries (:class:`FetchFailed`), lock  no
-                       held (:class:`LockHeld`), exchange calendar not verified,
-                       a rejected PDF upload, cancellation or an unexpected
-                       error; or, as ``"abandoned"``, a run whose process died
-                       while ``running``, once a later run of its name holds
-                       the lock
-=====================  ==========================================================  ============
+Corporate PDF uploads (``POST /ingest/pdf``) are not pipelines. The filings service
+(``opennse_terminal.services.filings_service``) calls
+:func:`~opennse_terminal.ingestion.files.pdf_line_items.extract_line_items` and records the
+``pdf_filing`` audit row through :class:`RunRecorder` itself, in a data transaction of its own
+and without an advisory lock. Of this module, that path uses only :class:`RunRecorder`,
+:class:`RunStatus` and :func:`parse_decimal_text`.
 
 Units convention for every record a pipeline writes: ``*_pct`` columns hold percentage points
 (``6.80`` means 6.80%), ``*_kes`` columns whole KES (never thousands), volumes and share counts
@@ -144,7 +105,37 @@ _ABANDONED: Final = "abandoned"
 
 
 class RunStatus(StrEnum):
-    """Status of a ``terminal_ingestion_runs`` row: ``running``, then exactly one final status."""
+    """Status of a ``terminal_ingestion_runs`` row: ``running``, then exactly one final status.
+
+    The final statuses of a run of :func:`execute_pipeline` (:func:`classify_exception` maps each
+    exception that ends a run to its status):
+
+    =====================  ========================================================  ============
+    Status                 Condition                                                 Data written
+    =====================  ========================================================  ============
+    ``succeeded``          every parsed row valid                                    yes
+    ``partial``            up to 10% of parsed rows rejected; ``details.rejected``   valid rows
+                           holds the first 50
+    ``no_new_data``        the source has not advanced, or there is nothing new to   no
+                           write
+    ``layout_changed``     headers, table or file link missing or different, fewer   no
+                           rows than ``min_rows``, or more than 10% rejected;
+                           ``details.expected`` and ``details.found`` record the
+                           comparison
+    ``blocked_by_robots``  ``robots.txt`` disallows the URL                          no
+    ``ambiguous_session``  the trading session of a snapshot cannot be               no
+                           established; the dating evidence goes into ``details``
+    ``failed``             a failed fetch (for example a network failure after       no
+                           retries), lock held, exchange calendar not verified,
+                           cancellation or an unexpected error; or, with
+                           ``error_message`` ``"abandoned"``, a run whose process
+                           died while ``running``, once a later run of its name
+                           holds the lock
+    =====================  ========================================================  ============
+
+    A PDF upload's ``pdf_filing`` audit row ends ``succeeded`` or ``failed`` as
+    :func:`~opennse_terminal.services.filings_service.ingest_pdf` describes.
+    """
 
     RUNNING = "running"
     SUCCEEDED = "succeeded"
@@ -212,7 +203,8 @@ class RobotsDisallowed(IngestionError):  # noqa: N818 - names the condition, as 
 
     Attributes:
         url: The URL that may not be fetched.
-        reason: ``"disallowed"``, or ``"robots_unreachable"`` when ``robots.txt`` answered 5xx.
+        reason: ``"disallowed"``, or ``"robots_unreachable"`` when ``robots.txt`` answered 5xx or
+            429 after retries.
     """
 
     def __init__(self, url: str, reason: str = "disallowed") -> None:
@@ -290,9 +282,9 @@ def _truncate(message: str) -> str:
 def classify_exception(exc: BaseException) -> tuple[RunStatus, str]:
     """Map an exception that ended a run to its final status and ``error_message``.
 
-    ==============================  =====================  ===================================
+    ==============================  =====================  ======================================
     Exception                       Status                 ``error_message``
-    ==============================  =====================  ===================================
+    ==============================  =====================  ======================================
     :class:`SourceLayoutChanged`    ``layout_changed``     its ``message``
     :class:`RobotsDisallowed`       ``blocked_by_robots``  ``str(exc)``
     :class:`AmbiguousSession`       ``ambiguous_session``  ``str(exc)``
@@ -301,10 +293,12 @@ def classify_exception(exc: BaseException) -> tuple[RunStatus, str]:
     :class:`FetchFailed`            ``failed``             ``str(exc)``
     ``CalendarNotVerified``         ``failed``             its message
     ``asyncio.CancelledError``      ``failed``             ``"cancelled"``
-    any other exception             ``failed``             ``"<ExceptionType>: <exc>"``
-    ==============================  =====================  ===================================
+    any other exception             ``failed``             ``"unexpected_error:<ExceptionType>"``
+    ==============================  =====================  ======================================
 
-    Messages are truncated to 2,000 characters.
+    Any other exception is recorded by its type name only, because its text can carry SQL with
+    its bound parameters, driver details or connection details. Messages are truncated to 2,000
+    characters.
     """
     if isinstance(exc, SourceLayoutChanged):
         return RunStatus.LAYOUT_CHANGED, _truncate(exc.message)
@@ -320,7 +314,7 @@ def classify_exception(exc: BaseException) -> tuple[RunStatus, str]:
         return RunStatus.FAILED, _truncate(str(exc))
     if isinstance(exc, asyncio.CancelledError):
         return RunStatus.FAILED, "cancelled"
-    return RunStatus.FAILED, _truncate(f"{type(exc).__name__}: {exc}")
+    return RunStatus.FAILED, _truncate(f"unexpected_error:{type(exc).__name__}")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -802,7 +796,7 @@ class RunRecorder:
         rows_rejected: int = 0,
     ) -> uuid.UUID:
         """Write a complete run row in one call (:meth:`start` then :meth:`finish`) and return
-        its id; for audit rows such as a PDF upload's ``pdf_filing`` run."""
+        its id, for a run whose outcome is known before it is recorded."""
         run_id = await self.start(pipeline=pipeline, trigger=trigger, source_url=source_url)
         await self.finish(
             run_id,
@@ -1130,7 +1124,9 @@ def _log_code(exc: BaseException) -> str:
 
     Exception messages, reasons and tracebacks can carry input file paths, file names, URLs and
     SQL statements with their bound parameters, so a log line gets only fixed codes and type
-    names:
+    names. A :class:`FetchFailed` reason is logged only as a code in ``_FETCH_FAILED_CODES`` or
+    one matching ``_HTTP_STATUS_REASON``; any other text in it is never logged, and an exception
+    type is taken from the exception's ``__cause__``, never from the reason.
 
     ==============================  ===================================================
     Exception                       Logged as
@@ -1138,44 +1134,20 @@ def _log_code(exc: BaseException) -> str:
     ``asyncio.CancelledError``      ``cancelled``
     :class:`LockHeld`               ``lock held``
     :class:`FetchFailed`            ``fetch_failed``, then ``:<code>`` when its
-                                    ``reason``, up to any ``:``, is a code the
-                                    ingestion modules raise (``http_<status>``,
-                                    ``robots_http_<status>``, ``invalid_url``,
-                                    ``unsupported_url``, ``url_has_userinfo``,
-                                    ``unsupported_content_encoding``,
-                                    ``invalid_content_encoding``,
-                                    ``too_many_redirects``, ``invalid_redirect``,
-                                    ``response_too_large``, ``too_many_rows``,
-                                    ``file_too_large``, ``file_not_found``,
-                                    ``not_a_file``, ``unreadable_file``,
-                                    ``xlsx_too_many_members``,
-                                    ``xlsx_expanded_too_large``,
-                                    ``xlsx_unsupported_member``,
-                                    ``xlsx_worksheet_too_large``,
-                                    ``xlsx_parts_too_large``,
-                                    ``xlsx_size_mismatch``,
-                                    ``browser_not_installed``,
-                                    ``browser_launch_failed``,
-                                    ``navigation_failed``,
-                                    ``sector_render_timeout``, ``run_timeout``,
-                                    ``browser_error``), then ``:<type>`` of the
-                                    exception it was raised from, for example
-                                    ``fetch_failed:http_404``,
-                                    ``fetch_failed:unreadable_file:PermissionError``,
-                                    ``fetch_failed:xlsx_size_mismatch:error``
-                                    or ``fetch_failed:ConnectTimeout``
+                                    ``reason``, up to any ``:``, is such a code, then
+                                    ``:<type>`` of its ``__cause__``
+                                    (:func:`_fetch_failed_code`), for example
+                                    ``fetch_failed:http_404`` or
+                                    ``fetch_failed:ConnectTimeout``
     ``CalendarNotVerified``         ``calendar_not_verified:<year>``
-    :class:`RobotsDisallowed`       its ``reason`` when it is ``disallowed`` or
-                                    ``robots_unreachable``, else its type name
+    :class:`RobotsDisallowed`       its ``reason`` when in ``_ROBOTS_REASONS``, else
+                                    its type name
     :class:`AmbiguousSession`       its type name; the dating evidence is recorded in
                                     the run's ``details``, never logged
     :class:`SourceLayoutChanged`    ``layout_changed``
     :class:`NoNewData`              ``no_new_data``
     any other exception             its type name, for example ``IntegrityError``
     ==============================  ===================================================
-
-    Any other text in a reason is never logged: an exception type it names is taken from the
-    exception's ``__cause__``, not from the reason.
     """
     if isinstance(exc, asyncio.CancelledError):
         return "cancelled"
@@ -1248,7 +1220,8 @@ async def execute_pipeline(
 ) -> RunResult:
     """Run one pipeline end to end and record it in ``terminal_ingestion_runs``.
 
-    1. A ``running`` row is committed through :class:`RunRecorder`.
+    1. A ``running`` row is committed through :class:`RunRecorder` in its own short transaction,
+       so the run stays visible whatever happens to the data.
     2. A :class:`~opennse_terminal.ingestion.http.PoliteClient` is opened for the run, unless
        ``http`` is injected (tests); an injected client is neither opened nor closed here, and
        keeps its own spacing. The opened client spaces its requests on ``spacing`` when given
@@ -1257,20 +1230,24 @@ async def execute_pipeline(
        across the runs), else on a spacing of its own; its cookies and ``robots.txt`` cache are
        the run's own either way.
     3. One dedicated connection opens the data transaction before fetching, sets the 30-minute
-       ``idle_in_transaction_session_timeout`` and takes
-       ``pg_try_advisory_xact_lock(hashtext('terminal:' || run_name))``; a held lock raises
-       :class:`LockHeld`. With the lock held, earlier rows of ``run_name`` still ``running``
-       are recorded ``failed`` ("abandoned") on a separate connection
-       (:meth:`RunRecorder.mark_abandoned`; best effort, an error is logged at WARNING by type
-       and the run goes on). Fetch, parse, validate, reconcile, the thresholds of
-       :func:`evaluate_thresholds` and the upsert run inside it, in that order, then the
+       ``idle_in_transaction_session_timeout`` and takes the transaction-scoped advisory lock
+       ``pg_try_advisory_xact_lock(hashtext('terminal:' || run_name))``, never at session level
+       nor twice on one connection; a held lock raises :class:`LockHeld`. With the lock held,
+       earlier rows of ``run_name`` still ``running``, whose process died without recording
+       them (for example on SIGKILL), are recorded ``failed`` ("abandoned") on a separate
+       connection (:meth:`RunRecorder.mark_abandoned`; best effort, an error is logged at
+       WARNING by type and the run goes on). Fetch, parse, validate, reconcile, the thresholds
+       of :func:`evaluate_thresholds` and the upsert run inside it, in that order, then the
        thresholds again when :meth:`Pipeline.write_rejections` reports rows the upsert could not
-       write; ``parse`` and ``validate`` run in a worker thread. It commits on success and rolls
-       back on any exception, and PostgreSQL releases the lock either way.
-    4. The run row is updated with the final status (see :func:`classify_exception`), counts,
-       ``error_message`` and ``details``: ``ctx.details``, the exception's evidence,
-       ``duration_seconds`` (seconds to 3 decimal places, measured with
-       :func:`time.monotonic_ns`) and the first 50 rejected rows.
+       write; ``parse`` and ``validate`` run in a worker thread, so decoding a large file never
+       blocks the event loop. It commits on success and rolls back on any exception. PostgreSQL
+       releases the lock when the transaction ends: on commit, on rollback after an exception,
+       and on cancellation or process death when the connection closes.
+    4. The run row is updated on a separate connection, so run-record writes never release or
+       extend the lock, with the final status (:class:`RunStatus`; :func:`classify_exception`
+       maps the exception that ended the run), counts, ``error_message`` and ``details``:
+       ``ctx.details``, the exception's evidence, ``duration_seconds`` (seconds to 3 decimal
+       places, measured with :func:`time.monotonic_ns`) and the first 50 rejected rows.
 
     Only ``succeeded`` and ``partial`` runs write data (``partial`` writes the valid rows only).
     Pipeline exceptions become statuses and are not raised.

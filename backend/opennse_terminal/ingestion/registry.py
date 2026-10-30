@@ -255,7 +255,10 @@ async def run_pipeline(
             :func:`create_pipeline`, before any engine is created or run row written.
         ValueError: ``settings.database_url`` is not a usable ``postgresql+asyncpg://`` URL.
         Exception: What ``execute_pipeline`` propagates: an error writing the run row.
-        asyncio.CancelledError: Re-raised once the cancelled run is recorded ``failed``.
+        asyncio.CancelledError: Re-raised once the cancelled run's row is final: ``failed``
+            ("cancelled") when the cancellation came before its data commit; otherwise the
+            committed status and ``rows_written`` stand. A cancellation that arrives while the
+            engine is disposed propagates too, the run's row being final already.
     """
     pipeline = create_pipeline(name, settings, trade_date=trade_date, limit=limit)
     engine = build_engine(settings)

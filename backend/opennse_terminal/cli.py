@@ -18,8 +18,14 @@ Exit codes (:data:`EXIT_CODES` for run statuses): ``0`` succeeded, partial or no
 failed, or from ``seed`` its own invalid arguments; ``2`` invalid arguments to any other
 command, or from ``seed`` the schema is not at head; ``3`` layout changed; ``4`` blocked by
 robots.txt; ``5`` ambiguous NSE session; ``130`` interrupted (Ctrl-C); ``143`` terminated by
-SIGTERM during ``ingest``, ``import`` or ``seed``, after the run was recorded ``failed``
-("cancelled").
+SIGTERM during ``ingest``, ``import`` or ``seed``. After ``130`` or ``143`` the interrupted run is
+rolled back and recorded ``failed`` ("cancelled") when the cancellation came before its data
+commit. An ``ingest`` or ``import`` commit already under way completes and the committed status
+stands. A ``seed`` run keeps its ``succeeded`` row and its data only if its commit had reached the
+server, and is otherwise rolled back and recorded ``failed`` ("cancelled") as well (see
+``opennse_terminal.seed.seed_terminal_db.seed``). The exit code therefore does not say whether
+data was written: the run's ``terminal_ingestion_runs`` row does (its ``status``, and for
+``ingest`` and ``import`` ``details.after_commit_error``).
 
 Importing this module is cheap: the migrations, seeder, ingestion and scheduler modules are
 imported inside the handlers, and the registry and importer modules that supply the argparse
@@ -85,8 +91,12 @@ EXIT_INTERRUPTED: Final = 130
 """128 + SIGINT: the shell's code for a command stopped by Ctrl-C."""
 EXIT_TERMINATED: Final = 143
 """128 + SIGTERM: returned when ``ingest``, ``import`` or ``seed`` is stopped by SIGTERM (see
-:func:`run_terminable`), after its run was recorded ``failed`` ("cancelled") and its uncommitted
-changes rolled back."""
+:func:`run_terminable`). The run it stopped is recorded ``failed`` ("cancelled"), with its
+uncommitted changes rolled back, when the cancellation came before its data commit. An ``ingest``
+or ``import`` commit already under way completes and the committed status stands; a ``seed`` run
+keeps its ``succeeded`` row and its data only if its commit had reached the server (see
+``opennse_terminal.seed.seed_terminal_db.seed``). The run's ``terminal_ingestion_runs`` row, not
+this code, therefore tells whether data was written."""
 
 EXIT_CODES: Final[Mapping[str, int]] = MappingProxyType(
     {
@@ -132,7 +142,13 @@ exit codes:
   5    ambiguous_session: the NSE session could not be dated; re-run with --trade-date
   130  interrupted (Ctrl-C); uncommitted changes were rolled back
   143  terminated (SIGTERM) during ingest, import or seed; uncommitted changes
-       were rolled back and the run recorded failed (cancelled)
+       were rolled back
+       After 130 or 143, a run stopped before its data commit is recorded failed
+       (cancelled). An ingest or import commit already under way completes and
+       its status stands. A seed run keeps its data and succeeded status only
+       if its commit had reached the server; otherwise it is recorded failed
+       (cancelled) as well. The run's row in terminal_ingestion_runs tells
+       whether data was written.
 """
 
 _MIGRATE_DESCRIPTION: Final = """\
@@ -527,12 +543,19 @@ def run_terminable(main: Coroutine[Any, Any, _T]) -> _T:
     SIGTERM at its default disposition, which kills the process before an ingestion run or the
     seeder can roll back and record itself. Here the first SIGTERM cancels the main task too, and
     only it: tasks ``main`` started, such as ``execute_pipeline``'s commit and run-row writes, run
-    on until the main task has waited for them. A run is therefore recorded ``failed``
-    ("cancelled") and its data transaction rolled back, and once ``main`` has ended cancelled,
-    :class:`TerminatedError` is raised. A further SIGTERM while ``main`` unwinds is logged and
-    ignored. An outcome other than a cancellation (a result, or another exception) is kept even
-    after SIGTERM, as ``asyncio.run`` keeps it after Ctrl-C; a ``CancelledError`` that no SIGTERM
-    preceded propagates unchanged.
+    on until the main task has waited for them. A run cancelled before its data commit is
+    therefore rolled back and recorded ``failed`` ("cancelled"). An ingestion run's commit already
+    under way completes, because ``execute_pipeline`` waits for it through the cancellation, and
+    the run's committed status stands. The seeder awaits its commit directly, so a seed run keeps
+    its ``succeeded`` row and its data only if its commit had reached the server, as it has when
+    the cancellation comes after the seeder's ``seed`` returned, and is otherwise rolled back and
+    recorded ``failed`` ("cancelled") as well (see ``opennse_terminal.seed.seed_terminal_db.seed``).
+    Once ``main`` has ended cancelled, :class:`TerminatedError` is raised whichever way the run
+    ended, so what was written is told by the run's ``terminal_ingestion_runs`` row, not by the
+    exception. A further SIGTERM while ``main`` unwinds is logged and ignored. An outcome other
+    than a cancellation (a result, or another exception) is kept even after SIGTERM, as
+    ``asyncio.run`` keeps it after Ctrl-C; a ``CancelledError`` that no SIGTERM preceded
+    propagates unchanged.
 
     The handler is installed only in the main thread and only while SIGTERM has its default
     disposition (see :func:`_install_sigterm_handler`), so a host's own handler, an ignored
@@ -778,8 +801,11 @@ async def _ingest(
 def _cmd_ingest(args: argparse.Namespace) -> int:
     """``ingest NAME``, or ``ingest cbk``: exit with the first non-zero code in run order.
 
-    The runs go through :func:`run_terminable`, so SIGTERM, like Ctrl-C, records the current run
-    ``failed`` ("cancelled") and stops the sequence (:class:`TerminatedError`).
+    The runs go through :func:`run_terminable`, so SIGTERM, like Ctrl-C, cancels the current run
+    and stops the sequence (:class:`TerminatedError`). That run is recorded ``failed``
+    ("cancelled") when the cancellation came before its data commit; otherwise its committed
+    status stands. Runs earlier in the sequence keep their recorded results, and later ones do
+    not start.
     """
     from opennse_terminal.ingestion.registry import CBK_PIPELINES
 
@@ -805,8 +831,9 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
 def _cmd_import(args: argparse.Namespace) -> int:
     """``import KIND PATH [--sheet NAME]`` through ``tabular_import.import_file``.
 
-    The import goes through :func:`run_terminable`, so SIGTERM, like Ctrl-C, records the run
-    ``failed`` ("cancelled") and rolls its data back (:class:`TerminatedError`).
+    The import goes through :func:`run_terminable`, so SIGTERM, like Ctrl-C, cancels the run
+    (:class:`TerminatedError`). It is rolled back and recorded ``failed`` ("cancelled") when the
+    cancellation came before its data commit; otherwise its committed status stands.
     """
     from opennse_terminal.ingestion.files.tabular_import import import_file
 
@@ -929,10 +956,13 @@ def main(argv: list[str] | None = None) -> int:
       invalid arguments. A ``SystemExit`` raised by a handler becomes its code the same way
       (``None`` is 0; a non-integer code is logged at ERROR by its type and returns 1).
     * Ctrl-C, while parsing or while a command runs, logs one WARNING and returns 130.
-    * SIGTERM while ``ingest`` or ``import`` runs (:func:`run_terminable`) cancels the run, which
-      is recorded ``failed`` ("cancelled") with its data rolled back, then logs one WARNING and
-      returns 143. ``migrate`` keeps SIGTERM's default disposition, and ``scheduler`` handles it
-      itself as a request to stop (exit 0).
+    * SIGTERM while ``ingest`` or ``import`` runs (:func:`run_terminable`) cancels the run, then
+      logs one WARNING and returns 143. As after Ctrl-C, the run is recorded ``failed``
+      ("cancelled") with its data rolled back when the cancellation came before its data commit;
+      otherwise the commit already under way completes and the committed status stands, so the
+      run's ``terminal_ingestion_runs`` row, not the exit code, tells whether data was written.
+      ``migrate`` keeps SIGTERM's default disposition, and ``scheduler`` handles it itself as a
+      request to stop (exit 0).
     * Any other exception that escapes parsing or a handler, such as a failed lazy import, logs
       one ERROR naming the command (``opennse-terminal`` before one is parsed) and the
       exception's type, never its text or traceback, which can carry the database URL, and
@@ -960,13 +990,17 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("%s exited with a non-integer status: %s", command, type(exc.code).__name__)
         return EXIT_FAILED
     except KeyboardInterrupt:
-        # asyncio.run cancels the running task first, so an ingestion run is recorded failed
-        # ("cancelled") and its data transaction rolled back, as is a migration's.
+        # asyncio.run cancels the running task first and lets it unwind. A migration interrupted
+        # before its commit is rolled back, as is an ingestion run, which is recorded failed
+        # ("cancelled"); an ingestion commit already under way completes and the run's committed
+        # status stands.
         logger.warning("interrupted; uncommitted changes were rolled back")
         return EXIT_INTERRUPTED
     except TerminatedError:
-        # run_terminable cancelled the running task on SIGTERM and let it unwind, so the run is
-        # recorded failed ("cancelled") and its data transaction rolled back.
+        # run_terminable cancelled the running ingest or import on SIGTERM and let it unwind (the
+        # seeder's main handles its own). As on Ctrl-C, the run is rolled back and recorded failed
+        # ("cancelled") when the cancellation came before its data commit, and otherwise keeps its
+        # committed status.
         logger.warning("terminated (SIGTERM); uncommitted changes were rolled back")
         return EXIT_TERMINATED
     except Exception as exc:
