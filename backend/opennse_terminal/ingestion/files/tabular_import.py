@@ -385,9 +385,17 @@ _DMY_DATE_RE: Final = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{4})")
 _XLSX_WORKSHEET_RE: Final = re.compile(r"xl/worksheets/[^/]+\.xml", re.IGNORECASE)
 _HUNDRED: Final = Decimal(100)
 _DEFAULT_PERIOD_TYPE: Final = "FY"
-_SESSION_KINDS: Final[frozenset[ImportKind]] = frozenset({"daily_prices", "foreign_flows"})
-"""Kinds whose ``trade_date`` names an observed session, so it may not be after today: a future
-row would be read as history and move every market endpoint's default ``as_of``."""
+_OBSERVATION_DATE_COLUMNS: Final[Mapping[ImportKind, str]] = MappingProxyType(
+    {
+        "daily_prices": "trade_date",
+        "foreign_flows": "trade_date",
+        "macro_indicators": "observation_date",
+    }
+)
+"""Per kind, the date column that names an observation, so it may not be after today: a future
+row would be read as observed history. A price or flow ``trade_date`` would move every market
+endpoint's default ``as_of``; a macro ``observation_date`` would become the macro overview's latest
+value and move its window into the future."""
 _IN_CHUNK: Final = 5_000
 _MISSING_KEYS_SAMPLE: Final = 50
 
@@ -1513,8 +1521,9 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
 
     Stages: :meth:`fetch` reads the file (at most :data:`MAX_FILE_BYTES`); :meth:`parse` reads
     the rows, checks the headers and converts the kind's columns; :meth:`validate` mirrors every
-    CHECK and length limit of the target table and rejects a ``daily_prices`` or
-    ``foreign_flows`` row dated after today (``future_date:trade_date``); :meth:`reconcile`
+    CHECK and length limit of the target table and rejects a row dated after today: a
+    ``daily_prices`` or ``foreign_flows`` ``trade_date`` (``future_date:trade_date``) or a
+    ``macro_indicators`` ``observation_date`` (``future_date:observation_date``); :meth:`reconcile`
     collapses repeated keys and checks stored data (unknown tickers, ISIN owners, currency
     conflicts, missing price rows); :meth:`upsert` writes through ``opennse_terminal.db.upsert``
     and reports, through :meth:`write_rejections`, each fundamentals row whose period a
@@ -1537,7 +1546,8 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         sheet: The worksheet of an ``.xlsx`` file; the first one when ``None`` or empty.
         now: Returns the current timezone-aware time; defaults to now in ``settings.tzinfo``.
             :meth:`validate` calls it once and rejects a ``daily_prices`` or ``foreign_flows`` row
-            dated after that day in ``settings.tzinfo`` (``future_date:trade_date``).
+            dated after that day in ``settings.tzinfo`` (``future_date:trade_date``), and a
+            ``macro_indicators`` row dated after it (``future_date:observation_date``).
 
     Raises:
         ValueError: ``kind`` is not an import kind, the extension is not ``.csv`` or ``.xlsx``,
@@ -1745,8 +1755,10 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         - ``macro_indicators``: a row with no indicator value (``no_values``).
         - ``daily_prices`` and ``foreign_flows``: a ``trade_date`` after today in
           ``settings.tzinfo`` (``future_date:trade_date``), because a future row would be read
-          as an observed session; today itself is accepted. Today is read once per call from the
-          pipeline's ``now``.
+          as an observed session. ``macro_indicators``: an ``observation_date`` after today in
+          ``settings.tzinfo`` (``future_date:observation_date``), because a future row would be
+          read as an observed value. Today itself is accepted, and it is read once per call from
+          the pipeline's ``now``.
 
         A cell that failed to convert is reported by its conversion code only, never also as
         ``missing_value``, ``no_values`` or ``future_date``. Rejected rows are reported with their
@@ -1802,15 +1814,17 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         """The kind's own rules; fills defaults and derived values into ``values``.
 
         ``failed`` names the columns whose cells did not convert: a row with an unconvertible
-        value is reported for that cell, not as ``no_values``. ``today`` is the latest
-        ``trade_date`` a session kind accepts; an unconvertible date is ``None`` here, so it is
+        value is reported for that cell, not as ``no_values``. ``today`` is the latest date a
+        kind of :data:`_OBSERVATION_DATE_COLUMNS` accepts in its observation column
+        (``trade_date`` or ``observation_date``); an unconvertible date is ``None`` here, so it is
         never also reported as ``future_date``.
         """
         codes: list[str] = []
-        if self.kind in _SESSION_KINDS:
-            trade_date = _date(values, "trade_date")
-            if trade_date is not None and trade_date > today:
-                codes.append("future_date:trade_date")
+        date_column = _OBSERVATION_DATE_COLUMNS.get(self.kind)
+        if date_column is not None:
+            observed = _date(values, date_column)
+            if observed is not None and observed > today:
+                codes.append(f"future_date:{date_column}")
         if self.kind == "equities":
             free_float = _decimal(values, "free_float_pct")
             if free_float is not None and not 0 <= free_float <= _HUNDRED:
@@ -2377,7 +2391,8 @@ async def import_file(
       currency differs from the stored row's is rejected (``currency_conflict``).
     - ``macro_indicators`` (observation_date; the eight indicator columns):
       ``terminal_macro_indicators`` on ``observation_date``, COALESCE-merged with
-      ``source_by_field`` entries ``csv_import``.
+      ``source_by_field`` entries ``csv_import``. A row dated after today in ``settings.tzinfo``
+      is rejected (``future_date:observation_date``).
     - ``foreign_flows`` (ticker, trade_date, foreign_net_flow_kes): sets only the flow and
       ``flow_source = 'csv_import'`` of existing price rows; rows without one, and rows dated
       after today in ``settings.tzinfo`` (``future_date:trade_date``), are rejected.

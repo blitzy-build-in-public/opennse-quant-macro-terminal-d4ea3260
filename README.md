@@ -541,9 +541,11 @@ session on or before the run's date in `TERMINAL_TIMEZONE`; otherwise the run en
 Headers are lowercased and trimmed, with spaces replaced by underscores. Thousands separators are
 stripped, parentheses mean negative, an empty cell is null, and dates are `YYYY-MM-DD` or
 `DD/MM/YYYY`. A `daily_prices` or `foreign_flows` row whose `trade_date` is after today in
-`TERMINAL_TIMEZONE` (Africa/Nairobi) is rejected (`future_date:trade_date`). Rows repeating a key
-are collapsed, the last one winning; if that row is rejected, every row of its key is rejected
-with it. Each import is recorded as `csv_import:<kind>`.
+`TERMINAL_TIMEZONE` (Africa/Nairobi) is rejected (`future_date:trade_date`), and so is a
+`macro_indicators` row whose `observation_date` is after today in `TERMINAL_TIMEZONE`
+(`future_date:observation_date`). Rows repeating a key are collapsed, the last one winning; if
+that row is rejected, every row of its key is rejected with it. Each import is recorded as
+`csv_import:<kind>`.
 
 Every run is recorded in `terminal_ingestion_runs` and ends with one of these statuses:
 

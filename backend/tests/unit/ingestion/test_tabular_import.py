@@ -2408,36 +2408,43 @@ async def test_validate_rejects_a_row_with_its_reason_codes(
 
 
 @pytest.mark.parametrize(
-    ("kind", "trade_date", "accepted", "reasons"),
+    ("kind", "column", "text", "accepted", "reasons"),
     [
-        pytest.param(kind, text, accepted, reasons, id=f"{kind}-{label}")
-        for kind in ("daily_prices", "foreign_flows")
+        # The past row is the kind's baseline, so its date is always accepted last.
+        pytest.param(kind, column, text, [*accepted, past], reasons, id=f"{kind}-{label}")
+        for kind, column, past in (
+            ("daily_prices", "trade_date", SESSION),
+            ("foreign_flows", "trade_date", SESSION),
+            ("macro_indicators", "observation_date", date(2026, 9, 30)),
+        )
         for label, text, accepted, reasons in (
             ("today", "2026-10-30", [NAIROBI_TODAY], []),
             ("today-day-month-year", "30/10/2026", [NAIROBI_TODAY], []),
-            ("tomorrow", "2026-10-31", [], ["future_date:trade_date"]),
-            ("future-day-month-year", "31/12/2026", [], ["future_date:trade_date"]),
+            ("tomorrow", "2026-10-31", [], [f"future_date:{column}"]),
+            ("future-day-month-year", "31/12/2026", [], [f"future_date:{column}"]),
             # Not a date at all, so reported by its conversion code only.
-            ("impossible-future-date", "31/11/2026", [], ["invalid_date:trade_date"]),
+            ("impossible-future-date", "31/11/2026", [], [f"invalid_date:{column}"]),
         )
     ],
 )
-async def test_validate_rejects_a_trade_date_after_today_in_nairobi(
+async def test_validate_rejects_a_date_after_today_in_nairobi(
     tmp_path: Path,
     kind: ImportKind,
-    trade_date: str,
+    column: str,
+    text: str,
     accepted: list[date],
     reasons: list[str],
 ) -> None:
-    """Today is the Nairobi date of the injected clock, read once for the whole file: a session
-    kind accepts it and rejects any later ``trade_date``, which counts toward the thresholds."""
+    """Today is the Nairobi date of the injected clock, read once for the whole file: a kind whose
+    date names an observation (a price or flow ``trade_date``, a macro ``observation_date``)
+    accepts it and rejects any later date, which counts toward the thresholds."""
     readings: list[datetime] = []
 
     def clock() -> datetime:
         readings.append(FROZEN_NOW)
         return FROZEN_NOW
 
-    row = {**VALID_CELLS[kind], "trade_date": trade_date}
+    row = {**VALID_CELLS[kind], column: text}
     # A second row, dated in the past: the clock is read once per file, never once per row.
     path = _write_csv(
         tmp_path / f"{kind}.csv",
@@ -2445,10 +2452,7 @@ async def test_validate_rejects_a_trade_date_after_today_in_nairobi(
     )
     staged = await _stage(kind, path, now=clock)
     assert len(readings) == 1
-    assert [record.values["trade_date"] for record in staged.outcome.valid] == [
-        *accepted,
-        SESSION,
-    ]
+    assert [record.values[column] for record in staged.outcome.valid] == accepted
     assert staged.outcome.rejected == [
         RejectedRow(index=2, reason=reason, row=row) for reason in reasons
     ]
@@ -4215,6 +4219,54 @@ async def test_a_price_row_dated_after_today_is_rejected_and_writes_nothing(
     assert await _stored_prices(engine) == before
 
 
+async def test_a_macro_row_dated_after_today_is_rejected_and_writes_nothing(
+    seeded_database: _Clone, tmp_path: Path
+) -> None:
+    """Inflation dated 2027-06-30, imported on 2026-10-30 in Nairobi: its only row is rejected, so
+    the run is ``layout_changed`` and the latest stored ``observation_date``, the macro overview's
+    latest value and the end of its window, stays the seeded 2026-09-30."""
+    engine = seeded_database.engine
+
+    async def stored() -> StoredRows:
+        return await _rows_by_key(
+            engine, TerminalMacroIndicator, ("observation_date",), MACRO_READ_COLUMNS
+        )
+
+    before = await stored()
+    assert max(day for (day,) in before) == date(2026, 9, 30)
+    path = _write_csv(
+        tmp_path / "macro.csv", [("observation_date", "inflation_yoy_pct"), ("2027-06-30", "5.55")]
+    )
+    pipeline = TabularImportPipeline(
+        seeded_database.settings, kind="macro_indicators", path=path, now=lambda: FROZEN_NOW
+    )
+
+    result = await execute_pipeline(pipeline, engine, trigger="cli")
+
+    assert (result.status, result.rows_fetched, result.rows_written, result.rows_rejected) == (
+        RunStatus.LAYOUT_CHANGED,
+        1,
+        0,
+        1,
+    )
+    assert result.details["rejected"] == [
+        {
+            "index": 2,
+            "reason": "future_date:observation_date",
+            "row": {"observation_date": "2027-06-30", "inflation_yoy_pct": "5.55"},
+        }
+    ]
+    assert await _run_row(engine, result.run_id) == {
+        "pipeline": "csv_import:macro_indicators",
+        "trigger": "cli",
+        "status": "layout_changed",
+        "rows_fetched": 1,
+        "rows_written": 0,
+        "rows_rejected": 1,
+    }
+    assert await stored() == before
+
+
 EQUITY_READ_COLUMNS = (
     "isin",
     "company_name",
@@ -4761,8 +4813,16 @@ async def test_macro_indicators_merge_one_column_and_insert_a_new_month(
 
     before = await stored()
     assert set(before) == {(september,)}
+    # A fixed clock on 2026-11-02 in Nairobi, so the October row is past: on the real clock it is
+    # a future observation (future_date:observation_date) on any day before 2026-10-31.
+    pipeline = TabularImportPipeline(
+        seeded_database.settings,
+        kind="macro_indicators",
+        path=path,
+        now=lambda: datetime(2026, 11, 2, 9, 0, tzinfo=UTC),
+    )
 
-    result = await import_file("macro_indicators", path, settings=seeded_database.settings)
+    result = await execute_pipeline(pipeline, engine, trigger="cli")
 
     assert (result.status, result.rows_fetched, result.rows_written, result.rows_rejected) == (
         RunStatus.SUCCEEDED,
