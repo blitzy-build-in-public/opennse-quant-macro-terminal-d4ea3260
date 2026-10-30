@@ -8,21 +8,29 @@ the file's bytes, and never touches an extracted value.
 
 Limits, in the order they apply:
 
-1. The whole request is bounded before multipart parsing by :class:`TerminalUploadRoute`, the
-   route class of this sub-router: ``TERMINAL_PDF_MAX_BYTES`` plus 1 MiB of multipart overhead,
-   answered with 413 ``request_too_large``. FastAPI parses and spools a multipart body before the
-   endpoint runs, so a check inside the endpoint could not bound it.
+1. The whole request and its form parts are bounded by :class:`TerminalUploadRoute`, the route
+   class of this sub-router, before any dependency runs. The request may carry
+   ``TERMINAL_PDF_MAX_BYTES`` plus 1 MiB of multipart overhead, and beyond it is answered with 413
+   ``request_too_large``: a declared ``Content-Length`` is checked before the body is read, and a
+   chunked body is counted while the multipart parser streams it, never cached whole. The form
+   may carry one file part and at most 32 other fields of at most 4 KiB each; beyond these, or
+   for any other multipart body the parser refuses (for example one without a boundary), the
+   answer is the framework's 400 with a string ``detail``. FastAPI parses and spools a multipart
+   body before the endpoint runs, so a check inside the endpoint could not bound it.
 2. The file itself, judged without loading it into memory: a spooled size above
    ``TERMINAL_PDF_MAX_BYTES`` is 413 ``file_too_large``, and a file whose first five bytes are not
    ``%PDF-`` is 415 ``not_a_pdf``.
 3. At most ``TERMINAL_PDF_MAX_CONCURRENCY`` (2) parses run at once per mounted router, which is
    per process for the standalone app and for a host that mounts ``terminal_router`` once. A
    request beyond it is answered at once with 429 ``ingest_busy`` and ``Retry-After: 5``; it
-   never queues and its file is never read. Each mount counts its own active parses across
-   settings changes: a lower limit applies to new requests at once while parses admitted under
-   the old one finish, so a request is admitted only while fewer parses than the limit in force
-   are running. Only an admitted request reads its file into memory, inside its parse slot, so
-   upload memory is bounded by the parse limit rather than by the number of concurrent uploads.
+   never queues, and its file is not read beyond the five magic bytes the type check reads.
+   Each mount counts its own active parses across settings changes: a lower limit applies to new
+   requests at once while parses admitted under the old one finish, so a request is admitted
+   only while fewer parses than the limit in force are running. Before admission a request holds
+   in memory at most its form fields and the first 1 MiB of its file, which the multipart parser
+   spools to a temporary file once it grows past that. Only an admitted request reads its whole
+   file into memory, inside its parse slot, so whole-file memory grows with admitted parses
+   while each other upload holds a small, bounded amount.
 
 A request rejected by these limits writes nothing and records no run row. A client that
 disconnects while its admitted request is served cancels it. Before the service's data commit
@@ -72,7 +80,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from starlette.concurrency import run_in_threadpool
-from starlette.requests import ClientDisconnect
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import Message, Receive
 
 from opennse_terminal.api.deps import (
@@ -123,8 +131,17 @@ _NO_NUL_PATTERN: Final = r"^[^\x00]*$"
 # is used only when ingest_pdf is awaited directly without it. The model has no fields, so the
 # shared instance holds no state.
 _NO_QUERY_PARAMS: Final = NoQueryParams()
-# FastAPI's own answer to a body it cannot read, reused when the client disconnects mid-body.
+# FastAPI's own answer to a body it cannot read, reused when the route's form parsing cannot
+# read the body, as when the client disconnects mid-body.
 _BODY_ERROR_MESSAGE: Final = "There was an error parsing the body"
+# File parts the upload form may carry: it declares one, ``file``.
+_MAX_FORM_FILES: Final = 1
+# Non-file parts the upload form may carry. It declares seven fields, ``items`` repeatable over
+# six names, so 12 parts carry every accepted request; 32 leaves room for repeated ``items``.
+_MAX_FORM_FIELDS: Final = 32
+# Bytes per non-file part. The longest accepted value, a 200-character ``company_name``, is at
+# most 800 bytes of UTF-8.
+_MAX_FORM_FIELD_BYTES: Final = 4096
 # ASGI scope key under which the route hands its mount's parse limiter to the endpoint.
 _PARSE_LIMITER_SCOPE_KEY: Final = "opennse_terminal.pdf_parse_limiter"
 # Seconds an over-limit body is drained at most: long enough for what a proxy that forwarded just
@@ -214,25 +231,73 @@ async def _discard_body(receive: Receive, allowance: int) -> None:
             raise
 
 
-class TerminalUploadRoute(APIRoute):
-    """Route class of the ingest sub-router: bounds the whole request before the body is parsed.
+async def _parse_form(request: Request) -> None:
+    """Parse the form of ``request`` within the upload form's part limits and cache it on the
+    request, where FastAPI's own form parsing finds it instead of parsing the body again.
 
-    The limit is ``pdf_max_bytes`` of the request's settings plus
+    The body is read through ``request.stream()`` as the parser consumes it, so a counting
+    ``receive`` behind ``request`` sees every byte. A multipart body may carry one file part
+    (:data:`_MAX_FORM_FILES`) and at most :data:`_MAX_FORM_FIELDS` other fields of at most
+    :data:`_MAX_FORM_FIELD_BYTES` each, and a URL-encoded body the same fields. The parser keeps
+    each field in memory and spools the file: its first 1 MiB in memory, all of it in a
+    temporary file once it grows past that. A body of any other type is not read, and the form
+    is empty. Failures are answered as FastAPI answers them when it parses a form:
+
+    * a body the parser refuses, such as a multipart body without a boundary, a second file
+      part, a field too many or a field over the size limit, raises Starlette's
+      ``HTTPException`` 400 with the parser's message as a string ``detail`` (for example
+      ``Too many files. Maximum number of files is 1.``), unchanged;
+    * :class:`_RequestTooLargeError`, raised by a counting ``receive``, propagates;
+    * any other failure to read the body, a client disconnect included, raises
+      ``HTTPException`` 400 ``There was an error parsing the body``.
+
+    The parser closes every file it spooled before a failure leaves it, and a cancellation
+    propagates.
+    """
+    try:
+        await request.form(
+            max_files=_MAX_FORM_FILES,
+            max_fields=_MAX_FORM_FIELDS,
+            max_part_size=_MAX_FORM_FIELD_BYTES,
+        )
+    except (StarletteHTTPException, _RequestTooLargeError):
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=_BODY_ERROR_MESSAGE
+        ) from exc
+
+
+class TerminalUploadRoute(APIRoute):
+    """Route class of the ingest sub-router: bounds the whole request and its form parts before
+    any dependency runs.
+
+    The request limit is ``pdf_max_bytes`` of the request's settings plus
     :data:`MULTIPART_OVERHEAD_BYTES`. It is checked before any dependency (session, principal,
-    ingest permission) is resolved and before multipart parsing, and is answered with 413
-    ``request_too_large``:
+    ingest permission) is resolved, and is answered with 413 ``request_too_large``:
 
     * A request with ``Content-Length`` above the limit, or with a value that is not a
       non-negative integer, is refused without reading its body. Within the limit the body is
-      parsed as usual; the server's framing stops it at the declared length.
-    * A request without ``Content-Length`` (chunked) is read through a counting ``receive`` that
-      stops the stream once the limit is passed. The bounded body is cached on the request, and
-      FastAPI's form parsing reads it from there. Once the limit is passed, the rest of the body
-      is read and discarded before the 413 is sent, so the connection closes cleanly and a proxy
-      that forwarded slightly past the limit receives the 413 rather than a reset. The drain
-      stops at the body's end, once 1 MiB past the limit has been read, or after one second
-      (``_DRAIN_TIMEOUT_SECONDS``), so a sender that stalls past the limit still gets its 413
-      promptly. The request is still never parsed or spooled.
+      parsed; the server's framing stops it at the declared length.
+    * A request without ``Content-Length`` (chunked) is parsed through a counting ``receive``
+      that stops the stream once the limit is passed, so the body is never cached whole. Once
+      the limit is passed, the parser closes the file it spooled, dropping the bytes received so
+      far, and the rest of the body is read and discarded before the 413 is sent, so the
+      connection closes cleanly and a proxy that forwarded slightly past the limit receives the
+      413 rather than a reset. The drain stops at the body's end, once 1 MiB past the limit has
+      been read, or after one second (``_DRAIN_TIMEOUT_SECONDS``), so a sender that stalls past
+      the limit still gets its 413 promptly. Nothing of the request reaches a dependency or the
+      endpoint.
+
+    The form is parsed here within its part limits (see :func:`_parse_form`) and cached on the
+    request, where FastAPI's form parsing finds it: one file part, and at most
+    :data:`_MAX_FORM_FIELDS` (32) other fields of at most :data:`_MAX_FORM_FIELD_BYTES` (4 KiB)
+    each. The parser holds the fields and the first 1 MiB of the file in memory, and spools a
+    larger file to a temporary file. A body beyond these limits, or any other multipart body the
+    parser refuses (for example one without a boundary), is the framework's 400 with a string
+    ``detail`` such as ``Too many files. Maximum number of files is 1.``, answered once the
+    parser meets it without reading the rest of the body; a body that cannot be read is 400
+    ``There was an error parsing the body``, as FastAPI answers it.
 
     A router cannot carry middleware, and ``include_router`` preserves the route class, so the
     guard reaches every host that mounts ``terminal_router`` without any ingress setting. A host
@@ -255,7 +320,8 @@ class TerminalUploadRoute(APIRoute):
     """
 
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
-        """Wrap FastAPI's handler with the request-size check and this mount's parse limiter."""
+        """Wrap FastAPI's handler with the request-size check, the bounded form parse and this
+        mount's parse limiter."""
         # Built here, synchronously: FastAPI resolves an included route's context during this
         # call, so deferring it to request time would lose that context.
         original = super().get_route_handler()
@@ -285,6 +351,9 @@ class TerminalUploadRoute(APIRoute):
                     return _too_large_response(limit)
                 if declared < 0 or declared > limit:
                     return _too_large_response(limit)
+                # Parsed here within the form's part limits; FastAPI would otherwise parse it
+                # with Starlette's defaults of 1000 files and 1000 fields of 1 MiB each.
+                await _parse_form(request)
                 return await original(request)
 
             received = 0
@@ -301,10 +370,11 @@ class TerminalUploadRoute(APIRoute):
                 return message
 
             counted = Request(request.scope, receive=counting_receive)
-            # Read here, inside this try, because FastAPI turns any exception raised while it
-            # parses the form into a 400 rather than letting this guard answer 413.
+            # Parsed here, inside this try, because FastAPI turns any exception raised while it
+            # parses the form into a 400 rather than letting this guard answer 413. The parser
+            # streams the body through the counting receive, so it is never cached whole.
             try:
-                await counted.body()
+                await _parse_form(counted)
             except _RequestTooLargeError:
                 # Answering with body bytes still unread makes the server reset the connection,
                 # so a proxy still forwarding them fails its write and never relays the 413. The
@@ -315,10 +385,6 @@ class TerminalUploadRoute(APIRoute):
                         request.receive, limit + MULTIPART_OVERHEAD_BYTES - received
                     )
                 return _too_large_response(limit)
-            except ClientDisconnect as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST, detail=_BODY_ERROR_MESSAGE
-                ) from exc
             return await original(counted)
 
         return guarded
@@ -579,6 +645,13 @@ async def _serve_while_connected(
     summary="Extract financial line items from a filing or prospectus PDF",
     dependencies=[Depends(require_ingest_permission)],
     responses={
+        400: {
+            "description": (
+                "The framework's 400 with a string detail: a multipart body the parser refuses, "
+                "such as one without a boundary or with more than one file part, more than 32 "
+                "fields or a field over 4 KiB, or a body that could not be read"
+            ),
+        },
         404: {"model": ErrorResponse, "description": "unknown_ticker"},
         409: {
             "model": ErrorResponse,
@@ -693,7 +766,10 @@ async def ingest_pdf(
     ``commit_requires_ticker_and_period`` or ``commit_requires_kes``, 409 ``currency_conflict``,
     404 ``unknown_ticker`` and 500 ``internal_error`` for a server fault. The 413
     ``file_too_large``, 415 and 429 are decided before the file is loaded into memory. Send
-    ``commit=false`` to preview what a PDF yields before committing it.
+    ``commit=false`` to preview what a PDF yields before committing it. A multipart body the
+    parser refuses (for example one without a boundary, or with more than one file part, more
+    than 32 fields or a field over 4 KiB) or a body that cannot be read is the framework's 400
+    with a string ``detail``, decided before any dependency runs.
 
     A client that disconnects before its answer cancels the request, and its parse slot is freed
     once the service has ended. A disconnect before the service's data commit starts (during the
@@ -740,10 +816,11 @@ async def ingest_pdf(
     )
     # A free slot is checked for and taken without waiting, and given back when the block exits,
     # also when the service raises, the request is cancelled or the client disconnects. A
-    # refused request never loads its file, so memory grows with admitted parses only. A
-    # service call cancelled while parsing kills its parser process and returns once its parse
-    # thread has ended, moments later; one cancelled once its data commit has started returns
-    # when that commit and its run row are written. The slot is held until then and no longer.
+    # refused request never loads its whole file, which the multipart parser holds spooled, so
+    # whole-file memory grows with admitted parses only. A service call cancelled while parsing
+    # kills its parser process and returns once its parse thread has ended, moments later; one
+    # cancelled once its data commit has started returns when that commit and its run row are
+    # written. The slot is held until then and no longer.
     async with limiter.slot(settings.pdf_max_concurrency) as admitted:
         if not admitted:
             raise _rejection(

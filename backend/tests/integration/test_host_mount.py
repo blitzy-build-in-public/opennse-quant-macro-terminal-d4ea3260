@@ -1529,8 +1529,9 @@ async def test_admission_never_exceeds_the_limit_in_force_across_every_resize_se
 
 
 HUGE_PARSE_LIMIT: Final = 10**7
-"""A limit far above what ``TerminalSettings`` allows; resizing one slot at a time took about
-0.6 s to grow to it, so a per-slot regression fails the time bound below without hanging."""
+"""Far above the highest ``pdf_max_concurrency`` that ``TerminalSettings`` allows: a limiter that
+resizes one slot at a time takes ten million steps to reach it, failing the time bound below
+without hanging the run, while constant-time accounting meets it."""
 RESIZE_SECONDS_BOUND: Final = 0.1
 
 

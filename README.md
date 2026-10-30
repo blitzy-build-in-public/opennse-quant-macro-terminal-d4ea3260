@@ -281,6 +281,10 @@ oversized body is never decoded.
 - The whole request is limited to `TERMINAL_PDF_MAX_BYTES` plus 1 MiB before multipart parsing
   (413 `request_too_large`). The guard is `TerminalUploadRoute`, the ingest sub-router's route
   class, so it travels with `terminal_router` into a host.
+- The form may carry one file part and at most 32 other fields of at most 4 KiB each. A body
+  beyond these limits, or any other multipart body the parser refuses (for example one without a
+  boundary), gets the framework's 400 with a string `detail`, such as
+  `Too many files. Maximum number of files is 1.`, before any dependency runs.
 - The file itself may be at most `TERMINAL_PDF_MAX_BYTES` (20 MiB, 413 `file_too_large`), must
   start with `%PDF-` (415 `not_a_pdf`), must not be encrypted or unreadable (422 `pdf_encrypted`,
   `pdf_unreadable`), must parse within 20 s plus 0.4 s per page of `TERMINAL_PDF_MAX_PAGES`

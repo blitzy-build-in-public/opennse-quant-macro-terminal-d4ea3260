@@ -18,9 +18,13 @@ through ``binds`` or a routing ``get_bind`` on that same connection, instead of 
 Rejections come from two layers. The route (size guard, file size, ``%PDF-`` magic bytes, parse
 slots) records no run row; the service (commit preconditions, parse failures, currency rules)
 records one ``failed`` run row carrying the error code. Either way the error body is the coded
-``{"detail": {"code", "message", "field"}}`` with no extraction, and no filing or fundamentals row
-is written; a server fault is the coded 500 ``internal_error``, never the fault itself. Only
-``terminal_`` tables are read or written here.
+``{"detail": {"code", "message", "field"}}`` with no extraction, and no filing or fundamentals
+row is written; a server fault is the coded 500 ``internal_error``, never the fault itself.
+Besides these coded errors, two shapes are uncoded: FastAPI's standard 422 list for field
+validation (a missing ``file``, an invalid form field, an unknown query parameter), and the
+framework's 400 with a string ``detail`` for a multipart body the parser refuses (one beyond the
+form's part limits, for example) or a body that cannot be read. Neither carries an extraction,
+records a run row or writes a filing row. Only ``terminal_`` tables are read or written here.
 
 The last section calls ``filings_service.ingest_pdf`` directly, below the route, and holds the
 service's own contract (run audit, preview and commit, statuses, currency, coded errors and
@@ -35,6 +39,7 @@ import hashlib
 import logging
 import threading
 import traceback
+import tracemalloc
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -136,6 +141,13 @@ trailer and no page tree, which pdfminer cannot recover a document from."""
 
 CHUNK_SIZE: Final = 64 * 1024
 BOUNDARY: Final = "opennse-terminal-test-boundary"
+MULTIPART_CONTENT_TYPE: Final = f"multipart/form-data; boundary={BOUNDARY}"
+FILE_PART_HEADER: Final = (
+    f"--{BOUNDARY}\r\n"
+    'Content-Disposition: form-data; name="file"; filename="filing.pdf"\r\n'
+    "Content-Type: application/pdf\r\n\r\n"
+).encode("ascii")
+"""The opening of a multipart body's ``file`` part, up to its first content byte."""
 
 _TRAILER_ROOT: Final = b"/Root 1 0 R >>"
 # A standard security handler (RC4, revision 2) whose /O and /U entries match no password, so the
@@ -239,14 +251,41 @@ async def chunked_multipart(payload: bytes) -> AsyncIterator[bytes]:
     An async iterator has no known length, so httpx sends it with chunked transfer encoding and
     no ``Content-Length``.
     """
-    body = (
-        f"--{BOUNDARY}\r\n"
-        'Content-Disposition: form-data; name="file"; filename="filing.pdf"\r\n'
-        "Content-Type: application/pdf\r\n\r\n"
-    ).encode("ascii")
-    body += payload + f"\r\n--{BOUNDARY}--\r\n".encode("ascii")
+    body = FILE_PART_HEADER + payload + f"\r\n--{BOUNDARY}--\r\n".encode("ascii")
     for start in range(0, len(body), CHUNK_SIZE):
         yield body[start : start + CHUNK_SIZE]
+
+
+def multipart_body(*parts: tuple[str, str | None, bytes]) -> bytes:
+    """A multipart body delimited by ``BOUNDARY`` holding ``parts`` in order.
+
+    Each part is ``(name, filename, content)``: a part with a ``filename`` is a file part of
+    type ``application/pdf``, one with ``None`` a plain form field.
+    """
+    body = bytearray()
+    for name, filename, content in parts:
+        disposition = f'form-data; name="{name}"'
+        if filename is None:
+            head = f"--{BOUNDARY}\r\nContent-Disposition: {disposition}\r\n\r\n"
+        else:
+            head = (
+                f"--{BOUNDARY}\r\nContent-Disposition: {disposition}; "
+                f'filename="{filename}"\r\nContent-Type: application/pdf\r\n\r\n'
+            )
+        body += head.encode("ascii") + content + b"\r\n"
+    body += f"--{BOUNDARY}--\r\n".encode("ascii")
+    return bytes(body)
+
+
+def in_chunks(body: bytes) -> list[bytes]:
+    """``body`` cut into 64 KiB chunks, built before a request so sending them copies nothing."""
+    return [body[start : start + CHUNK_SIZE] for start in range(0, len(body), CHUNK_SIZE)]
+
+
+async def streamed(chunks: Sequence[bytes]) -> AsyncIterator[bytes]:
+    """``chunks`` as they are, as a body httpx sends chunked, without ``Content-Length``."""
+    for chunk in chunks:
+        yield chunk
 
 
 # ---------------------------------------------------------------------------------------------
@@ -838,6 +877,31 @@ async def test_request_too_large(
     assert await run_rows(committed_query, OVERSIZED_REQUEST_PAYLOAD) == []
 
 
+async def test_chunked_upload_within_the_bound_is_ingested(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    committed_query: CommittedQuery,
+    statement_pdf: StatementPdf,
+) -> None:
+    """A chunked upload within the request bound reaches the endpoint through the form the guard
+    parsed while counting it: 200 with the file's SHA-256, a filing row and a ``succeeded`` run
+    row."""
+    pdf = statement_pdf(tag="chunked within the bound")
+
+    response = await client.post(
+        URL, content=chunked_multipart(pdf), headers={"Content-Type": MULTIPART_CONTENT_TYPE}
+    )
+
+    assert "content-length" not in response.request.headers
+    assert response.status_code == 200, response.text
+    assert response.json()["file_sha256"] == sha(pdf)
+    assert await filing_row(db_session, pdf) is not None
+    runs = await run_rows(committed_query, pdf)
+    assert [
+        (run["status"], run["trigger"], run["finished"], run["error_message"]) for run in runs
+    ] == [("succeeded", "api", True, None)]
+
+
 @dataclass(frozen=True)
 class OverBoundBody:
     """A chunked body that passes the request bound under ``pdf_max_bytes=1024``.
@@ -875,9 +939,10 @@ async def test_request_too_large_drains_chunked_body_within_allowance(
     413 ``request_too_large`` is sent, so a proxy's forwarded body is consumed. A sender that
     stalls past the bound still gets the 413 once the drain deadline passes.
 
-    The app is driven over raw ASGI so that every ``receive`` is recorded. The guard never reads
-    once the body has ended, where a server's ``receive`` would wait for a disconnect, and never
-    more than one message past the allowance.
+    The app is driven over raw ASGI so that every ``receive`` is recorded. The first message
+    opens the multipart ``file`` part, so the parser streams every later byte into it until the
+    count passes the bound. The guard never reads once the body has ended, where a server's
+    ``receive`` would wait for a disconnect, and never more than one message past the allowance.
     """
     configure_settings(pdf_max_bytes=PDF_MAX_BYTES_SMALL)
     if body.stalls:
@@ -902,7 +967,10 @@ async def test_request_too_large_drains_chunked_body_within_allowance(
         assert read <= allowance_end + CHUNK_SIZE, f"{read} bytes read, past the allowance"
         ended = not more_body
         events.append("receive")
-        return {"type": "http.request", "body": b"0" * size, "more_body": more_body}
+        chunk = b"0" * size
+        if index == 0:
+            chunk = FILE_PART_HEADER + chunk[len(FILE_PART_HEADER) :]
+        return {"type": "http.request", "body": chunk, "more_body": more_body}
 
     async def send(message: dict[str, Any]) -> None:
         events.append(message["type"])
@@ -945,6 +1013,119 @@ async def test_request_too_large_drains_chunked_body_within_allowance(
     else:
         assert ended
         assert reads == len(body.sizes)
+
+
+PART_LIMIT_BREACHES: Final = [
+    pytest.param(
+        "second file part",
+        (("file", "second.pdf", b"%PDF-1.4\n"),),
+        "Too many files. Maximum number of files is 1.",
+        id="second_file_part",
+    ),
+    pytest.param(
+        "a field too many",
+        tuple(("items", None, b"revenue") for _ in range(33)),
+        "Too many fields. Maximum number of fields is 32.",
+        id="33_fields",
+    ),
+    pytest.param(
+        "an over long field",
+        (("company_name", None, b"x" * 4097),),
+        "Part exceeded maximum size of 4KB.",
+        id="field_over_4_kib",
+    ),
+]
+"""The filing tag, the parts sent after a valid ``file`` part, and the parser's message for the
+limit they pass."""
+
+
+@pytest.mark.parametrize("chunked", [False, True], ids=["by_content_length", "without_length"])
+@pytest.mark.parametrize(("breach", "extra_parts", "message"), PART_LIMIT_BREACHES)
+async def test_form_beyond_its_part_limits_is_the_framework_400(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    committed_query: CommittedQuery,
+    statement_pdf: StatementPdf,
+    breach: str,
+    extra_parts: tuple[tuple[str, str | None, bytes], ...],
+    message: str,
+    chunked: bool,
+) -> None:
+    """A form with a second file part, a 33rd field or a field over 4 KiB, within the request
+    bound, is the framework's 400 with the parser's message as a string ``detail``, with or
+    without ``Content-Length``. The guard answers it while parsing, so the upload never reaches
+    the service: no filing row and no run row."""
+    pdf = statement_pdf(tag=f"part limit {breach} {'chunked' if chunked else 'by length'}")
+    body = multipart_body(("file", "filing.pdf", pdf), *extra_parts)
+
+    response = await client.post(
+        URL,
+        content=streamed(in_chunks(body)) if chunked else body,
+        headers={"Content-Type": MULTIPART_CONTENT_TYPE},
+    )
+
+    assert ("content-length" not in response.request.headers) is chunked
+    assert response.status_code == 400, response.text
+    assert response.json() == {"detail": message}
+    assert await filing_row(db_session, pdf) is None
+    assert await run_rows(committed_query, pdf) == []
+
+
+@pytest.mark.parametrize("chunked", [False, True], ids=["by_content_length", "without_length"])
+async def test_client_disconnect_mid_body_is_the_framework_400(
+    app: FastAPI,
+    committed_query: CommittedQuery,
+    statement_pdf: StatementPdf,
+    chunked: bool,
+) -> None:
+    """A client that disconnects while its upload's body is parsed gets FastAPI's own 400
+    ``There was an error parsing the body``, with or without ``Content-Length``, and the upload
+    never reaches the service: no run row. The app is driven over raw ASGI, since an HTTP
+    client cannot disconnect mid-body."""
+    pdf = statement_pdf(tag=f"disconnect mid body {'chunked' if chunked else 'by length'}")
+    body = multipart_body(("file", "filing.pdf", pdf))
+    messages: list[dict[str, Any]] = [
+        {"type": "http.request", "body": body[: len(body) // 2], "more_body": True},
+        {"type": "http.disconnect"},
+    ]
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    framing = (
+        (b"transfer-encoding", b"chunked") if chunked else (b"content-length", b"%d" % len(body))
+    )
+    scope: dict[str, Any] = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "server": ("test", 80),
+        "client": ("127.0.0.1", 50000),
+        "root_path": "",
+        "path": URL,
+        "raw_path": URL.encode("ascii"),
+        "query_string": b"",
+        "headers": [
+            (b"host", b"test"),
+            (b"content-type", MULTIPART_CONTENT_TYPE.encode("ascii")),
+            framing,
+        ],
+    }
+
+    async with asyncio.timeout(10):
+        await app(scope, receive, send)
+
+    start, answer = sent
+    response = httpx.Response(start["status"], content=answer["body"])
+    assert response.status_code == 400, response.text
+    assert response.json() == {"detail": "There was an error parsing the body"}
+    assert await run_rows(committed_query, pdf) == []
 
 
 async def test_concurrency_limit_returns_429(
@@ -1040,6 +1221,93 @@ async def test_refused_upload_is_never_read_into_memory(
         len(b"%PDF-"),
         settings.pdf_max_bytes + 1,
     ]
+
+
+NEAR_BOUND_PDF_MAX_BYTES: Final = 8 * 1024 * 1024
+"""``pdf_max_bytes`` of the admission-memory test: one body cached whole is then several times
+what a streamed upload holds (a 1 MiB spool and a 64 KiB chunk), and the test stays quick."""
+
+
+async def test_refused_uploads_hold_no_whole_body_while_every_slot_is_busy(
+    client: httpx.AsyncClient,
+    configure_settings: SettingsConfigurer,
+    monkeypatch: pytest.MonkeyPatch,
+    statement_pdf: StatementPdf,
+) -> None:
+    """With both parse slots held, four simultaneous chunked uploads just inside the request
+    bound each get 429 ``ingest_busy``, and an upload of 200 small file parts gets the
+    framework's 400 at its second file part, while the Python memory all five allocate peaks
+    below the size of one chunked body: no body is cached whole before admission, and no file
+    part beyond the first is kept.
+
+    The bodies are built before ``tracemalloc`` measures, and the chunked ones are sent as
+    pre-cut chunks, so only what the app allocates is counted. The service is replaced by one
+    that holds its slot until released, as in :func:`test_concurrency_limit_returns_429`, and
+    the held requests are always released and awaited.
+    """
+    settings = configure_settings(pdf_max_concurrency=2, pdf_max_bytes=NEAR_BOUND_PDF_MAX_BYTES)
+    request_limit = settings.pdf_max_bytes + MULTIPART_OVERHEAD_BYTES
+    calls = 0
+    both_inside = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked(*_args: object, **_kwargs: object) -> NoReturn:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            both_inside.set()
+        await release.wait()
+        raise HTTPException(409, detail={"code": "released", "message": "released", "field": None})
+
+    monkeypatch.setattr(filings_service, "ingest_pdf", blocked)
+    # A file of exactly pdf_max_bytes, so each upload passes the size and magic-byte checks and
+    # is refused only for want of a parse slot.
+    near_bound = multipart_body(
+        ("file", "filing.pdf", b"%PDF-" + b"0" * (settings.pdf_max_bytes - len(b"%PDF-")))
+    )
+    assert settings.pdf_max_bytes < len(near_bound) <= request_limit
+    chunks = in_chunks(near_bound)
+    many_parts = multipart_body(
+        *(("file", f"part-{index}.pdf", b"%PDF-" + b"0" * 20_480) for index in range(200))
+    )
+    assert len(many_parts) <= request_limit
+    headers = {"Content-Type": MULTIPART_CONTENT_TYPE}
+    pdf = statement_pdf(tag="admission memory")
+    held = [asyncio.create_task(upload(client, pdf)) for _ in range(2)]
+    try:
+        await asyncio.wait_for(both_inside.wait(), 10)
+        started = not tracemalloc.is_tracing()
+        if started:
+            tracemalloc.start()
+        tracemalloc.reset_peak()
+        baseline, _ = tracemalloc.get_traced_memory()
+        try:
+            async with asyncio.timeout(60):
+                *near_bound_answers, many_parts_answer = await asyncio.gather(
+                    *(
+                        client.post(URL, content=streamed(chunks), headers=headers)
+                        for _ in range(4)
+                    ),
+                    client.post(URL, content=many_parts, headers=headers),
+                )
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            if started:
+                tracemalloc.stop()
+    finally:
+        release.set()
+        outcomes = await asyncio.gather(*held, return_exceptions=True)
+
+    for answer in near_bound_answers:
+        assert "content-length" not in answer.request.headers
+        coded_error(answer, 429, "ingest_busy", None)
+    assert many_parts_answer.status_code == 400, many_parts_answer.text
+    assert many_parts_answer.json() == {"detail": "Too many files. Maximum number of files is 1."}
+    assert peak - baseline < len(near_bound), f"{peak - baseline} bytes allocated at the peak"
+    assert calls == 2
+    for outcome in outcomes:
+        assert isinstance(outcome, httpx.Response), outcome
+        coded_error(outcome, 409, "released", None)
 
 
 @pytest.mark.parametrize("counted", [None, 0], ids=["size_not_counted", "size_under_counted"])

@@ -1112,9 +1112,12 @@ export interface ExtractedItem {
  *   for a missing `file` or an invalid form field, such as an unknown `document_type` or `items`
  *   value, an over-long `ticker` or a malformed `period_end_date`.
  *
- * A body FastAPI cannot parse as multipart gets FastAPI's own 400 with a string `detail`, and a
- * host's auth override answers in the host's own shape. Ingestion is API-only: this folder ships
- * no upload widget.
+ * A multipart body the parser refuses (one beyond the form's part limits of one file part and at
+ * most 32 other fields of at most 4 KiB each, or one without a boundary) and a body that cannot
+ * be read get the framework's 400 with a string `detail`, such as
+ * `Too many files. Maximum number of files is 1.`, before any dependency runs, so before a host's
+ * auth override, which otherwise answers in the host's own shape. Ingestion is API-only: this
+ * folder ships no upload widget.
  */
 export interface IngestPdfResponse {
   /** The `terminal_corporate_filings` row (UUID), upserted on `file_sha256` by every upload. */
