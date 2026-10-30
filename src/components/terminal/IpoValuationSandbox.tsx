@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactElement } from "react";
 import {
   Bar,
@@ -9,15 +9,17 @@ import {
   Rectangle,
   ReferenceLine,
   ResponsiveContainer,
+  Text,
   Tooltip,
+  useActiveTooltipCoordinate,
   XAxis,
   YAxis,
 } from "recharts";
-import type { BarShapeProps } from "recharts";
+import type { BarShapeProps, TooltipContentProps, XAxisTickContentProps } from "recharts";
 
 import { SensitivityMatrix } from "./SensitivityMatrix";
 import { apiSend, fieldErrorMap, isAbortError, TerminalApiError } from "./lib/apiClient";
-import { AXIS_TICK, CHART_COLORS, TOOLTIP_CONTENT_STYLE } from "./lib/chartTheme";
+import { AXIS_TICK, CHART_COLORS } from "./lib/chartTheme";
 import {
   checkDecimalRange,
   compareDecimal,
@@ -301,9 +303,19 @@ const OUTPUT_CLASS =
   "flex min-w-0 flex-col gap-4 motion-safe:transition-opacity motion-safe:duration-200 motion-safe:ease-out";
 // Keyboard focus on the chart's `<svg tabindex="0">` gets the controls' sky outline. A mouse click
 // focuses the svg or one of Recharts' internal layers (tabindex -1) without :focus-visible, and
-// that focus draws no ring.
+// that focus draws no ring. When Tab scrolls the chart into view, the svg's scroll-my-2 keeps the
+// whole ring (2px wide at a 2px offset) inside the viewport, with room to spare even when a host's
+// root font size makes the rem-based margin smaller than 8px.
 const FAIR_VALUE_CHART_CLASS =
-  "mt-2 h-56 w-full [&_*:focus:not(:focus-visible)]:outline-none [&_svg:focus-visible]:outline-2 [&_svg:focus-visible]:outline-offset-2 [&_svg:focus-visible]:outline-sky-400";
+  "mt-2 h-56 w-full [&_*:focus:not(:focus-visible)]:outline-none [&_svg]:scroll-my-2 [&_svg:focus-visible]:outline-2 [&_svg:focus-visible]:outline-offset-2 [&_svg:focus-visible]:outline-sky-400";
+// The chart tooltip mirrors TOOLTIP_CONTENT_STYLE (slate-900 surface, slate-700 border, slate-300
+// text, 12px) with utility classes: the widget renders this content itself, in place of the
+// Recharts default content that takes `contentStyle`.
+const TOOLTIP_CLASS =
+  "flex flex-col gap-1 whitespace-nowrap rounded border border-slate-700 bg-slate-900 px-2.5 py-2 text-xs text-slate-300 shadow-lg";
+const TOOLTIP_TITLE_CLASS = "m-0 font-medium text-slate-100";
+const TOOLTIP_ROW_CLASS = "m-0";
+const TOOLTIP_VALUE_CLASS = "tabular-nums text-slate-100";
 const FLAG_CLASS =
   "rounded border border-amber-800 bg-amber-950 px-2 py-0.5 font-mono text-xs text-amber-200";
 const GENERAL_ERROR_CLASS =
@@ -571,19 +583,134 @@ function renderFairValueBar(props: BarShapeProps): ReactElement {
   return <Rectangle {...props} fill={isFairValueBar(entry) ? entry.fill : CHART_COLORS.muted} />;
 }
 
-/** Tooltip text: the exact fair value string, never the bar's float height. */
-function fairValueTooltip(
-  _value: unknown,
-  _name: unknown,
-  item: { payload?: unknown },
-): [string, string] {
-  const entry = item.payload;
-  return [formatDecimal(isFairValueBar(entry) ? entry.raw : null, "per_share"), "Fair value"];
+/**
+ * Tooltip of the active bar: its method and the exact fair value string, never the bar's float
+ * height. It renders nothing while the tooltip is inactive or dismissed, so no stale text stays in
+ * the hidden box. It has no live region: Recharts' default content announces every arrow key
+ * assertively, and the chart's description already gives each value.
+ */
+function FairValueTooltipContent({ active, payload }: TooltipContentProps): ReactElement | null {
+  const entry: unknown = payload[0]?.payload;
+  if (!active || !isFairValueBar(entry)) return null;
+  return (
+    <div className={TOOLTIP_CLASS}>
+      <p className={TOOLTIP_TITLE_CLASS}>{entry.method}</p>
+      <p className={TOOLTIP_ROW_CLASS}>
+        Fair value :{" "}
+        <span className={TOOLTIP_VALUE_CLASS}>{formatDecimal(entry.raw, "per_share")}</span>
+      </p>
+    </div>
+  );
+}
+
+/** The active tooltip coordinate when Escape was pressed, (0, 0) when there was none. */
+interface TooltipDismissal {
+  x: number;
+  y: number;
+}
+
+/**
+ * The chart's Tooltip, which Escape dismisses together with its cursor band. Recharts' own Escape
+ * handling only hides the tooltip box and leaves the band drawn. This applies the same rule (a
+ * document-level Escape dismisses until the active coordinate changes, so the next arrow key or
+ * pointer move onto another position shows both again) and switches the whole Tooltip off while
+ * it holds, so the band never shows without the tooltip, nor the tooltip without the band.
+ */
+function FairValueTooltip(): ReactElement {
+  const coordinate = useActiveTooltipCoordinate();
+  const x = coordinate?.x ?? 0;
+  const y = coordinate?.y ?? 0;
+  const [dismissal, setDismissal] = useState<TooltipDismissal | null>(null);
+  useEffect(() => {
+    function dismissOnEscape(event: KeyboardEvent): void {
+      if (event.key === "Escape") setDismissal({ x, y });
+    }
+    document.addEventListener("keydown", dismissOnEscape);
+    return () => document.removeEventListener("keydown", dismissOnEscape);
+  }, [x, y]);
+  const dismissed = dismissal !== null && dismissal.x === x && dismissal.y === y;
+  // A move away ends the dismissal, so coming back to the same bar later shows it again.
+  if (dismissal !== null && !dismissed) setDismissal(null);
+  return (
+    <Tooltip
+      active={dismissed ? false : undefined}
+      cursor={{ fill: CHART_COLORS.grid, fillOpacity: 0.35 }}
+      content={FairValueTooltipContent}
+    />
+  );
 }
 
 /** Y-axis ticks are generated chart coordinates with no source string, labelled at 2 dp. */
 function formatAxisTick(value: number): string {
   return Number.isFinite(value) ? formatDecimal(value.toFixed(2), "per_share", { unit: false }) : "";
+}
+
+/**
+ * Each method's x-axis labels, longest first. The Y axis widens with its longest tick (over 20
+ * characters for the largest valuations the inputs allow) and the right margin holds the offer
+ * label, so a narrow chart's bands can be narrower than "Comparables", and at the extremes than
+ * "Comps". The tooltip and the chart's description keep the full names.
+ */
+const METHOD_AXIS_LABELS: Readonly<Record<string, readonly string[]>> = {
+  DCF: ["DCF", "D"],
+  Comparables: ["Comparables", "Comps", "C"],
+  Blended: ["Blended", "Blend", "B"],
+};
+
+/** Least room a label leaves in its band: Recharts' default `minTickGap` between ticks. */
+const METHOD_LABEL_GAP = 5;
+
+/**
+ * One bar's x-axis label: the longest of its method's labels whose rendered width, measured in
+ * the host page's font, fits the bar's category band with {@link METHOD_LABEL_GAP} to spare (the
+ * shortest when none does). Each label then stays within its own band, so neighbours never
+ * overlap.
+ */
+function MethodAxisTick(props: XAxisTickContentProps): ReactElement {
+  const method = String(props.payload.value);
+  const labels = METHOD_AXIS_LABELS[method] ?? [method];
+  // Recharts sets a category tick's `offset` to half its band.
+  const band = 2 * (props.payload.offset ?? 0);
+  const textRef = useRef<SVGTextElement>(null);
+  // Rendered width of each label measured so far.
+  const [widths, setWidths] = useState<Readonly<Record<string, number>>>({});
+  // A label not measured yet is rendered so it can be measured; without a band, the full name.
+  const label =
+    labels.find((candidate) => {
+      const width = widths[candidate];
+      return width === undefined || !(band > 0) || width + METHOD_LABEL_GAP <= band;
+    }) ??
+    labels[labels.length - 1] ??
+    method;
+
+  // Measures the rendered label before paint, so one too wide for its band is replaced by the
+  // next before it is ever drawn. Without SVG text layout (jsdom) the full name stays.
+  useLayoutEffect(() => {
+    const text = textRef.current;
+    if (text === null || typeof text.getComputedTextLength !== "function") return;
+    const width = text.getComputedTextLength();
+    if (widths[label] !== width) setWidths((previous) => ({ ...previous, [label]: width }));
+  }, [label, widths]);
+
+  // A host web font that loads after the measurement changes every width: measure again (where
+  // the CSS Font Loading API exists).
+  useEffect(() => {
+    if (!("fonts" in document)) return undefined;
+    const fonts = document.fonts;
+    const remeasure = (): void => setWidths({});
+    fonts.addEventListener("loadingdone", remeasure);
+    return () => fonts.removeEventListener("loadingdone", remeasure);
+  }, []);
+
+  return (
+    <Text ref={textRef} {...props} {...AXIS_TICK}>
+      {label}
+    </Text>
+  );
+}
+
+function renderMethodTick(props: XAxisTickContentProps): ReactElement {
+  return <MethodAxisTick {...props} />;
 }
 
 function FairValueChart({ response }: { response: IpoValuationResponse }): ReactElement {
@@ -608,28 +735,29 @@ function FairValueChart({ response }: { response: IpoValuationResponse }): React
       <div className={FAIR_VALUE_CHART_CLASS} data-testid="ipo-fair-value-chart">
         <ResponsiveContainer width="100%" height="100%">
           {/* The right margin holds the offer line's label beside the plot, where it cannot
-              cover the Blended bar. */}
+              cover the Blended bar. The Y axis is as wide as its longest tick label, which
+              Recharts rounds to a whole pixel; the 1px left margin keeps that label's first
+              glyph inside the svg. Every bar keeps an x-axis label (interval 0). */}
           <BarChart
             data={bars}
             title="Fair value per share by method against the offer price"
             desc={description}
-            margin={{ top: 12, right: 96, bottom: 0, left: 0 }}
+            margin={{ top: 12, right: 96, bottom: 0, left: 1 }}
           >
             <CartesianGrid stroke={CHART_COLORS.grid} strokeDasharray="3 3" vertical={false} />
-            <XAxis dataKey="method" tick={AXIS_TICK} stroke={CHART_COLORS.axis} />
+            <XAxis
+              dataKey="method"
+              tick={renderMethodTick}
+              interval={0}
+              stroke={CHART_COLORS.axis}
+            />
             <YAxis
               tick={AXIS_TICK}
               stroke={CHART_COLORS.axis}
               tickFormatter={formatAxisTick}
-              width={48}
+              width="auto"
             />
-            <Tooltip
-              cursor={{ fill: CHART_COLORS.grid, fillOpacity: 0.35 }}
-              contentStyle={TOOLTIP_CONTENT_STYLE}
-              labelStyle={{ color: CHART_COLORS.text }}
-              itemStyle={{ color: CHART_COLORS.text }}
-              formatter={fairValueTooltip}
-            />
+            <FairValueTooltip />
             <Bar dataKey="y" name="Fair value" isAnimationActive={false} shape={renderFairValueBar} />
             {offerY === null ? null : (
               <ReferenceLine
