@@ -12,7 +12,7 @@ source token times the detected statement scale, so a "KShs '000" figure of ``1,
 converted to another currency: a USD statement is returned in USD.
 
 Every rejection (413 ``request_too_large`` or ``file_too_large``, 415 ``not_a_pdf``, 422
-``pdf_encrypted``, ``pdf_unreadable``, ``too_many_pages``,
+``pdf_encrypted``, ``pdf_unreadable``, ``pdf_parse_timeout``, ``too_many_pages``,
 ``commit_requires_ticker_and_period`` or ``commit_requires_kes``, 409 ``currency_conflict``,
 404 ``unknown_ticker``, 429 ``ingest_busy``) is a coded ``schemas.common.ErrorDetail`` body that
 carries no extraction, so none is modelled here.

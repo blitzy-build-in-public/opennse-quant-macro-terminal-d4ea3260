@@ -429,7 +429,13 @@ async def app(
 
 @pytest_asyncio.fixture
 async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
-    """An ``httpx.AsyncClient`` driving ``app`` over ASGI at ``http://test`` (no lifespan run)."""
+    """An ``httpx.AsyncClient`` driving ``app`` over ASGI at ``http://test``.
+
+    ``httpx.ASGITransport`` runs no lifespan, which is why ``app`` disposes the engine itself.
+    The standalone lifespan (its start log, and engine disposal on normal and exceptional exit) and
+    the mounted router's freedom from lifespan side effects are covered by the ``lifespan`` tests
+    of ``tests/integration/test_host_mount.py``.
+    """
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as http_client:
         yield http_client

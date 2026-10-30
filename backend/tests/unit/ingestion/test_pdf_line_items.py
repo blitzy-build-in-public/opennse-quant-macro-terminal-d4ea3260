@@ -18,12 +18,15 @@ a database or the settings.
 import functools
 import hashlib
 import logging
+import subprocess
 import sys
+import threading
 import time
 import zlib
 from collections.abc import Mapping, Sequence
 from datetime import date
 from decimal import Decimal
+from typing import Any
 
 import pdfplumber
 import pytest
@@ -37,7 +40,9 @@ from opennse_terminal.ingestion.files.pdf_line_items import (
     DerivationPart,
     ExtractedLineItem,
     ExtractionResult,
+    ParseCancelledError,
     PdfEncrypted,
+    PdfParseTimeout,
     PdfUnreadable,
     TooManyPages,
     extract_line_items,
@@ -2130,6 +2135,9 @@ def test_rejection_errors_are_value_errors() -> None:
     assert issubclass(PdfEncrypted, ValueError)
     assert issubclass(PdfUnreadable, ValueError)
     assert issubclass(TooManyPages, ValueError)
+    # A timeout is the server's time budget, never reported as an unreadable file.
+    assert issubclass(PdfParseTimeout, ValueError)
+    assert not issubclass(PdfParseTimeout, PdfUnreadable)
 
 
 # Pages are enumerated directly from pdfminer's page generator, so the raw error is the cause; it
@@ -2390,16 +2398,109 @@ def test_page_content_within_the_budget_is_read(layout: str) -> None:
     assert (revenue.status, revenue.value) == ("found", Decimal("1234000"))
 
 
-def test_parse_over_the_time_limit_is_unreadable() -> None:
+def test_parse_over_the_time_limit_is_a_timeout_not_an_unreadable_pdf() -> None:
     # 4 MiB of "q Q" is within the content budget but takes pdfminer several seconds.
     pdf_bytes = flood_pdf("content_stream", b"q Q\n", 4 * MIB)
     started = time.monotonic()
 
-    with pytest.raises(PdfUnreadable) as raised:
+    with pytest.raises(PdfParseTimeout) as raised:
         pdf_line_items._run_isolated(pdf_bytes, ["revenue"], None, 400, time_limit=1)
 
+    assert not isinstance(raised.value, PdfUnreadable)
+    assert raised.value.time_limit == 1
     assert str(raised.value) == "the PDF could not be parsed within 1 seconds"
     assert time.monotonic() - started < 5
+
+
+@pytest.mark.parametrize(("max_pages", "time_limit"), [(400, 180.0), (10, 24.0)])
+def test_time_limit_is_sized_to_the_page_limit(
+    monkeypatch: pytest.MonkeyPatch, max_pages: int, time_limit: float
+) -> None:
+    """20 seconds plus 0.4 per page the parse admits; the cancel event is passed on as given."""
+    calls: list[tuple[int, object, object]] = []
+    result = ExtractionResult(
+        page_count=1,
+        detected_scale=None,
+        currency="KES",
+        status="no_items",
+        items=[ExtractedLineItem(item="revenue", status="not_found", value=None, unit="KES")],
+        missing_items=["revenue"],
+        warnings=["no_text_layer"],
+    )
+
+    def capture(
+        _pdf_bytes: bytes,
+        _requested: Sequence[str],
+        _period_end_date: date | None,
+        pages: int,
+        **limits: object,
+    ) -> ExtractionResult:
+        calls.append((pages, limits["time_limit"], limits["cancel"]))
+        return result
+
+    monkeypatch.setattr(pdf_line_items, "_run_isolated", capture)
+    cancel = threading.Event()
+
+    assert extract_line_items(b"%PDF-", ["revenue"], max_pages=max_pages, cancel=cancel) is result
+    assert calls == [(max_pages, time_limit, cancel)]
+
+
+def recording_popen(monkeypatch: pytest.MonkeyPatch) -> list[subprocess.Popen[bytes]]:
+    """Record every parser process the extractor starts, in start order."""
+    started: list[subprocess.Popen[bytes]] = []
+    real_popen = subprocess.Popen
+
+    def popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        process: subprocess.Popen[bytes] = real_popen(*args, **kwargs)
+        started.append(process)
+        return process
+
+    monkeypatch.setattr(pdf_line_items.subprocess, "Popen", popen)
+    return started
+
+
+def test_cancel_kills_the_running_parser_process_promptly(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The flood takes the parser process about 8 seconds; the event is set half a second into it.
+    pdf_bytes = flood_pdf("content_stream", b"q Q\n", 4 * MIB)
+    started = recording_popen(monkeypatch)
+    cancel = threading.Event()
+    cancelled_at: list[float] = []
+
+    def cancel_while_parsing() -> None:
+        deadline = time.monotonic() + 10
+        while not started and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.5)
+        cancelled_at.append(time.monotonic())
+        cancel.set()
+
+    canceller = threading.Thread(target=cancel_while_parsing)
+    canceller.start()
+    try:
+        with pytest.raises(ParseCancelledError) as raised:
+            extract_line_items(pdf_bytes, ["revenue"], cancel=cancel)
+        stopped_at = time.monotonic()
+    finally:
+        canceller.join()
+
+    assert str(raised.value) == "the PDF parse was cancelled"
+    assert stopped_at - cancelled_at[0] < 2
+    [process] = started
+    # Killed by a signal and already reaped.
+    assert process.returncode is not None and process.returncode < 0
+
+
+def test_cancel_set_before_the_parse_starts_no_parser_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = recording_popen(monkeypatch)
+    cancel = threading.Event()
+    cancel.set()
+
+    with pytest.raises(ParseCancelledError):
+        extract_line_items(build_pdf([text_page(["Revenue 1,234"])]), cancel=cancel)
+
+    assert started == []
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is enforced on Linux")

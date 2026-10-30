@@ -53,7 +53,8 @@ class TerminalSettings(BaseSettings):
     A process environment variable takes precedence over ``.env``, which is resolved relative to
     the working directory (the documented commands run from the repository root). Keys in
     ``.env`` that are not fields here, such as ``TERMINAL_TEST_DATABASE_URL`` and
-    ``TERMINAL_API_ORIGIN``, are ignored, because the file is shared with Next.js and the tests.
+    ``TERMINAL_API_ORIGIN``, are ignored, because the file is shared with Next.js and documents
+    the test suite's variable, which the suite reads from the process environment only.
 
     A host need not use the environment at all: every field can be passed as a keyword argument,
     so ``app.dependency_overrides[get_terminal_settings] = lambda: TerminalSettings(
@@ -163,8 +164,11 @@ class TerminalSettings(BaseSettings):
         ge=1,
         le=_PDF_MAX_CONCURRENCY_LIMIT,
         description=(
-            f"Concurrent PDF parses per API process, 1-{_PDF_MAX_CONCURRENCY_LIMIT}; a request "
-            "beyond it is answered with 429."
+            "Concurrent PDF parses per mounted terminal router, "
+            f"1-{_PDF_MAX_CONCURRENCY_LIMIT} (per API process for the standalone app or a host "
+            "that mounts the router once); a request beyond it is answered with 429 and "
+            "Retry-After: 5. A host can share one cap across mounts by overriding "
+            "opennse_terminal.api.routes.ingest.get_pdf_parse_limiter."
         ),
     )
 

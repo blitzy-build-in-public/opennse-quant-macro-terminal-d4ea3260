@@ -12,19 +12,29 @@ Limits, in the order they apply:
    route class of this sub-router: ``TERMINAL_PDF_MAX_BYTES`` plus 1 MiB of multipart overhead,
    answered with 413 ``request_too_large``. FastAPI parses and spools a multipart body before the
    endpoint runs, so a check inside the endpoint could not bound it.
-2. The file itself: more than ``TERMINAL_PDF_MAX_BYTES`` is 413 ``file_too_large``, and bytes that
-   do not start with ``%PDF-`` are 415 ``not_a_pdf``.
+2. The file itself, judged without loading it into memory: a spooled size above
+   ``TERMINAL_PDF_MAX_BYTES`` is 413 ``file_too_large``, and a file whose first five bytes are not
+   ``%PDF-`` is 415 ``not_a_pdf``.
 3. At most ``TERMINAL_PDF_MAX_CONCURRENCY`` (2) parses run at once per mounted router, which is
    per process for the standalone app and for a host that mounts ``terminal_router`` once. A
    request beyond it is answered at once with 429 ``ingest_busy`` and ``Retry-After: 5``; it
-   never queues. Each mount counts its own active parses across settings changes: a lower limit
-   applies to new requests at once while parses admitted under the old one finish, so a request
-   is admitted only while fewer parses than the limit in force are running.
+   never queues and its file is never read. Each mount counts its own active parses across
+   settings changes: a lower limit applies to new requests at once while parses admitted under
+   the old one finish, so a request is admitted only while fewer parses than the limit in force
+   are running. Only an admitted request reads its file into memory, inside its parse slot, so
+   upload memory is bounded by the parse limit rather than by the number of concurrent uploads.
 
-A request rejected by these limits writes nothing and records no run row. Every coded error is the
-body ``{"detail": {"code", "message", "field"}}`` and carries no extraction. Single-field form
-failures (an unknown ``document_type``, an over-long ``ticker``, an invalid date, a missing
-``file``) stay FastAPI's standard 422 list.
+A request rejected by these limits writes nothing and records no run row. A client that
+disconnects while its admitted request is served cancels it. Before the service's data commit
+starts (while its run row is started, its pre-parse checks run, it parses or it makes its
+uncommitted writes), the parse is stopped or never started, no filing or fundamentals row is
+written and the run row ends ``failed`` with ``cancelled``. Once that commit has started, it runs
+to completion: the filing, and any merged fundamentals, are stored and the run row ends
+``succeeded``, although no response is delivered. Either way the route logs the disconnect once
+at INFO and returns a bare 499 that nobody receives (see :func:`ingest_pdf`). Every coded error
+is the body ``{"detail": {"code", "message", "field"}}`` and carries no extraction.
+Single-field form failures (an unknown ``document_type``, an over-long ``ticker``, an invalid
+date, a missing ``file``) stay FastAPI's standard 422 list.
 
 The sub-router carries no prefix, tags, middleware or exception handlers: ``api/router.py`` mounts
 it under ``/api/v1/terminal``, where the router-level principal dependency applies, and the route
@@ -40,17 +50,20 @@ reads the ``Annotated`` form and dependency metadata from the route signature.
 import asyncio
 import inspect
 import logging
+import os
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from contextlib import asynccontextmanager
 from datetime import date
 from typing import Annotated, Any, Final
 
+import anyio
 from fastapi import (
     APIRouter,
     Depends,
     File,
     Form,
     HTTPException,
+    Query,
     Request,
     Response,
     UploadFile,
@@ -58,6 +71,7 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 from starlette.types import Message, Receive
 
@@ -75,6 +89,7 @@ from opennse_terminal.schemas import (
     ErrorResponse,
     IngestPdfResponse,
     LineItemName,
+    NoQueryParams,
     PeriodType,
     ValidationErrorResponse,
 )
@@ -104,6 +119,10 @@ DEFAULT_FILE_NAME: Final = "upload.pdf"
 # PostgreSQL text cannot hold a NUL character, so a form field carrying one is refused as a
 # single-field 422 here rather than failing as a 500 when the service queries or stores it.
 _NO_NUL_PATTERN: Final = r"^[^\x00]*$"
+# FastAPI validates the query string into a fresh NoQueryParams on every request, so this default
+# is used only when ingest_pdf is awaited directly without it. The model has no fields, so the
+# shared instance holds no state.
+_NO_QUERY_PARAMS: Final = NoQueryParams()
 # FastAPI's own answer to a body it cannot read, reused when the client disconnects mid-body.
 _BODY_ERROR_MESSAGE: Final = "There was an error parsing the body"
 # ASGI scope key under which the route hands its mount's parse limiter to the endpoint.
@@ -111,6 +130,9 @@ _PARSE_LIMITER_SCOPE_KEY: Final = "opennse_terminal.pdf_parse_limiter"
 # Seconds an over-limit body is drained at most: long enough for what a proxy that forwarded just
 # past the limit still has in flight, short enough that a stalled sender gets its 413 promptly.
 _DRAIN_TIMEOUT_SECONDS: Final = 1.0
+# Status of the bare answer to a request whose client has disconnected (nginx's "client closed
+# request"). No client receives it: the server discards a response to a closed connection.
+_CLIENT_CLOSED_REQUEST: Final = 499
 
 logger = logging.getLogger("opennse_terminal.api.routes.ingest")
 
@@ -432,6 +454,120 @@ def _blank_to_none(value: str | None) -> str | None:
     return value.strip() or None
 
 
+async def _upload_size(file: UploadFile) -> int:
+    """The uploaded file's size in bytes, found without loading the file: the size the multipart
+    parser counted while spooling it, else the end offset of the spooled file."""
+    if file.size is not None:
+        return file.size
+    spooled = file.file
+    return await run_in_threadpool(spooled.seek, 0, os.SEEK_END)
+
+
+# ---------------------------------------------------------------------------------------------
+# Client disconnects
+# ---------------------------------------------------------------------------------------------
+
+
+async def _client_disconnect(receive: Receive) -> None:
+    """Return once the client has disconnected, at the first ``http.disconnect`` message.
+
+    Called only after the request body has been read to its end, so every message the server
+    still delivers reports the connection, as in Starlette's ``listen_for_disconnect``: the next
+    one arrives when the client goes away.
+    """
+    while True:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            return
+
+
+async def _settle(*tasks: asyncio.Task[Any]) -> asyncio.CancelledError | None:
+    """Wait until every task has ended, however often the caller is cancelled meanwhile; return
+    the first such cancellation for the caller to raise, or ``None``.
+
+    The shield keeps a cancelled anyio scope around the request from re-delivering its
+    cancellation on every pass of the wait, which would spin the event loop.
+    """
+    received: asyncio.CancelledError | None = None
+    with anyio.CancelScope(shield=True):
+        while not all(task.done() for task in tasks):
+            try:
+                await asyncio.wait(tasks)
+            except asyncio.CancelledError as exc:
+                if received is None:
+                    received = exc
+    return received
+
+
+def _retrieve(task: asyncio.Task[Any]) -> None:
+    """Mark the ended ``task``'s exception as retrieved, so asyncio never reports it as
+    unhandled when the caller answers otherwise."""
+    if not task.cancelled():
+        task.exception()
+
+
+async def _serve_while_connected(
+    request: Request, service: Coroutine[Any, Any, IngestPdfResponse]
+) -> IngestPdfResponse | Response:
+    """Run the ``service`` call to its end while watching for the client's disconnect.
+
+    * The service ends first: its response is returned, or its exception raised, unchanged.
+    * The client disconnects first: the service is cancelled, and this waits until it has ended,
+      so the caller's parse slot is held until then and never longer. A service cancelled before
+      its data commit starts kills its parser process, if one runs, and writes no filing or
+      fundamentals row; one cancelled once that commit has started completes it and records its
+      run ``succeeded`` (see ``filings_service.ingest_pdf``). The abandoned request is logged
+      once at INFO and answered with a bare 499 (client closed request) that nobody receives:
+      the server discards a response to a closed connection, so no error code or exception is
+      raised for it.
+    * The request itself is cancelled (a server shutdown, or a host's task group or timeout):
+      the cancellation is passed to the service, and raised once the service has ended.
+
+    The watcher reads the request's ``receive`` only after FastAPI has read the body to its end.
+    A watcher that fails leaves the service to run to its end unwatched.
+    """
+    serving = asyncio.create_task(service)
+    watching = asyncio.create_task(_client_disconnect(request.receive))
+    waiting: set[asyncio.Task[Any]] = {serving, watching}
+    disconnected = False
+    try:
+        while not serving.done() and not disconnected:
+            await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+            if serving.done() or not watching.done():
+                continue
+            # Only a watcher that returned saw a disconnect; one that failed or was cancelled saw
+            # nothing, and the service then runs to its end unwatched.
+            failure = asyncio.CancelledError() if watching.cancelled() else watching.exception()
+            if failure is None:
+                disconnected = True
+            else:
+                logger.warning(
+                    "PDF upload: the client's connection cannot be watched: %s",
+                    type(failure).__name__,
+                )
+                waiting = {serving}
+    except asyncio.CancelledError:
+        serving.cancel()
+        watching.cancel()
+        await _settle(serving, watching)
+        _retrieve(serving)
+        raise
+    if not disconnected:
+        watching.cancel()
+        cancellation = await _settle(watching)
+        if cancellation is not None:
+            _retrieve(serving)
+            raise cancellation
+        return serving.result()
+    serving.cancel()
+    cancellation = await _settle(serving)
+    _retrieve(serving)
+    logger.info("PDF upload abandoned: the client disconnected before the answer")
+    if cancellation is not None:
+        raise cancellation
+    return Response(status_code=_CLIENT_CLOSED_REQUEST)
+
+
 # ---------------------------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------------------------
@@ -462,9 +598,10 @@ def _blank_to_none(value: str | None) -> str | None:
         422: {
             "model": ErrorResponse | ValidationErrorResponse,
             "description": (
-                "Coded: pdf_encrypted, pdf_unreadable, too_many_pages, "
-                "commit_requires_ticker_and_period or commit_requires_kes; or FastAPI's standard "
-                "validation list for a single form field"
+                "Coded: pdf_encrypted, pdf_unreadable, pdf_parse_timeout (the parse reached its "
+                "wall-clock limit, 20 s plus 0.4 s per page of TERMINAL_PDF_MAX_PAGES), "
+                "too_many_pages, commit_requires_ticker_and_period or commit_requires_kes; or "
+                "FastAPI's standard validation list for a single form field"
             ),
         },
         429: {
@@ -478,6 +615,7 @@ def _blank_to_none(value: str | None) -> str | None:
     },
 )
 async def ingest_pdf(
+    request: Request,
     session: SessionDep,
     settings: SettingsDep,
     limiter: ParseLimiterDep,
@@ -533,32 +671,53 @@ async def ingest_pdf(
             ),
         ),
     ] = False,
-) -> IngestPdfResponse:
+    params: Annotated[NoQueryParams, Query()] = _NO_QUERY_PARAMS,
+) -> IngestPdfResponse | Response:
     """Extract Revenue, EBITDA, Net Income, Total Debt, operating Cash Flow and Shares
     Outstanding from an uploaded PDF, and with ``commit`` merge them into the fundamentals.
 
     Returns 200 with the extraction for every accepted upload, with or without ``commit``:
-    monetary values in whole units of the filing's currency (KES, or USD returned unconverted)
-    as decimal strings, share counts as integers, and a ``not_found`` entry for each missing
-    item. Every 200 upserts the ``terminal_corporate_filings`` row on the file's SHA-256; the raw
-    bytes are never stored.
+    monetary values as 2-place decimal strings in whole units of the filing's currency (KES, or
+    USD returned unconverted), share counts as integral-valued decimal strings in ``value`` with
+    no fractional digits (``"40065428000"``), and a ``not_found`` entry for each missing item.
+    Derivation and candidate values take the same form, while metadata such as ``page_count``,
+    ``detected_scale``, ``scale_applied`` and ``page_number`` are JSON integers. Every 200
+    upserts the ``terminal_corporate_filings`` row on the file's SHA-256; the raw bytes are never
+    stored.
 
     Errors carry no extraction and write no filing or fundamentals row: 413
     ``request_too_large`` or ``file_too_large``, 415 ``not_a_pdf``, 429 ``ingest_busy`` (with
     ``Retry-After: 5``), and from the service 422 ``pdf_encrypted``, ``pdf_unreadable``,
-    ``too_many_pages``, ``commit_requires_ticker_and_period`` or ``commit_requires_kes``, 409
-    ``currency_conflict``, 404 ``unknown_ticker`` and 500 ``internal_error`` for a server fault.
-    Send ``commit=false`` to preview what a PDF yields before committing it.
+    ``pdf_parse_timeout`` (the parse reached its wall-clock limit, 20 s plus 0.4 s per page of
+    ``TERMINAL_PDF_MAX_PAGES``: 180 s at 400), ``too_many_pages``,
+    ``commit_requires_ticker_and_period`` or ``commit_requires_kes``, 409 ``currency_conflict``,
+    404 ``unknown_ticker`` and 500 ``internal_error`` for a server fault. The 413
+    ``file_too_large``, 415 and 429 are decided before the file is loaded into memory. Send
+    ``commit=false`` to preview what a PDF yields before committing it.
+
+    A client that disconnects before its answer cancels the request, and its parse slot is freed
+    once the service has ended. A disconnect before the service's data commit starts (during the
+    run-row start, the pre-parse checks, the parse or the uncommitted writes) stops the parse, or
+    keeps it from starting, writes no filing or fundamentals row and finishes the run row
+    ``failed`` with ``cancelled``. A disconnect once that commit has started lets it complete:
+    the filing, and any merged fundamentals, are stored and the run row is finished
+    ``succeeded``, although no response is delivered. Either way the route logs it once at INFO
+    and returns a bare 499, which the server discards because nobody is left to receive it.
+
+    Every input is a form field, and the endpoint takes no query parameter: ``params`` carries
+    none and is not read, and any query parameter, for example ``?foo=1``, is FastAPI's standard
+    422 list with one ``extra_forbidden`` entry per unknown name, and the upload is neither parsed
+    nor stored and records no run row.
     """
-    data = await file.read(settings.pdf_max_bytes + 1)
-    if len(data) > settings.pdf_max_bytes:
+    if await _upload_size(file) > settings.pdf_max_bytes:
         raise _rejection(
             status.HTTP_413_CONTENT_TOO_LARGE,
             "file_too_large",
             f"The uploaded file exceeds {settings.pdf_max_bytes} bytes.",
             "file",
         )
-    if not data.startswith(PDF_MAGIC):
+    await file.seek(0)
+    if await file.read(len(PDF_MAGIC)) != PDF_MAGIC:
         raise _rejection(
             status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
             "not_a_pdf",
@@ -580,8 +739,11 @@ async def ingest_pdf(
         commit=commit,
     )
     # A free slot is checked for and taken without waiting, and given back when the block exits,
-    # also when the service raises or the request is cancelled. A cancelled service call returns
-    # only once its parse thread has ended, so the slot is held for as long as that parse runs.
+    # also when the service raises, the request is cancelled or the client disconnects. A
+    # refused request never loads its file, so memory grows with admitted parses only. A
+    # service call cancelled while parsing kills its parser process and returns once its parse
+    # thread has ended, moments later; one cancelled once its data commit has started returns
+    # when that commit and its run row are written. The slot is held until then and no longer.
     async with limiter.slot(settings.pdf_max_concurrency) as admitted:
         if not admitted:
             raise _rejection(
@@ -591,4 +753,16 @@ async def ingest_pdf(
                 None,
                 headers={"Retry-After": RETRY_AFTER_SECONDS},
             )
-        return await filings_service.ingest_pdf(session, settings, data, file_name, form)
+        await file.seek(0)
+        data = await file.read(settings.pdf_max_bytes + 1)
+        # The size checked above is the multipart parser's count; the bytes read are the proof.
+        if len(data) > settings.pdf_max_bytes:
+            raise _rejection(
+                status.HTTP_413_CONTENT_TOO_LARGE,
+                "file_too_large",
+                f"The uploaded file exceeds {settings.pdf_max_bytes} bytes.",
+                "file",
+            )
+        return await _serve_while_connected(
+            request, filings_service.ingest_pdf(session, settings, data, file_name, form)
+        )

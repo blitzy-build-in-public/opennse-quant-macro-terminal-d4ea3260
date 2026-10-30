@@ -45,7 +45,10 @@ Collision invariants a host relies on:
 * The sub-routers are included as their modules define them, with no prefix, tags,
   dependencies or route class added. ``include_router`` keeps each route's class, so the ingest
   router's ``TerminalUploadRoute`` (the whole-request 413 guard) and the ``TerminalJsonRoute``
-  body decoding of the IPO and watchlist routers travel with ``terminal_router`` into a host.
+  of the IPO and watchlist routers travel with ``terminal_router`` into a host. The latter
+  bounds each JSON body to 64 KiB (413 ``request_too_large``), answers an undecodable one with
+  FastAPI's ``json_invalid`` 422, and raises either verdict only after this router's principal
+  dependency and any a host adds, so the order is host dependencies, body verdict, validation.
 * The router deliberately registers no startup, shutdown or lifespan hooks and no other global
   state. This is the terminal's policy, not a framework limit: a host's ``include_router`` would
   carry such hooks into the host's own lifecycle, so the terminal keeps none and the host owns

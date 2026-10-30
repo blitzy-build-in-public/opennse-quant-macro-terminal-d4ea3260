@@ -1426,6 +1426,8 @@ type CycleTooltipEntry =
   | {
       type: "line";
       key: string;
+      /** The event date of the row's cycle. */
+      eventDate: string;
       name: string;
       color: string;
       width: number;
@@ -1472,6 +1474,7 @@ function CycleChartTooltip({
       entries.push({
         type: "line",
         key: item.key + "-observed",
+        eventDate: item.cycle.event_date,
         name: displayLabel(item.cycle.label),
         color: item.color,
         width: item.strokeWidth,
@@ -1501,6 +1504,7 @@ function CycleChartTooltip({
         entries.push({
           type: "line",
           key: item.key + "-projection",
+          eventDate: item.cycle.event_date,
           name: "Projection \u00b7 " + displayLabel(item.cycle.label),
           color: item.color,
           width: item.projectionStrokeWidth,
@@ -1556,7 +1560,13 @@ function CycleChartTooltip({
                 <span>{entry.text}</span>
               </li>
             ) : (
-              <li key={entry.key} className={TOOLTIP_ROW_CLASS}>
+              <li
+                key={entry.key}
+                data-testid="cycle-tooltip-row"
+                data-event-date={entry.eventDate}
+                data-series={entry.row.kind}
+                className={TOOLTIP_ROW_CLASS}
+              >
                 <span className={TOOLTIP_NAME_CLASS}>
                   <LineSwatch
                     color={entry.color}
@@ -1571,7 +1581,9 @@ function CycleChartTooltip({
                     {formatOffset(entry.row.x) + " d"}
                   </span>
                 </span>
-                <span className={TOOLTIP_VALUE_CLASS}>{formatRowValue(entry.row, metric)}</span>
+                <span data-part="value" className={TOOLTIP_VALUE_CLASS}>
+                  {formatRowValue(entry.row, metric)}
+                </span>
               </li>
             ),
           )}
@@ -1601,7 +1613,12 @@ function OverlayTooltip({ active, label, rows }: OverlayTooltipProps): ReactElem
       </p>
       <ul className={TOOLTIP_LIST_CLASS}>
         {OVERLAY_SERIES.map((overlay) => (
-          <li key={overlay.field} className={TOOLTIP_ROW_CLASS}>
+          <li
+            key={overlay.field}
+            data-testid="cycle-overlay-tooltip-row"
+            data-series={overlay.field}
+            className={TOOLTIP_ROW_CLASS}
+          >
             <span className={TOOLTIP_NAME_CLASS}>
               <LineSwatch
                 color={overlay.color}
@@ -1611,7 +1628,7 @@ function OverlayTooltip({ active, label, rows }: OverlayTooltipProps): ReactElem
               />
               <span>{overlay.label}</span>
             </span>
-            <span className={TOOLTIP_VALUE_CLASS}>
+            <span data-part="value" className={TOOLTIP_VALUE_CLASS}>
               {formatDecimal(row.point[overlay.field], "pct")}
             </span>
           </li>
@@ -2440,11 +2457,15 @@ export function CycleBacktester({
                 <ReferenceLine x={0} stroke={CHART_COLORS.axis} label={eventLabel} />
                 {/* activeDot is off: a line has a value only on its own sessions, so the dot
                     would vanish on other days, while the tooltip shows each line's session on
-                    or before the hovered day. */}
+                    or before the hovered day. Recharts copies a Line's data-* props onto its
+                    path.recharts-line-curve, so each drawn path names its cycle and series. */}
                 {chartModel.series.map((item) =>
                   item.observed.length > 0 ? (
                     <Line
                       key={item.key + "-observed"}
+                      data-testid="cycle-line"
+                      data-event-date={item.cycle.event_date}
+                      data-series="observed"
                       dataKey={item.observedField}
                       name={displayLabel(item.cycle.label)}
                       type="linear"
@@ -2460,6 +2481,9 @@ export function CycleBacktester({
                 {drawnProjections.map((item) => (
                   <Line
                     key={item.key + "-projection"}
+                    data-testid="cycle-line"
+                    data-event-date={item.cycle.event_date}
+                    data-series="projection"
                     dataKey={item.projectionField}
                     name={item.projectionName ?? "Projection"}
                     type="linear"
@@ -2664,10 +2688,12 @@ export function CycleBacktester({
                   <ReferenceLine x={0} stroke={CHART_COLORS.axis} label={eventLabel} />
                   {/* activeDot is off, as on the main chart: a rate has a value only on the
                       cycle's sessions, while the tooltip shows the session on or before the
-                      hovered day. */}
+                      hovered day. As there, the data-* props name each drawn path's series. */}
                   {OVERLAY_SERIES.map((overlay) => (
                     <Line
                       key={overlay.field}
+                      data-testid="cycle-overlay-line"
+                      data-series={overlay.field}
                       dataKey={overlay.field}
                       name={overlay.label}
                       type="linear"

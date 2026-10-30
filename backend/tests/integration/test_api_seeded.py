@@ -21,12 +21,14 @@ import datetime as dt
 import hashlib
 import logging
 import uuid
+from bisect import bisect_right
 from calendar import monthrange
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from statistics import mean
 from typing import Any, Final, Protocol
 from zoneinfo import ZoneInfo
 
@@ -60,6 +62,7 @@ from opennse_terminal.quant.backtest import (
     BacktestCandidate,
     CycleBacktestResult,
     CycleEvent,
+    CyclePointResult,
     CycleWindow,
     run_cycle_backtest,
 )
@@ -131,6 +134,13 @@ PLANTED_MIN_Z: Final[Decimal] = Decimal("4.00")
 
 HISTORICAL_CYCLES: Final[tuple[str, ...]] = ("2013 Cycle", "2017 Cycle", "2022 Cycle")
 FUTURE_CYCLE: Final[str] = "2027 Election Watch"
+
+HUNDRED: Final[Decimal] = Decimal(100)
+HALF_CENT: Final[Decimal] = Decimal("0.005")
+"""The most a value moves when it is rounded once to 2 dp, as every response value is."""
+
+PROJECTED_LEVELS: Final[tuple[str, ...]] = ("price_index", "turnover_index", "pe_index")
+"""The normalized levels a cycle projection averages, in the order its points carry them."""
 
 RISK_TITLES: Final[tuple[str, ...]] = ("Ownership & Motive", "Growth Financing", "Valuation Floor")
 SENSITIVITY_AXES: Final[frozenset[str]] = frozenset(
@@ -224,6 +234,61 @@ async def fetch_one(session: AsyncSession, statement: Executable) -> RowMapping:
 def date_of(value: str) -> dt.date:
     """Parse an ISO ``YYYY-MM-DD`` response date."""
     return dt.date.fromisoformat(value)
+
+
+def level_of(point: JsonObject, key: str) -> Decimal | None:
+    """``point[key]`` as a ``Decimal``, or ``None`` when the response carries null."""
+    raw = point[key]
+    return None if raw is None else dec(raw)
+
+
+Bounds = tuple[Decimal, Decimal]
+
+
+def assert_rounded_within(value: object, bounds: Bounds | None, name: str) -> None:
+    """``value`` is null exactly when ``bounds`` is, and otherwise rounds a figure inside them.
+
+    A response value is its unrounded figure rounded once to 2 dp, so it may lie up to
+    :data:`HALF_CENT` outside the range the unrounded figure is known to occupy.
+    """
+    if bounds is None:
+        assert value is None, f"{name}: expected null, got {value!r}"
+        return
+    low, high = bounds
+    assert value is not None, f"{name}: expected a value in [{low}, {high}], got null"
+    assert low - HALF_CENT <= dec(value) <= high + HALF_CENT, (name, value, low, high)
+
+
+Track = tuple[int, int, Sequence[int], Sequence[Sequence[Decimal | None]]]
+"""One complete cycle for a projection: the first and last calendar offsets of its window, its
+points' ``offset_days`` (ascending) and each point's :data:`PROJECTED_LEVELS`."""
+
+
+def mean_paths(
+    first: int, last: int, tracks: Sequence[Track]
+) -> list[tuple[int, list[Decimal | None]]]:
+    """The mean of each projected level across ``tracks`` at every offset from ``first`` to
+    ``last``, as ``(offset, [price_index, turnover_index, pe_index])``.
+
+    At offset o a track contributes its last point with ``offset_days <= o``, only when o lies
+    inside its own window, and only that point's non-null levels; a level no track defines at o
+    is ``None``, and an offset where every level is undefined is left out. ``statistics.mean``
+    keeps ``Decimal`` inputs ``Decimal``.
+    """
+    means: list[tuple[int, list[Decimal | None]]] = []
+    for offset in range(first, last + 1):
+        columns: list[list[Decimal]] = [[] for _ in PROJECTED_LEVELS]
+        for start, end, offsets, levels in tracks:
+            position = bisect_right(offsets, offset)
+            if not start <= offset <= end or position == 0:
+                continue
+            for column, level in zip(columns, levels[position - 1], strict=True):
+                if level is not None:
+                    column.append(level)
+        row: list[Decimal | None] = [mean(column) if column else None for column in columns]
+        if any(level is not None for level in row):
+            means.append((offset, row))
+    return means
 
 
 # ---------------------------------------------------------------------------------------------
@@ -445,6 +510,66 @@ async def test_sector_heatmap_covers_four_sectors_over_twelve_month_ends(
 
 
 @pytest.mark.parametrize(
+    ("params", "as_of", "interval", "period_ends"),
+    [
+        pytest.param(
+            {"interval": "week", "periods": 4},
+            ANCHOR,
+            "week",
+            ["2026-09-11", "2026-09-18", "2026-09-25", ANCHOR],
+            id="four-weeks",
+        ),
+        pytest.param(
+            {"periods": 3, "as_of": "2026-06-17"},
+            "2026-06-17",
+            "month",
+            ["2026-04-30", "2026-05-29", "2026-06-17"],
+            id="three-months-to-mid-june",
+        ),
+        pytest.param(
+            {"interval": "week", "periods": 3, "as_of": "2026-06-17"},
+            "2026-06-17",
+            "week",
+            ["2026-06-05", "2026-06-12", "2026-06-17"],
+            id="three-weeks-to-mid-june",
+        ),
+        pytest.param({"periods": 1}, ANCHOR, "month", [ANCHOR], id="one-month"),
+    ],
+)
+async def test_sector_heatmap_serves_the_requested_interval_periods_and_as_of(
+    client: httpx.AsyncClient,
+    params: dict[str, Any],
+    as_of: str,
+    interval: str,
+    period_ends: list[str],
+) -> None:
+    """``interval``, ``periods`` and ``as_of`` reach the service. Boundaries are the last session
+    on or before each Friday (week) or month-end (month), the latest being ``as_of`` itself
+    (Wednesday 2026-09-30 or 2026-06-17), so a weekly heatmap or one ending mid-June differs from
+    the default 12 month-ends to 2026-09-30. The market row (all 8 counters) and each of the 4
+    sector rows hold one cell per period, and each cell is the one the same request over 12
+    periods gives for that period: fewer periods trim the history, never move a boundary."""
+    body = await get_json(client, "/market/sector-heatmap", params)
+
+    assert (body["as_of"], body["interval"], body["period_ends"]) == (as_of, interval, period_ends)
+    count = len(period_ends)
+    assert [cell["period_end"] for cell in body["market"]] == period_ends
+    assert [cell["constituents"] for cell in body["market"]] == [8] * count
+    sectors = by_key(body["sectors"], "sector")
+    assert set(sectors) == SECTORS
+    for row in sectors.values():
+        assert [cell["period_end"] for cell in row["cells"]] == period_ends
+
+    longer = await get_json(client, "/market/sector-heatmap", {**params, "periods": 12})
+    assert len(longer["period_ends"]) == 12
+    assert longer["period_ends"][-count:] == period_ends
+    assert longer["market"][-count:] == body["market"]
+    longer_sectors = by_key(longer["sectors"], "sector")
+    for name, row in sectors.items():
+        assert longer_sectors[name]["cells"][-count:] == row["cells"]
+
+
+@pytest.mark.parametrize(
     ("params", "subject", "subject_type"),
     [
         ({"ticker": "SCOM"}, "SCOM", "ticker"),
@@ -477,6 +602,75 @@ async def test_valuation_bands_are_ok_over_the_default_five_years(
     assert dec(stats["current"]) == dec(body["series"][-1]["value"])
 
 
+@pytest.mark.parametrize(
+    ("params", "scope", "coverage", "stats", "last_point"),
+    [
+        pytest.param(
+            {"ticker": "scom", "metric": "pb", "lookback_years": 15},
+            ("SCOM", "ticker", "pb", ANCHOR, "ok", []),
+            ("2011-09-30", "2012-01-02", True),
+            (3762, "4.50"),
+            {"date": ANCHOR, "value": "4.50"},
+            id="ticker-pb-fifteen-years",
+        ),
+        pytest.param(
+            {"ticker": "KCB", "lookback_years": 1, "as_of": "2012-02-15"},
+            ("KCB", "ticker", "pe", "2012-02-15", "insufficient_history", ["insufficient_history"]),
+            ("2011-02-15", "2012-01-02", True),
+            None,
+            {"date": "2012-02-15", "value": "6.48"},
+            id="ticker-one-year-to-2012",
+        ),
+        pytest.param(
+            {"sector": "Banking", "metric": "pb", "lookback_years": 2, "as_of": "2026-06-30"},
+            ("Banking", "sector", "pb", "2026-06-30", "ok", []),
+            ("2024-06-30", "2024-07-01", False),
+            (508, "0.85"),
+            {"date": "2026-06-30", "value": "0.85"},
+            id="sector-pb-two-years-to-june",
+        ),
+    ],
+)
+async def test_valuation_bands_serve_the_requested_metric_lookback_and_as_of(
+    client: httpx.AsyncClient,
+    params: dict[str, Any],
+    scope: tuple[str, str, str, str, str, list[str]],
+    coverage: tuple[str, str, bool],
+    stats: tuple[int, str] | None,
+    last_point: JsonObject,
+) -> None:
+    """``ticker`` (normalised) or ``sector``, ``metric``, ``lookback_years`` and ``as_of`` reach
+    the service: ``requested_start`` is ``as_of`` minus the lookback and the weekly series ends on
+    ``as_of``. Fifteen years of SCOM P/B start before the history on 2012-01-02, so coverage is
+    partial over all 3,762 sessions, current 4.50 (P/E would be 14.00). One year of KCB P/E to
+    2012-02-15 holds too few sessions for statistics. Two years of Banking P/B to 2026-06-30 start
+    on Monday 2024-07-01, within 7 days of the Sunday requested start, over 508 sessions."""
+    body = await get_json(client, "/market/valuation-bands", params)
+
+    assert (
+        body["subject"],
+        body["subject_type"],
+        body["metric"],
+        body["as_of"],
+        body["status"],
+        body["flags"],
+    ) == scope
+    requested_start, coverage_start, is_partial = coverage
+    assert body["coverage"] == {
+        "requested_start": requested_start,
+        "coverage_start": coverage_start,
+        "is_partial_coverage": is_partial,
+    }
+    assert body["series"][-1] == last_point
+    assert date_of(body["series"][0]["date"]) >= date_of(coverage_start)
+    if stats is None:
+        assert body["stats"] is None
+    else:
+        observations, current = stats
+        assert body["stats"]["observations"] == observations
+        assert body["stats"]["current"] == current == last_point["value"]
+
+
 async def test_anomalies_include_the_three_planted_volume_spikes_in_feed_order(
     client: httpx.AsyncClient,
 ) -> None:
@@ -505,6 +699,141 @@ async def test_anomalies_include_the_three_planted_volume_spikes_in_feed_order(
         assert earlier[0] > later[0] or (earlier[0] == later[0] and earlier[1] >= later[1])
 
 
+# (ticker, trade_date, metric, z_score, observations_used) of a feed item.
+AnomalyRow = tuple[str, str, str, str, int]
+BOTH_METRICS: Final[frozenset[str]] = frozenset({"volume", "turnover"})
+
+
+@pytest.mark.parametrize(
+    ("params", "window", "threshold", "tickers", "metrics", "first_day", "included"),
+    [
+        pytest.param(
+            {"ticker": "kcb", "metric": "volume", "threshold": "4"},
+            20,
+            "4",
+            frozenset({"KCB"}),
+            frozenset({"volume"}),
+            date(2026, 9, 3),
+            [("KCB", "2026-09-24", "volume", "5.10", 20)],
+            id="ticker-volume-threshold-4",
+        ),
+        pytest.param(
+            {"sector": "Banking", "metric": "turnover", "threshold": "5"},
+            20,
+            "5",
+            BANKS,
+            frozenset({"turnover"}),
+            date(2026, 9, 3),
+            [
+                ("KCB", "2026-09-24", "turnover", "5.39", 20),
+                ("COOP", "2026-09-11", "turnover", "5.31", 20),
+            ],
+            id="sector-turnover-threshold-5",
+        ),
+        pytest.param(
+            {"ticker": "KCB", "lookback_sessions": 12},
+            20,
+            "2.0",
+            frozenset({"KCB"}),
+            BOTH_METRICS,
+            date(2026, 9, 15),
+            [
+                ("KCB", "2026-09-24", "turnover", "5.39", 20),
+                ("KCB", "2026-09-24", "volume", "5.10", 20),
+            ],
+            id="twelve-sessions",
+        ),
+        pytest.param(
+            {"ticker": "SCOM", "lookback_sessions": 11},
+            20,
+            "2.0",
+            frozenset({"SCOM"}),
+            BOTH_METRICS,
+            date(2026, 9, 16),
+            [],
+            id="eleven-sessions-start-after-the-spike",
+        ),
+        pytest.param(
+            {"ticker": "SCOM", "window": 10, "lookback_sessions": 12},
+            10,
+            "2.0",
+            frozenset({"SCOM"}),
+            BOTH_METRICS,
+            date(2026, 9, 15),
+            [
+                ("SCOM", "2026-09-15", "turnover", "3.20", 10),
+                ("SCOM", "2026-09-15", "volume", "3.08", 10),
+            ],
+            id="ten-row-window",
+        ),
+        pytest.param(
+            {"ticker": "SCOM", "sector": "Banking"},
+            20,
+            "2.0",
+            frozenset(),
+            BOTH_METRICS,
+            date(2026, 9, 3),
+            [],
+            id="ticker-outside-the-sector",
+        ),
+    ],
+)
+async def test_anomaly_feed_serves_the_requested_metric_window_threshold_lookback_and_subject(
+    client: httpx.AsyncClient,
+    params: dict[str, Any],
+    window: int,
+    threshold: str,
+    tickers: frozenset[str],
+    metrics: frozenset[str],
+    first_day: date,
+    included: list[AnomalyRow],
+) -> None:
+    """``metric``, ``window``, ``threshold``, ``lookback_sessions``, ``ticker`` (normalised) and
+    ``sector`` reach the service, and ``window`` and ``threshold`` are echoed as given.
+
+    The feed is checked by scope and inclusion, never by count, since background noise may add
+    crossings: every item is a candidate ticker's (the ticker, the sector's members, or none for a
+    ticker outside the sector), of a requested metric, at a Z-score at or above the threshold,
+    dated from the first of the last ``lookback_sessions`` sessions (20 from 2026-09-03, 12 from
+    2026-09-15, 11 from 2026-09-16) to 2026-09-30, and scored over at most ``window`` rows; items
+    run by date, then Z-score, both descending; and the listed items appear in that order.
+
+    Dropping an argument brings in a seeded crossing outside the requested scope. ``metric``: KCB's
+    2026-09-24 turnover (Z 5.39) beside its volume, and COOP's 2026-09-11 volume (5.60) beside
+    the Banking turnover. ``threshold``: KCB's 2026-09-09 volume (3.40) under 4, and EQTY's
+    2026-09-25 turnover (2.10) under 5. ``lookback_sessions``: KCB's 2026-09-09 spikes before the
+    12 sessions, SCOM's 2026-09-15 spikes (4.16, 4.00) before the 11 sessions, and SCOM's
+    2026-09-04 turnover (2.12 over 10 rows) before the 12. ``window``: SCOM's 2026-09-15 spikes
+    over 20 rows rather than 10 (3.20, 3.08), with 20 echoed. ``ticker``: EABL's 2026-09-29
+    volume (5.90) beside KCB's, and the Banking members' spikes, such as KCB's 2026-09-24, into
+    SCOM within Banking. ``sector``: EABL's 2026-09-29 (6.17) and KEGN's 2026-09-16 (5.73)
+    turnover beside the Banking members', and SCOM's 2026-09-15 spikes into SCOM within Banking,
+    whose candidate set is empty because SCOM is not a Banking member."""
+    body = await get_json(client, "/market/anomalies", params)
+
+    assert (body["window"], body["threshold"]) == (window, threshold)
+    rows: list[AnomalyRow] = []
+    for item in body["items"]:
+        assert item["ticker"] in tickers, item
+        assert item["metric"] in metrics, item
+        assert dec(item["z_score"]) >= Decimal(threshold), item
+        assert first_day <= date_of(item["trade_date"]) <= date_of(ANCHOR), item
+        assert is_json_int(item["observations_used"]), item
+        assert item["observations_used"] <= window, item
+        rows.append(
+            (
+                item["ticker"],
+                item["trade_date"],
+                item["metric"],
+                item["z_score"],
+                item["observations_used"],
+            )
+        )
+    order = [(date_of(trade_date), dec(z_score)) for _, trade_date, _, z_score, _ in rows]
+    assert order == sorted(order, reverse=True)
+    assert [row for row in rows if row in included] == included
+
+
 async def test_flows_for_scom_cover_the_trailing_year_with_local_mirroring_foreign(
     client: httpx.AsyncClient,
 ) -> None:
@@ -530,13 +859,199 @@ async def test_flows_for_scom_cover_the_trailing_year_with_local_mirroring_forei
         assert dec(point["local_net_kes"]) == -dec(point["foreign_net_kes"])
 
 
+@pytest.mark.parametrize(
+    ("params", "subject", "dates", "sessions", "rolling_window", "foreign_total"),
+    [
+        pytest.param(
+            {"ticker": "KCB", "start": "2026-09-28", "end": ANCHOR, "rolling_window": 5},
+            "KCB",
+            (ANCHOR, "2026-09-28", ANCHOR, "2026-09-28"),
+            3,
+            5,
+            "-2513051.82",
+            id="explicit-range",
+        ),
+        pytest.param(
+            {"ticker": "EABL", "as_of": "2026-06-30"},
+            "EABL",
+            ("2026-06-30", "2025-06-30", "2026-06-30", "2025-06-30"),
+            254,
+            20,
+            "1424333.20",
+            id="as-of",
+        ),
+        pytest.param(
+            {"ticker": "EABL", "end": "2026-06-30"},
+            "EABL",
+            (ANCHOR, "2025-06-30", "2026-06-30", "2025-06-30"),
+            254,
+            20,
+            "1424333.20",
+            id="end",
+        ),
+        pytest.param(
+            {"ticker": "EABL", "start": "2026-06-01"},
+            "EABL",
+            (ANCHOR, "2026-06-01", ANCHOR, "2026-06-02"),
+            87,
+            20,
+            "653487.05",
+            id="start",
+        ),
+        pytest.param(
+            {"sector": "Banking", "rolling_window": 5},
+            "Banking",
+            (ANCHOR, "2025-09-30", ANCHOR, "2025-09-30"),
+            254,
+            5,
+            "72937052.59",
+            id="sector-five-session-rolling-sum",
+        ),
+    ],
+)
+async def test_flows_serve_the_requested_subject_range_and_rolling_window(
+    client: httpx.AsyncClient,
+    params: dict[str, Any],
+    subject: str,
+    dates: tuple[str, str, str, str],
+    sessions: int,
+    rolling_window: int,
+    foreign_total: str,
+) -> None:
+    """``ticker`` or ``sector``, ``as_of``, ``start``, ``end`` and ``rolling_window`` reach the
+    service. ``dates`` is ``(as_of, start, end, first session)``: ``end`` defaults to ``as_of``
+    and ``start`` to 365 days before ``end``, and a given bound is served as given (2026-06-01 is
+    not a session, so the series opens on 2026-06-02). On every session local = -foreign, the
+    cumulative flow is the running foreign sum and the rolling flow is the sum of the last
+    ``rolling_window`` sessions from the ``rolling_window``-th session on (the 20th by default),
+    each an exact sum of 2 dp amounts; every seeded row has a flow, so coverage is complete and
+    the totals are the last cumulative flow and its negation."""
+    body = await get_json(client, "/market/flows", params)
+
+    as_of, start, end, first = dates
+    assert (body["subject"], body["as_of"], body["start"], body["end"]) == (
+        subject,
+        as_of,
+        start,
+        end,
+    )
+    assert (body["status"], body["flags"], body["coverage_pct"]) == ("ok", [], "100.00")
+    series = body["series"]
+    assert len(series) == sessions
+    assert (series[0]["trade_date"], series[-1]["trade_date"]) == (first, end)
+    foreign = [dec(point["foreign_net_kes"]) for point in series]
+    running = Decimal(0)
+    for index, point in enumerate(series):
+        running += foreign[index]
+        assert dec(point["local_net_kes"]) == -foreign[index]
+        assert dec(point["cumulative_foreign_net_kes"]) == running
+        if index < rolling_window - 1:
+            assert point["rolling_foreign_net_kes"] is None
+        else:
+            window_sum = sum(foreign[index - rolling_window + 1 : index + 1], Decimal(0))
+            assert dec(point["rolling_foreign_net_kes"]) == window_sum
+    totals = body["totals"]
+    assert (
+        totals["foreign_net_kes"],
+        totals["local_net_kes"],
+        totals["sessions_with_data"],
+        totals["sessions_in_range"],
+    ) == (foreign_total, str(-Decimal(foreign_total)), sessions, sessions)
+    assert running == Decimal(foreign_total)
+
+
 # ---------------------------------------------------------------------------------------------
 # Election and event cycles
 # ---------------------------------------------------------------------------------------------
 
 
+def window_span(cycle: JsonObject) -> tuple[int, int]:
+    """The calendar offsets of ``cycle``'s window start and end from its event date."""
+    event = date_of(cycle["event_date"])
+    return (
+        (date_of(cycle["window_start"]) - event).days,
+        (date_of(cycle["window_end"]) - event).days,
+    )
+
+
+def returned_track(cycle: JsonObject) -> Track:
+    """``cycle``'s window and returned points as a projection :data:`Track`."""
+    first, last = window_span(cycle)
+    points = cycle["points"]
+    return (
+        first,
+        last,
+        [point["offset_days"] for point in points],
+        [[level_of(point, key) for key in PROJECTED_LEVELS] for point in points],
+    )
+
+
+def assert_summary_from_points(cycle: JsonObject) -> None:
+    """``cycle``'s summary is the summary rule recomputed from its own returned points.
+
+    "Index at T" is the price index of the last point on or before T. The pre-event return is
+    (index at T / 100 - 1) x 100; the post-event return (last index / index at T - 1) x 100, null
+    with no point after T; the maximum drawdown the minimum over the points of (index / running
+    maximum - 1) x 100; the P/E compression (P/E at the valuation floor / anchor P/E - 1) x 100,
+    which is the P/E index at the floor minus 100, null when the floor fell back to the price
+    index or the P/E index is null. A figure is null wherever its input level is.
+
+    The service computes each figure from unrounded levels and rounds it once. Each returned
+    level is within :data:`HALF_CENT` of its unrounded level and every formula is monotonic in
+    each level, so the unrounded figure lies between the formula's values at the ends of those
+    ranges, and the returned figure within a further half cent of it. The floor is the first
+    point with the minimum returned P/E, as the response defines it.
+    """
+    summary = cycle["summary"]
+    assert summary is not None, cycle["label"]
+    points = cycle["points"]
+    event = date_of(cycle["event_date"])
+    at_or_before = [point for point in points if date_of(point["trade_date"]) <= event]
+    index_at_event = level_of(at_or_before[-1], "price_index") if at_or_before else None
+    last_index = level_of(points[-1], "price_index")
+
+    pre_event: Bounds | None = None
+    post_event: Bounds | None = None
+    if index_at_event is not None:
+        pre_event = (index_at_event - HALF_CENT - HUNDRED, index_at_event + HALF_CENT - HUNDRED)
+        if last_index is not None and date_of(points[-1]["trade_date"]) > event:
+            post_event = (
+                ((last_index - HALF_CENT) / (index_at_event + HALF_CENT) - 1) * HUNDRED,
+                ((last_index + HALF_CENT) / (index_at_event - HALF_CENT) - 1) * HUNDRED,
+            )
+
+    lows: list[Decimal] = []
+    highs: list[Decimal] = []
+    running_max: Decimal | None = None
+    for point in points:
+        level = level_of(point, "price_index")
+        if level is None:
+            continue
+        running_max = level if running_max is None else max(running_max, level)
+        lows.append(((level - HALF_CENT) / (running_max + HALF_CENT) - 1) * HUNDRED)
+        # An index never exceeds its own running maximum, whatever the rounding.
+        ratio = min(Decimal(1), (level + HALF_CENT) / (running_max - HALF_CENT))
+        highs.append((ratio - 1) * HUNDRED)
+    drawdown: Bounds | None = (min(lows), min(highs)) if lows else None
+
+    floor = earliest_min(points, "pe_ratio")
+    floor_index = None if floor is None else level_of(floor, "pe_index")
+    compression: Bounds | None = (
+        None
+        if floor_index is None
+        else (floor_index - HALF_CENT - HUNDRED, floor_index + HALF_CENT - HUNDRED)
+    )
+
+    label = cycle["label"]
+    assert_rounded_within(summary["pre_event_return_pct"], pre_event, f"{label} pre-event")
+    assert_rounded_within(summary["post_event_return_pct"], post_event, f"{label} post-event")
+    assert_rounded_within(summary["max_drawdown_pct"], drawdown, f"{label} drawdown")
+    assert_rounded_within(summary["pe_compression_pct"], compression, f"{label} compression")
+
+
 def assert_complete_cycle(cycle: JsonObject) -> None:
-    """A completed historical cycle: points, a summary, and markers recomputable from the points."""
+    """A completed historical cycle: points, a summary recomputed from the points, and markers
+    recomputable from the points."""
     assert cycle["status"] == "complete", cycle["label"]
     points = cycle["points"]
     assert points
@@ -544,6 +1059,7 @@ def assert_complete_cycle(cycle: JsonObject) -> None:
     assert all(is_json_int(offset) for offset in offsets)
     assert offsets == sorted(offsets)
     assert cycle["summary"] is not None
+    assert_summary_from_points(cycle)
 
     markers = cycle["markers"]
     assert markers is not None
@@ -558,8 +1074,34 @@ def assert_complete_cycle(cycle: JsonObject) -> None:
     )
 
 
-def assert_projection_from_history(cycle: JsonObject) -> None:
-    """A labelled projection averaged over the three completed historical cycles."""
+def assert_projection_means(cycle: JsonObject, cycles: Sequence[JsonObject]) -> None:
+    """``cycle``'s projection is the mean of the complete ``cycles``' returned paths.
+
+    The basis lists the complete cycles in response order. The projected offsets are exactly the
+    offsets of ``cycle``'s window at which a complete cycle defines a level (see
+    :func:`mean_paths`), and each projected level is within 0.01 of the mean of the complete
+    cycles' returned levels: each returned level is within half a cent of the unrounded level
+    the service averages, so their means differ by at most half a cent, and the projection
+    rounds the unrounded mean once.
+    """
+    complete = [other for other in cycles if other["status"] == "complete"]
+    projection = cycle["projection"]
+    assert projection is not None, cycle["label"]
+    assert projection["is_projection"] is True
+    assert projection["basis"] == [other["label"] for other in complete]
+    first, last = window_span(cycle)
+    expected = mean_paths(first, last, [returned_track(other) for other in complete])
+    points = projection["points"]
+    assert [point["offset_days"] for point in points] == [offset for offset, _ in expected]
+    for point, (offset, means) in zip(points, expected, strict=True):
+        for key, level in zip(PROJECTED_LEVELS, means, strict=True):
+            bounds = None if level is None else (level - HALF_CENT, level + HALF_CENT)
+            assert_rounded_within(point[key], bounds, f"{cycle['label']} {key} at {offset}")
+
+
+def assert_projection_from_history(cycle: JsonObject, cycles: Sequence[JsonObject]) -> None:
+    """A labelled projection averaged over the three completed historical cycles of ``cycles``,
+    each level recomputed from their returned points."""
     projection = cycle["projection"]
     assert projection is not None
     assert projection["is_projection"] is True
@@ -569,6 +1111,7 @@ def assert_projection_from_history(cycle: JsonObject) -> None:
         assert is_json_int(point["offset_days"])
         if point["price_index"] is not None:
             dec(point["price_index"])
+    assert_projection_means(cycle, cycles)
 
 
 async def test_backtest_default_window_completes_history_and_projects_2027(
@@ -600,7 +1143,8 @@ async def test_backtest_default_window_completes_history_and_projects_2027(
     assert future["summary"] is None
     assert is_json_int(future["days_until_window_start"])
     assert future["days_until_window_start"] > 0
-    assert_projection_from_history(future)
+    assert future["flags"] == []
+    assert_projection_from_history(future, body["cycles"])
 
 
 async def test_backtest_twelve_month_window_makes_2027_partial_with_observed_points(
@@ -629,7 +1173,609 @@ async def test_backtest_twelve_month_window_makes_2027_partial_with_observed_poi
     assert future["summary"] is not None
     # No observed point lies after the event, so there is no post-event return yet.
     assert future["summary"]["post_event_return_pct"] is None
-    assert_projection_from_history(future)
+    assert_summary_from_points(future)
+    assert future["flags"] == []
+    assert_projection_from_history(future, body["cycles"])
+
+
+# (label, event_date, window_start, window_end, status) of a returned cycle.
+CycleRow = tuple[str, str, str, str, str]
+
+DAYS_180: Final[tuple[int | None, ...]] = (180, 180, None, None)
+DEFAULT_CYCLE_ROWS: Final[list[CycleRow]] = [
+    ("2013 Cycle", "2013-03-04", "2012-09-05", "2013-08-31", "complete"),
+    ("2017 Cycle", "2017-08-08", "2017-02-09", "2018-02-04", "complete"),
+    ("2022 Cycle", "2022-08-09", "2022-02-10", "2023-02-05", "complete"),
+    (FUTURE_CYCLE, "2027-08-10", "2027-02-11", "2028-02-06", "awaiting_data"),
+]
+"""The four stored events over the default +-180 days."""
+
+
+@pytest.mark.parametrize(
+    ("params", "window", "candidates", "cycles"),
+    [
+        pytest.param(
+            {"event_dates": ["2022-08-09", "2013-03-04"]},
+            DAYS_180,
+            sorted(SEEDED_TICKERS),
+            [DEFAULT_CYCLE_ROWS[0], DEFAULT_CYCLE_ROWS[2]],
+            id="repeated-event-dates",
+        ),
+        pytest.param(
+            {"event_dates": "2015-06-15", "pre_days": 30, "post_days": 45},
+            (30, 45, None, None),
+            sorted(SEEDED_TICKERS),
+            [("Event 2015-06-15", "2015-06-15", "2015-05-16", "2015-07-30", "complete")],
+            id="unstored-event-day-window",
+        ),
+        pytest.param(
+            {"event_dates": "2022-08-09", "pre_months": 3, "post_months": 6},
+            (None, None, 3, 6),
+            sorted(SEEDED_TICKERS),
+            [("2022 Cycle", "2022-08-09", "2022-05-09", "2023-02-09", "complete")],
+            id="month-window",
+        ),
+        pytest.param(
+            {"tickers": ["SCOM", "kcb"]},
+            DAYS_180,
+            ["KCB", "SCOM"],
+            DEFAULT_CYCLE_ROWS,
+            id="repeated-tickers",
+        ),
+        pytest.param(
+            {"sector": "Banking"}, DAYS_180, sorted(BANKS), DEFAULT_CYCLE_ROWS, id="sector"
+        ),
+        pytest.param(
+            {"sector": "Banking", "tickers": ["SCOM", "KCB"]},
+            DAYS_180,
+            ["KCB"],
+            DEFAULT_CYCLE_ROWS,
+            id="tickers-in-sector",
+        ),
+        pytest.param(
+            {"event_dates": ["2027-08-10", "2013-03-04"]},
+            DAYS_180,
+            sorted(SEEDED_TICKERS),
+            [DEFAULT_CYCLE_ROWS[0], DEFAULT_CYCLE_ROWS[3]],
+            id="one-complete-cycle",
+        ),
+    ],
+)
+async def test_backtest_serves_the_requested_events_window_and_candidates(
+    client: httpx.AsyncClient,
+    params: dict[str, Any],
+    window: tuple[int | None, ...],
+    candidates: list[str],
+    cycles: list[CycleRow],
+) -> None:
+    """``event_dates`` (repeatable, served ascending), ``pre_days``/``post_days`` or
+    ``pre_months``/``post_months``, ``tickers`` (repeatable, normalised) and ``sector`` reach
+    the service. The window echo carries the form used. A stored date keeps its
+    ``terminal_cycles`` label and another is labelled "Event YYYY-MM-DD"; each window is T minus
+    and plus the given calendar days or months (2022-08-09 less 3 months is 2022-05-09, plus 6 is
+    2023-02-09), and every point's offset ``trade_date - T`` lies inside it. The candidates are
+    the tickers, the sector's five banks, or the tickers in the sector (KCB alone); every one
+    joins each complete cycle, whose summary and markers are recomputed from its points. A cycle
+    awaiting data is projected from at least 2 complete cycles; with 1 it has no projection and
+    is flagged ``insufficient_projection_basis``."""
+    body = await get_json(client, "/cycles/backtest", params)
+
+    assert body["window"] == dict(
+        zip(("pre_days", "post_days", "pre_months", "post_months"), window, strict=True)
+    )
+    assert (body["candidates"], body["data_available_through"]) == (candidates, ANCHOR)
+    assert [
+        (
+            cycle["label"],
+            cycle["event_date"],
+            cycle["window_start"],
+            cycle["window_end"],
+            cycle["status"],
+        )
+        for cycle in body["cycles"]
+    ] == cycles
+    complete = [cycle for cycle in body["cycles"] if cycle["status"] == "complete"]
+    for cycle in body["cycles"]:
+        event = date_of(cycle["event_date"])
+        first, last = window_span(cycle)
+        for point in cycle["points"]:
+            assert point["offset_days"] == (date_of(point["trade_date"]) - event).days
+            assert first <= point["offset_days"] <= last
+        if cycle["status"] == "complete":
+            assert (cycle["constituents"], cycle["excluded_constituents"]) == (candidates, [])
+            assert_complete_cycle(cycle)
+        elif len(complete) >= 2:
+            assert cycle["flags"] == []
+            assert_projection_means(cycle, body["cycles"])
+        else:
+            assert cycle["projection"] is None
+            assert cycle["flags"] == ["insufficient_projection_basis"]
+
+
+# Sessions of the crafted counters below, all seeded weekdays; Monday 2026-06-01 is not one.
+FEB_LEAD_IN: Final[list[date]] = [date(2026, 2, day) for day in (5, 6, 9, 10)]
+FEB_WINDOW: Final[list[date]] = [date(2026, 2, day) for day in (11, 12, 13, 16, 17, 18, 19, 20)]
+JUNE_LEAD_IN: Final[list[date]] = [date(2026, 6, day) for day in (4, 5, 8, 9)]
+JUNE_WINDOW: Final[list[date]] = [date(2026, 6, day) for day in (10, 11, 12, 15, 16, 17, 18, 19)]
+LATE_LEAD_IN: Final[list[date]] = [date(2026, 6, day) for day in (8, 9, 10, 11, 12)]
+LATE_WINDOW: Final[list[date]] = [date(2026, 6, day) for day in (15, 16, 17, 18, 19)]
+
+CYCLE_PATH: Final[tuple[str, ...]] = (
+    "10.00",
+    "9.50",
+    "9.00",
+    "9.20",
+    "8.80",
+    "9.40",
+    "9.90",
+    "10.50",
+)
+"""Closes of a crafted cycle's window sessions: price index 100, 95, 90, 92, 88, 94, 99, 105."""
+
+
+def crafted_closes(lead_in: Sequence[date], window: Sequence[date]) -> dict[date, Decimal]:
+    """10.00 on each lead-in session, then :data:`CYCLE_PATH` on the window's sessions in turn."""
+    closes = dict.fromkeys(lead_in, Decimal("10.00"))
+    closes.update(zip(window, (Decimal(close) for close in CYCLE_PATH), strict=False))
+    return closes
+
+
+async def test_backtest_floor_on_a_rounded_pe_tie_is_the_earlier_session(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """QTIE is added inside this test's rolled-back transaction by ``add_sparse_counter``
+    (1,000,000 shares and FY2025 net income 100,000 KES from 2026-03-31, so its P/E is the close
+    x 10). It closes 1.2500 on four lead-in sessions from 2026-06-04 and on the anchor 2026-06-10,
+    then 1.1000, 1.0004, 1.0500 (T = Monday 2026-06-15), 1.0001, 1.0800, 1.1500 and 1.2000 on
+    2026-06-19, the end of the T-5 to T+4 window.
+
+    The raw P/E of 2026-06-12 (10.004) and of 2026-06-16 (10.001) both round to 10.00. The floor
+    is the earlier session, the first minimum a client finds in the points, although the later
+    raw P/E is lower, and the P/E compression is computed from the floor's own raw P/E:
+    (10.004 / 12.5 - 1) x 100 = -19.968, so -19.97, not the later session's -19.99. The price and
+    P/E indices are 100 x close / 1.25. The index is 84.00 at T, a pre-event return of -16.00;
+    the last is 96.00, a post-event return of (96 / 84 - 1) x 100 = 14.2857, so 14.29; the
+    deepest drawdown is 80.008 against the 100.00 anchor, -19.992, so -19.99. Five turnover rows
+    by the anchor define the turnover index, so no flag is raised."""
+    closes = dict.fromkeys(JUNE_LEAD_IN, Decimal("1.2500"))
+    window_closes = ("1.2500", "1.1000", "1.0004", "1.0500", "1.0001", "1.0800", "1.1500", "1.2000")
+    closes.update(zip(JUNE_WINDOW, (Decimal(close) for close in window_closes), strict=True))
+    await add_sparse_counter(db_session, "QTIE", "QA Tie", closes)
+
+    body = await get_json(
+        client,
+        "/cycles/backtest",
+        {"event_dates": "2026-06-15", "pre_days": 5, "post_days": 4, "tickers": "QTIE"},
+    )
+
+    assert (body["candidates"], body["data_available_through"]) == (["QTIE"], "2026-06-19")
+    (cycle,) = body["cycles"]
+    assert (
+        cycle["label"],
+        cycle["window_start"],
+        cycle["window_end"],
+        cycle["status"],
+        cycle["anchor_date"],
+        cycle["constituents"],
+        cycle["flags"],
+    ) == ("Event 2026-06-15", "2026-06-10", "2026-06-19", "complete", "2026-06-10", ["QTIE"], [])
+    assert [
+        (
+            point["trade_date"],
+            point["offset_days"],
+            point["price_index"],
+            point["pe_ratio"],
+            point["pe_index"],
+        )
+        for point in cycle["points"]
+    ] == [
+        ("2026-06-10", -5, "100.00", "12.50", "100.00"),
+        ("2026-06-11", -4, "88.00", "11.00", "88.00"),
+        ("2026-06-12", -3, "80.03", "10.00", "80.03"),
+        ("2026-06-15", 0, "84.00", "10.50", "84.00"),
+        ("2026-06-16", 1, "80.01", "10.00", "80.01"),
+        ("2026-06-17", 2, "86.40", "10.80", "86.40"),
+        ("2026-06-18", 3, "92.00", "11.50", "92.00"),
+        ("2026-06-19", 4, "96.00", "12.00", "96.00"),
+    ]
+    assert cycle["markers"]["valuation_floor"] == {
+        "offset_days": -3,
+        "trade_date": "2026-06-12",
+        "metric": "pe_ratio",
+        "value": "10.00",
+    }
+    assert cycle["summary"] == {
+        "pre_event_return_pct": "-16.00",
+        "post_event_return_pct": "14.29",
+        "max_drawdown_pct": "-19.99",
+        "pe_compression_pct": "-19.97",
+    }
+    assert_complete_cycle(cycle)
+
+
+FEB_EVENT: Final[dict[str, Any]] = {"event_dates": "2026-02-16", "pre_days": 5, "post_days": 4}
+JUNE_EVENT: Final[dict[str, Any]] = {"event_dates": "2026-06-15", "pre_days": 5, "post_days": 4}
+SUMMARY_KEYS: Final[tuple[str, ...]] = (
+    "pre_event_return_pct",
+    "post_event_return_pct",
+    "max_drawdown_pct",
+    "pe_compression_pct",
+)
+POINT_LEVELS: Final[tuple[str, ...]] = ("price_index", "turnover_index", "pe_ratio", "pe_index")
+
+
+@pytest.mark.parametrize(
+    ("ticker", "closes", "zeroed", "params", "flags", "null_levels", "floor", "summary"),
+    [
+        pytest.param(
+            "QPF",
+            crafted_closes(FEB_LEAD_IN, FEB_WINDOW),
+            None,
+            FEB_EVENT,
+            ["pe_anchor_unavailable"],
+            {"pe_ratio", "pe_index"},
+            {
+                "offset_days": 1,
+                "trade_date": "2026-02-17",
+                "metric": "price_index",
+                "value": "88.00",
+            },
+            ("-8.00", "14.13", "-12.00", None),
+            id="price-floor-fallback",
+        ),
+        pytest.param(
+            "QZS",
+            crafted_closes(FEB_LEAD_IN, FEB_WINDOW),
+            "shares",
+            FEB_EVENT,
+            ["zero_anchor_capitalization", "pe_anchor_unavailable"],
+            {"price_index", "pe_ratio", "pe_index"},
+            None,
+            (None, None, None, None),
+            id="zero-anchor-capitalization",
+        ),
+        pytest.param(
+            "QNT",
+            crafted_closes([], JUNE_WINDOW),
+            None,
+            JUNE_EVENT,
+            ["insufficient_turnover_history"],
+            {"turnover_index"},
+            {"offset_days": 1, "trade_date": "2026-06-16", "metric": "pe_ratio", "value": "88.00"},
+            ("-8.00", "14.13", "-12.00", "-12.00"),
+            id="insufficient-turnover-history",
+        ),
+        pytest.param(
+            "QZT",
+            crafted_closes(JUNE_LEAD_IN, JUNE_WINDOW),
+            "turnover",
+            JUNE_EVENT,
+            ["zero_anchor_turnover"],
+            {"turnover_index"},
+            {"offset_days": 1, "trade_date": "2026-06-16", "metric": "pe_ratio", "value": "88.00"},
+            ("-8.00", "14.13", "-12.00", "-12.00"),
+            id="zero-anchor-turnover",
+        ),
+        pytest.param(
+            "QNP",
+            crafted_closes(LATE_LEAD_IN, LATE_WINDOW),
+            None,
+            {"event_dates": "2026-06-14", "pre_days": 1, "post_days": 5},
+            ["no_pre_event_data"],
+            set(),
+            {"offset_days": 5, "trade_date": "2026-06-19", "metric": "pe_ratio", "value": "88.00"},
+            (None, None, "-12.00", "-12.00"),
+            id="no-pre-event-data",
+        ),
+    ],
+)
+async def test_backtest_undefined_normalizations_are_null_and_flagged(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    ticker: str,
+    closes: dict[date, Decimal],
+    zeroed: str | None,
+    params: dict[str, Any],
+    flags: list[str],
+    null_levels: set[str],
+    floor: JsonObject | None,
+    summary: tuple[str | None, ...],
+) -> None:
+    """A one-counter cohort added inside this test's rolled-back transaction by
+    ``add_sparse_counter`` (1,000,000 shares, a turnover of 1,000 x the close, FY2025 net income
+    100,000 KES available from 2026-03-31), with its shares or its volume and turnover then set
+    to 0 where ``zeroed`` says, closes 10.00 on its lead-in sessions, then follows price index
+    100, 95, 90, 92 (T), 88, 94, 99 and 105 over a T-5 to T+4 window: a pre-event return of
+    -8.00, a post-event return of (105 / 92 - 1) x 100 = 14.1304, so 14.13, and a drawdown of
+    88 / 100 - 1 = -12.00. Each undefined normalization nulls its outputs and flags the cycle.
+
+    - February, before its fundamentals are available: P/E is null throughout
+      (``pe_anchor_unavailable``), so the floor falls back to the lowest price index, 88.00, and
+      there is no P/E compression.
+    - The same with 0 shares: the anchor capitalization is 0 (``zero_anchor_capitalization``), so
+      the price index is null as well; with neither a P/E nor a price index there is no valuation
+      floor, and every summary figure is null.
+    - June without lead-in rows: one turnover row by the anchor is below the 5 the turnover mean
+      needs (``insufficient_turnover_history``), so the turnover index and the volume exhaustion
+      are null; P/E is the close x 10, so the floor is P/E 88.00 and the compression -12.00.
+    - The same June window after four lead-in rows, every row with 0 volume and turnover: the
+      turnover mean at the anchor is defined but 0 (``zero_anchor_turnover``), with the same nulls.
+    - T on Sunday 2026-06-14 with a T-1 to T+5 window: it opens on Saturday, so its first
+      session, the anchor, is after T (``no_pre_event_data``) and neither return is defined; its
+      five sessions to 2026-06-19 follow the first five levels, the last being the floor.
+    """
+    await add_sparse_counter(db_session, ticker, "QA Cycle", closes)
+    if zeroed == "shares":
+        await db_session.execute(
+            update(TerminalEquity)
+            .where(TerminalEquity.ticker == ticker)
+            .values(shares_outstanding=0)
+        )
+    elif zeroed == "turnover":
+        await db_session.execute(
+            update(TerminalDailyPrice)
+            .where(TerminalDailyPrice.ticker == ticker)
+            .values(volume=0, turnover_kes=Decimal("0.00"))
+        )
+
+    body = await get_json(client, "/cycles/backtest", {**params, "tickers": ticker})
+
+    (cycle,) = body["cycles"]
+    assert (cycle["status"], cycle["constituents"], cycle["flags"]) == ("complete", [ticker], flags)
+    assert cycle["points"]
+    for point in cycle["points"]:
+        for key in POINT_LEVELS:
+            assert (point[key] is None) == (key in null_levels), (point["trade_date"], key)
+    markers = cycle["markers"]
+    assert markers["valuation_floor"] == floor
+    if "turnover_index" in null_levels:
+        assert markers["volume_exhaustion"] is None
+    else:
+        assert_marker(
+            markers["volume_exhaustion"],
+            earliest_min(cycle["points"], "turnover_index"),
+            "turnover_index",
+        )
+    assert cycle["summary"] == dict(zip(SUMMARY_KEYS, summary, strict=True))
+    assert_summary_from_points(cycle)
+
+
+# ---------------------------------------------------------------------------------------------
+# Coded errors of the market and cycle routes
+# ---------------------------------------------------------------------------------------------
+
+UNKNOWN_TICKER: Final[str] = "Ticker 'NOPE' is not a known equity."
+UNKNOWN_SECTOR: Final[str] = "Sector 'Agriculture' has no listed equity."
+ONE_SUBJECT: Final[str] = "Give exactly one of ticker or sector."
+WINDOW_UNITS: Final[str] = (
+    "Give the window either in days (pre_days, post_days) or in months "
+    "(pre_months, post_months), not both."
+)
+
+
+@pytest.mark.parametrize(
+    ("path", "params", "status", "code", "field", "message"),
+    [
+        pytest.param(
+            "/market/valuation-bands",
+            {"ticker": "SCOM", "sector": "Banking"},
+            422,
+            "exactly_one_subject",
+            None,
+            ONE_SUBJECT,
+            id="bands-both-subjects",
+        ),
+        pytest.param(
+            "/market/valuation-bands",
+            {"metric": "pb"},
+            422,
+            "exactly_one_subject",
+            None,
+            ONE_SUBJECT,
+            id="bands-no-subject",
+        ),
+        pytest.param(
+            "/market/valuation-bands",
+            {"ticker": "nope"},
+            404,
+            "unknown_ticker",
+            "ticker",
+            UNKNOWN_TICKER,
+            id="bands-unknown-ticker",
+        ),
+        pytest.param(
+            "/market/valuation-bands",
+            {"sector": "Agriculture"},
+            404,
+            "unknown_sector",
+            "sector",
+            UNKNOWN_SECTOR,
+            id="bands-unknown-sector",
+        ),
+        pytest.param(
+            "/market/anomalies",
+            {"ticker": "nope"},
+            404,
+            "unknown_ticker",
+            "ticker",
+            UNKNOWN_TICKER,
+            id="anomalies-unknown-ticker",
+        ),
+        pytest.param(
+            "/market/anomalies",
+            {"sector": "Agriculture"},
+            404,
+            "unknown_sector",
+            "sector",
+            UNKNOWN_SECTOR,
+            id="anomalies-unknown-sector",
+        ),
+        pytest.param(
+            "/market/flows",
+            {"ticker": "SCOM", "sector": "Banking"},
+            422,
+            "conflicting_subjects",
+            "sector",
+            "Give a ticker or a sector, not both; give neither for the whole market.",
+            id="flows-both-subjects",
+        ),
+        pytest.param(
+            "/market/flows",
+            {"ticker": "nope"},
+            404,
+            "unknown_ticker",
+            "ticker",
+            UNKNOWN_TICKER,
+            id="flows-unknown-ticker",
+        ),
+        pytest.param(
+            "/market/flows",
+            {"sector": "Agriculture"},
+            404,
+            "unknown_sector",
+            "sector",
+            UNKNOWN_SECTOR,
+            id="flows-unknown-sector",
+        ),
+        pytest.param(
+            "/market/flows",
+            {"start": "2026-10-01"},
+            422,
+            "start_after_end",
+            "start",
+            "start (2026-10-01) must not be after end (2026-09-30).",
+            id="flows-start-after-default-end",
+        ),
+        pytest.param(
+            "/market/flows",
+            {"ticker": "KCB", "start": ANCHOR, "end": "2026-09-29"},
+            422,
+            "start_after_end",
+            "start",
+            "start (2026-09-30) must not be after end (2026-09-29).",
+            id="flows-start-after-end",
+        ),
+        pytest.param(
+            "/cycles/backtest",
+            {"tickers": ["SCOM", "nope"]},
+            404,
+            "unknown_ticker",
+            "tickers",
+            UNKNOWN_TICKER,
+            id="cycles-unknown-ticker",
+        ),
+        pytest.param(
+            "/cycles/backtest",
+            {"sector": "Agriculture"},
+            404,
+            "unknown_sector",
+            "sector",
+            UNKNOWN_SECTOR,
+            id="cycles-unknown-sector",
+        ),
+        pytest.param(
+            "/cycles/backtest",
+            {"pre_days": 30, "pre_months": 3},
+            422,
+            "conflicting_window_units",
+            "pre_months",
+            WINDOW_UNITS,
+            id="cycles-days-and-pre-months",
+        ),
+        pytest.param(
+            "/cycles/backtest",
+            {"post_days": 30, "post_months": 3},
+            422,
+            "conflicting_window_units",
+            "post_months",
+            WINDOW_UNITS,
+            id="cycles-days-and-post-months",
+        ),
+    ],
+)
+async def test_route_rules_and_unknown_entities_are_coded_errors(
+    client: httpx.AsyncClient,
+    path: str,
+    params: dict[str, Any],
+    status: int,
+    code: str,
+    field: str | None,
+    message: str,
+) -> None:
+    """Each route hands its service the parameters the service checks, so a cross-field rule is
+    a coded 422 and an unknown ticker (normalised in the message) or sector a coded 404 naming the
+    offending parameter, never a 200 over a defaulted or widened scope. ``detail`` is the object
+    ``{code, message, field}``, not FastAPI's list."""
+    response = await client.get(f"{BASE}{path}", params=params)
+
+    assert response.status_code == status, response.text
+    assert response.json() == {"detail": {"code": code, "message": message, "field": field}}
+
+
+@pytest.mark.parametrize(
+    ("key", "values", "limit"),
+    [
+        pytest.param(
+            "event_dates",
+            [f"2015-06-{day:02d}" for day in range(1, 10)],
+            8,
+            id="nine-event-dates",
+        ),
+        pytest.param("tickers", [f"Q{index}" for index in range(101)], 100, id="101-tickers"),
+    ],
+)
+async def test_backtest_list_bounds_are_the_standard_422(
+    client: httpx.AsyncClient, key: str, values: list[str], limit: int
+) -> None:
+    """At most 8 event dates and 100 tickers are bound; one more is FastAPI's standard 422 list
+    (``too_long``), refused before the service runs, while ``limit`` values pass validation: 8
+    dates are backtested, and 100 unknown tickers reach the service's coded 404."""
+    rejected = await client.get(f"{BASE}/cycles/backtest", params={key: values})
+
+    assert rejected.status_code == 422, rejected.text
+    detail = rejected.json()["detail"]
+    assert isinstance(detail, list), detail
+    assert [(entry["type"], entry["loc"], entry["ctx"]["max_length"]) for entry in detail] == [
+        ("too_long", ["query", key], limit)
+    ]
+
+    accepted = await client.get(
+        f"{BASE}/cycles/backtest", params={key: values[:limit], "pre_days": 1, "post_days": 1}
+    )
+    if key == "event_dates":
+        assert accepted.status_code == 200, accepted.text
+        assert [cycle["event_date"] for cycle in accepted.json()["cycles"]] == values[:limit]
+    else:
+        assert accepted.status_code == 404, accepted.text
+        assert accepted.json()["detail"]["code"] == "unknown_ticker"
+
+
+async def test_backtest_without_stored_or_requested_events_is_a_coded_422(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """With every ``terminal_cycles`` row deleted inside this test's rolled-back transaction, a
+    request without ``event_dates`` has no event: 422 ``no_event_dates`` against
+    ``event_dates``. A requested date still runs, labelled "Event YYYY-MM-DD" now that no stored
+    row names it."""
+    await db_session.execute(delete(TerminalCycle))
+
+    response = await client.get(f"{BASE}/cycles/backtest")
+
+    assert response.status_code == 422, response.text
+    assert response.json() == {
+        "detail": {
+            "code": "no_event_dates",
+            "message": (
+                "No event dates were given and terminal_cycles holds no events. Pass event_dates "
+                "or run the seeder to load the default election cycles."
+            ),
+            "field": "event_dates",
+        }
+    }
+    body = await get_json(client, "/cycles/backtest", {"event_dates": "2013-03-04"})
+    assert [(cycle["label"], cycle["status"]) for cycle in body["cycles"]] == [
+        ("Event 2013-03-04", "complete")
+    ]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -874,7 +2020,7 @@ async def test_watchlist_create_add_remove_and_delete_lifecycle(
 
 
 # ---------------------------------------------------------------------------------------------
-# Query parameters of the health, macro and market endpoints
+# Query parameters of the health, macro, market, cycles, IPO and watchlist endpoints
 # ---------------------------------------------------------------------------------------------
 #
 # Each of these endpoints binds its query through one query-parameter model that forbids unknown
@@ -892,7 +2038,8 @@ def query_spec(parameter: JsonObject) -> QuerySpec:
     """The default, bounds and enum an OpenAPI query parameter documents.
 
     A nullable or Decimal parameter documents its bounds inside an ``anyOf`` member; bounds are
-    read back through ``str`` into ``Decimal``, so a bound of 0.5 compares exactly.
+    read back through ``str`` into ``Decimal``, so a bound of 0.5 compares exactly. The maximum
+    of a repeatable parameter is its most repeats, ``maxItems``.
     """
     schema = parameter["schema"]
     members = [schema, *schema.get("anyOf", [])]
@@ -901,6 +2048,8 @@ def query_spec(parameter: JsonObject) -> QuerySpec:
         return next((member[key] for member in members if key in member), None)
 
     minimum, maximum = first("minimum"), first("maximum")
+    if maximum is None:
+        maximum = first("maxItems")
     return (
         schema.get("default"),
         None if minimum is None else Decimal(str(minimum)),
@@ -926,6 +2075,15 @@ def query_spec(parameter: JsonObject) -> QuerySpec:
         pytest.param("/market/anomalies", {"tickr": "SCOM"}, "tickr", id="anomalies"),
         pytest.param("/market/flows", {"tickr": "SCOM"}, "tickr", id="flows"),
         pytest.param("/market/screener", {"tickr": "SCOM"}, "tickr", id="screener"),
+        pytest.param("/ipo/scenarios", {"bogus": "1"}, "bogus", id="ipo-scenarios"),
+        pytest.param("/cycles/backtest", {"bogus": "1"}, "bogus", id="cycles-backtest"),
+        pytest.param(
+            "/cycles/backtest",
+            {"pre_months": "12", "bogus": "1"},
+            "bogus",
+            id="cycles-backtest-beside-declared",
+        ),
+        pytest.param("/watchlists", {"bogus": "1"}, "bogus", id="watchlists"),
     ],
 )
 async def test_unknown_query_parameter_is_the_standard_422(
@@ -946,6 +2104,85 @@ async def test_unknown_query_parameter_is_the_standard_422(
             }
         ]
     }
+
+
+async def test_unknown_query_parameter_on_ipo_valuation_is_the_standard_422(
+    client: httpx.AsyncClient,
+) -> None:
+    """``POST /ipo/valuation`` declares no query parameter: with the valid seeded preset as its
+    body, an unknown one is refused with exactly one ``extra_forbidden`` entry, and the error body
+    carries no valuation."""
+    scenarios = await get_json(client, "/ipo/scenarios")
+    response = await client.post(
+        f"{BASE}/ipo/valuation", params={"bogus": "1"}, json=scenarios[0]["assumptions"]
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json() == {
+        "detail": [
+            {
+                "type": "extra_forbidden",
+                "loc": ["query", "bogus"],
+                "msg": "Extra inputs are not permitted",
+                "input": "1",
+            }
+        ]
+    }
+
+
+async def test_backtest_binds_each_repeat_of_event_dates_and_tickers(
+    client: httpx.AsyncClient,
+) -> None:
+    """``event_dates`` and ``tickers`` are repeatable: each repeat is one value of the list."""
+    body = await get_json(
+        client,
+        "/cycles/backtest",
+        {"event_dates": ["2017-08-08", "2022-08-09"], "tickers": ["SCOM", "KCB"]},
+    )
+
+    assert sorted(body["candidates"]) == ["KCB", "SCOM"]
+    assert [cycle["event_date"] for cycle in body["cycles"]] == ["2017-08-08", "2022-08-09"]
+
+
+@pytest.mark.parametrize(
+    ("params", "loc", "error_type"),
+    [
+        pytest.param(
+            {"event_dates": [f"2017-08-{day:02d}" for day in range(1, 10)]},
+            ["query", "event_dates"],
+            "too_long",
+            id="nine-event-dates",
+        ),
+        pytest.param(
+            {"tickers": [f"T{index}" for index in range(101)]},
+            ["query", "tickers"],
+            "too_long",
+            id="101-tickers",
+        ),
+        pytest.param(
+            {"tickers": ["SCOM", "S" * 17]},
+            ["query", "tickers", 1],
+            "string_too_long",
+            id="ticker-too-long",
+        ),
+        pytest.param(
+            {"sector": "Bank\x00ing"},
+            ["query", "sector"],
+            "string_pattern_mismatch",
+            id="sector-with-nul",
+        ),
+    ],
+)
+async def test_backtest_single_parameter_bound_is_the_standard_422(
+    client: httpx.AsyncClient, params: Mapping[str, Any], loc: list[object], error_type: str
+) -> None:
+    """At most 8 event dates and 100 tickers, each ticker 1-16 characters and no NUL in a
+    sector: a breach is one standard 422 entry at the offending parameter or repeat."""
+    response = await client.get(f"{BASE}/cycles/backtest", params=params)
+
+    assert response.status_code == 422, response.text
+    [entry] = response.json()["detail"]
+    assert (entry["type"], entry["loc"]) == (error_type, loc)
 
 
 @pytest.fixture(scope="module")
@@ -1008,6 +2245,21 @@ def terminal_openapi() -> JsonObject:
             },
             id="flows",
         ),
+        pytest.param(
+            "/cycles/backtest",
+            {
+                "event_dates": (None, None, Decimal(8), None),
+                "pre_days": (None, Decimal(1), Decimal(365), None),
+                "post_days": (None, Decimal(1), Decimal(365), None),
+                "pre_months": (None, Decimal(1), Decimal(12), None),
+                "post_months": (None, Decimal(1), Decimal(12), None),
+                "tickers": (None, None, Decimal(100), None),
+                "sector": NO_BOUNDS,
+            },
+            id="cycles-backtest",
+        ),
+        pytest.param("/ipo/scenarios", {}, id="ipo-scenarios"),
+        pytest.param("/watchlists", {}, id="watchlists"),
     ],
 )
 def test_documented_query_parameters_keep_their_defaults_and_bounds(
@@ -3316,7 +4568,9 @@ async def test_boundary_dates_build_the_overview_without_raising(
 #   window), cohort, every point's trade date and index levels, and every overlay equal what
 #   the full observed calendar, every price row and every macro row give: the backtest of
 #   ``quant.run_cycle_backtest`` over that full history, and ``macro_as_of`` at most 62 days
-#   old.
+#   old. The valuation floor (on the returned values, earliest on a tie), the summary, the
+#   flags and the projection equal the summary and projection rules applied in this module to
+#   that history's unrounded points, rounded once, independently of the service's assembly.
 # - **Log escaping.** The DEBUG summary repr-escapes each stored ``terminal_cycles.label``, so
 #   CR, LF and other control or line-separator characters cannot forge a log line; the response
 #   carries the stored label unchanged.
@@ -3578,6 +4832,140 @@ def assert_cycle_matches(
             )
 
 
+def earliest_minimum(values: Sequence[Decimal | None]) -> int | None:
+    """Position of the first minimum among the non-null ``values``; ``None`` if all are null."""
+    best: tuple[int, Decimal] | None = None
+    for position, value in enumerate(values):
+        if value is not None and (best is None or value < best[1]):
+            best = (position, value)
+    return None if best is None else best[0]
+
+
+def formula_summary(
+    points: Sequence[CyclePointResult], event_date: date
+) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+    """Pre-event return, post-event return and maximum drawdown in %, unrounded, over ``points``.
+
+    "Index at T" is the price index of the last point on or before T: the pre-event return is
+    (index at T / 100 - 1) x 100, the post-event return (last index / index at T - 1) x 100 when a
+    point lies after T, and the drawdown the minimum of (index / running maximum - 1) x 100. Each
+    is ``None`` where its input level is.
+    """
+    at_or_before = [point for point in points if point.trade_date <= event_date]
+    index_at_event = at_or_before[-1].price_index if at_or_before else None
+    last = points[-1]
+    pre_event = None if index_at_event is None else (index_at_event / HUNDRED - 1) * HUNDRED
+    post_event = None
+    if index_at_event is not None and last.trade_date > event_date and last.price_index is not None:
+        post_event = (last.price_index / index_at_event - 1) * HUNDRED
+    drawdowns: list[Decimal] = []
+    running_max: Decimal | None = None
+    for point in points:
+        level = point.price_index
+        if level is None:
+            continue
+        running_max = level if running_max is None else max(running_max, level)
+        drawdowns.append((level / running_max - 1) * HUNDRED)
+    return pre_event, post_event, min(drawdowns) if drawdowns else None
+
+
+def result_track(cycle: CycleBacktestResult) -> Track:
+    """A full-history cycle's window and unrounded points as a projection :data:`Track`."""
+    return (
+        (cycle.window_start - cycle.event_date).days,
+        (cycle.window_end - cycle.event_date).days,
+        [point.offset_days for point in cycle.points],
+        [[point.price_index, point.turnover_index, point.pe_index] for point in cycle.points],
+    )
+
+
+def assert_cycle_outputs_match(
+    cycle: CycleResult,
+    reference: CycleBacktestResult,
+    complete: Sequence[CycleBacktestResult],
+) -> None:
+    """``cycle``'s floor, summary, flags and projection follow from the full-history
+    ``reference`` and the request's ``complete`` references, each rounded once.
+
+    The summary figures are :func:`formula_summary` over the reference's unrounded points. The
+    valuation floor is chosen as the response defines its markers, on the returned (rounded)
+    values: the first minimum P/E, else the first minimum price index. The P/E compression is the
+    reference's unrounded P/E at that session over its anchor P/E, (P/E / anchor P/E - 1) x 100,
+    and is null when the floor fell back to the price index or the anchor P/E is null or not
+    positive. The flags are the reference's, plus ``insufficient_projection_basis`` for a partial
+    or awaiting-data cycle when fewer than 2 complete cycles exist. Such a cycle is otherwise
+    projected: its basis lists the complete cycles in order, and each point is :func:`mean_paths`
+    over their unrounded levels. A complete or empty cycle has no projection.
+    """
+    projected = reference.status in {"partial", "awaiting_data"}
+    unprojectable = projected and len(complete) < 2
+    assert cycle.flags == [
+        *reference.flags,
+        *(["insufficient_projection_basis"] if unprojectable else []),
+    ]
+
+    if reference.status in {"awaiting_data", "no_constituents"}:
+        assert (cycle.markers, cycle.summary) == (None, None)
+    else:
+        floor_metric = "pe_ratio"
+        floor = earliest_minimum([point.pe_ratio for point in cycle.points])
+        if floor is None:
+            floor_metric = "price_index"
+            floor = earliest_minimum([point.price_index for point in cycle.points])
+        assert cycle.markers is not None
+        marker = cycle.markers.valuation_floor
+        if floor is None:
+            assert marker is None
+        else:
+            assert marker is not None
+            floor_point = cycle.points[floor]
+            assert (marker.trade_date, marker.offset_days, marker.metric) == (
+                floor_point.trade_date,
+                floor_point.offset_days,
+                floor_metric,
+            )
+            assert marker.value == getattr(floor_point, floor_metric)
+
+        compression = None
+        anchor_pe = reference.points[0].pe_ratio
+        if floor is not None and floor_metric == "pe_ratio" and anchor_pe is not None:
+            floor_pe = reference.points[floor].pe_ratio
+            assert floor_pe is not None
+            if anchor_pe > 0:
+                compression = (floor_pe / anchor_pe - 1) * HUNDRED
+        pre_event, post_event, drawdown = formula_summary(reference.points, reference.event_date)
+        assert cycle.summary is not None
+        assert (
+            cycle.summary.pre_event_return_pct,
+            cycle.summary.post_event_return_pct,
+            cycle.summary.max_drawdown_pct,
+            cycle.summary.pe_compression_pct,
+        ) == (
+            quantize_out(pre_event, "pct"),
+            quantize_out(post_event, "pct"),
+            quantize_out(drawdown, "pct"),
+            quantize_out(compression, "pct"),
+        )
+
+    if not projected or unprojectable:
+        assert cycle.projection is None
+        return
+    assert cycle.projection is not None
+    assert cycle.projection.is_projection is True
+    assert cycle.projection.basis == [other.label for other in complete]
+    expected = mean_paths(
+        (reference.window_start - reference.event_date).days,
+        (reference.window_end - reference.event_date).days,
+        [result_track(other) for other in complete],
+    )
+    assert [
+        (point.offset_days, point.price_index, point.turnover_index, point.pe_index)
+        for point in cycle.projection.points
+    ] == [
+        (offset, *(quantize_out(level, "index") for level in levels)) for offset, levels in expected
+    ]
+
+
 @pytest.mark.parametrize(
     ("request_args", "statuses"),
     [
@@ -3617,6 +5005,14 @@ def assert_cycle_matches(
             ["awaiting_data"],
             id="window_before_the_data",
         ),
+        # The Banking 2017 cycle's lowest P/E rounds alike on 2017-08-10 and 2017-08-11, whose
+        # raw P/E is lower: the floor and its compression (-14.06, not -14.13) are 2017-08-10's,
+        # as test_banking_2017_floor_is_the_earlier_session_of_a_rounded_pe_tie pins.
+        pytest.param(
+            {"sector": "Banking"},
+            ["complete", "complete", "complete", "awaiting_data"],
+            id="banking_rounded_pe_tie",
+        ),
     ],
 )
 async def test_bounded_reads_give_the_full_history_answer(
@@ -3625,7 +5021,11 @@ async def test_bounded_reads_give_the_full_history_answer(
     request_args: dict[str, Any],
     statuses: list[str],
 ) -> None:
-    """Anchors, cohorts, points and overlays equal those of the full stored history."""
+    """Anchors, cohorts, points and overlays equal those of the full stored history, and the
+    floors, summaries, flags and projections follow from that history by their rules (see
+    :func:`assert_cycle_outputs_match`). Awaiting data (by default) or partly observed (over 12
+    months), the 2027 cycle is projected from the three complete cycles; the 2005 cycle, before
+    the data, has no complete cycle to project from and is flagged instead."""
     response = await cs.get_backtest(session, settings, **request_args)
 
     assert response.data_available_through == LATEST
@@ -3633,10 +5033,51 @@ async def test_bounded_reads_give_the_full_history_answer(
     full_calendar = await ms.load_market_sessions(session)
     macro_rows = await full_overlay_rows(session)
     references = await full_history_cycles(session, settings, response, macro_rows)
+    complete = [reference for reference in references if reference.status == "complete"]
     for cycle, reference in zip(response.cycles, references, strict=True):
         last_day = min(cycle.window_end, LATEST)
         in_window = [day for day in full_calendar if cycle.window_start <= day <= last_day]
         assert_cycle_matches(cycle, reference, in_window, macro_rows)
+        assert_cycle_outputs_match(cycle, reference, complete)
+
+
+async def test_banking_2017_floor_is_the_earlier_session_of_a_rounded_pe_tie(
+    session: AsyncSession, settings: TerminalSettings
+) -> None:
+    """The seeded Banking 2017 Cycle's lowest P/E rounds to 5.88 on 2017-08-10 and on 2017-08-11,
+    whose unrounded P/E (the full-history reference's) is the lower. The floor is the earlier
+    session, chosen on the rounded values, and the compression is 2017-08-10's, -14.06; floored on
+    the unrounded values it would be 2017-08-11's, -14.13."""
+    response = await cs.get_backtest(session, settings, sector="Banking")
+    macro_rows = await full_overlay_rows(session)
+    references = await full_history_cycles(session, settings, response, macro_rows)
+    (position,) = [
+        position for position, cycle in enumerate(response.cycles) if cycle.label == "2017 Cycle"
+    ]
+    cycle, reference = response.cycles[position], references[position]
+    floor_day, tie_day = date(2017, 8, 10), date(2017, 8, 11)
+
+    assert cycle.markers is not None
+    floor = cycle.markers.valuation_floor
+    assert floor is not None
+    assert (floor.trade_date, floor.offset_days, floor.metric, floor.value) == (
+        floor_day,
+        2,
+        "pe_ratio",
+        Decimal("5.88"),
+    )
+    rounded = {point.trade_date: point.pe_ratio for point in cycle.points}
+    assert rounded[floor_day] == rounded[tie_day] == Decimal("5.88")
+    unrounded = {point.trade_date: point.pe_ratio for point in reference.points}
+    floor_pe, tie_pe = unrounded[floor_day], unrounded[tie_day]
+    assert floor_pe is not None
+    assert tie_pe is not None
+    assert tie_pe < floor_pe
+    assert cycle.summary is not None
+    assert cycle.summary.pe_compression_pct == Decimal("-14.06")
+    anchor_pe = reference.points[0].pe_ratio
+    assert anchor_pe is not None
+    assert quantize_out((tie_pe / anchor_pe - 1) * HUNDRED, "pct") == Decimal("-14.13")
 
 
 async def test_short_lead_in_reads_every_earlier_session(

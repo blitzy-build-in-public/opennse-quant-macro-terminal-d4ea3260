@@ -1,4 +1,4 @@
-"""Response contract of ``GET /cycles/backtest``, the event and election cycle backtester.
+"""Request and response contract of ``GET /cycles/backtest``, the event and election backtester.
 
 Each cycle maps NSE price, turnover, valuation and foreign-flow behaviour over a window around an
 event date (T) onto one event-relative axis, ``offset_days = trade_date - T`` in calendar days,
@@ -9,9 +9,10 @@ Index levels, P/E multiples, percentages, KES flows and macro overlays are ``Dec
 serialized as JSON strings already quantized to 2 dp by the cycle service. Offsets, counts and
 day numbers are ``int``.
 
-The request rules that span several parameters (``no_event_dates``, ``conflicting_window_units``
-and ``window_out_of_range``, all 422) are coded errors raised by the service or the route, never
-validators here. The limits below bound the route's query parameters.
+:class:`BacktestParams` declares the route's query parameters with their single-field bounds,
+using the limits below, and forbids unknown ones. The request rules that span several parameters
+(``no_event_dates``, ``conflicting_window_units`` and ``window_out_of_range``, all 422) are coded
+errors raised by the service, never validators here.
 """
 
 import datetime as dt
@@ -20,7 +21,12 @@ from typing import Final, Literal
 
 from pydantic import Field
 
-from opennse_terminal.schemas.common import TerminalResponseModel
+from opennse_terminal.schemas.common import (
+    SectorName,
+    TerminalRequestModel,
+    TerminalResponseModel,
+    Ticker,
+)
 
 __all__ = [
     "DEFAULT_WINDOW_DAYS",
@@ -28,6 +34,7 @@ __all__ = [
     "MAX_EVENT_DATES",
     "MAX_WINDOW_DAYS",
     "MAX_WINDOW_MONTHS",
+    "BacktestParams",
     "BacktestResponse",
     "BacktestStatus",
     "BacktestWindow",
@@ -65,6 +72,84 @@ MAX_WINDOW_DAYS: Final[int] = 365
 
 MAX_WINDOW_MONTHS: Final[int] = 12
 """Largest accepted ``pre_months`` or ``post_months``; the smallest is 1."""
+
+
+# ---------------------------------------------------------------------------------------------
+# Query-parameter model
+# ---------------------------------------------------------------------------------------------
+
+
+class BacktestParams(TerminalRequestModel):
+    """Query parameters of ``GET /cycles/backtest``.
+
+    The route declares it as a FastAPI query-parameter model, ``Annotated[BacktestParams,
+    Query()]``, so each field appears as an individual query parameter in OpenAPI, ``event_dates``
+    and ``tickers`` are repeatable (``?tickers=SCOM&tickers=KCB``), and an unknown parameter is
+    FastAPI's standard 422 ``extra_forbidden``. A list bound limits the number of repeats; each
+    ticker is bounded by its element type, and a ticker or sector carrying a NUL character is a
+    standard 422 rather than a database error.
+
+    The four window fields default to None, never 180: the service applies the 180-day default
+    only when no window parameter is given, and a day default here would make every months request
+    look like both forms were supplied. Giving a day and a month field together is the service's
+    coded 422 ``conflicting_window_units``, not a validation error here.
+    """
+
+    event_dates: list[dt.date] | None = Field(
+        default=None,
+        max_length=MAX_EVENT_DATES,
+        description="Event dates T (repeatable). Defaults to every terminal_cycles row.",
+    )
+    pre_days: int | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_WINDOW_DAYS,
+        description=(
+            "Calendar days before each event date. Default 180 days each side when no window "
+            "parameter is given; cannot be combined with pre_months or post_months."
+        ),
+    )
+    post_days: int | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_WINDOW_DAYS,
+        description=(
+            "Calendar days after each event date. Default 180 days each side when no window "
+            "parameter is given; cannot be combined with pre_months or post_months."
+        ),
+    )
+    pre_months: int | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_WINDOW_MONTHS,
+        description=(
+            "Calendar months before each event date, the day clamped to the target month's last "
+            "day (12 when only post_months is given). Without any window parameter the window is "
+            "180 days each side; cannot be combined with pre_days or post_days."
+        ),
+    )
+    post_months: int | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_WINDOW_MONTHS,
+        description=(
+            "Calendar months after each event date, the day clamped to the target month's last "
+            "day (12 when only pre_months is given). Without any window parameter the window is "
+            "180 days each side; cannot be combined with pre_days or post_days."
+        ),
+    )
+    tickers: list[Ticker] | None = Field(
+        default=None,
+        max_length=MAX_BACKTEST_TICKERS,
+        description=(
+            "Candidate tickers (repeatable). Defaults to every equity, or to the equities of "
+            "sector; an unknown ticker is a 404."
+        ),
+    )
+    sector: SectorName | None = Field(
+        default=None,
+        description="Candidate sector as stored, for example Banking; unknown is a 404.",
+    )
 
 
 # ---------------------------------------------------------------------------------------------

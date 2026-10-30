@@ -218,6 +218,7 @@ ErrorCode = Literal[
     "not_a_pdf",
     "pdf_encrypted",
     "pdf_unreadable",
+    "pdf_parse_timeout",
     "too_many_pages",
     "commit_requires_ticker_and_period",
     "commit_requires_kes",

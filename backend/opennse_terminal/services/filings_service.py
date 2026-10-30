@@ -9,7 +9,9 @@ The route (``api.routes.ingest``) has already bounded the request and the file s
    cannot be started is logged once and answered with 500 ``internal_error``, or the cancellation
    re-raised when the request or the insert was cancelled; nothing else runs and no filing or
    fundamentals row is written.
-2. Pre-parse checks, then the pdfplumber parse in a worker thread, then the commit checks.
+2. Pre-parse checks, whose read transaction is committed before the pdfplumber parse runs in a
+   worker thread, so the request holds no transaction or lock while parsing; then the commit
+   checks.
 3. One transaction on the request session upserts ``terminal_corporate_filings`` on
    ``file_sha256`` and, with ``commit``, merges the ``found`` and ``derived`` items into
    ``terminal_fundamentals``. Any error rolls both back, so a rejected request writes neither.
@@ -26,6 +28,9 @@ Status  Code                                    Condition
                                                 with or without ``commit``
 422     ``pdf_encrypted``                       the PDF is encrypted
 422     ``pdf_unreadable``                      the PDF cannot be parsed
+422     ``pdf_parse_timeout``                   the parse did not finish within its wall-clock
+                                                limit, 20 s plus 0.4 s per page of
+                                                ``TERMINAL_PDF_MAX_PAGES`` (180 s at 400)
 422     ``too_many_pages``                      more than ``TERMINAL_PDF_MAX_PAGES`` pages
 422     ``commit_requires_kes``                 ``commit`` on a statement not in KES
 409     ``currency_conflict``                   ``commit`` into a fundamentals row whose
@@ -48,8 +53,10 @@ pdfplumber-based extractor.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import logging
+import threading
 import uuid
 from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass
@@ -72,6 +79,7 @@ from opennse_terminal.ingestion.files.pdf_line_items import (
     ExtractedLineItem,
     ExtractionResult,
     PdfEncrypted,
+    PdfParseTimeout,
     PdfUnreadable,
     TooManyPages,
     extract_line_items,
@@ -197,9 +205,10 @@ async def _run_to_completion(
     """Run ``awaitable`` as its own task until it is done, however often the caller is cancelled
     meanwhile, and return the finished task with whether a cancellation was requested.
 
-    Used for the PDF parse, the transaction commit and the run-row writes, so a cancelled request
-    never outlives its parse thread, leaves the commit's outcome unknown or leaves its run row
-    ``running``. The task's result or exception stays on it for the caller to read.
+    Used for the transaction commits and the run-row writes, so a cancelled request never leaves a
+    commit's outcome unknown or its run row ``running``; :func:`_extract` waits for its parse
+    thread in the same way once it has cancelled the parse. The task's result or exception stays
+    on it for the caller to read.
     """
     task = asyncio.create_task(awaitable)
     cancel_requested = False
@@ -349,31 +358,46 @@ async def _extract(
 ) -> ExtractionResult:
     """Parse the PDF in a worker thread, mapping the parser's rejections to coded 422s.
 
-    A worker thread cannot be stopped, so this returns only once the parse has ended, however
-    often the request is cancelled meanwhile, and the route's parse slot stays held for the whole
-    parse. A task cancellation (``Task.cancel()``) that arrives meanwhile is re-raised as
-    ``asyncio.CancelledError`` once the thread has finished, before the parse's outcome is
-    mapped. A cancelled anyio cancel scope around the request (a host's task group or timeout)
-    is held off until then and takes effect at the caller's next await.
+    The parse gets a ``threading.Event`` as its ``cancel``. The first cancellation that reaches
+    the wait sets it, which kills the parser process: a task cancellation (``Task.cancel()``,
+    which the route sends when its client disconnects, as does a server shutdown) or a cancelled
+    anyio cancel scope around the request (a host's task group or timeout). The wait then goes on,
+    shielded and absorbing further cancellations, until the worker thread has ended, within
+    moments of the kill, so a cancelled request never outlives its parse thread and the route's
+    parse slot is freed promptly. The thread's outcome is retrieved and the cancellation
+    re-raised; the parse's outcome is never mapped then.
+
+    Otherwise the result is returned, or the parser's rejection raised as 422 ``pdf_encrypted``,
+    ``pdf_unreadable``, ``pdf_parse_timeout`` (the parse reached its wall-clock limit, 20 s plus
+    0.4 s per page of ``pdf_max_pages``) or ``too_many_pages``, each on the field ``file``.
     """
-    # The shield keeps a cancelled anyio scope from re-delivering its cancellation on every pass
-    # of the wait, which would spin the event loop for as long as the parse runs.
-    with anyio.CancelScope(shield=True):
-        task, cancel_requested = await _run_to_completion(
-            run_in_threadpool(
-                extract_line_items,
-                upload_bytes,
-                list(form.items),
-                period_end_date=form.period_end_date,
-                max_pages=settings.pdf_max_pages,
-            )
+    cancel = threading.Event()
+    task = asyncio.create_task(
+        run_in_threadpool(
+            extract_line_items,
+            upload_bytes,
+            list(form.items),
+            period_end_date=form.period_end_date,
+            max_pages=settings.pdf_max_pages,
+            cancel=cancel,
         )
-    if cancel_requested:
+    )
+    try:
+        # Unshielded, so the first cancellation of either kind lands here.
+        await asyncio.wait((task,))
+    except asyncio.CancelledError:
+        cancel.set()
+        # The shield keeps a cancelled anyio scope from re-delivering its cancellation on every
+        # pass of the wait, which would spin the event loop until the thread has ended.
+        with anyio.CancelScope(shield=True):
+            while not task.done():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.wait((task,))
         # The cancellation supersedes the parse's outcome, which is still retrieved so that
         # asyncio never reports it as an unhandled exception.
         if not task.cancelled():
             task.exception()
-        raise asyncio.CancelledError
+        raise
     try:
         return task.result()
     except PdfEncrypted as exc:
@@ -388,6 +412,13 @@ async def _extract(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
             "pdf_unreadable",
             "The PDF could not be parsed.",
+            "file",
+        ) from exc
+    except PdfParseTimeout as exc:
+        raise _coded_error(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "pdf_parse_timeout",
+            f"The PDF could not be parsed within {exc.time_limit:g} seconds.",
             "file",
         ) from exc
     except TooManyPages as exc:
@@ -628,8 +659,9 @@ async def ingest_pdf(
 
     * Every call that reaches this function writes one ``terminal_ingestion_runs`` row
       (``pipeline='pdf_filing'``, ``trigger='api'``) on its own connection: ``succeeded`` for an
-      HTTP 200, otherwise ``failed`` with the error code (``unexpected_error:<Type>`` for a
-      server fault, ``cancelled`` for a cancelled request) as ``error_message``. Its
+      HTTP 200 or a request cancelled once its data commit has started (below), otherwise
+      ``failed`` with the error code (``unexpected_error:<Type>`` for a server fault,
+      ``cancelled`` for a request cancelled before that commit) as ``error_message``. Its
       ``details`` hold ``file_sha256``, ``ticker``, ``period_end_date``, ``document_type`` and
       ``commit``, plus ``filing_id``, ``status``, ``committed`` and ``fundamentals_id`` on
       success. When the row cannot be started (the audit engine cannot be resolved, or its
@@ -647,15 +679,25 @@ async def ingest_pdf(
       ``internal_error`` raised ``from None``: its text, which can carry SQL with bound
       parameters (the file name, the form fields, the extraction), never reaches the response,
       a log or a traceback.
+    * The pre-parse checks' read is committed before parsing, so the request session holds no
+      transaction, and no lock on ``terminal_equities``, while the PDF is parsed; the filing and
+      fundamentals writes then share one new transaction. That commit runs to completion even if
+      the request is cancelled meanwhile; such a cancellation is then honoured before parsing
+      and the run row finished ``failed`` with ``cancelled``. A host session joined to an outer
+      transaction only releases its savepoint (``create_savepoint``) or leaves that transaction
+      open (``rollback_only``); the outer transaction keeps the check's lock until the host ends
+      it.
     * The transaction is committed here (services own write transactions). The run-row insert,
-      the parse, the commit and the run-row writes run to completion even if the request is
-      cancelled meanwhile. A worker thread cannot be stopped, so a request cancelled while
-      parsing raises its cancellation only once the parse thread has ended, and the route's
-      parse slot stays held until then. A cancellation received while the row is inserted
-      finishes it ``failed`` with ``cancelled`` and then re-raises; a cancelled request whose
-      row could not be started re-raises the cancellation without one, logged once: at WARNING
-      as ``cancelled`` when the cancellation ended the insert itself, otherwise at ERROR as the
-      insert's fault.
+      the commit and the run-row writes run to completion even if the request is cancelled
+      meanwhile. A request cancelled while parsing (by ``Task.cancel()``, as the route does when
+      its client disconnects, or by an anyio cancel scope) stops its parse instead: the parser
+      process is killed, the cancellation is raised once the parse thread has ended, moments
+      later, and the route's parse slot is then freed; no filing or fundamentals row is written
+      and the run row is finished ``failed`` with ``cancelled``. A cancellation received while
+      the row is inserted finishes it ``failed`` with ``cancelled`` and then re-raises; a
+      cancelled request whose row could not be started re-raises the cancellation without one,
+      logged once: at WARNING as ``cancelled`` when the cancellation ended the insert itself,
+      otherwise at ERROR as the insert's fault.
 
     Args:
         session: The request session; the filing and fundamentals writes share its transaction.
@@ -681,6 +723,17 @@ async def ingest_pdf(
             # The row is committed: the cancellation branch below finishes it, then re-raises.
             raise asyncio.CancelledError
         await _check_preconditions(session, form)
+        # The check's read transaction ends before the parse, so none (and no lock, such as the
+        # check's on terminal_equities) is held while it runs. A commit, never a rollback, which
+        # would roll back the outer transaction a "rollback_only" host session joins.
+        read_commit, cancelled_while_committing = await _run_to_completion(session.commit())
+        if cancelled_while_committing:
+            # The cancellation supersedes the commit's outcome, which is still retrieved so that
+            # asyncio never reports it as an unhandled exception.
+            if not read_commit.cancelled():
+                read_commit.exception()
+            raise asyncio.CancelledError
+        read_commit.result()
         result = await _extract(upload_bytes, form, settings)
         rows_fetched = len(result.items)
         if form.commit:

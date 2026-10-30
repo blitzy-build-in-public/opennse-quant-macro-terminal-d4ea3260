@@ -18,9 +18,10 @@
  * runs see the same seeded state. Every request goes to the app's own origin, which proxies the
  * terminal API; no external URL is involved. Some tests answer API requests themselves through
  * `page.route` with in-memory bodies, such as a valuation-bands multiple no seeded counter has,
- * or the empty results and injected outages of the widget-state tests. Those tests are read-only
- * against the database as well: a handler answers a request from memory or passes a GET request
- * through to the real API, and the widget-state handlers block every other method.
+ * or the empty results and injected outages of the widget-state tests, and one cycle test blanks
+ * overlay rates in a fetched backtest response before the page receives it. Those tests are
+ * read-only against the database as well: a handler answers a request from memory or passes a
+ * GET request through to the real API, and the widget-state handlers block every other method.
  */
 import { expect, test } from "@playwright/test";
 import type { Locator, Page } from "@playwright/test";
@@ -29,6 +30,9 @@ import { CHART_COLORS } from "../src/components/terminal/lib/chartTheme";
 import type {
   AnomaliesResponse,
   BacktestResponse,
+  CyclePoint,
+  CycleResult,
+  DecimalString,
   FlowsResponse,
   IpoScenario,
   MacroOverviewResponse,
@@ -373,15 +377,494 @@ test.describe("Macro and market overview (/)", () => {
 });
 
 test.describe("Election and cycle backtesting (/cycles)", () => {
+  const BACKTEST_PATH = "/api/v1/terminal/cycles/backtest";
+  /**
+   * px within which two path coordinates count as equal. Recharts writes them with 3 decimals, so
+   * the difference of two rounded coordinates is off by at most 0.001.
+   */
+  const PIXEL_TOLERANCE = 0.01;
+  /** Fraction digits kept when a decimal string is read as a scaled integer. */
+  const DECIMAL_SCALE = 6;
+
+  type Metric = "price_index" | "pe_index" | "turnover_index" | "cumulative_foreign_net_kes";
+  /** The metrics a projection carries: it has no cumulative foreign flow. */
+  type IndexMetric = Exclude<Metric, "cumulative_foreign_net_kes">;
+  type OverlayField = "inflation_yoy_pct" | "tbill_91d_pct" | "tbill_364d_pct";
+  type LineSeries = "observed" | "projection";
+
+  /** One value a line plots, at its calendar offset from the event; null draws no vertex. */
+  interface SeriesValue {
+    offset: number;
+    value: DecimalString | null;
+  }
+
+  /** A vertex of a drawn path, in the chart's SVG pixel coordinates. */
+  interface Vertex {
+    x: number;
+    y: number;
+  }
+
+  /** Every backtest request the page sends, in order. */
+  function recordBacktestRequests(page: Page): URL[] {
+    const requests: URL[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (url.pathname === BACKTEST_PATH) requests.push(url);
+    });
+    return requests;
+  }
+
+  /**
+   * The next successful backtest response whose query passes `matches`, with that query and its
+   * body. Call it before the action that sends the request.
+   */
+  async function nextBacktest(
+    page: Page,
+    matches: (query: URLSearchParams) => boolean,
+  ): Promise<{ query: URLSearchParams; body: BacktestResponse }> {
+    const response = await page.waitForResponse(
+      (candidate) => {
+        const url = new URL(candidate.url());
+        return url.pathname === BACKTEST_PATH && matches(url.searchParams);
+      },
+      { timeout: SLOW_READY_TIMEOUT },
+    );
+    expect(response.status()).toBe(200);
+    return {
+      query: new URL(response.url()).searchParams,
+      body: (await response.json()) as BacktestResponse,
+    };
+  }
+
+  /** Asserts that `query` sends the window once, in `unit` only, `size` on both sides. */
+  function expectWindowQuery(query: URLSearchParams, unit: "days" | "months", size: string): void {
+    const other = unit === "days" ? "months" : "days";
+    expect(query.getAll(`pre_${unit}`)).toEqual([size]);
+    expect(query.getAll(`post_${unit}`)).toEqual([size]);
+    expect(query.has(`pre_${other}`)).toBe(false);
+    expect(query.has(`post_${other}`)).toBe(false);
+  }
+
+  function cycleOf(body: BacktestResponse, eventDate: string): CycleResult {
+    const cycle = body.cycles.find((candidate) => candidate.event_date === eventDate);
+    if (cycle === undefined) throw new Error(`The backtest response has no ${eventDate} cycle`);
+    return cycle;
+  }
+
+  /** The `field` value of each of the cycle's sessions. */
+  function observedSeries(cycle: CycleResult, field: Metric | OverlayField): SeriesValue[] {
+    return cycle.points.map((point: CyclePoint) => ({
+      offset: point.offset_days,
+      value: point[field],
+    }));
+  }
+
+  /** The `metric` value at each offset of the cycle's projection; [] without one. */
+  function projectionSeries(cycle: CycleResult, metric: IndexMetric): SeriesValue[] {
+    return (cycle.projection?.points ?? []).map((point) => ({
+      offset: point.offset_days,
+      value: point[metric],
+    }));
+  }
+
+  /** The main-chart path drawn for `eventDate`'s observed sessions or its projection. */
+  function cycleLine(chart: Locator, eventDate: string, series: LineSeries): Locator {
+    return withAttributes(chart, "cycle-line", {
+      "data-event-date": eventDate,
+      "data-series": series,
+    });
+  }
+
+  /**
+   * The vertices of a path Recharts draws with its linear curve, `M x,y` then `L x,y` per value;
+   * [] for a path without geometry. They are pixel coordinates, never displayed values.
+   */
+  function pathVertices(d: string | null): Vertex[] {
+    return Array.from((d ?? "").matchAll(/[ML](-?[\d.]+),(-?[\d.]+)/g), (match) => ({
+      x: Number(match[1]),
+      y: Number(match[2]),
+    }));
+  }
+
+  /**
+   * A decimal string such as `"-1234.5"` as an exact integer count of 10^-DECIMAL_SCALE units,
+   * read from its digits and never through a float (Rule 4).
+   */
+  function scaledDecimal(value: DecimalString): bigint {
+    const match = /^(-?)(\d+)(?:\.(\d+))?$/.exec(value);
+    const fraction = match?.[3] ?? "";
+    if (match === null || fraction.length > DECIMAL_SCALE) {
+      throw new Error(`Not a decimal string of at most ${DECIMAL_SCALE} places: ${value}`);
+    }
+    const magnitude = BigInt((match[2] ?? "") + fraction.padEnd(DECIMAL_SCALE, "0"));
+    return match[1] === "-" ? -magnitude : magnitude;
+  }
+
+  /**
+   * How `vertices` depart from the values they should draw, one message per departure. Each value
+   * needs a vertex placed linearly in its offset, which rises above the previous vertex where the
+   * value rises, falls where it falls and stays level where it holds; the highest value must be
+   * drawn more than 1 px above the lowest, so a flat line never passes.
+   */
+  function pathMismatches(
+    vertices: readonly Vertex[],
+    drawn: ReadonlyArray<{ offset: number; value: bigint }>,
+  ): string[] {
+    if (vertices.length !== drawn.length) {
+      return [`${vertices.length} vertices for ${drawn.length} values`];
+    }
+    const firstVertex = vertices[0];
+    const lastVertex = vertices[vertices.length - 1];
+    const first = drawn[0];
+    const last = drawn[drawn.length - 1];
+    if (!firstVertex || !lastVertex || !first || !last || last.offset <= first.offset) {
+      return ["fewer than two values at distinct offsets"];
+    }
+    const pxPerDay = (lastVertex.x - firstVertex.x) / (last.offset - first.offset);
+    const mismatches: string[] = pxPerDay > 0 ? [] : [`x moves ${pxPerDay} px per day`];
+    let highest = 0;
+    let lowest = 0;
+    drawn.forEach((item, index) => {
+      const vertex = vertices[index];
+      if (vertex === undefined) return;
+      const expectedX = firstVertex.x + (item.offset - first.offset) * pxPerDay;
+      if (Math.abs(vertex.x - expectedX) > PIXEL_TOLERANCE) {
+        mismatches.push(`offset ${item.offset}: x ${vertex.x}, expected ${expectedX}`);
+      }
+      if (item.value > (drawn[highest]?.value ?? item.value)) highest = index;
+      if (item.value < (drawn[lowest]?.value ?? item.value)) lowest = index;
+      const previous = drawn[index - 1];
+      const previousVertex = vertices[index - 1];
+      if (previous === undefined || previousVertex === undefined) return;
+      // SVG y grows downwards, so a rising value moves the line up.
+      const dy = vertex.y - previousVertex.y;
+      let follows = Math.abs(dy) <= PIXEL_TOLERANCE;
+      if (item.value > previous.value) follows = dy < PIXEL_TOLERANCE;
+      if (item.value < previous.value) follows = dy > -PIXEL_TOLERANCE;
+      if (!follows) mismatches.push(`offset ${item.offset}: y moves ${dy} against its value`);
+    });
+    const top = vertices[highest]?.y ?? Number.NaN;
+    const bottom = vertices[lowest]?.y ?? Number.NaN;
+    const hasRange = (drawn[highest]?.value ?? 0) !== (drawn[lowest]?.value ?? 0);
+    if (hasRange && !(bottom - top > 1)) {
+      mismatches.push(`the highest value is drawn at y ${top}, the lowest at y ${bottom}`);
+    }
+    return mismatches;
+  }
+
+  /**
+   * Asserts that `path` is one drawn line through exactly the non-null values of `series`, in
+   * order (see {@link pathMismatches}), retrying while the chart re-renders; returns its vertices.
+   */
+  async function expectPathDraws(path: Locator, series: readonly SeriesValue[]): Promise<Vertex[]> {
+    const drawn = series.flatMap((item) =>
+      item.value === null ? [] : [{ offset: item.offset, value: scaledDecimal(item.value) }],
+    );
+    expect(drawn.length).toBeGreaterThanOrEqual(2);
+    let vertices: Vertex[] = [];
+    await expect(async () => {
+      expect(await path.count(), "paths drawn for the series").toBe(1);
+      vertices = pathVertices(await path.getAttribute("d", { timeout: 1_000 }));
+      expect(pathMismatches(vertices, drawn)).toEqual([]);
+    }).toPass({ timeout: READY_TIMEOUT });
+    return vertices;
+  }
+
+  /**
+   * Asserts that `cycle` is drawn as one visible, solid line through every session's `metric`
+   * value; returns its path data.
+   */
+  async function expectObservedLine(
+    chart: Locator,
+    cycle: CycleResult,
+    metric: Metric,
+  ): Promise<string> {
+    const line = cycleLine(chart, cycle.event_date, "observed");
+    await expectPathDraws(line, observedSeries(cycle, metric));
+    await expect(line).toBeVisible();
+    await expect(line).not.toHaveAttribute("stroke-dasharray", /\S/);
+    expect((await line.boundingBox())?.width ?? 0).toBeGreaterThan(0);
+    return (await line.getAttribute("d")) ?? "";
+  }
+
+  const OVERLAY_FIELDS: readonly OverlayField[] = [
+    "inflation_yoy_pct",
+    "tbill_91d_pct",
+    "tbill_364d_pct",
+  ];
+
+  /**
+   * The metric toggles in the order the metric test presses them, each a change from the one
+   * before, with the heading, value-axis title and tooltip prefix each shows.
+   */
+  const METRIC_TOGGLES: ReadonlyArray<{
+    metric: Metric;
+    label: string;
+    axisTitle: string;
+    prefix: string;
+  }> = [
+    { metric: "pe_index", label: "P/E index", axisTitle: "P/E index (anchor = 100)", prefix: "" },
+    {
+      metric: "turnover_index",
+      label: "Turnover index",
+      axisTitle: "Turnover index (anchor = 100)",
+      prefix: "",
+    },
+    {
+      metric: "cumulative_foreign_net_kes",
+      label: "Cumulative foreign flow",
+      axisTitle: "Cumulative foreign net flow (KES)",
+      prefix: "KES ",
+    },
+    {
+      metric: "price_index",
+      label: "Price index",
+      axisTitle: "Price index (anchor = 100)",
+      prefix: "",
+    },
+  ];
+
+  /** A date with no stored cycle, inside the seeded history, so it backtests as complete. */
+  const CUSTOM_EVENT_DATE = "2020-03-16";
+  /** Days on each side of the event within which the null-overlay fixture removes inflation. */
+  const INFLATION_GAP_DAYS = 30;
+  const MONTH_ABBREVIATIONS = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+  ] as const;
+
+  function isIndexMetric(metric: Metric): metric is IndexMetric {
+    return metric !== "cumulative_foreign_net_kes";
+  }
+
+  /** The overlay-chart path drawn for `field`. */
+  function overlayLine(chart: Locator, field: OverlayField): Locator {
+    return withAttributes(chart, "cycle-overlay-line", { "data-series": field });
+  }
+
+  function eventChip(backtester: Locator, eventDate: string): Locator {
+    return withAttributes(backtester, "cycle-event-chip", { "data-event-date": eventDate });
+  }
+
+  /** An ISO date as the widgets display it: `4 Mar 2013`. */
+  function displayedDate(iso: string): string {
+    const [year = "", month = "", day = ""] = iso.split("-");
+    const monthName = MONTH_ABBREVIATIONS[Number.parseInt(month, 10) - 1] ?? "";
+    return `${Number.parseInt(day, 10)} ${monthName} ${year}`;
+  }
+
+  /**
+   * A cycle label as the widget displays it: the server's generic `Event 2020-03-16` names its
+   * date in short form, `Event 16 Mar 2020`; a stored label such as `2013 Cycle` is unchanged.
+   */
+  function displayedLabel(label: string): string {
+    const date = /^Event (\d{4}-\d{2}-\d{2})$/.exec(label)?.[1];
+    return date === undefined ? label : `Event ${displayedDate(date)}`;
+  }
+
+  /**
+   * `value` as `formatDecimal` displays it, built from the string alone: integer digits grouped
+   * with ",", U+2212 before a non-zero negative, `prefix` before the sign and `suffix` after; "—"
+   * for null.
+   */
+  function displayedDecimal(value: DecimalString | null, prefix = "", suffix = ""): string {
+    if (value === null) return EMPTY_VALUE;
+    const match = /^(-?)(\d+)(\.\d+)?$/.exec(value);
+    if (match === null) throw new Error(`Not a decimal string: ${value}`);
+    const integer = match[2] ?? "";
+    const fraction = match[3] ?? "";
+    const sign = match[1] === "-" && /[1-9]/.test(integer + fraction) ? MINUS_SIGN : "";
+    const grouped = integer.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    return `${prefix}${sign}${grouped}${fraction}${suffix}`;
+  }
+
+  /** A whole-day offset as the tooltips show it: `+12`, `0`, `−5`. */
+  function displayedOffset(offset: number): string {
+    if (offset > 0) return `+${offset}`;
+    return offset < 0 ? `${MINUS_SIGN}${-offset}` : "0";
+  }
+
+  /** The offset a tooltip shows as `+12`, `0` or `−5`. */
+  function parseDisplayedOffset(text: string): number {
+    const match = /^([+\u2212]?)(\d+)$/.exec(text);
+    if (match === null) throw new Error(`Not a displayed offset: ${JSON.stringify(text)}`);
+    const days = Number.parseInt(match[2] ?? "", 10);
+    return match[1] === MINUS_SIGN ? -days : days;
+  }
+
+  /**
+   * The last of `rows` at or before `day`, or undefined when `day` is past every row: the session
+   * or projected offset a tooltip pairs with a hovered day.
+   */
+  function lastAtOrBefore<R extends { offset_days: number }>(
+    rows: readonly R[],
+    day: number,
+  ): R | undefined {
+    let found: R | undefined;
+    let latest = Number.NEGATIVE_INFINITY;
+    for (const row of rows) {
+      latest = Math.max(latest, row.offset_days);
+      if (row.offset_days <= day && (found === undefined || row.offset_days > found.offset_days)) {
+        found = row;
+      }
+    }
+    return day > latest ? undefined : found;
+  }
+
+  /** Points at the middle of `chart`'s event line, which opens its tooltip at about day 0. */
+  async function hoverEventLine(page: Page, chart: Locator): Promise<void> {
+    await chart.scrollIntoViewIfNeeded();
+    const centre = await chart.locator(".recharts-reference-line-line").evaluate((element) => {
+      const box = element.getBoundingClientRect();
+      return { x: box.left + box.width / 2, y: box.top + box.height / 2 };
+    });
+    // From outside the chart, so the pointer enters it afresh.
+    await page.mouse.move(0, 0);
+    await page.mouse.move(centre.x, centre.y, { steps: 4 });
+  }
+
+  /**
+   * Hovers the main chart's event line and checks its tooltip against `body`: each cycle's row
+   * names its last session on or before the hovered day and shows that session's `metric` value,
+   * each projection's row its value at the last projected offset on or before that day, both as
+   * `formatDecimal` displays them. A line with nothing on or before that day, or a projection
+   * under cumulative flow, has no row.
+   */
+  async function expectMainTooltip(
+    page: Page,
+    chart: Locator,
+    body: BacktestResponse,
+    metric: Metric,
+    prefix: string,
+  ): Promise<void> {
+    await hoverEventLine(page, chart);
+    const title = chart.getByText(/^On or before day \S+ from event$/);
+    await expect(title).toBeVisible();
+    const dayText = /day (\S+) from/.exec((await title.textContent()) ?? "")?.[1] ?? "";
+    const day = parseDisplayedOffset(dayText);
+    for (const cycle of body.cycles) {
+      const rowOf = (series: LineSeries): Locator =>
+        withAttributes(chart, "cycle-tooltip-row", {
+          "data-event-date": cycle.event_date,
+          "data-series": series,
+        });
+      const observedRow = rowOf("observed");
+      const session = lastAtOrBefore(cycle.points, day);
+      if (session === undefined) {
+        await expect(observedRow).toHaveCount(0);
+      } else {
+        const meta =
+          `${displayedDate(session.trade_date)} \u00b7 ` +
+          `${displayedOffset(session.offset_days)} d`;
+        await expect(observedRow).toContainText(meta);
+        await expect(observedRow.locator('[data-part="value"]')).toHaveText(
+          displayedDecimal(session[metric], prefix),
+        );
+      }
+      const projectionRow = rowOf("projection");
+      const projected = isIndexMetric(metric)
+        ? lastAtOrBefore(cycle.projection?.points ?? [], day)
+        : undefined;
+      if (projected === undefined || !isIndexMetric(metric)) {
+        await expect(projectionRow).toHaveCount(0);
+      } else {
+        const name = `Projection \u00b7 ${displayedLabel(cycle.label)}`;
+        await expect(projectionRow).toContainText(
+          `${name}${displayedOffset(projected.offset_days)} d`,
+        );
+        await expect(projectionRow.locator('[data-part="value"]')).toHaveText(
+          displayedDecimal(projected[metric], prefix),
+        );
+      }
+    }
+  }
+
+  /**
+   * Hovers the overlay chart's event line and checks its tooltip against `cycle`: the session it
+   * names, and each rate of that session as `formatDecimal` displays it, "—" where it is null.
+   * Returns that session.
+   */
+  async function expectOverlayTooltip(
+    page: Page,
+    chart: Locator,
+    cycle: CycleResult,
+  ): Promise<CyclePoint> {
+    await hoverEventLine(page, chart);
+    const offsetLabel = chart.getByText(/^\(\S+ d\)$/);
+    await expect(offsetLabel).toBeVisible();
+    const offsetText = /^\((\S+) d\)$/.exec((await offsetLabel.textContent()) ?? "")?.[1] ?? "";
+    const offset = parseDisplayedOffset(offsetText);
+    const session = cycle.points.find((point) => point.offset_days === offset);
+    if (session === undefined) {
+      throw new Error(`The ${cycle.event_date} cycle has no session at ${offset} d`);
+    }
+    await expect(offsetLabel.locator("xpath=..")).toHaveText(
+      `${displayedDate(session.trade_date)} (${displayedOffset(offset)} d)`,
+    );
+    for (const field of OVERLAY_FIELDS) {
+      const row = withAttributes(chart, "cycle-overlay-tooltip-row", { "data-series": field });
+      await expect(row.locator('[data-part="value"]')).toHaveText(
+        displayedDecimal(session[field], "", "%"),
+      );
+    }
+    return session;
+  }
+
+  /**
+   * `body` with its first cycle's 364-day T-bill null on every session, as the API reports a
+   * yield more than 62 days stale, and its inflation null within {@link INFLATION_GAP_DAYS} of
+   * the event.
+   */
+  function withBlankedOverlay(body: BacktestResponse): BacktestResponse {
+    return {
+      ...body,
+      cycles: body.cycles.map((cycle, index) =>
+        index === 0
+          ? {
+              ...cycle,
+              points: cycle.points.map((point) => ({
+                ...point,
+                inflation_yoy_pct:
+                  Math.abs(point.offset_days) <= INFLATION_GAP_DAYS
+                    ? null
+                    : point.inflation_yoy_pct,
+                tbill_364d_pct: null,
+              })),
+            }
+          : cycle,
+      ),
+    };
+  }
+
   test("overlays four cycles with markers, then projects the 2027 cycle at ±12 months", async ({
     page,
   }) => {
     // Two cold backtests can each take up to SLOW_READY_TIMEOUT.
     test.slow();
+    const requests = recordBacktestRequests(page);
+    const defaultBacktest = nextBacktest(page, () => true);
     await page.goto("/cycles");
 
     const backtester = page.getByTestId("terminal-cycle-backtester");
     await expectReady(backtester, SLOW_READY_TIMEOUT);
+
+    // The first request names no event, so the server backtests its stored cycles, and sends the
+    // ±180-day window in days only.
+    const { query: daysQuery, body: daysResult } = await defaultBacktest;
+    expect(requests).toHaveLength(1);
+    expectWindowQuery(daysQuery, "days", "180");
+    expect(daysQuery.has("event_dates")).toBe(false);
+    expect(daysResult.cycles.map((cycle) => cycle.event_date)).toEqual([...ELECTION_DATES]);
 
     // Default ±180-day window over the four seeded election dates.
     const legendItems = backtester.getByTestId("cycle-legend-item");
@@ -412,6 +895,18 @@ test.describe("Election and cycle backtesting (/cycles)", () => {
       .poll(() => mainChart.locator("path.recharts-line-curve[stroke-dasharray]").count())
       .toBeGreaterThanOrEqual(1);
 
+    // Each completed cycle is one solid line through every session's price index. The awaiting
+    // 2027 cycle has no observed line, only its dashed projection through the projected offsets.
+    for (const date of COMPLETED_ELECTION_DATES) {
+      await expectObservedLine(mainChart, cycleOf(daysResult, date), "price_index");
+    }
+    const awaiting = cycleOf(daysResult, FUTURE_ELECTION_DATE);
+    expect(awaiting.points).toEqual([]);
+    await expect(cycleLine(mainChart, FUTURE_ELECTION_DATE, "observed")).toHaveCount(0);
+    const futureProjection = cycleLine(mainChart, FUTURE_ELECTION_DATE, "projection");
+    await expectPathDraws(futureProjection, projectionSeries(awaiting, "price_index"));
+    await expect(futureProjection).toHaveAttribute("stroke-dasharray", /\S/);
+
     // One valuation floor and one volume exhaustion per completed cycle; the awaiting 2027
     // cycle has no markers.
     await expect(backtester.getByTestId("marker-valuation-floor")).toHaveCount(3);
@@ -419,26 +914,394 @@ test.describe("Election and cycle backtesting (/cycles)", () => {
     for (const date of COMPLETED_ELECTION_DATES) {
       await expect(backtester.getByTestId(`cycle-status-${date}`)).toContainText(/complete/i);
     }
-    await expect(backtester.getByTestId(`cycle-status-${FUTURE_ELECTION_DATE}`)).toContainText(
-      /awaiting data/i,
-    );
+    const futureStatus = backtester.getByTestId(`cycle-status-${FUTURE_ELECTION_DATE}`);
+    await expect(futureStatus).toContainText(/awaiting data/i);
+    expect(awaiting.days_until_window_start).not.toBeNull();
+    await expect(futureStatus).toContainText(`opens in ${awaiting.days_until_window_start} days`);
 
     // ±12 months opens the 2027 window on 2026-08-10, inside the seeded history, so the cycle
     // turns partial with an observed segment and keeps its projection. Marker counts are not
     // asserted here: a partial cycle may carry markers of its own.
+    const monthsBacktest = nextBacktest(page, (query) => query.has("pre_months"));
     const twelveMonths = backtester.getByTestId("cycle-window-12m");
     await twelveMonths.click();
     await expect(twelveMonths).toHaveAttribute("aria-pressed", "true");
-    await expect(backtester.getByTestId(`cycle-status-${FUTURE_ELECTION_DATE}`)).toContainText(
-      /partial/i,
-      { timeout: SLOW_READY_TIMEOUT },
-    );
+
+    // The preset sends the window in months only, still for the stored cycles.
+    const { query: monthsQuery, body: monthsResult } = await monthsBacktest;
+    expect(requests).toHaveLength(2);
+    expectWindowQuery(monthsQuery, "months", "12");
+    expect(monthsQuery.has("event_dates")).toBe(false);
+    const partial = cycleOf(monthsResult, FUTURE_ELECTION_DATE);
+    expect(partial).toMatchObject({
+      status: "partial",
+      window_start: "2026-08-10",
+      window_end: "2028-08-10",
+    });
+    const firstSession = partial.points[0];
+    const lastSession = partial.points[partial.points.length - 1];
+    expect(firstSession?.trade_date).toBe("2026-08-10");
+    expect(lastSession?.trade_date).toBe("2026-09-30");
+    expect(partial.projection).not.toBeNull();
+
+    await expect(futureStatus).toContainText(/partial/i, { timeout: SLOW_READY_TIMEOUT });
     await expectReady(backtester, SLOW_READY_TIMEOUT);
     await expect(legendItems).toHaveCount(4);
     await expect(futureLegend).toBeVisible();
     await expect(futureLegend).not.toContainText("no observed sessions");
     await expect(projectionLegend).toBeVisible();
     await expect(projectionLegend).toContainText("Projection");
+
+    // Every cycle is now redrawn over its ±12-month sessions, 2027's observed segment included.
+    for (const date of COMPLETED_ELECTION_DATES) {
+      await expectObservedLine(mainChart, cycleOf(monthsResult, date), "price_index");
+    }
+    const segment = pathVertices(await expectObservedLine(mainChart, partial, "price_index"));
+    await expectPathDraws(futureProjection, projectionSeries(partial, "price_index"));
+    await expect(futureProjection).toHaveAttribute("stroke-dasharray", /\S/);
+
+    // The segment's sessions all precede the event, so it lies wholly left of the event line,
+    // and its own offsets, laid out at its own pixels per day, put day 0 on that line.
+    const firstVertex = segment[0];
+    const lastVertex = segment[segment.length - 1];
+    if (!firstSession || !lastSession || !firstVertex || !lastVertex) {
+      throw new Error("The partial 2027 cycle drew no observed segment");
+    }
+    expect(lastSession.offset_days).toBeLessThan(0);
+    const eventLine = mainChart.locator(".recharts-reference-line-line");
+    await expect(eventLine).toHaveCount(1);
+    const eventX = Number(await eventLine.getAttribute("x1"));
+    const pxPerDay =
+      (lastVertex.x - firstVertex.x) / (lastSession.offset_days - firstSession.offset_days);
+    expect(Math.abs(firstVertex.x - firstSession.offset_days * pxPerDay - eventX)).toBeLessThan(
+      0.5,
+    );
+    const segmentRight = await cycleLine(mainChart, FUTURE_ELECTION_DATE, "observed").evaluate(
+      (element) => element.getBoundingClientRect().right,
+    );
+    const eventLeft = await eventLine.evaluate((element) => element.getBoundingClientRect().left);
+    expect(segmentRight).toBeLessThan(eventLeft);
+  });
+
+  test("editing event dates re-queries the backtest, and invalid dates send no request", async ({
+    page,
+  }) => {
+    // Each of the many chip changes waits on a backtest of its own.
+    test.slow();
+    const requests = recordBacktestRequests(page);
+    const initial = nextBacktest(page, () => true);
+    await page.goto("/cycles");
+
+    const backtester = page.getByTestId("terminal-cycle-backtester");
+    await expectReady(backtester, SLOW_READY_TIMEOUT);
+    await initial;
+    const mainChart = backtester.getByTestId("cycle-main-chart");
+    const chips = backtester.getByTestId("cycle-event-chip");
+    const legendItems = backtester.getByTestId("cycle-legend-item");
+    const summaryRows = backtester.getByTestId("cycle-summary-row");
+    const removeButton = (date: string): Locator =>
+      eventChip(backtester, date).getByRole("button", { name: /^Remove / });
+    await expect(chips).toHaveCount(ELECTION_DATES.length);
+
+    // Removing the 2013 chip asks for exactly the three remaining dates, in the same window, and
+    // the 2013 cycle leaves the chips, the legend, the summary and the chart.
+    const [removed, ...kept] = ELECTION_DATES;
+    const removal = nextBacktest(page, (query) => query.has("event_dates"));
+    await removeButton(removed).click();
+    const { query: removalQuery, body: afterRemoval } = await removal;
+    expect(removalQuery.getAll("event_dates")).toEqual(kept);
+    expectWindowQuery(removalQuery, "days", "180");
+    expect(afterRemoval.cycles.map((cycle) => cycle.event_date)).toEqual(kept);
+    await expect(chips).toHaveCount(kept.length);
+    await expect(eventChip(backtester, removed)).toHaveCount(0);
+    for (const testId of ["cycle-legend-item", "cycle-summary-row"]) {
+      await expect(
+        withAttributes(backtester, testId, { "data-event-date": removed }),
+      ).toHaveCount(0);
+    }
+    await expect(legendItems).toHaveCount(kept.length);
+    await expect(summaryRows).toHaveCount(kept.length);
+    await expect(cycleLine(mainChart, removed, "observed")).toHaveCount(0);
+    for (const date of kept.filter((date) => date !== FUTURE_ELECTION_DATE)) {
+      await expectObservedLine(mainChart, cycleOf(afterRemoval, date), "price_index");
+    }
+
+    // A custom date joins the chips in date order and returns under the server's generic label,
+    // shown with its date in short form, as a complete cycle drawn with its own line.
+    const customDate = backtester.getByTestId("cycle-custom-date");
+    const addDate = backtester.getByTestId("cycle-add-date");
+    const withCustom = [...kept, CUSTOM_EVENT_DATE].sort();
+    const addition = nextBacktest(page, (query) =>
+      query.getAll("event_dates").includes(CUSTOM_EVENT_DATE),
+    );
+    await customDate.fill(CUSTOM_EVENT_DATE);
+    await addDate.click();
+    const { query: additionQuery, body: afterAddition } = await addition;
+    expect(additionQuery.getAll("event_dates")).toEqual(withCustom);
+    expectWindowQuery(additionQuery, "days", "180");
+    const custom = cycleOf(afterAddition, CUSTOM_EVENT_DATE);
+    expect(custom.label).toBe(`Event ${CUSTOM_EVENT_DATE}`);
+    expect(custom.status).toBe("complete");
+    const customLabel = displayedLabel(custom.label);
+    expect(customLabel).toBe("Event 16 Mar 2020");
+    await expect(customDate).toHaveValue("");
+    await expect(chips).toHaveCount(withCustom.length);
+    await expect(eventChip(backtester, CUSTOM_EVENT_DATE)).toHaveText(customLabel);
+    await expect(
+      withAttributes(backtester, "cycle-legend-item", { "data-event-date": CUSTOM_EVENT_DATE }),
+    ).toHaveText(customLabel);
+    await expect(
+      withAttributes(backtester, "cycle-summary-row", { "data-event-date": CUSTOM_EVENT_DATE }),
+    ).toContainText(customLabel);
+    await expect(backtester.getByTestId(`cycle-status-${CUSTOM_EVENT_DATE}`)).toHaveText(
+      "complete",
+    );
+    await expectObservedLine(mainChart, custom, "price_index");
+
+    // Invalid additions are refused in place without a request: a date already selected, no
+    // date, an unfinished date, and a date whose ±180-day window would leave the API's calendar.
+    const chipError = backtester.getByTestId("cycle-chip-error");
+    const rangePhrase = "between 30 Jun 0001 and 4 Jul 9999 for the ±180 days window";
+    const settledRequests = requests.length;
+    await customDate.fill(kept[0]);
+    await addDate.click();
+    await expect(chipError).toHaveText(`${displayedDate(kept[0])} is already selected.`);
+    await customDate.fill("");
+    await addDate.click();
+    await expect(chipError).toHaveText("Enter a complete date.");
+    // Typing only the month leaves the input's value empty, with bad input.
+    await customDate.focus();
+    await page.keyboard.type("03");
+    await addDate.click();
+    await expect(chipError).toHaveText(`Enter a complete date ${rangePhrase}.`);
+    await customDate.fill("0001-01-01");
+    await addDate.click();
+    await expect(chipError).toHaveText(`Enter a date ${rangePhrase}.`);
+    await expect(chips).toHaveCount(withCustom.length);
+    expect(requests).toHaveLength(settledRequests);
+
+    // Four more dates reach the limit of eight; a ninth is refused without a request.
+    const extraDates = ["2013-03-04", "2015-06-01", "2019-01-15", "2024-05-20"];
+    for (const date of extraDates) {
+      const added = nextBacktest(page, (query) => query.getAll("event_dates").includes(date));
+      await customDate.fill(date);
+      await addDate.click();
+      await added;
+    }
+    const eightDates = [...withCustom, ...extraDates].sort();
+    await expect(chips).toHaveCount(8);
+    await expect(legendItems).toHaveCount(8);
+    expect(
+      await chips.evaluateAll((elements) =>
+        elements.map((element) => element.getAttribute("data-event-date")),
+      ),
+    ).toEqual(eightDates);
+    const requestsAtLimit = requests.length;
+    await customDate.fill("2025-01-15");
+    await addDate.click();
+    await expect(chipError).toHaveText("At most 8 event dates can be compared. Remove one first.");
+    await expect(chips).toHaveCount(8);
+    expect(requests).toHaveLength(requestsAtLimit);
+
+    // Removing all dates but one: the last chip's Remove is disabled, so no empty list is sent.
+    const lastDate = "2022-08-09";
+    const lastRemoval = nextBacktest(
+      page,
+      (query) => query.getAll("event_dates").join() === lastDate,
+    );
+    for (const date of eightDates.filter((date) => date !== lastDate)) {
+      await removeButton(date).click();
+      await expect(eventChip(backtester, date)).toHaveCount(0);
+    }
+    const { body: single } = await lastRemoval;
+    expect(single.cycles.map((cycle) => cycle.event_date)).toEqual([lastDate]);
+    await expect(chips).toHaveCount(1);
+    await expect(removeButton(lastDate)).toBeDisabled();
+    await expect(legendItems).toHaveCount(1);
+    await expect(summaryRows).toHaveCount(1);
+    await expectObservedLine(mainChart, cycleOf(single, lastDate), "price_index");
+  });
+
+  test("each metric redraws every cycle from that metric's values without a new request", async ({
+    page,
+  }) => {
+    test.slow();
+    const requests = recordBacktestRequests(page);
+    const initial = nextBacktest(page, () => true);
+    await page.goto("/cycles");
+
+    const backtester = page.getByTestId("terminal-cycle-backtester");
+    await expectReady(backtester, SLOW_READY_TIMEOUT);
+    const { body } = await initial;
+    const mainChart = backtester.getByTestId("cycle-main-chart");
+    const awaiting = cycleOf(body, FUTURE_ELECTION_DATE);
+    const projection = cycleLine(mainChart, FUTURE_ELECTION_DATE, "projection");
+    const projectionLegend = withAttributes(backtester, "cycle-projection-legend", {
+      "data-event-date": FUTURE_ELECTION_DATE,
+    });
+    const projectionNote = backtester.getByText(/^Projections are descriptive averages/);
+    // Every metric's value-axis title ends "(anchor = 100)" or "(KES)".
+    const valueAxisTitle = mainChart
+      .locator("text.recharts-label")
+      .filter({ hasText: /\((?:anchor = 100|KES)\)$/ });
+
+    // The price index is plotted first.
+    await expect(backtester.getByTestId("cycle-metric-price_index")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    const drawn = new Map<string, string>();
+    for (const date of COMPLETED_ELECTION_DATES) {
+      drawn.set(date, await expectObservedLine(mainChart, cycleOf(body, date), "price_index"));
+    }
+
+    for (const toggle of METRIC_TOGGLES) {
+      await backtester.getByTestId(`cycle-metric-${toggle.metric}`).click();
+      for (const other of METRIC_TOGGLES) {
+        await expect(backtester.getByTestId(`cycle-metric-${other.metric}`)).toHaveAttribute(
+          "aria-pressed",
+          String(other === toggle),
+        );
+      }
+      const heading = `${toggle.label} by days from event`;
+      await expect(backtester.getByRole("heading", { name: heading, exact: true })).toBeVisible();
+      await expect(valueAxisTitle).toHaveText([toggle.axisTitle]);
+
+      // Every completed cycle's line changes, to one through this metric's values.
+      for (const date of COMPLETED_ELECTION_DATES) {
+        await expect(cycleLine(mainChart, date, "observed")).not.toHaveAttribute(
+          "d",
+          drawn.get(date) ?? "",
+        );
+        drawn.set(date, await expectObservedLine(mainChart, cycleOf(body, date), toggle.metric));
+      }
+
+      // A projection carries the three index levels only.
+      if (isIndexMetric(toggle.metric)) {
+        await expectPathDraws(projection, projectionSeries(awaiting, toggle.metric));
+        await expect(projection).toHaveAttribute("stroke-dasharray", /\S/);
+        await expect(projectionLegend).toBeVisible();
+        await expect(projectionNote).toHaveText(
+          "Projections are descriptive averages of completed cycles, not forecasts.",
+        );
+      } else {
+        await expect(projection).toHaveCount(0);
+        await expect(projectionLegend).toHaveCount(0);
+        await expect(projectionNote).toHaveText(
+          "Projections are descriptive averages of completed cycles, not forecasts; none is drawn" +
+            " for cumulative foreign flow.",
+        );
+      }
+
+      await expectMainTooltip(page, mainChart, body, toggle.metric, toggle.prefix);
+    }
+
+    // A metric change redraws the loaded result; it never asks the server again.
+    expect(requests).toHaveLength(1);
+  });
+
+  test("the macro overlay plots inflation and both T-bill yields of the selected cycle", async ({
+    page,
+  }) => {
+    test.slow();
+    const requests = recordBacktestRequests(page);
+    const initial = nextBacktest(page, () => true);
+    await page.goto("/cycles");
+
+    const backtester = page.getByTestId("terminal-cycle-backtester");
+    await expectReady(backtester, SLOW_READY_TIMEOUT);
+    const { body } = await initial;
+    const select = backtester.getByTestId("cycle-overlay-select");
+    const overlayChart = backtester.getByTestId("cycle-overlay-chart");
+
+    // Only cycles with sessions can be overlaid, so the awaiting 2027 cycle is not offered, and
+    // the first of them is selected.
+    const candidates = body.cycles.filter((cycle) => cycle.points.length > 0);
+    expect(candidates.map((cycle) => cycle.event_date)).toEqual([...COMPLETED_ELECTION_DATES]);
+    const options = select.locator("option");
+    await expect(options).toHaveText(candidates.map((cycle) => displayedLabel(cycle.label)));
+    expect(
+      await options.evaluateAll((elements) =>
+        elements.map((element) => element.getAttribute("value")),
+      ),
+    ).toEqual(candidates.map((cycle) => cycle.event_date));
+    const [first, second] = candidates;
+    if (first === undefined || second === undefined) {
+      throw new Error("The backtest response has fewer than two cycles with sessions");
+    }
+    await expect(select).toHaveValue(first.event_date);
+
+    await expect(overlayChart.getByTestId("cycle-overlay-line")).toHaveCount(OVERLAY_FIELDS.length);
+    const drawn = new Map<OverlayField, string>();
+    for (const field of OVERLAY_FIELDS) {
+      const line = overlayLine(overlayChart, field);
+      await expectPathDraws(line, observedSeries(first, field));
+      await expect(line).toBeVisible();
+      drawn.set(field, (await line.getAttribute("d")) ?? "");
+    }
+    await expectOverlayTooltip(page, overlayChart, first);
+
+    // Choosing another cycle redraws every rate from its sessions, out of the loaded result.
+    await select.selectOption(second.event_date);
+    await expect(select).toHaveValue(second.event_date);
+    for (const field of OVERLAY_FIELDS) {
+      const line = overlayLine(overlayChart, field);
+      await expect(line).not.toHaveAttribute("d", drawn.get(field) ?? "");
+      await expectPathDraws(line, observedSeries(second, field));
+      await expect(line).toBeVisible();
+    }
+    await expectOverlayTooltip(page, overlayChart, second);
+    expect(requests).toHaveLength(1);
+  });
+
+  test("stale and missing overlay rates leave gaps in the overlay and show as —", async ({
+    page,
+  }) => {
+    // The handler fetches the real backtest response and blanks rates in that copy before the page
+    // receives it; nothing is written to the database.
+    const served: BacktestResponse[] = [];
+    await page.route("**/api/v1/terminal/cycles/backtest**", async (route) => {
+      const response = await route.fetch();
+      const body = withBlankedOverlay((await response.json()) as BacktestResponse);
+      served.push(body);
+      await route.fulfill({ response, json: body });
+    });
+    await page.goto("/cycles");
+
+    const backtester = page.getByTestId("terminal-cycle-backtester");
+    await expectReady(backtester, SLOW_READY_TIMEOUT);
+    expect(served).toHaveLength(1);
+    const cycle = served[0]?.cycles[0];
+    if (cycle === undefined) throw new Error("The backtest response has no cycle");
+    expect(cycle.event_date).toBe(ELECTION_DATES[0]);
+    await expect(backtester.getByTestId("cycle-overlay-select")).toHaveValue(cycle.event_date);
+    const overlayChart = backtester.getByTestId("cycle-overlay-chart");
+
+    // Inflation is drawn through its remaining readings and the 91-day yield through all of
+    // them; the 364-day yield, null on every session, has no geometry at all.
+    const inflation = observedSeries(cycle, "inflation_yoy_pct");
+    expect(inflation.some((item) => item.value === null)).toBe(true);
+    await expectPathDraws(overlayLine(overlayChart, "inflation_yoy_pct"), inflation);
+    await expectPathDraws(
+      overlayLine(overlayChart, "tbill_91d_pct"),
+      observedSeries(cycle, "tbill_91d_pct"),
+    );
+    const staleGeometry = await overlayLine(overlayChart, "tbill_364d_pct").evaluateAll(
+      (elements) => elements.map((element) => element.getAttribute("d")),
+    );
+    expect(staleGeometry.flatMap((d) => pathVertices(d))).toEqual([]);
+
+    // A session inside the inflation gap shows both missing rates as "—" beside its 91-day yield.
+    const session = await expectOverlayTooltip(page, overlayChart, cycle);
+    expect(session.inflation_yoy_pct).toBeNull();
+    expect(session.tbill_364d_pct).toBeNull();
+    expect(session.tbill_91d_pct).not.toBeNull();
+    for (const field of ["inflation_yoy_pct", "tbill_364d_pct"] as const) {
+      const row = withAttributes(overlayChart, "cycle-overlay-tooltip-row", {
+        "data-series": field,
+      });
+      await expect(row.locator('[data-part="value"]')).toHaveText(EMPTY_VALUE);
+    }
   });
 });
 

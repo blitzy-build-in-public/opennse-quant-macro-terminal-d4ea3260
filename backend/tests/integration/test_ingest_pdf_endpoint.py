@@ -58,6 +58,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import Mapper, Session
 from sqlalchemy.sql import ClauseElement
+from starlette.datastructures import UploadFile
 
 from helpers.pdf_builder import Page, StatementRow, build_pdf, statement_page, text_page
 from opennse_terminal.api import get_terminal_session
@@ -66,10 +67,12 @@ from opennse_terminal.api.routes.ingest import MULTIPART_OVERHEAD_BYTES
 from opennse_terminal.config import TerminalSettings
 from opennse_terminal.db.base import TerminalBase
 from opennse_terminal.ingestion.base import RunRecorder, RunStatus
+from opennse_terminal.ingestion.files import pdf_line_items
 from opennse_terminal.ingestion.files.pdf_line_items import (
     ITEM_COLUMNS,
     LINE_ITEMS,
     ExtractionResult,
+    ParseCancelledError,
 )
 from opennse_terminal.models import (
     TerminalCorporateFiling,
@@ -772,6 +775,39 @@ async def test_rejected_upload_writes_no_data(
     ] == expected
 
 
+async def test_unknown_query_parameter_is_the_standard_422_and_writes_nothing(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    committed_query: CommittedQuery,
+    statement_pdf: StatementPdf,
+) -> None:
+    """The route declares no query parameter, only form fields: ``?bogus=1`` beside a valid
+    preview upload is FastAPI's standard 422 list with exactly one ``extra_forbidden`` entry,
+    and the route does not run, so no filing row and no run row is written."""
+    pdf = statement_pdf(tag="unknown query parameter")
+
+    response = await client.post(
+        URL,
+        params={"bogus": "1"},
+        files={"file": ("filing.pdf", pdf, "application/pdf")},
+        data={**SCOM_FORM, "commit": "false"},
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json() == {
+        "detail": [
+            {
+                "type": "extra_forbidden",
+                "loc": ["query", "bogus"],
+                "msg": "Extra inputs are not permitted",
+                "input": "1",
+            }
+        ]
+    }
+    assert await filing_row(db_session, pdf) is None
+    assert await run_rows(committed_query, pdf) == []
+
+
 @pytest.mark.parametrize("chunked", [False, True], ids=["by_content_length", "without_length"])
 async def test_request_too_large(
     client: httpx.AsyncClient,
@@ -954,6 +990,262 @@ async def test_concurrency_limit_returns_429(
     for outcome in outcomes:
         assert isinstance(outcome, httpx.Response), outcome
         coded_error(outcome, 409, "released", None)
+
+
+async def test_refused_upload_is_never_read_into_memory(
+    client: httpx.AsyncClient,
+    configure_settings: SettingsConfigurer,
+    monkeypatch: pytest.MonkeyPatch,
+    statement_pdf: StatementPdf,
+) -> None:
+    """With the only parse slot held, a further upload gets 429 ``ingest_busy`` having read only
+    its five magic bytes: the size check uses the multipart parser's count, and only an admitted
+    upload loads its file, inside its slot."""
+    settings = configure_settings(pdf_max_concurrency=1)
+    reads: list[tuple[str | None, int]] = []
+    real_read = UploadFile.read
+
+    async def recording_read(self: UploadFile, size: int = -1) -> bytes:
+        reads.append((self.filename, size))
+        return await real_read(self, size)
+
+    inside = asyncio.Event()
+    release = asyncio.Event()
+
+    async def held(*_args: object, **_kwargs: object) -> NoReturn:
+        inside.set()
+        await release.wait()
+        raise HTTPException(409, detail={"code": "released", "message": "released", "field": None})
+
+    monkeypatch.setattr(UploadFile, "read", recording_read)
+    monkeypatch.setattr(filings_service, "ingest_pdf", held)
+    pdf = statement_pdf(tag="refused unread")
+    holder = asyncio.create_task(
+        client.post(URL, files={"file": ("held.pdf", pdf, "application/pdf")})
+    )
+    try:
+        await asyncio.wait_for(inside.wait(), 10)
+
+        refused = await client.post(URL, files={"file": ("refused.pdf", pdf, "application/pdf")})
+
+        coded_error(refused, 429, "ingest_busy", None)
+    finally:
+        release.set()
+        [held_outcome] = await asyncio.gather(holder, return_exceptions=True)
+
+    assert isinstance(held_outcome, httpx.Response), held_outcome
+    coded_error(held_outcome, 409, "released", None)
+    assert [size for name, size in reads if name == "refused.pdf"] == [len(b"%PDF-")]
+    assert [size for name, size in reads if name == "held.pdf"] == [
+        len(b"%PDF-"),
+        settings.pdf_max_bytes + 1,
+    ]
+
+
+@pytest.mark.parametrize("counted", [None, 0], ids=["size_not_counted", "size_under_counted"])
+async def test_file_size_holds_without_the_multipart_count(
+    client: httpx.AsyncClient,
+    committed_query: CommittedQuery,
+    configure_settings: SettingsConfigurer,
+    monkeypatch: pytest.MonkeyPatch,
+    counted: int | None,
+) -> None:
+    """A file one byte over ``pdf_max_bytes`` is 413 ``file_too_large`` even when the multipart
+    parser's size count is missing, where the spooled file's end offset is measured instead, or
+    too low, where the bounded read inside the parse slot catches it. Neither reaches the
+    service or records a run row."""
+    configure_settings(pdf_max_bytes=PDF_MAX_BYTES_SMALL)
+    real_upload_size = ingest_routes._upload_size
+
+    async def miscounted(file: UploadFile) -> int:
+        file.size = counted
+        return await real_upload_size(file)
+
+    monkeypatch.setattr(ingest_routes, "_upload_size", miscounted)
+
+    response = await upload(client, OVERSIZED_FILE)
+
+    coded_error(response, 413, "file_too_large", "file")
+    assert await run_rows(committed_query, OVERSIZED_FILE) == []
+
+
+async def test_parse_over_its_time_limit_is_a_coded_timeout_and_a_failed_run(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    committed_query: CommittedQuery,
+    monkeypatch: pytest.MonkeyPatch,
+    statement_pdf: StatementPdf,
+) -> None:
+    """A parse stopped at its wall-clock limit is 422 ``pdf_parse_timeout`` on ``file``, never
+    ``pdf_unreadable``, with no extraction or filing row and a ``failed`` run row carrying the
+    code. The real parser runs; only its limit (20 s plus 0.4 s per page) is cut to 10 ms, which
+    no parser process can meet."""
+    monkeypatch.setattr(pdf_line_items, "_parse_time_limit", lambda _max_pages: 0.01)
+    pdf = statement_pdf(tag="parse timeout")
+
+    response = await upload(client, pdf)
+
+    detail = coded_error(response, 422, "pdf_parse_timeout", "file")
+    assert detail["message"] == "The PDF could not be parsed within 0.01 seconds."
+    assert await filing_row(db_session, pdf) is None
+    runs = await run_rows(committed_query, pdf)
+    assert [
+        (run["status"], run["trigger"], run["finished"], run["error_message"]) for run in runs
+    ] == [("failed", "api", True, "pdf_parse_timeout")]
+
+
+async def raw_upload(
+    app: FastAPI, pdf: bytes, after_the_body: Callable[[], Awaitable[dict[str, Any]]]
+) -> list[dict[str, Any]]:
+    """POST ``pdf`` as the multipart ``file`` part straight to ``app`` over ASGI, with
+    ``Content-Length``, and return the messages it sent.
+
+    The first ``receive`` delivers the whole body; every later one returns what
+    ``after_the_body`` does, standing for the server's report of the connection.
+    """
+    built = httpx.Request(
+        "POST", f"http://test{URL}", files={"file": ("filing.pdf", pdf, "application/pdf")}
+    )
+    body = built.read()
+    delivered = False
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        nonlocal delivered
+        if delivered:
+            return await after_the_body()
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    scope: dict[str, Any] = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "server": ("test", 80),
+        "client": ("127.0.0.1", 50000),
+        "root_path": "",
+        "path": URL,
+        "raw_path": URL.encode("ascii"),
+        "query_string": b"",
+        "headers": [
+            (b"host", b"test"),
+            (b"content-type", built.headers["content-type"].encode("ascii")),
+            (b"content-length", str(len(body)).encode("ascii")),
+        ],
+    }
+    await app(scope, receive, send)
+    return sent
+
+
+async def test_client_disconnect_during_the_parse_stops_it_and_frees_the_slot(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    committed_query: CommittedQuery,
+    configure_settings: SettingsConfigurer,
+    monkeypatch: pytest.MonkeyPatch,
+    statement_pdf: StatementPdf,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A client that disconnects while its upload is parsed cancels the request: the parse's
+    ``cancel`` event is set, the app call ends without a cancellation or traceback, the run row
+    ends ``failed`` with ``cancelled``, no filing row is written, and the only parse slot is
+    free for the next upload at once.
+
+    The app is driven over raw ASGI: ``receive`` delivers the whole multipart body, and its next
+    call reports ``http.disconnect`` once the parse has started. The first parse waits for its
+    ``cancel`` event and then stops as the real extractor does; later parses are real.
+    """
+    configure_settings(pdf_max_concurrency=1)
+    loop = asyncio.get_running_loop()
+    parse_started = asyncio.Event()
+    cancels: list[threading.Event] = []
+    real_extract = fs.extract_line_items
+
+    def cancellable_extract(
+        *args: Any, cancel: threading.Event | None = None, **kwargs: Any
+    ) -> ExtractionResult:
+        if cancels:
+            return real_extract(*args, cancel=cancel, **kwargs)
+        assert cancel is not None
+        cancels.append(cancel)
+        loop.call_soon_threadsafe(parse_started.set)
+        if not cancel.wait(30):
+            raise TimeoutError("the abandoned parse was never cancelled")
+        raise ParseCancelledError
+
+    monkeypatch.setattr(fs, "extract_line_items", cancellable_extract)
+    pdf = statement_pdf(tag="client disconnect")
+
+    async def after_the_body() -> dict[str, Any]:
+        await parse_started.wait()
+        return {"type": "http.disconnect"}
+
+    with caplog.at_level(logging.INFO, logger=ingest_routes.logger.name):
+        async with asyncio.timeout(30):
+            sent = await raw_upload(app, pdf, after_the_body)
+
+    [cancel] = cancels
+    assert cancel.is_set()
+    # The bare answer the server discards for a closed connection; no error body is built.
+    assert [message["type"] for message in sent] == ["http.response.start", "http.response.body"]
+    assert sent[0]["status"] == 499
+    assert sent[1].get("body", b"") == b""
+    assert [
+        record.getMessage() for record in caplog.records if record.name == ingest_routes.logger.name
+    ] == ["PDF upload abandoned: the client disconnected before the answer"]
+    assert await filing_row(db_session, pdf) is None
+    runs = await run_rows(committed_query, pdf)
+    assert [
+        (run["status"], run["trigger"], run["finished"], run["error_message"]) for run in runs
+    ] == [("failed", "api", True, "cancelled")]
+
+    async with asyncio.timeout(30):
+        admitted = await upload(client, statement_pdf(tag="after a disconnect"))
+    assert admitted.status_code == 200, admitted.text
+    assert len(cancels) == 1
+
+
+async def test_connection_that_cannot_be_watched_still_gets_its_answer(
+    app: FastAPI,
+    db_session: AsyncSession,
+    committed_query: CommittedQuery,
+    statement_pdf: StatementPdf,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``receive`` that fails once the body has been read, as a host middleware's wrapper may
+    on a message it does not expect, ends only the disconnect watch: the upload is parsed and
+    answered 200 with its filing row and a ``succeeded`` run row, and one WARNING names the
+    failure's type, never its text."""
+    pdf = statement_pdf(tag="unwatchable connection")
+
+    async def after_the_body() -> dict[str, Any]:
+        raise RuntimeError(LEAK_SENTINEL)
+
+    with caplog.at_level(logging.WARNING, logger=ingest_routes.logger.name):
+        async with asyncio.timeout(60):
+            sent = await raw_upload(app, pdf, after_the_body)
+
+    start, answer = sent
+    assert start["status"] == 200, answer
+    response = httpx.Response(start["status"], content=answer["body"])
+    assert response.json()["file_sha256"] == sha(pdf)
+    assert await filing_row(db_session, pdf) is not None
+    runs = await run_rows(committed_query, pdf)
+    assert [
+        (run["status"], run["trigger"], run["finished"], run["error_message"]) for run in runs
+    ] == [("succeeded", "api", True, None)]
+    assert [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.name == ingest_routes.logger.name
+    ] == [(logging.WARNING, "PDF upload: the client's connection cannot be watched: RuntimeError")]
+    assert LEAK_SENTINEL not in caplog.text
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2106,6 +2398,291 @@ async def test_commit_into_a_non_kes_fundamentals_row_is_a_currency_conflict(
     assert await scom_fundamentals(engine) == usd_row
 
 
+async def test_request_holds_no_transaction_or_lock_while_its_pdf_is_parsed(
+    monkeypatch: pytest.MonkeyPatch,
+    session: AsyncSession,
+    engine: AsyncEngine,
+    settings: TerminalSettings,
+) -> None:
+    """The pre-parse check's read is committed before the parse. While the parse runs, the
+    request session holds no transaction, no other backend of the database is idle in one, and
+    another connection takes ``ACCESS EXCLUSIVE`` on ``terminal_equities`` without waiting, so
+    DDL issued meanwhile never queues equities queries behind the upload. The commit then lands
+    as usual."""
+    seeded = await scom_fundamentals(engine)
+    parse_started = threading.Event()
+    release_parse = threading.Event()
+    real_extract = fs.extract_line_items
+
+    def gated_extract(*args: Any, **kwargs: Any) -> ExtractionResult:
+        parse_started.set()
+        release_parse.wait(30)
+        return real_extract(*args, **kwargs)
+
+    monkeypatch.setattr(fs, "extract_line_items", gated_extract)
+    form = PdfIngestForm(ticker="SCOM", period_end_date=SCOM_PERIOD, commit=True)
+    request = asyncio.create_task(ingest_pdf(session, settings, FULL_KES_PDF, "scom.pdf", form))
+    try:
+        assert await asyncio.to_thread(parse_started.wait, 30), "the parse never started"
+        assert session.in_transaction() is False
+        async with engine.connect() as probe:
+            idle_in_transaction = await probe.scalar(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                    "AND pid <> pg_backend_pid() AND state LIKE 'idle in transaction%'"
+                )
+            )
+            await probe.execute(
+                text("LOCK TABLE terminal_equities IN ACCESS EXCLUSIVE MODE NOWAIT")
+            )
+            await probe.rollback()
+        assert idle_in_transaction == 0
+        release_parse.set()
+        response = await asyncio.wait_for(request, 60)
+    finally:
+        release_parse.set()
+        if not request.done():
+            request.cancel()
+        await asyncio.wait({request}, timeout=60)
+        if request.done() and not request.cancelled():
+            request.exception()
+
+    assert (response.committed, response.fundamentals_id) == (True, seeded["id"])
+    merged = await scom_fundamentals(engine)
+    assert {column: merged[column] for column in WRITTEN_COLUMNS} == FULL_KES_VALUES
+    assert merged["filing_id"] == response.filing_id
+    [run] = await pdf_runs(engine)
+    assert_run(
+        run,
+        status="succeeded",
+        error_message=None,
+        rows_fetched=6,
+        rows_written=2,
+        details=run_details(
+            sha256(FULL_KES_PDF),
+            commit=True,
+            filing_id=str(response.filing_id),
+            status="extracted",
+            committed=True,
+            fundamentals_id=str(seeded["id"]),
+        ),
+    )
+
+
+async def test_rollback_only_host_session_keeps_its_outer_transaction_through_the_request(
+    engine: AsyncEngine, settings: TerminalSettings
+) -> None:
+    """A host session joined to an outer transaction in ``rollback_only`` mode: neither the
+    commit ending the pre-parse read nor the data commit ends the host's transaction, which is
+    still open when the request returns, so rolling it back removes the filing and the merge,
+    while the run row, written on its own connection, stays."""
+    seeded = await scom_fundamentals(engine)
+    sha = sha256(FULL_KES_PDF)
+    form = PdfIngestForm(ticker="SCOM", period_end_date=SCOM_PERIOD, commit=True)
+
+    async with engine.connect() as connection:
+        outer = await connection.begin()
+        host_session = AsyncSession(
+            bind=connection, join_transaction_mode="rollback_only", expire_on_commit=False
+        )
+        try:
+            response = await ingest_pdf(host_session, settings, FULL_KES_PDF, "scom.pdf", form)
+            outer_still_open = outer.is_active
+            inside = await connection.scalar(
+                select(TerminalCorporateFiling.id).where(TerminalCorporateFiling.file_sha256 == sha)
+            )
+        finally:
+            await host_session.close()
+            await outer.rollback()
+
+    assert outer_still_open is True
+    assert inside == response.filing_id
+    assert response.committed is True
+    assert await filing_by_sha(engine, sha) is None
+    assert await scom_fundamentals(engine) == seeded
+    [run] = await pdf_runs(engine)
+    assert_run(
+        run,
+        status="succeeded",
+        error_message=None,
+        rows_fetched=6,
+        rows_written=2,
+        details=run_details(
+            sha,
+            commit=True,
+            filing_id=str(response.filing_id),
+            status="extracted",
+            committed=True,
+            fundamentals_id=str(seeded["id"]),
+        ),
+    )
+
+
+async def test_request_cancelled_while_its_pre_parse_read_commits_stops_before_the_parse(
+    monkeypatch: pytest.MonkeyPatch,
+    session: AsyncSession,
+    engine: AsyncEngine,
+    settings: TerminalSettings,
+) -> None:
+    """A cancellation that arrives while the pre-parse read commits lets that commit finish and
+    is then honoured before the parse: the PDF is never parsed, nothing is written, and the run
+    row ends ``failed`` with ``cancelled``."""
+    seeded = await scom_fundamentals(engine)
+    committing = asyncio.Event()
+    release_commit = asyncio.Event()
+    committed = asyncio.Event()
+    real_commit = session.commit
+    real_extract = fs.extract_line_items
+    parses: list[int] = []
+
+    async def gated_commit() -> None:
+        committing.set()
+        await release_commit.wait()
+        await real_commit()
+        committed.set()
+
+    def counted_extract(*args: Any, **kwargs: Any) -> ExtractionResult:
+        parses.append(len(parses) + 1)
+        return real_extract(*args, **kwargs)
+
+    monkeypatch.setattr(session, "commit", gated_commit)
+    monkeypatch.setattr(fs, "extract_line_items", counted_extract)
+    form = PdfIngestForm(ticker="SCOM", period_end_date=SCOM_PERIOD, commit=True)
+    request = asyncio.create_task(ingest_pdf(session, settings, FULL_KES_PDF, "scom.pdf", form))
+    try:
+        await asyncio.wait_for(committing.wait(), 30)
+        request.cancel()
+        done, _ = await asyncio.wait({request}, timeout=0.2)
+        assert not done, "the cancelled request ended before its pre-parse commit did"
+        release_commit.set()
+        done, _ = await asyncio.wait({request}, timeout=30)
+        assert done, "the cancelled request did not end once its pre-parse commit was released"
+        with pytest.raises(asyncio.CancelledError):
+            request.result()
+    finally:
+        release_commit.set()
+        if not request.done():
+            request.cancel()
+        await asyncio.wait({request}, timeout=60)
+        if request.done() and not request.cancelled():
+            request.exception()
+
+    assert committed.is_set()
+    assert parses == []
+    assert await filing_count(engine) == 0
+    assert await scom_fundamentals(engine) == seeded
+    [run] = await pdf_runs(engine)
+    assert_run(
+        run,
+        status="failed",
+        error_message="cancelled",
+        rows_fetched=0,
+        rows_written=0,
+        details=run_details(sha256(FULL_KES_PDF), commit=True),
+    )
+
+
+class LateWriteError(Exception):
+    """A fault injected after the filing upsert, inside the request transaction."""
+
+
+async def committed_rows(engine: AsyncEngine) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Every column of the ``FULL_KES_PDF`` filing row (``None`` when there is none) and of the
+    SCOM FY 2026-03-31 fundamentals row, as another connection sees them."""
+    async with reader(engine) as db:
+        filing = await filing_row(db, FULL_KES_PDF)
+        fundamentals = await fundamentals_row(db, "SCOM", SCOM_PERIOD)
+    assert fundamentals is not None
+    return (None if filing is None else dict(filing)), dict(fundamentals)
+
+
+async def request_writes(db: AsyncSession) -> tuple[bool | None, str]:
+    """What the request transaction holds: the ``FULL_KES_PDF`` filing's
+    ``committed_to_fundamentals`` (``None`` without a row) and the SCOM row's ``revenue_kes``
+    provenance."""
+    flag = await db.scalar(
+        select(TerminalCorporateFiling.committed_to_fundamentals).where(
+            TerminalCorporateFiling.file_sha256 == sha256(FULL_KES_PDF)
+        )
+    )
+    provenance = await db.scalar(
+        select(TerminalFundamental.source_by_field).where(*_SCOM_FUNDAMENTALS_KEY)
+    )
+    assert provenance is not None
+    return flag, provenance["revenue_kes"]
+
+
+@pytest.mark.parametrize("failing_step", ["fundamentals_merge", "final_commit"])
+@pytest.mark.parametrize("previewed", [False, True], ids=["new_hash", "previewed_hash"])
+async def test_failure_after_the_filing_upsert_rolls_back_the_filing_and_the_merge(
+    monkeypatch: pytest.MonkeyPatch,
+    session: AsyncSession,
+    engine: AsyncEngine,
+    settings: TerminalSettings,
+    previewed: bool,
+    failing_step: str,
+) -> None:
+    """A commit that fails after its real filing upsert, in the fundamentals merge (after its
+    statement ran) or in the final commit, rolls the whole request transaction back. Another
+    connection then sees no filing row for a new hash and exactly the preview's row for a
+    previewed one, and the SCOM row unchanged in every column. The run row ends ``failed`` with
+    the fault's type and the request fields only, and the answer is the coded 500 with no
+    extraction. The commit ending the pre-parse read still succeeds before the parse."""
+    if previewed:
+        await ingest_pdf(
+            session,
+            settings,
+            FULL_KES_PDF,
+            "scom-preview.pdf",
+            PdfIngestForm(ticker="SCOM", period_end_date=SCOM_PERIOD),
+        )
+    before = await committed_rows(engine)
+    assert (before[0] is not None) is previewed
+    runs_before = [run.id for run in await pdf_runs(engine)]
+    seen: list[tuple[bool | None, str]] = []
+    if failing_step == "fundamentals_merge":
+        real_merge = fs.upsert_fundamentals
+
+        async def failing_merge(db: AsyncSession, *args: Any, **kwargs: Any) -> int:
+            await real_merge(db, *args, **kwargs)
+            seen.append(await request_writes(db))
+            raise LateWriteError("the fundamentals merge failed after its statement")
+
+        monkeypatch.setattr(fs, "upsert_fundamentals", failing_merge)
+        expected_seen = [(True, "pdf_filing")]
+    else:
+        real_commit = session.commit
+
+        async def failing_commit() -> None:
+            seen.append(await request_writes(session))
+            if seen[-1][0] is True:
+                raise LateWriteError("the commit failed after the filing upsert and the merge")
+            await real_commit()
+
+        monkeypatch.setattr(session, "commit", failing_commit)
+        # The pre-parse commit sees the stored filing (or none); the data commit sees both writes.
+        expected_seen = [(False if previewed else None, "seed"), (True, "pdf_filing")]
+    form = PdfIngestForm(ticker="SCOM", period_end_date=SCOM_PERIOD, commit=True)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await ingest_pdf(session, settings, FULL_KES_PDF, "scom-commit.pdf", form)
+
+    assert_coded(excinfo.value, 500, "internal_error", None, INTERNAL_ERROR_MESSAGE)
+    assert excinfo.value.__cause__ is None
+    assert seen == expected_seen
+    assert await committed_rows(engine) == before
+    *earlier, run = await pdf_runs(engine)
+    assert [earlier_run.id for earlier_run in earlier] == runs_before
+    assert_run(
+        run,
+        status="failed",
+        error_message="unexpected_error:LateWriteError",
+        rows_fetched=6,
+        rows_written=0,
+        details=run_details(sha256(FULL_KES_PDF), commit=True),
+    )
+
+
 async def test_unexpected_error_is_recorded_by_type_and_answered_as_internal_error(
     session: AsyncSession, engine: AsyncEngine, settings: TerminalSettings
 ) -> None:
@@ -2282,6 +2859,75 @@ async def test_run_row_that_cannot_be_finished_is_logged_not_raised(
 # ---------------------------------------------------------------------------------------------
 
 
+REQUEST_DRAIN_SECONDS: Final = 30
+"""How long a cancellation test's exit waits for its request, then its parse thread, to end."""
+
+
+class DrainedOnExit:
+    """Leaves nothing of a gated ``ingest_pdf`` request running, however the test body exits.
+
+    On exit it sets every gate the test owns, cancels the request if it is still pending, and
+    waits at most ``REQUEST_DRAIN_SECONDS`` for the request to end and then for a parse thread
+    that started (``parse_started``) to set ``parse_done``, all before the ``session`` fixture
+    closes the request's session. The gates are set first: the service runs its run-row writes,
+    parse and commit to completion whatever cancellations arrive, so a cancellation alone cannot
+    end a request that a gate holds. The wait itself cancels nothing, unlike ``asyncio.wait_for``,
+    which on timeout cancels the request and then awaits it without bound. The request's outcome
+    is retrieved, never raised, because the body asserts it. Work still running after the bound
+    fails a body that passed, and is added as a note to the exception of a body that failed,
+    which stays the failure reported.
+    """
+
+    def __init__(
+        self,
+        request: asyncio.Task[Any],
+        *gates: asyncio.Event | threading.Event,
+        parse_started: threading.Event | None = None,
+        parse_done: threading.Event | None = None,
+    ) -> None:
+        self.request = request
+        self.gates = gates
+        self.parse_started = parse_started
+        self.parse_done = parse_done
+
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object
+    ) -> None:
+        still_running = await self._drain()
+        if still_running is None:
+            return
+        if exc is None:
+            pytest.fail(still_running)
+        exc.add_note(still_running)
+
+    async def _drain(self) -> str | None:
+        """Release, cancel and wait as above; return what is still running, or ``None``."""
+        for gate in self.gates:
+            gate.set()
+        if not self.request.done():
+            self.request.cancel()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + REQUEST_DRAIN_SECONDS
+        await asyncio.wait({self.request}, timeout=REQUEST_DRAIN_SECONDS)
+        if not self.request.done():
+            return f"request still pending {REQUEST_DRAIN_SECONDS} s after its gates were set"
+        if not self.request.cancelled():
+            # Retrieved so that asyncio never reports it as an unhandled exception.
+            self.request.exception()
+        if (
+            self.parse_started is not None
+            and self.parse_done is not None
+            and self.parse_started.is_set()
+            and not self.parse_done.is_set()
+            and not await asyncio.to_thread(self.parse_done.wait, max(0.0, deadline - loop.time()))
+        ):
+            return f"parse thread still running {REQUEST_DRAIN_SECONDS} s after its gate was set"
+        return None
+
+
 async def test_request_cancelled_while_its_run_row_is_inserted_finishes_the_row_cancelled(
     monkeypatch: pytest.MonkeyPatch,
     session: AsyncSession,
@@ -2307,13 +2953,14 @@ async def test_request_cancelled_while_its_run_row_is_inserted_finishes_the_row_
     form = PdfIngestForm(ticker="SCOM", period_end_date=SCOM_PERIOD, commit=True)
     request = asyncio.create_task(ingest_pdf(session, settings, FULL_KES_PDF, "scom.pdf", form))
 
-    await asyncio.wait_for(inserted.wait(), 30)
-    [running] = await pdf_runs(engine)
-    assert (running.status, running.finished_at) == ("running", None)
-    request.cancel()
-    release_start.set()
-    with pytest.raises(asyncio.CancelledError):
-        await request
+    async with DrainedOnExit(request, release_start):
+        await asyncio.wait_for(inserted.wait(), 30)
+        [running] = await pdf_runs(engine)
+        assert (running.status, running.finished_at) == ("running", None)
+        request.cancel()
+        release_start.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
 
     assert await filing_count(engine) == 0
     assert await scom_fundamentals(engine) == seeded
@@ -2377,12 +3024,13 @@ async def test_cancellation_meeting_a_run_row_never_started_is_re_raised_without
 
     with caplog.at_level(logging.DEBUG):
         request = asyncio.create_task(ingest_pdf(session, settings, FULL_KES_PDF, "scom.pdf", form))
-        await asyncio.wait_for(starting.wait(), 30)
-        if cancel_request:
-            request.cancel()
-        release_start.set()
-        with pytest.raises(asyncio.CancelledError):
-            await request
+        async with DrainedOnExit(request, release_start):
+            await asyncio.wait_for(starting.wait(), 30)
+            if cancel_request:
+                request.cancel()
+            release_start.set()
+            with pytest.raises(asyncio.CancelledError):
+                await request
 
     assert LEAK_SENTINEL not in caplog.text
     assert [
@@ -2421,15 +3069,19 @@ async def test_request_cancelled_while_parsing_rolls_back_and_records_cancelled(
     form = PdfIngestForm(ticker="SCOM", period_end_date=SCOM_PERIOD, commit=True)
     request = asyncio.create_task(ingest_pdf(session, settings, FULL_KES_PDF, "scom.pdf", form))
 
-    assert await asyncio.to_thread(parse_started.wait, 30)
-    request.cancel()
-    done, _ = await asyncio.wait({request}, timeout=0.5)
-    assert not done, "the cancelled request ended while its parse thread was still running"
-    assert not parse_done.is_set()
-    release_parse.set()
-    with pytest.raises(asyncio.CancelledError):
-        await request
-    assert parse_done.is_set()
+    async with DrainedOnExit(
+        request, release_parse, parse_started=parse_started, parse_done=parse_done
+    ):
+        assert await asyncio.to_thread(parse_started.wait, 30)
+        request.cancel()
+        done, _ = await asyncio.wait({request}, timeout=0.5)
+        assert not done, "the cancelled request ended while its parse thread was still running"
+        assert not parse_done.is_set()
+        release_parse.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        # Inside the block: its exit waits for the parse thread, which would make this vacuous.
+        assert parse_done.is_set()
 
     assert await filing_count(engine) == 0
     assert await scom_fundamentals(engine) == seeded
@@ -2457,21 +3109,27 @@ async def test_request_cancelled_during_its_commit_still_commits_and_records_suc
     committing = asyncio.Event()
     release_commit = asyncio.Event()
     real_commit = session.commit
+    commits = 0
 
     async def gated_commit() -> None:
-        committing.set()
-        await release_commit.wait()
+        # The first commit only ends the pre-parse check's read; the second is the data commit.
+        nonlocal commits
+        commits += 1
+        if commits == 2:
+            committing.set()
+            await release_commit.wait()
         await real_commit()
 
     monkeypatch.setattr(session, "commit", gated_commit)
     form = PdfIngestForm(ticker="SCOM", period_end_date=SCOM_PERIOD, commit=True)
     request = asyncio.create_task(ingest_pdf(session, settings, FULL_KES_PDF, "scom.pdf", form))
 
-    await asyncio.wait_for(committing.wait(), 60)
-    request.cancel()
-    release_commit.set()
-    with pytest.raises(asyncio.CancelledError):
-        await request
+    async with DrainedOnExit(request, release_commit):
+        await asyncio.wait_for(committing.wait(), 60)
+        request.cancel()
+        release_commit.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
 
     stored = await filing_by_sha(engine, sha256(FULL_KES_PDF))
     assert stored is not None

@@ -259,6 +259,12 @@ standalone app) lists every parameter and schema.
 
 Error bodies never carry result data.
 
+**JSON bodies** of `POST /ipo/valuation` and `POST /watchlists` are bounded to 64 KiB (413
+`request_too_large`); a body that cannot be decoded gets FastAPI's standard 422 with one
+`json_invalid` entry. Both verdicts come only after the host's authentication: a
+`get_terminal_principal` override that raises 401 answers 401 whatever the body holds, and an
+oversized body is never decoded.
+
 **PDF uploads** (`POST /ingest/pdf`, multipart: `file`, `document_type`, `ticker`, `company_name`,
 `period_end_date`, `period_type`, `items`, `commit`) are bounded as follows:
 
@@ -267,8 +273,9 @@ Error bodies never carry result data.
   class, so it travels with `terminal_router` into a host.
 - The file itself may be at most `TERMINAL_PDF_MAX_BYTES` (20 MiB, 413 `file_too_large`), must
   start with `%PDF-` (415 `not_a_pdf`), must not be encrypted or unreadable (422 `pdf_encrypted`,
-  `pdf_unreadable`) and may have at most 400 pages (`TERMINAL_PDF_MAX_PAGES`, 422
-  `too_many_pages`).
+  `pdf_unreadable`), must parse within 20 s plus 0.4 s per page of `TERMINAL_PDF_MAX_PAGES`
+  (180 s at 400 pages; 422 `pdf_parse_timeout`) and may have at most 400 pages
+  (`TERMINAL_PDF_MAX_PAGES`, 422 `too_many_pages`).
 - At most 2 parses run per process (`TERMINAL_PDF_MAX_CONCURRENCY`); a further request gets 429
   `ingest_busy` with `Retry-After: 5`. Parsing runs in a worker thread, and the raw bytes are never
   stored.
@@ -477,8 +484,9 @@ rewrites must raise `experimental.proxyClientMaxBodySize` (10 MB by default) abo
 `TERMINAL_PDF_MAX_BYTES` + 1 MiB, as `e2e/host-fixture/next.config.mjs` does, or PDF uploads over
 10 MB fail with a plain 500. Keep it within a further 1 MiB, which the API reads and discards
 before answering an over-limit upload, so the proxy relays that 413 rather than a reset. Such a
-host must also raise `experimental.proxyTimeout` (30 s by default) above the API's 50 s parse
-limit, as that file does with 10 minutes, or an upload whose parse takes longer than 30 s, such
+host must also raise `experimental.proxyTimeout` (30 s by default) above the API's parse limit
+(20 s plus 0.4 s per page of `TERMINAL_PDF_MAX_PAGES`, 180 s at 400 pages), as that file does
+with 10 minutes, or an upload whose parse takes longer than 30 s, such
 as a 400-page filing, fails with a plain 500 although the API answers it. A client that
 disconnects still ends the proxied request at once.
 
@@ -594,7 +602,7 @@ which pytest reads only from the process environment (see the note after the tab
 | `TERMINAL_SCRAPER_MAX_RETRIES` | `3` | Retries on timeouts and HTTP 429, 500, 502, 503 and 504 |
 | `TERMINAL_PDF_MAX_BYTES` | `20971520` | Per-file PDF upload limit (20 MiB), at most 1073741824 (1 GiB); the whole request may carry 1 MiB more |
 | `TERMINAL_PDF_MAX_PAGES` | `400` | Maximum pages per uploaded PDF |
-| `TERMINAL_PDF_MAX_CONCURRENCY` | `2` | Concurrent PDF parses per API process, 1-32; further requests get 429 |
+| `TERMINAL_PDF_MAX_CONCURRENCY` | `2` | Concurrent PDF parses per mounted terminal router (per API process for the standalone app or a host that mounts it once), 1-32; further requests get 429 with `Retry-After: 5`. A host can share one cap across mounts by overriding `get_pdf_parse_limiter` (`opennse_terminal.api.routes.ingest`) |
 | `TERMINAL_API_ORIGIN` | `http://localhost:8000` | FastAPI origin of the Next.js rewrites and the Playwright servers; fixed at `next build` |
 
 `TERMINAL_TEST_DATABASE_URL` and `TERMINAL_API_ORIGIN` are not backend settings and are ignored by

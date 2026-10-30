@@ -1088,7 +1088,8 @@ export interface ExtractedItem {
  * of the ticker and period. No error body carries an extraction. The endpoint's coded and
  * field-validation rejections are told apart by the JSON type of `detail`:
  * - an object, the coded {@link TerminalErrorDetail}: 413 `request_too_large` or
- *   `file_too_large`, 415 `not_a_pdf`, 422 `pdf_encrypted`, `pdf_unreadable`, `too_many_pages`,
+ *   `file_too_large`, 415 `not_a_pdf`, 422 `pdf_encrypted`, `pdf_unreadable`,
+ *   `pdf_parse_timeout` (the parse reached its wall-clock limit), `too_many_pages`,
  *   `commit_requires_ticker_and_period` or `commit_requires_kes`, 409 `currency_conflict`,
  *   404 `unknown_ticker`, 429 `ingest_busy` (with `Retry-After: 5`) and 500 `internal_error`;
  * - a list of {@link FastApiValidationItem} entries with no stable code: FastAPI's standard 422

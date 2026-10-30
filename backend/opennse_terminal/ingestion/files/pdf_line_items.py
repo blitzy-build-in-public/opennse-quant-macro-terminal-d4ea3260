@@ -5,12 +5,16 @@ Shares Outstanding from the text layer of an annual report, interim report or pr
 is no OCR: a PDF whose pages carry no text yields ``no_items`` with the warning ``no_text_layer``.
 
 The PDF is untrusted input, so it is parsed in a separate Python process that the calling thread
-supervises and waits for: 50 seconds of wall time, 1 GiB of address space and 8 MiB of decoded
-content per page, with cross-reference sections that list more objects than the file holds
-rejected before any page is enumerated. Exceeding a limit makes the PDF unreadable; the caller
-is never hung or exhausted. ``services/filings_service.py`` therefore still runs it in a worker
-thread for ``POST /ingest/pdf``. It reads no settings and keeps no module-level mutable state;
-the bytes go to that process through a pipe and are never written to disk.
+supervises and waits for: wall time sized to the page limit (20 seconds plus 0.4 per page, 180
+seconds at the default 400 pages), 1 GiB of address space and 8 MiB of decoded content per page,
+with cross-reference sections that list more objects than the file holds rejected before any page
+is enumerated. Exceeding the memory or content limit makes the PDF unreadable. Reaching the wall
+time is reported apart, as :class:`PdfParseTimeout`, because it is the server's time budget rather
+than a fault of the file. The caller can also stop a parse early by setting its ``cancel`` event,
+which kills the process (:class:`ParseCancelledError`). The caller is never hung or exhausted.
+``services/filings_service.py`` therefore still runs it in a worker thread for ``POST
+/ingest/pdf``. It reads no settings and keeps no module-level mutable state; the bytes go to that
+process through a pipe and are never written to disk.
 
 How a value is chosen:
 
@@ -58,6 +62,8 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
 import types
 import zlib
 from collections import Counter
@@ -101,7 +107,9 @@ __all__ = [
     "ItemStatus",
     "ItemUnit",
     "LineItemName",
+    "ParseCancelledError",
     "PdfEncrypted",
+    "PdfParseTimeout",
     "PdfUnreadable",
     "TooManyPages",
     "extract_line_items",
@@ -171,6 +179,25 @@ class TooManyPages(ValueError):  # noqa: N818 - names the condition, as in the e
         super().__init__(f"the PDF has {page_count} pages; at most {max_pages} can be parsed")
         self.page_count = page_count
         self.max_pages = max_pages
+
+
+class PdfParseTimeout(ValueError):  # noqa: N818 - names the condition, as in the error code
+    """The parse did not finish within its wall-clock limit of ``time_limit`` seconds: its parser
+    process was killed and nothing was extracted. The limit is the server's time budget, so this
+    is never a :class:`PdfUnreadable`."""
+
+    def __init__(self, time_limit: float) -> None:
+        super().__init__(f"the PDF could not be parsed within {time_limit:g} seconds")
+        self.time_limit = time_limit
+
+
+class ParseCancelledError(Exception):
+    """The caller set the parse's ``cancel`` event: the parser process was killed, or never
+    started, and nothing was extracted. It reports the caller's own request, never a property of
+    the PDF."""
+
+    def __init__(self, message: str = "the PDF parse was cancelled") -> None:
+        super().__init__(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,9 +274,18 @@ _MAX_PAGE_CONTENT_BYTES: Final = 8 * _MIB
 """Largest decoded size of one page's content streams plus every Form XObject they can draw,
 each stream counted once. Statement pages hold tens of KiB; a page over this is rejected before
 pdfminer decodes or interprets it, which bounds decompression bombs and operator floods."""
-_PARSE_TIME_LIMIT_SECONDS: Final = 50.0
-"""Wall-clock limit of one parse, the PDF parser process included. 400 dense statement pages
-take under 40 seconds; the parser process is killed at the limit and the PDF is unreadable."""
+_PARSE_TIME_BASE_SECONDS: Final = 20.0
+"""Fixed part of one parse's wall-clock limit, the PDF parser process's start included; the limit
+is this plus :data:`_PARSE_SECONDS_PER_PAGE` for each page the parse admits (``max_pages``)."""
+_PARSE_SECONDS_PER_PAGE: Final = 0.4
+"""Per-page part of the wall-clock limit, so the limit grows with the largest document admitted:
+180 seconds at the default 400 pages. A dense 400-page document (about 1,190 words per page, 3.8
+to 4.0 MB) parsed in 45 to 52 seconds, alone and as one of two concurrent parses; 180 seconds is
+about 3.5 times that, margin for a loaded host. The parser process is killed at the limit and
+:class:`PdfParseTimeout` is raised."""
+_SUPERVISION_SLICE_SECONDS: Final = 0.25
+"""Longest the supervising thread waits on the parser process between checks of the deadline and
+of the ``cancel`` event, so a cancelled parse is stopped within this time."""
 _PARSE_MEMORY_LIMIT_BYTES: Final = 1 << 30
 """Address-space limit (``RLIMIT_AS``) of the PDF parser process, about 100 MiB of it taken by
 the interpreter and imports. A parse that needs more fails there, never in the caller."""
@@ -2222,31 +2258,110 @@ def _child_environment() -> dict[str, str]:
     return {**os.environ, "PYTHONPATH": path}
 
 
+def _parse_time_limit(max_pages: int) -> float:
+    """Wall-clock limit in seconds of a parse that admits up to ``max_pages`` pages:
+    :data:`_PARSE_TIME_BASE_SECONDS` plus :data:`_PARSE_SECONDS_PER_PAGE` per page, 20 + 0.4 x
+    ``max_pages`` (180 seconds at 400 pages)."""
+    return _PARSE_TIME_BASE_SECONDS + _PARSE_SECONDS_PER_PAGE * max_pages
+
+
+def _exchange(
+    process: subprocess.Popen[bytes],
+    request: bytes,
+    time_limit: float,
+    cancel: threading.Event | None,
+) -> bytes:
+    """Send ``request`` to the parser process and return its standard output, stopping the
+    process at ``time_limit`` seconds or once ``cancel`` is set.
+
+    One ``communicate`` call runs on a helper thread, because CPython does not resume a timed-out
+    ``communicate`` with the input it had not yet written, so the exchange cannot be retried in
+    slices. The calling thread waits for the helper in slices of at most
+    :data:`_SUPERVISION_SLICE_SECONDS`, checking the deadline and ``cancel`` between them. To stop
+    the process it kills it and waits for the helper, whose ``communicate`` then reads to the end
+    of the dead process's output and reaps it, so no process outlives this call. A finished
+    exchange is returned even when ``cancel`` was set meanwhile.
+
+    Raises:
+        PdfParseTimeout: The deadline passed first.
+        ParseCancelledError: ``cancel`` was set first.
+        RuntimeError: The request could not be sent or the reply read: a fault of the server.
+    """
+    replies: list[bytes] = []
+    failures: list[Exception] = []
+
+    def communicate() -> None:
+        try:
+            replies.append(process.communicate(request)[0])
+        except Exception as exc:
+            # Handed to the supervising thread, which raises it as a server fault.
+            failures.append(exc)
+
+    helper = threading.Thread(target=communicate, name="pdf-parser-exchange", daemon=True)
+    deadline = time.monotonic() + time_limit
+    helper.start()
+    stopped: PdfParseTimeout | ParseCancelledError | None = None
+    try:
+        while helper.is_alive():
+            if cancel is not None and cancel.is_set():
+                stopped = ParseCancelledError()
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stopped = PdfParseTimeout(time_limit)
+                break
+            helper.join(min(remaining, _SUPERVISION_SLICE_SECONDS))
+    except BaseException:
+        process.kill()
+        helper.join()
+        raise
+    if stopped is not None:
+        process.kill()
+        helper.join()
+        if isinstance(stopped, PdfParseTimeout):
+            logger.warning("PDF parse stopped at the time limit of %g seconds", time_limit)
+        raise stopped
+    if failures:
+        raise RuntimeError("the PDF parser process could not be sent its request") from failures[0]
+    return replies[0]
+
+
 def _run_isolated(
     pdf_bytes: bytes,
     requested: Sequence[str],
     period_end_date: date | None,
     max_pages: int,
     *,
-    time_limit: float = _PARSE_TIME_LIMIT_SECONDS,
+    time_limit: float | None = None,
     memory_limit: int = _PARSE_MEMORY_LIMIT_BYTES,
+    cancel: threading.Event | None = None,
 ) -> ExtractionResult:
     """Run :func:`_extract` in a separate Python process and return its result.
 
     The calling thread supervises the process and blocks until it ends. The process gets
-    ``time_limit`` seconds of wall time, after which it is killed, and ``memory_limit`` bytes of
-    address space. The request (a JSON header line, then the PDF bytes) is written to its
-    standard input and the reply read from its standard output, so the PDF never touches the
-    disk; decimals cross as exact strings and every field of the reply is validated.
+    ``time_limit`` seconds of wall time (``None``: :func:`_parse_time_limit` of ``max_pages``)
+    and ``memory_limit`` bytes of address space, and is killed at the deadline or, within
+    :data:`_SUPERVISION_SLICE_SECONDS`, once another thread sets ``cancel``. The request (a JSON
+    header line, then the PDF bytes) is written to its standard input and the reply read from its
+    standard output (see :func:`_exchange`), so the PDF never touches the disk; decimals cross as
+    exact strings and every field of the reply is validated.
 
     Raises:
         PdfEncrypted, PdfUnreadable, TooManyPages: As :func:`_extract` raised them, rebuilt.
-        PdfUnreadable: Also when the parse needed more time or memory than its limits allow.
+        PdfUnreadable: Also when the parse needed more memory than its limit allows, or the
+            process was stopped by a signal (its CPU-time backstop included).
+        PdfParseTimeout: The parse reached ``time_limit``.
+        ParseCancelledError: ``cancel`` was set before the parse answered; when it is set
+            already, no process is started.
         RuntimeError: The process could not be started, failed, or sent a malformed reply: a
             fault of the server, not of the PDF.
     """
+    if time_limit is None:
+        time_limit = _parse_time_limit(max_pages)
     if not sys.executable:
         raise RuntimeError("no Python interpreter is available to start the PDF parser process")
+    if cancel is not None and cancel.is_set():
+        raise ParseCancelledError
     # Only the calendar date crosses: a datetime, which is also a date, selects by its year too.
     period = (
         None
@@ -2280,19 +2395,7 @@ def _run_isolated(
     except OSError as exc:
         raise RuntimeError("the PDF parser process could not be started") from exc
     with process:
-        try:
-            output, _ = process.communicate(request, timeout=time_limit)
-        except subprocess.TimeoutExpired as exc:
-            process.kill()
-            process.communicate()
-            logger.warning("PDF parse stopped at the time limit of %g seconds", time_limit)
-            raise PdfUnreadable(
-                f"the PDF could not be parsed within {time_limit:g} seconds"
-            ) from exc
-        except BaseException:
-            process.kill()
-            process.wait()
-            raise
+        output = _exchange(process, request, time_limit, cancel)
     if process.returncode < 0:
         logger.warning(
             "PDF parse stopped by signal %d at the limits of %g seconds and %d MiB",
@@ -2331,15 +2434,19 @@ def extract_line_items(
     *,
     period_end_date: date | None = None,
     max_pages: int = 400,
+    cancel: threading.Event | None = None,
 ) -> ExtractionResult:
     """Extract the requested line items from a filing or prospectus PDF.
 
     The arguments are validated here; the PDF is then parsed in a separate Python process with
-    bounded wall time (``_PARSE_TIME_LIMIT_SECONDS``, 50 s), address space
+    bounded wall time (``_PARSE_TIME_BASE_SECONDS`` plus ``_PARSE_SECONDS_PER_PAGE`` per page of
+    ``max_pages``: 20 s + 0.4 s x ``max_pages``, 180 s at 400 pages), address space
     (``_PARSE_MEMORY_LIMIT_BYTES``, 1 GiB) and decoded content per page
     (``_MAX_PAGE_CONTENT_BYTES``, 8 MiB), so a hostile file can neither hang nor exhaust the
     caller. The calling thread waits for that process, so services still call this in a worker
-    thread (``run_in_threadpool``). The INFO summary is logged once, here.
+    thread (``run_in_threadpool``), and another thread stops the wait early by setting
+    ``cancel``. Concurrent calls from several threads are independent: nothing is shared between
+    them. The INFO summary is logged once, here.
 
     Args:
         pdf_bytes: The whole PDF. Size, the ``%PDF-`` magic bytes and concurrency are the
@@ -2347,7 +2454,11 @@ def extract_line_items(
         items: Names from :data:`LINE_ITEMS`, results in this order (duplicates dropped).
         period_end_date: Selects the period column by its year; without it the latest year is
             read.
-        max_pages: Largest page count parsed.
+        max_pages: Largest page count parsed; it also sizes the wall-clock limit.
+        cancel: An event another thread sets to stop the parse, for example when the request it
+            serves is abandoned: the parser process is killed within 0.25 s
+            (``_SUPERVISION_SLICE_SECONDS``) and :class:`ParseCancelledError` is raised. When it
+            is set already, the arguments are still validated but no parse starts.
 
     Returns:
         One :class:`ExtractedLineItem` per requested item. Monetary values are whole KES after
@@ -2364,14 +2475,24 @@ def extract_line_items(
         PdfEncrypted: The PDF is encrypted, even with an empty user password.
         PdfUnreadable: The bytes cannot be parsed; a cross-reference section lists more objects
             than it holds; the PDF has no pages; a page's content cannot be read or decodes to
-            more than 8 MiB; or the parse exceeds its time or memory limit.
+            more than 8 MiB; or the parse exceeds its memory limit or is stopped by a signal.
+        PdfParseTimeout: The parse did not finish within its wall-clock limit; its
+            ``time_limit`` names the seconds allowed.
         TooManyPages: More than ``max_pages`` pages, found after enumerating at most
             ``max_pages + 1`` of them and before any text is extracted.
+        ParseCancelledError: ``cancel`` was set before the parse finished.
         RuntimeError: The parser process could not run or failed: a server fault.
     """
     requested = _requested_items(items)
     if max_pages < 1:
         raise ValueError(f"max_pages must be at least 1, got {max_pages}")
-    result = _run_isolated(pdf_bytes, requested, period_end_date, max_pages)
+    result = _run_isolated(
+        pdf_bytes,
+        requested,
+        period_end_date,
+        max_pages,
+        time_limit=_parse_time_limit(max_pages),
+        cancel=cancel,
+    )
     _log_result(result)
     return result

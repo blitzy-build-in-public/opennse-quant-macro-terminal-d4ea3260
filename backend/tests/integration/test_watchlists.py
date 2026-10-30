@@ -329,6 +329,52 @@ async def test_field_bounds_use_standard_validation_list(
     assert await names(client) == [SEEDED_WATCHLIST]
 
 
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        pytest.param("POST", "/watchlists", {"name": "Refused", "tickers": ["KCB"]}, id="create"),
+        pytest.param("DELETE", "/watchlists/{watchlist_id}", None, id="delete"),
+        pytest.param("PUT", "/watchlists/{watchlist_id}/items/KCB", None, id="add-item"),
+        pytest.param("DELETE", "/watchlists/{watchlist_id}/items/SCOM", None, id="remove-item"),
+    ],
+)
+async def test_unknown_query_parameter_is_the_standard_422_and_writes_nothing(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    method: str,
+    path: str,
+    body: dict[str, Any] | None,
+) -> None:
+    """No watchlist route declares a query parameter, so ``?bogus=1`` on a request that would
+    otherwise change a list is FastAPI's standard 422 list with exactly one ``extra_forbidden``
+    entry, and the route does not run: no list is created or deleted and no item changes."""
+    target = await create(client, "Target", ["SCOM"])
+    before = (await client.get(f"{BASE}/watchlists")).json()
+    count_before = await watchlist_count(db_session)
+
+    response = await client.request(
+        method,
+        f"{BASE}{path.format(watchlist_id=target['id'])}",
+        params={"bogus": "1"},
+        json=body,
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json() == {
+        "detail": [
+            {
+                "type": "extra_forbidden",
+                "loc": ["query", "bogus"],
+                "msg": "Extra inputs are not permitted",
+                "input": "1",
+            }
+        ]
+    }
+    assert (await client.get(f"{BASE}/watchlists")).json() == before
+    assert await watchlist_count(db_session) == count_before
+    assert await stored_items(db_session, target["id"]) == ["SCOM"]
+
+
 # ---------------------------------------------------------------------------------------------
 # Items
 # ---------------------------------------------------------------------------------------------

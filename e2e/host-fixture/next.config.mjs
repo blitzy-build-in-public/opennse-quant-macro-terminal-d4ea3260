@@ -89,11 +89,12 @@ function resolveProxyBodyLimit(raw) {
 /**
  * The proxy's wait on an idle API connection, in milliseconds: 10 minutes, as in the standalone
  * app. By default Next.js destroys a proxied request after 30 s without traffic from the API,
- * while POST /ingest/pdf sends nothing until its parse ends: a valid 400-page upload took under
- * 40 s, alone and as one of two concurrent uploads, and the API stops any parse at 50 s with its
- * own 422 pdf_unreadable. Ten minutes is twelve times that limit. A client that disconnects still
- * ends the proxied request at once, and the widget's calls stay bounded by the browser client's
- * own 20 s REQUEST_TIMEOUT_MS (src/components/terminal/lib/apiClient.ts).
+ * while POST /ingest/pdf sends nothing until its parse ends: a dense 400-page upload took 45 to
+ * 52 s, alone and as one of two concurrent uploads, and the API stops a parse at 20 s plus 0.4 s
+ * per page of TERMINAL_PDF_MAX_PAGES (180 s at 400 pages) with its own 422 pdf_parse_timeout. Ten
+ * minutes is over three times that limit. A client that disconnects still ends the proxied
+ * request at once, and the widget's calls stay bounded by the browser client's own 20 s
+ * REQUEST_TIMEOUT_MS (src/components/terminal/lib/apiClient.ts).
  */
 const PROXY_TIMEOUT_MS = 600_000;
 

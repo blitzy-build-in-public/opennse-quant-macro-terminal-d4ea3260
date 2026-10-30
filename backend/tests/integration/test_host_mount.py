@@ -13,19 +13,28 @@ transaction through SAVEPOINTs, so every write rolls back after its test. The te
 - the host's session and principal overrides serve the screener and own the watchlist it creates;
 - a host session with no default bind, configured only through ``binds``, answers ``/health``;
 - a principal override raising 401 blocks every terminal operation while the host's own routes
-  still answer 200;
-- the whole-request upload bound answers 413 inside the host with no host configuration at all.
+  still answer 200, also for a malformed, over-nested or oversized JSON body: the host's 401
+  precedes every body verdict, and for an admitted caller the verdict comes after the principal
+  and before any session is opened;
+- the whole-request upload bound answers 413 inside the host with no host configuration at all;
+- a ``require_ingest_permission`` override answering 403 refuses only ingestion, before any parse
+  or write, an override that admits the caller is handed the host's principal, and the principal
+  is resolved first, so a caller the host rejects gets its 401, never the 403.
 
 The contracts a host inherits through ``include_router`` and through the settings and sessions it
 supplies are proved in sections of their own below, each without PostgreSQL: hostile JSON request
-bodies get one of the two 422 shapes; ``GET /health`` answers a coded 503 once its database round
-trip outlives its bound; the health service's ``SELECT 1`` probe answers ok, or a coded 503 that
-names only the failure's type; ``TerminalSettings`` bounds its durations and PDF upload limits
-and keeps ``database_url`` out of its repr; and the session module names a database only by its
-credential-free label. Two more such sections sit beside the checks they extend: after the route
-table, a bare host app's OpenAPI documents both 422 shapes on every operation that declares its
-own 422, and after the upload guard, ``PdfParseLimiter`` counts PDF parse slots against the limit
-in force, separately for every app that mounts the router.
+bodies within 64 KiB get one of the two 422 shapes, an undecodable one FastAPI's ``json_invalid``
+entry, and larger ones the coded 413 ``request_too_large`` without being decoded; ``GET /health``
+answers a coded 503 once its database round trip outlives its bound; the health service's
+``SELECT 1`` probe answers ok, or a coded 503 that names only the failure's type;
+``TerminalSettings`` bounds its durations and PDF upload limits and keeps ``database_url`` out of
+its repr; and the session module names a database only by its credential-free label. Two more
+such sections sit beside the checks they extend: after the route table, a bare host app's OpenAPI
+documents both 422 shapes on every operation that declares its own 422, and after the upload
+guard and ingest permission checks, ``PdfParseLimiter`` counts PDF parse slots against the limit
+in force, separately for every app that mounts the router. A last such section ends the file: the
+standalone app's lifespan disposes its default engine when it ends, normally or with an
+exception, and a mounted ``terminal_router`` adds nothing to a host's lifespan.
 
 Authentication stays pluggable through dependency injection: ownership is the opaque principal
 subject stored as ``owner_key``, and no users or auth table is read or created.
@@ -46,7 +55,7 @@ import time
 import traceback
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
-from contextlib import AbstractAsyncContextManager, AsyncExitStack
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Final, NoReturn, Protocol, cast
@@ -81,6 +90,7 @@ from opennse_terminal.api import (
     get_terminal_principal,
     get_terminal_session,
     get_terminal_settings,
+    require_ingest_permission,
     terminal_router,
 )
 from opennse_terminal.api.deps import TerminalJsonRoute
@@ -94,7 +104,8 @@ from opennse_terminal.config import TerminalSettings
 from opennse_terminal.db import session as db_session
 from opennse_terminal.db.base import TerminalBase
 from opennse_terminal.db.session import build_engine, database_log_label, session_factory
-from opennse_terminal.ingestion.files.pdf_line_items import PdfUnreadable
+from opennse_terminal.ingestion.files.pdf_line_items import ParseCancelledError, PdfUnreadable
+from opennse_terminal.main import create_app
 from opennse_terminal.models import (
     TerminalCorporateFiling,
     TerminalIngestionRun,
@@ -624,6 +635,210 @@ async def test_host_auth_failure_blocks_every_terminal_operation(
         assert response.json() == expected_body
 
 
+JSON_BODY_LIMIT_BYTES: Final = 65_536
+"""Largest JSON body ``POST /ipo/valuation`` and ``POST /watchlists`` accept, stated here as the
+contract rather than read from ``api.deps``."""
+
+JSON_BODY_DRAIN_BYTES: Final = 1_048_576
+"""Bytes past the JSON body limit that an over-limit chunked body is read and dropped at most."""
+
+LONG_ZERO_PADDING: Final = "0" * 4_300
+"""Leading zeroes that, with any digit after them, make a ``Content-Length`` longer than the 4,300
+digits ``int()`` converts by default, while leaving its value unchanged."""
+
+STREAM_CHUNK_BYTES: Final = 16_384
+
+DEPS_LOGGER: Final = "opennse_terminal.api.deps"
+TOO_LARGE_LOG: Final = "JSON request body rejected: request_too_large (limit 65536 bytes)"
+
+
+@dataclass
+class TrackedBody:
+    """A JSON request body streamed to the app in chunks, counting the bytes the app pulled.
+
+    ``httpx.ASGITransport`` pulls the next chunk only when the app calls ``receive``, so
+    ``pulled`` is how much of the body the app has read. ``declared`` is sent as the
+    ``Content-Length``; without it the body is framed as chunked.
+    """
+
+    data: bytes
+    declared: str | None = None
+    pulled: int = 0
+
+    async def _chunks(self) -> AsyncIterator[bytes]:
+        for start in range(0, len(self.data), STREAM_CHUNK_BYTES):
+            chunk = self.data[start : start + STREAM_CHUNK_BYTES]
+            self.pulled += len(chunk)
+            yield chunk
+
+    async def post(self, client: httpx.AsyncClient, url: str) -> httpx.Response:
+        """POST the body to ``url`` as ``application/json``."""
+        headers = {"content-type": "application/json"}
+        if self.declared is not None:
+            headers["content-length"] = self.declared
+        return await client.post(url, content=self._chunks(), headers=headers)
+
+
+def framed(data: bytes, *, chunked: bool) -> TrackedBody:
+    """``data`` as a body declaring its own length, or framed as chunked."""
+    return TrackedBody(data, declared=None if chunked else str(len(data)))
+
+
+def padded_json(document: object, size: int) -> bytes:
+    """``document`` as JSON text followed by insignificant whitespace, ``size`` bytes in all."""
+    text = json.dumps(document).encode()
+    assert len(text) <= size
+    return text + b" " * (size - len(text))
+
+
+def too_large_records(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The messages of the 413 ``request_too_large`` records logged by ``api.deps``."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == DEPS_LOGGER and "request_too_large" in record.getMessage()
+    ]
+
+
+OVERSIZED_WATCHLIST: Final = padded_json(
+    {"name": "big", "tickers": ["SCOM"]}, 4 * JSON_BODY_LIMIT_BYTES
+)
+OVERSIZED_OBJECT: Final = padded_json({}, 4 * JSON_BODY_LIMIT_BYTES)
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        pytest.param("/watchlists", framed(b'{"name":', chunked=False), id="watchlist_malformed"),
+        pytest.param("/ipo/valuation", framed(b"{bad", chunked=False), id="ipo_malformed"),
+        pytest.param(
+            "/watchlists",
+            framed(b"[" * 5_000 + b"]" * 5_000, chunked=False),
+            id="watchlist_over_nested",
+        ),
+        pytest.param(
+            "/ipo/valuation",
+            framed(b"[" * 5_000 + b"]" * 5_000, chunked=False),
+            id="ipo_over_nested",
+        ),
+        pytest.param(
+            "/watchlists",
+            framed(OVERSIZED_WATCHLIST, chunked=False),
+            id="watchlist_oversized_content_length",
+        ),
+        pytest.param(
+            "/ipo/valuation",
+            framed(OVERSIZED_OBJECT, chunked=False),
+            id="ipo_oversized_content_length",
+        ),
+        pytest.param(
+            "/watchlists",
+            framed(OVERSIZED_WATCHLIST, chunked=True),
+            id="watchlist_oversized_chunked",
+        ),
+        pytest.param(
+            "/ipo/valuation", framed(OVERSIZED_OBJECT, chunked=True), id="ipo_oversized_chunked"
+        ),
+        pytest.param(
+            "/watchlists",
+            TrackedBody(b'{"name": "x"}', declared=LONG_ZERO_PADDING + "13"),
+            id="watchlist_zero_padded_content_length",
+        ),
+        pytest.param(
+            "/ipo/valuation",
+            TrackedBody(b"{}", declared=LONG_ZERO_PADDING + "2"),
+            id="ipo_zero_padded_content_length",
+        ),
+        pytest.param(
+            "/watchlists",
+            TrackedBody(b'{"name": "x"}', declared="9" * 5_000),
+            id="watchlist_5000_digit_content_length",
+        ),
+        pytest.param(
+            "/ipo/valuation",
+            TrackedBody(b"{}", declared="9" * 5_000),
+            id="ipo_5000_digit_content_length",
+        ),
+        pytest.param(
+            "/watchlists",
+            TrackedBody(b'{"name": "x"}', declared=LONG_ZERO_PADDING + "65537"),
+            id="watchlist_zero_padded_oversized_content_length",
+        ),
+        pytest.param(
+            "/ipo/valuation",
+            TrackedBody(b"{}", declared=LONG_ZERO_PADDING + "65537"),
+            id="ipo_zero_padded_oversized_content_length",
+        ),
+    ],
+)
+async def test_host_auth_failure_precedes_every_body_verdict(
+    host_app: HostApp,
+    host_client: httpx.AsyncClient,
+    db_connection: AsyncConnection,
+    caplog: pytest.LogCaptureFixture,
+    path: str,
+    body: TrackedBody,
+) -> None:
+    """A principal override that raises 401 answers a malformed, over-nested or oversized JSON
+    body, or one whose ``Content-Length`` has more digits than ``int()`` converts, with the host's
+    401, not the body's 422 or 413: the body verdict waits for the host's dependencies, so no
+    session is opened and no watchlist row is written."""
+
+    async def host_rejects_caller() -> TerminalPrincipal:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="host says no")
+
+    host_app.app.dependency_overrides[get_terminal_principal] = host_rejects_caller
+    watchlists_count = select(func.count()).select_from(TerminalWatchlist)
+    watchlists_before = await _count(db_connection, watchlists_count)
+    caplog.set_level(logging.INFO, logger=DEPS_LOGGER)
+
+    response = await body.post(host_client, f"{TERMINAL_PREFIX}{path}")
+
+    assert response.status_code == 401, response.text
+    assert response.json() == {"detail": "host says no"}
+    assert host_app.sessions_opened == 0
+    assert await _count(db_connection, watchlists_count) == watchlists_before
+    assert too_large_records(caplog) == []
+
+
+@pytest.mark.parametrize(
+    ("body", "status_code", "sessions_opened"),
+    [
+        pytest.param(framed(b'{"name":', chunked=False), 422, 0, id="malformed"),
+        pytest.param(framed(OVERSIZED_WATCHLIST, chunked=False), 413, 0, id="oversized"),
+        pytest.param(framed(OVERSIZED_WATCHLIST, chunked=True), 413, 0, id="oversized_chunked"),
+        pytest.param(framed(b'{"name": "Ordered"}', chunked=False), 201, 1, id="valid"),
+    ],
+)
+async def test_body_verdict_follows_the_principal_and_precedes_the_session(
+    host_app: HostApp,
+    host_client: httpx.AsyncClient,
+    db_connection: AsyncConnection,
+    body: TrackedBody,
+    status_code: int,
+    sessions_opened: int,
+) -> None:
+    """``POST /watchlists`` resolves the host's principal first, then judges the body, and opens
+    the host's session only for a body that passes: a refused body is answered after the
+    principal ran once, with no session opened and no row written."""
+    principal_calls: list[str] = []
+
+    async def host_records_caller() -> TerminalPrincipal:
+        principal_calls.append(HOST_SUBJECT)
+        return TerminalPrincipal(subject=HOST_SUBJECT, is_authenticated=True)
+
+    host_app.app.dependency_overrides[get_terminal_principal] = host_records_caller
+    watchlists_count = select(func.count()).select_from(TerminalWatchlist)
+    watchlists_before = await _count(db_connection, watchlists_count)
+
+    response = await body.post(host_client, f"{TERMINAL_PREFIX}/watchlists")
+
+    assert response.status_code == status_code, response.text
+    assert principal_calls == [HOST_SUBJECT]
+    assert host_app.sessions_opened == sessions_opened
+    assert await _count(db_connection, watchlists_count) == watchlists_before + sessions_opened
+
+
 # ---------------------------------------------------------------------------------------------
 # Upload guard inside the host
 # ---------------------------------------------------------------------------------------------
@@ -667,21 +882,188 @@ async def test_request_size_guard_travels_with_router(
 
 
 # ---------------------------------------------------------------------------------------------
+# Ingest permission inside the host
+#
+# ``require_ingest_permission`` guards ``POST /ingest/pdf`` on top of the router-level principal
+# dependency, so a host restricts ingestion, for example to its administrators, without
+# restricting any other terminal operation. The host overrides the object exported by
+# ``opennse_terminal.api``, the one the route depends on. ``ingestion_calls`` records every call
+# that reaches the real ingestion service and its PDF parser, both still run unchanged, so a
+# refused upload is shown to stop before either starts.
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def ingestion_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Calls that reached ``filings_service.ingest_pdf`` (``"service"``) and its parser
+    ``filings_service.extract_line_items`` (``"parse"``), in order; each call is passed on to the
+    real function."""
+    calls: list[str] = []
+    service = filings_service.ingest_pdf
+    parser = filings_service.extract_line_items
+
+    async def recorded_service(*args: Any, **kwargs: Any) -> Any:
+        calls.append("service")
+        return await service(*args, **kwargs)
+
+    def recorded_parser(*args: Any, **kwargs: Any) -> Any:
+        calls.append("parse")
+        return parser(*args, **kwargs)
+
+    monkeypatch.setattr(filings_service, "ingest_pdf", recorded_service)
+    monkeypatch.setattr(filings_service, "extract_line_items", recorded_parser)
+    return calls
+
+
+async def test_ingest_permission_override_refuses_upload_before_any_ingestion_work(
+    host_app: HostApp,
+    host_client: httpx.AsyncClient,
+    db_connection: AsyncConnection,
+    statement_pdf: Callable[..., bytes],
+    ingestion_calls: list[str],
+) -> None:
+    """An authenticated caller whom the host's ``require_ingest_permission`` override refuses
+    gets the host's 403 for an otherwise valid upload before the ingestion service starts: no
+    parse, no filing row and no run row. Only ingestion is restricted: the same caller still
+    reads the screener and creates a watchlist."""
+    assert require_ingest_permission is opennse_terminal.api.deps.require_ingest_permission
+    refusals: list[str] = []
+
+    async def host_requires_administrator() -> None:
+        refusals.append("refused")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="administrators only")
+
+    host_app.app.dependency_overrides[require_ingest_permission] = host_requires_administrator
+
+    # Valid in every respect, so without the guard it would be parsed and answered 200.
+    pdf = statement_pdf("KES", tag="host ingest refused")
+    filings_count = select(func.count()).select_from(TerminalCorporateFiling)
+    runs_count = (
+        select(func.count())
+        .select_from(TerminalIngestionRun)
+        .where(TerminalIngestionRun.pipeline == "pdf_filing")
+    )
+    filings_before = await _count(db_connection, filings_count)
+    runs_before = await _count(db_connection, runs_count)
+
+    response = await host_client.post(
+        f"{TERMINAL_PREFIX}/ingest/pdf",
+        files={"file": ("statement.pdf", pdf, "application/pdf")},
+    )
+
+    assert response.status_code == 403, response.text
+    assert response.json() == {"detail": "administrators only"}
+    assert refusals == ["refused"]
+    assert ingestion_calls == []
+    file_sha256 = hashlib.sha256(pdf).hexdigest()
+    assert (
+        await _count(
+            db_connection,
+            filings_count.where(TerminalCorporateFiling.file_sha256 == file_sha256),
+        )
+        == 0
+    )
+    assert await _count(db_connection, filings_count) == filings_before
+    # Run rows are committed on their own connection; READ COMMITTED shows them here as well.
+    assert await _count(db_connection, runs_count) == runs_before
+
+    screener = await host_client.get(f"{TERMINAL_PREFIX}/market/screener")
+    assert screener.status_code == 200, screener.text
+    assert screener.json()["count"] == 8
+    created = await host_client.post(
+        f"{TERMINAL_PREFIX}/watchlists", json={"name": "Ingest refused", "tickers": ["KCB"]}
+    )
+    assert created.status_code == 201, created.text
+    assert (created.json()["name"], created.json()["tickers"]) == ("Ingest refused", ["KCB"])
+
+
+async def test_ingest_permission_override_is_handed_the_host_principal(
+    host_app: HostApp,
+    host_client: httpx.AsyncClient,
+    statement_pdf: Callable[..., bytes],
+    ingestion_calls: list[str],
+) -> None:
+    """An override that declares the principal dependency receives the caller the host's
+    principal override resolved, and by admitting that caller lets the upload through to the
+    service: the preview answers 200."""
+    administrators = frozenset({HOST_SUBJECT})
+    callers: list[TerminalPrincipal] = []
+
+    async def host_admits_administrators(
+        principal: Annotated[TerminalPrincipal, Depends(get_terminal_principal)],
+    ) -> None:
+        callers.append(principal)
+        if principal.subject not in administrators:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="administrators only")
+
+    host_app.app.dependency_overrides[require_ingest_permission] = host_admits_administrators
+    pdf = statement_pdf("KES", tag="host ingest permitted")
+
+    response = await host_client.post(
+        f"{TERMINAL_PREFIX}/ingest/pdf",
+        files={"file": ("statement.pdf", pdf, "application/pdf")},
+        data={"commit": "false"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["file_sha256"] == hashlib.sha256(pdf).hexdigest()
+    assert (body["committed"], body["missing_items"]) == (False, [])
+    assert callers == [TerminalPrincipal(subject=HOST_SUBJECT, is_authenticated=True)]
+    assert ingestion_calls == ["service", "parse"]
+
+
+async def test_host_principal_is_resolved_before_the_ingest_permission(
+    host_app: HostApp,
+    host_client: httpx.AsyncClient,
+    statement_pdf: Callable[..., bytes],
+    ingestion_calls: list[str],
+) -> None:
+    """A caller the host's principal override rejects gets its 401, not the 403 of an ingest
+    permission override that does not itself depend on the principal: the router-level
+    principal dependency runs first, so the permission check never runs for that caller."""
+    permission_checks: list[str] = []
+
+    async def host_rejects_caller() -> TerminalPrincipal:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="host says no")
+
+    async def host_refuses_ingestion() -> None:
+        permission_checks.append("checked")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="administrators only")
+
+    host_app.app.dependency_overrides[get_terminal_principal] = host_rejects_caller
+    host_app.app.dependency_overrides[require_ingest_permission] = host_refuses_ingestion
+    pdf = statement_pdf("KES", tag="host ingest unauthenticated")
+
+    response = await host_client.post(
+        f"{TERMINAL_PREFIX}/ingest/pdf",
+        files={"file": ("statement.pdf", pdf, "application/pdf")},
+    )
+
+    assert response.status_code == 401, response.text
+    assert response.json() == {"detail": "host says no"}
+    assert permission_checks == []
+    assert ingestion_calls == []
+
+
+# ---------------------------------------------------------------------------------------------
 # PDF parse slots: ``PdfParseLimiter`` accounting and its isolation between mounted hosts
 #
 # ``PdfParseLimiter`` admits a parse only while fewer parses than the limit in force are active,
 # never waits for a slot, and keeps counting the parses it admitted when a request arrives with a
 # different ``pdf_max_concurrency``: a lower limit refuses new requests at once while the running
 # parses finish, and a higher one admits up to the new limit. Slots come back when the block
-# exits, also on an exception or a cancellation. A cancelled upload keeps its slot until its parse
-# thread has ended, because a worker thread cannot be stopped.
+# exits, also on an exception or a cancellation. A cancelled upload sets its parse's ``cancel``
+# event, which the real extractor answers by killing its parser process, and keeps its slot until
+# its parse thread has ended: moments later for a parse that honours the event, and for as long as
+# one that ignores it runs.
 #
 # ``TerminalUploadRoute`` gives every application that mounts ``terminal_router`` its own limiter
 # and its own once-only settings-fallback warning, so two hosts in one process never share upload
 # accounting. The endpoint tests mount ``terminal_router`` in separate ``FastAPI()`` apps whose
 # ``get_terminal_settings`` override builds a new ``TerminalSettings`` on every call, as a host's
 # ``lambda: TerminalSettings(...)`` does. ``filings_service.ingest_pdf`` is replaced by
-# :class:`HeldParses`, so no parse runs and no database is touched; the cancellation test replaces
+# :class:`HeldParses`, so no parse runs and no database is touched; the cancellation tests replace
 # it with :func:`_extract_only`, which runs the real ``filings_service._extract`` with
 # :class:`GatedParses` as the extractor, still without a database.
 # ---------------------------------------------------------------------------------------------
@@ -694,6 +1076,8 @@ SETTINGS_FALLBACK_WARNING: Final = "not TerminalSettings"
 PARSE_GATE_SECONDS: Final = 30.0
 """How long a :class:`GatedParses` parse waits to be released before it gives up, so a failing
 test never leaves a worker thread behind."""
+CANCEL_POLL_SECONDS: Final = 0.01
+"""How often a cancel-honouring :class:`GatedParses` parse checks its ``cancel`` event."""
 TASK_CANCEL: Final = "task"
 SCOPE_CANCEL: Final = "anyio_scope"
 
@@ -846,16 +1230,20 @@ class GatedParses:
 
     Each parse blocks its thread until released and then raises ``PdfUnreadable``, so a released
     upload ends as the coded 422 ``pdf_unreadable``. Parses are numbered from 0 in arrival order;
-    after :meth:`release_all`, later parses are released on arrival.
+    after :meth:`release_all`, later parses are released on arrival. By default a parse ignores
+    its ``cancel`` event; with ``honours_cancel`` it also ends once that event is set, raising
+    ``ParseCancelledError`` as the real extractor does after killing its parser process.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, honours_cancel: bool = False) -> None:
         self._lock = threading.Lock()
         self._parses: list[GatedParse] = []
         self._arrived = 0
         self._running = 0
         self._max_running = 0
         self._open = False
+        self._honours_cancel = honours_cancel
+        self._cancelled: list[int] = []
         # Background uploads, released and awaited when the test ends.
         self.tasks: list[asyncio.Task[Any]] = []
 
@@ -871,6 +1259,12 @@ class GatedParses:
         with self._lock:
             return self._max_running
 
+    @property
+    def cancelled(self) -> list[int]:
+        """Parses ended by their ``cancel`` event, in the order they ended."""
+        with self._lock:
+            return list(self._cancelled)
+
     def parse(self, index: int) -> GatedParse:
         """Parse ``index``, created ahead of its arrival when a test refers to it first."""
         with self._lock:
@@ -881,7 +1275,9 @@ class GatedParses:
                 self._parses.append(created)
             return self._parses[index]
 
-    def __call__(self, *_args: object, **_kwargs: object) -> NoReturn:
+    def __call__(
+        self, *_args: object, cancel: threading.Event | None = None, **_kwargs: object
+    ) -> NoReturn:
         with self._lock:
             index = self._arrived
             self._arrived += 1
@@ -890,13 +1286,29 @@ class GatedParses:
         parse = self.parse(index)
         parse.started.set()
         try:
-            if not parse.gate.wait(PARSE_GATE_SECONDS):
+            if self._honours_cancel and cancel is not None:
+                self._wait_unless_cancelled(index, parse, cancel)
+            elif not parse.gate.wait(PARSE_GATE_SECONDS):
                 raise TimeoutError(f"gated parse {index} was never released")
             raise PdfUnreadable
         finally:
             with self._lock:
                 self._running -= 1
             parse.finished.set()
+
+    def _wait_unless_cancelled(
+        self, index: int, parse: GatedParse, cancel: threading.Event
+    ) -> None:
+        """Return once parse ``index`` is released; raise ``ParseCancelledError`` once ``cancel``
+        is set first. The two events are polled, as one thread cannot wait on both."""
+        deadline = time.monotonic() + PARSE_GATE_SECONDS
+        while not parse.gate.wait(CANCEL_POLL_SECONDS):
+            if cancel.is_set():
+                with self._lock:
+                    self._cancelled.append(index)
+                raise ParseCancelledError
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"gated parse {index} was never released or cancelled")
 
     def hold(self, host: Host) -> None:
         """Start an upload to ``host`` in the background; once admitted, its parse is held."""
@@ -966,11 +1378,12 @@ async def parses(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[HeldParses]:
         await asyncio.gather(*held.tasks, return_exceptions=True)
 
 
-@pytest.fixture
-async def gated_parses(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[GatedParses]:
-    """:class:`GatedParses` installed as the extractor behind :func:`_extract_only`; every upload
-    is released and awaited, and every parse thread has ended before the test is done."""
-    gated = GatedParses()
+@asynccontextmanager
+async def _installed_parses(
+    monkeypatch: pytest.MonkeyPatch, gated: GatedParses
+) -> AsyncIterator[GatedParses]:
+    """``gated`` installed as the extractor behind :func:`_extract_only`; on exit every upload is
+    released and awaited, and every parse thread has ended."""
     monkeypatch.setattr(filings_service, "extract_line_items", gated)
     monkeypatch.setattr(filings_service, "ingest_pdf", _extract_only)
     try:
@@ -979,6 +1392,22 @@ async def gated_parses(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[GatedPa
         gated.release_all()
         await asyncio.gather(*gated.tasks, return_exceptions=True)
         assert await gated.wait_all_finished(), "a gated parse thread did not end"
+
+
+@pytest.fixture
+async def gated_parses(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[GatedParses]:
+    """:class:`GatedParses` whose parses ignore their ``cancel`` event, installed by
+    :func:`_installed_parses`."""
+    async with _installed_parses(monkeypatch, GatedParses()) as gated:
+        yield gated
+
+
+@pytest.fixture
+async def cancellable_parses(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[GatedParses]:
+    """:class:`GatedParses` whose parses end once their ``cancel`` event is set, installed by
+    :func:`_installed_parses`."""
+    async with _installed_parses(monkeypatch, GatedParses(honours_cancel=True)) as gated:
+        yield gated
 
 
 @pytest.fixture
@@ -1132,6 +1561,35 @@ class ParseFailedError(Exception):
     """Raised inside a held slot to stand for a failing parse."""
 
 
+SLOT_WAIT_SECONDS: Final = 10.0
+"""How long the abnormal-ending test waits for its parse to hold the slot, and then to end,
+before it fails, so a parse that goes wrong first reports its own error instead of hanging."""
+
+
+async def wait_for_signal(event: asyncio.Event, producer: asyncio.Task[None]) -> None:
+    """Wait until ``producer`` sets ``event``, for at most :data:`SLOT_WAIT_SECONDS`.
+
+    A producer that ends without setting it fails the test at once: with the producer's own
+    exception when it raised one, otherwise with a message saying it was cancelled or returned.
+    """
+    waiter = asyncio.create_task(event.wait())
+    try:
+        await asyncio.wait(
+            {waiter, producer}, timeout=SLOT_WAIT_SECONDS, return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+    if event.is_set():
+        return
+    if not producer.done():
+        pytest.fail(f"the parse did not take its slot within {SLOT_WAIT_SECONDS} s")
+    if producer.cancelled():
+        pytest.fail("the parse was cancelled before it took its slot")
+    await producer  # re-raises the exception the parse ended with
+    pytest.fail("the parse returned before it took its slot")
+
+
 @pytest.mark.parametrize("ending", ["exception", "cancellation"])
 async def test_slot_is_given_back_when_the_block_ends_abnormally(ending: str) -> None:
     """A parse that raises or whose request is cancelled frees its slot for the next request."""
@@ -1148,16 +1606,21 @@ async def test_slot_is_given_back_when_the_block_ends_abnormally(ending: str) ->
             await asyncio.Event().wait()
 
     task = asyncio.create_task(parse())
-    await inside.wait()
-    if ending == "cancellation":
-        async with limiter.slot(1) as admitted:
-            assert not admitted
+    try:
+        await wait_for_signal(inside, task)
+        if ending == "cancellation":
+            async with limiter.slot(1) as admitted:
+                assert not admitted
+            task.cancel()
+        expected: type[BaseException] = (
+            ParseFailedError if ending == "exception" else asyncio.CancelledError
+        )
+        with pytest.raises(expected):
+            async with asyncio.timeout(SLOT_WAIT_SECONDS):
+                await task
+    finally:
         task.cancel()
-    expected: type[BaseException] = (
-        ParseFailedError if ending == "exception" else asyncio.CancelledError
-    )
-    with pytest.raises(expected):
-        await task
+        await asyncio.gather(task, return_exceptions=True)
 
     assert limiter.active == 0
     async with limiter.slot(1) as admitted:
@@ -1326,12 +1789,13 @@ async def test_cancelled_upload_holds_its_slot_until_its_parse_thread_ends(
     asyncio task group does, or through an anyio cancel scope around it, as a host's anyio task
     group or timeout does.
 
-    A worker thread cannot be stopped, so the cancelled request stays in flight and keeps its
-    slot while its parse runs, without spinning the event loop, and a new upload is refused with
-    429. Once that parse ends the request ends: a task cancellation is re-raised, and a cancel
-    scope's cancellation takes effect at the caller's next await and stays inside that scope.
-    The next upload is then admitted. No more than ``limit`` parses ever run at once, and every
-    other parse still ends as its coded 422.
+    The cancellation sets the parse's ``cancel`` event, which these parses ignore (the real
+    extractor kills its parser process; see the next test). A worker thread cannot be stopped,
+    so the cancelled request stays in flight and keeps its slot while its parse runs, without
+    spinning the event loop, and a new upload is refused with 429. Once that parse ends the
+    request ends: a task cancellation is re-raised, and a cancel scope's cancellation stays
+    inside that scope. The next upload is then admitted. No more than ``limit`` parses ever run
+    at once, and every other parse still ends as its coded 422.
     """
     host = await make_host(limit)
     scope = anyio.CancelScope()
@@ -1385,10 +1849,74 @@ async def test_cancelled_upload_holds_its_slot_until_its_parse_thread_ends(
     assert gated_parses.max_running == limit
 
 
+@pytest.mark.parametrize("limit", [1, 2])
+@pytest.mark.parametrize(
+    "cancellation",
+    [
+        pytest.param(TASK_CANCEL, id="task_cancel"),
+        pytest.param(SCOPE_CANCEL, id="anyio_cancel_scope"),
+    ],
+)
+async def test_cancelled_upload_stops_its_parse_and_frees_its_slot_promptly(
+    make_host: Callable[[int], Awaitable[Host]],
+    cancellable_parses: GatedParses,
+    limit: int,
+    cancellation: str,
+) -> None:
+    """``limit`` uploads hold every slot, and the first one is then cancelled by
+    ``Task.cancel()`` or through an anyio cancel scope around it, as in the previous test.
+
+    Here the parse honours its ``cancel`` event, as the real extractor does by killing its
+    parser process, so the cancelled request ends within moments, without its parse being
+    released: a task cancellation is re-raised, and a cancel scope's cancellation stays inside
+    that scope. Its slot is then free for the next upload at once, no more than ``limit`` parses
+    ever run at once, and every other parse still ends as its coded 422.
+    """
+    host = await make_host(limit)
+    scope = anyio.CancelScope()
+
+    async def first_upload() -> httpx.Response | None:
+        with scope:
+            response = await host.upload()
+            await asyncio.sleep(0)  # the caller's next await
+            return response
+        return None  # the scope caught its own cancellation
+
+    first = asyncio.create_task(first_upload())
+    cancellable_parses.tasks.append(first)
+    assert await cancellable_parses.wait_started(0)
+    for index in range(1, limit):
+        cancellable_parses.hold(host)
+        assert await cancellable_parses.wait_started(index)
+
+    if cancellation == TASK_CANCEL:
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            async with asyncio.timeout(2):
+                await first
+    else:
+        scope.cancel()
+        async with asyncio.timeout(2):
+            assert await first is None
+        assert scope.cancelled_caught
+    assert cancellable_parses.parse(0).finished.is_set()
+    assert cancellable_parses.cancelled == [0]
+
+    cancellable_parses.hold(host)
+    assert await cancellable_parses.wait_started(limit)
+    cancellable_parses.release_all()
+    for outcome in await asyncio.gather(*cancellable_parses.tasks[1:]):
+        assert outcome.status_code == 422, outcome.text
+        assert outcome.json()["detail"]["code"] == "pdf_unreadable", outcome.text
+    assert cancellable_parses.max_running == limit
+
+
 # ---------------------------------------------------------------------------------------------
-# Request body errors: hostile JSON bodies get one of the two 422 shapes, never a 500 or a 400
+# Request body errors: hostile JSON bodies get one of the two 422 shapes or the coded 413, never a
+# 500 or a 400
 #
-# Two layers make every rejected JSON body answer with FastAPI's standard 422 list:
+# Two layers make every rejected JSON body within the bound answer with FastAPI's standard 422
+# list:
 #
 # * ``TerminalRequestModel``'s wrap hook re-spells a rejected NaN or infinite float input as its
 #   JSON literal (``"NaN"``, ``"Infinity"``, ``"-Infinity"``), which FastAPI's default handler
@@ -1396,6 +1924,11 @@ async def test_cancelled_upload_holds_its_slot_until_its_parse_thread_ends(
 # * ``TerminalJsonRoute`` turns every decoding failure of the standard-library JSON decoder
 #   (deep nesting, over-long integer literals, invalid UTF-8, unpaired surrogates) into
 #   FastAPI's own ``json_invalid`` entry instead of a 400 with a string ``detail``.
+#
+# ``TerminalJsonRoute`` also bounds the body to 64 KiB: a larger one, declared by its
+# ``Content-Length`` or counted while it is read, is the coded 413 ``request_too_large``. Every
+# verdict is raised only after the router's principal dependency; the 401 propagation section
+# above proves that order inside a host.
 #
 # The app mirrors the planned body routes, ``POST /ipo/valuation`` and ``POST /watchlists``,
 # each on a plain ``APIRouter()`` and on ``APIRouter(route_class=TerminalJsonRoute)``, included
@@ -1850,7 +2383,8 @@ async def test_canonical_spellings_value_like_the_preset(
             id="offer_price_kes_array_10k",
         ),
         pytest.param(IPO, nested_object(10_000).encode(), 0, JSON_NESTING_ERROR, id="object_10k"),
-        pytest.param(IPO, nested_array(100_000).encode(), 0, JSON_NESTING_ERROR, id="array_100k"),
+        # The deepest array that fits the 64 KiB body bound.
+        pytest.param(IPO, nested_array(32_000).encode(), 0, JSON_NESTING_ERROR, id="array_32k"),
         # Decodable by the standard library, but too deep for FastAPI's error renderer.
         pytest.param(IPO, nested_array(5_000).encode(), 0, JSON_NESTING_ERROR, id="array_5k"),
         pytest.param(
@@ -1862,17 +2396,17 @@ async def test_canonical_spellings_value_like_the_preset(
         ),
         pytest.param(
             IPO,
-            quickmart_raw(base_revenue_kes="9" * 1_000_000),
+            quickmart_raw(base_revenue_kes="9" * 5_000),
             0,
             INTEGER_LIMIT_ERROR,
-            id="base_revenue_kes_1M_digits",
+            id="base_revenue_kes_5000_digits",
         ),
         pytest.param(
             IPO,
-            quickmart_raw(shares_outstanding="9" * 1_000_000),
+            quickmart_raw(shares_outstanding="9" * 5_000),
             0,
             INTEGER_LIMIT_ERROR,
-            id="shares_outstanding_1M_digits",
+            id="shares_outstanding_5000_digits",
         ),
         pytest.param(
             IPO,
@@ -1907,6 +2441,8 @@ async def test_canonical_spellings_value_like_the_preset(
 async def test_undecodable_body_returns_json_invalid(
     body_client: httpx.AsyncClient, path: str, body: bytes, position: int, error: str
 ) -> None:
+    # Within the body bound, so the decoder rather than the bound judges every case.
+    assert len(body) <= JSON_BODY_LIMIT_BYTES
     response = await post_raw(body_client, JSON_ROUTE_PREFIX + path, body)
 
     assert response.status_code == 422
@@ -1936,12 +2472,15 @@ async def test_nesting_at_the_limit_is_validated(body_client: httpx.AsyncClient)
 
 
 async def test_host_validation_handler_receives_undecodable_body() -> None:
-    """A host's RequestValidationError handler answers an undecodable body, not a 400."""
+    """A host's RequestValidationError handler answers an undecodable body, not a 400, and
+    receives the decoded body text as FastAPI's own ``json_invalid`` error carries it."""
     app = build_app()
 
     async def host_handler(request: Request, exc: Exception) -> JSONResponse:
         assert isinstance(exc, RequestValidationError)
-        return JSONResponse({"host_errors": [error["type"] for error in exc.errors()]}, 418)
+        return JSONResponse(
+            {"host_errors": [error["type"] for error in exc.errors()], "body": exc.body}, 418
+        )
 
     app.add_exception_handler(RequestValidationError, host_handler)
     transport = httpx.ASGITransport(app=app)
@@ -1949,7 +2488,259 @@ async def test_host_validation_handler_receives_undecodable_body() -> None:
         response = await post_raw(http, JSON_ROUTE_PREFIX + IPO, nested_array(10_000).encode())
 
     assert response.status_code == 418
-    assert response.json() == {"host_errors": ["json_invalid"]}
+    assert response.json() == {"host_errors": ["json_invalid"], "body": nested_array(10_000)}
+
+
+# ---------------------------------------------------------------------------------------------
+# Body bound on TerminalJsonRoute: a body over 64 KiB is the coded 413, read at most to the bound
+# ---------------------------------------------------------------------------------------------
+
+TOO_LARGE_DETAIL: Final = {
+    "code": "request_too_large",
+    "message": "Request body exceeds 65536 bytes.",
+    "field": None,
+}
+VALID_BODIES = [
+    pytest.param(IPO, QUICKMART, 200, id="ipo"),
+    pytest.param(WATCHLISTS, {"name": "Banks", "tickers": ["KCB"]}, 201, id="watchlist"),
+]
+FRAMINGS = [
+    pytest.param(False, id="content_length"),
+    pytest.param(True, id="chunked"),
+]
+
+
+@pytest.mark.parametrize("chunked", FRAMINGS)
+@pytest.mark.parametrize(("path", "document", "status_code"), VALID_BODIES)
+async def test_body_over_the_bound_returns_request_too_large(
+    body_client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+    path: str,
+    document: dict[str, object],
+    status_code: int,
+    chunked: bool,
+) -> None:
+    """A body one byte over 64 KiB, valid apart from its size, is the coded 413 with one INFO
+    record naming only the limit. Declared by its ``Content-Length``, the body is never read;
+    counted while it is read, it is read to its end and dropped, never decoded."""
+    body = framed(padded_json(document, JSON_BODY_LIMIT_BYTES + 1), chunked=chunked)
+    caplog.set_level(logging.INFO, logger=DEPS_LOGGER)
+
+    response = await body.post(body_client, JSON_ROUTE_PREFIX + path)
+
+    assert response.status_code == 413, response.text
+    assert response.json() == {"detail": TOO_LARGE_DETAIL}
+    assert body.pulled == (JSON_BODY_LIMIT_BYTES + 1 if chunked else 0)
+    assert too_large_records(caplog) == [TOO_LARGE_LOG]
+
+
+@pytest.mark.parametrize("chunked", FRAMINGS)
+@pytest.mark.parametrize(("path", "document", "status_code"), VALID_BODIES)
+async def test_body_at_the_bound_is_judged_normally(
+    body_client: httpx.AsyncClient,
+    path: str,
+    document: dict[str, object],
+    status_code: int,
+    chunked: bool,
+) -> None:
+    """A valid body of exactly 64 KiB, however it is framed, is read whole and answered exactly
+    as the same document without its padding."""
+    body = framed(padded_json(document, JSON_BODY_LIMIT_BYTES), chunked=chunked)
+
+    response = await body.post(body_client, JSON_ROUTE_PREFIX + path)
+    unpadded = await body_client.post(JSON_ROUTE_PREFIX + path, json=document)
+
+    assert response.status_code == status_code, response.text
+    assert body.pulled == JSON_BODY_LIMIT_BYTES
+    assert (response.status_code, response.json()) == (unpadded.status_code, unpadded.json())
+
+
+@pytest.mark.parametrize(
+    "host_refuses", [pytest.param(False, id="admitted"), pytest.param(True, id="host_401")]
+)
+@pytest.mark.parametrize("path", [IPO, WATCHLISTS])
+@pytest.mark.parametrize(
+    "declared",
+    [
+        "200000000",
+        "-1",
+        "+12",
+        "1_000",
+        "1e3",
+        "abc",
+        pytest.param("9" * 5_000, id="5000_nines"),
+        pytest.param(LONG_ZERO_PADDING + "65537", id="zero_padded_65537"),
+        pytest.param(LONG_ZERO_PADDING + "100000", id="zero_padded_100000"),
+    ],
+)
+async def test_invalid_or_oversized_content_length_is_refused_unread(
+    declared: str, path: str, host_refuses: bool
+) -> None:
+    """A ``Content-Length`` over the bound, however many digits or leading zeroes it has, or one
+    that is not a decimal integer (even one that ``int()`` would accept), is the coded 413 and
+    not one byte of the body is read; a principal override that raises 401 still answers first,
+    with the body equally unread."""
+
+    async def host_rejects_caller() -> TerminalPrincipal:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="host says no")
+
+    app = build_app()
+    if host_refuses:
+        app.dependency_overrides[get_terminal_principal] = host_rejects_caller
+    body = TrackedBody(b'{"name": "x"}', declared=declared)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://terminal.test") as http:
+        response = await body.post(http, JSON_ROUTE_PREFIX + path)
+
+    if host_refuses:
+        assert response.status_code == 401, response.text
+        assert response.json() == {"detail": "host says no"}
+    else:
+        assert response.status_code == 413, response.text
+        assert response.json() == {"detail": TOO_LARGE_DETAIL}
+    assert body.pulled == 0
+
+
+@pytest.mark.parametrize(
+    ("path", "data", "status_code"),
+    [
+        pytest.param(IPO, quickmart_raw(), 200, id="ipo"),
+        pytest.param(IPO, b"{}", 422, id="ipo_schema_422"),
+        pytest.param(WATCHLISTS, b'{"name": "Banks", "tickers": ["KCB"]}', 201, id="watchlist"),
+        pytest.param(WATCHLISTS, b"{}", 422, id="watchlist_schema_422"),
+        pytest.param(WATCHLISTS, b"", 422, id="watchlist_empty_body"),
+    ],
+)
+async def test_zero_padded_content_length_is_judged_by_its_value(
+    body_client: httpx.AsyncClient, path: str, data: bytes, status_code: int
+) -> None:
+    """A ``Content-Length`` of 4,300 leading zeroes and then the body's length, longer than
+    ``int()`` converts, declares that same length: the body is read whole and answered exactly
+    as with the canonical ``Content-Length``. An empty body's all-zero length is 0."""
+    padded = TrackedBody(data, declared=LONG_ZERO_PADDING + str(len(data)))
+    canonical = TrackedBody(data, declared=str(len(data)))
+
+    response = await padded.post(body_client, JSON_ROUTE_PREFIX + path)
+    expected = await canonical.post(body_client, JSON_ROUTE_PREFIX + path)
+
+    assert response.status_code == status_code, response.text
+    assert padded.pulled == canonical.pulled == len(data)
+    assert (response.status_code, response.json()) == (expected.status_code, expected.json())
+
+
+async def test_oversized_chunked_body_is_read_at_most_a_mebibyte_past_the_bound(
+    body_client: httpx.AsyncClient,
+) -> None:
+    """A 4 MiB chunked body is the coded 413 once 1 MiB past the bound has been drained, give
+    or take a chunk; the rest is never read."""
+    body = framed(padded_json({}, 4 * JSON_BODY_DRAIN_BYTES), chunked=True)
+
+    response = await body.post(body_client, JSON_ROUTE_PREFIX + IPO)
+
+    assert response.status_code == 413, response.text
+    assert response.json() == {"detail": TOO_LARGE_DETAIL}
+    assert JSON_BODY_LIMIT_BYTES + JSON_BODY_DRAIN_BYTES < body.pulled
+    assert body.pulled <= JSON_BODY_LIMIT_BYTES + JSON_BODY_DRAIN_BYTES + 2 * STREAM_CHUNK_BYTES
+
+
+async def test_stalled_sender_past_the_bound_gets_413_after_the_drain_deadline(
+    body_client: httpx.AsyncClient,
+) -> None:
+    """A chunked body that stops arriving once past the bound is answered 413 when the
+    one-second drain deadline expires, not when the sender resumes."""
+    sender_stalled = asyncio.Event()
+
+    async def stalling_body() -> AsyncIterator[bytes]:
+        yield b" " * (JSON_BODY_LIMIT_BYTES + 1)
+        sender_stalled.set()
+        await asyncio.Event().wait()
+
+    started = time.monotonic()
+    async with asyncio.timeout(10):
+        response = await body_client.post(
+            JSON_ROUTE_PREFIX + IPO, content=stalling_body(), headers=JSON_HEADERS
+        )
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 413, response.text
+    assert response.json() == {"detail": TOO_LARGE_DETAIL}
+    assert sender_stalled.is_set()
+    assert 0.9 <= elapsed < 5.0
+
+
+@pytest.mark.parametrize("prefix", BOTH_PREFIXES)
+async def test_client_disconnect_mid_body_gets_fastapi_400(prefix: str) -> None:
+    """A client that disconnects while its body is read gets FastAPI's own 400 on either route
+    class. The app is driven over raw ASGI, since an HTTP client cannot disconnect mid-body."""
+    messages: list[dict[str, Any]] = [
+        {"type": "http.request", "body": b'{"name": ', "more_body": True},
+        {"type": "http.disconnect"},
+    ]
+    sent: list[Mapping[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+    async def send(message: Mapping[str, Any]) -> None:
+        sent.append(message)
+
+    path = prefix + WATCHLISTS
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", b"terminal.test"), (b"content-type", b"application/json")],
+        "server": ("terminal.test", 80),
+        "client": ("127.0.0.1", 50000),
+    }
+
+    await build_app()(scope, receive, send)
+
+    [start] = [message for message in sent if message["type"] == "http.response.start"]
+    body = b"".join(
+        message.get("body", b"") for message in sent if message["type"] == "http.response.body"
+    )
+    assert start["status"] == 400
+    assert json.loads(body) == {"detail": "There was an error parsing the body"}
+
+
+def test_body_verdict_dependency_is_appended_once() -> None:
+    """``TerminalJsonRoute`` adds its body-verdict dependency after the route's own, and a route
+    rebuilt from an existing route's dependencies keeps exactly one."""
+
+    async def create(body: WatchlistCreate) -> WatchlistCreate:
+        return body
+
+    route = TerminalJsonRoute(
+        WATCHLISTS, create, methods=["POST"], dependencies=[Depends(get_terminal_principal)]
+    )
+    rebuilt = TerminalJsonRoute(
+        WATCHLISTS, create, methods=["POST"], dependencies=route.dependencies
+    )
+
+    assert len(route.dependencies) == 2
+    assert route.dependencies[0].dependency is get_terminal_principal
+    assert rebuilt.dependencies == route.dependencies
+    assert len(rebuilt.dependant.dependencies) == len(route.dependant.dependencies)
+
+
+@pytest.mark.parametrize("path", [IPO, WATCHLISTS])
+def test_json_route_documents_the_operation_of_a_plain_route(path: str) -> None:
+    """The bound and its verdict dependency add no parameter, body or response to OpenAPI."""
+    paths = build_app().openapi()["paths"]
+    plain = dict(paths[PLAIN_PREFIX + path]["post"])
+    bounded = dict(paths[JSON_ROUTE_PREFIX + path]["post"])
+    plain.pop("operationId")
+    bounded.pop("operationId")
+
+    assert bounded == plain
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2095,7 +2886,7 @@ def silent_listener_port() -> Iterator[int]:
         yield port
 
 
-# Shared with the session-label section below.
+# Shared with the session-label and lifespan sections below.
 @pytest.fixture
 async def no_cached_engines() -> AsyncIterator[None]:
     """Start and end with an empty engine cache, so no engine outlives its test."""
@@ -2858,3 +3649,123 @@ async def test_failing_dispose_log(
     monkeypatch.undo()
     for engine in failing_engines:
         await engine.dispose()
+
+
+# ---------------------------------------------------------------------------------------------
+# Lifespan: the standalone app disposes its default engine; the router adds nothing to a host's
+#
+# ``create_app()`` declares the only lifespan: it logs the start with the package version and
+# calls ``dispose_terminal_engine()`` when the block ends, normally or with an exception.
+# ``terminal_router`` registers no lifespan, startup or shutdown hook, so a host that mounts it
+# keeps its own lifespan as the only one and owns the lifecycle of any default engine.
+# ``httpx.ASGITransport`` runs no lifespan, so the ``client`` and ``host_client`` fixtures never
+# exercise one; each case enters ``router.lifespan_context`` itself. ``include_router`` wraps the
+# including app's ``lifespan_context`` in a merged one, so the cases assert what a lifespan does,
+# never which object it is.
+#
+# Every case runs without PostgreSQL: the default engine is cached through ``session_factory`` but
+# never connects. ``AsyncEngine.dispose()`` replaces the engine's pool, so an unchanged pool shows
+# the engine was not disposed. The ``no_cached_engines`` fixture is the health check section's.
+# ---------------------------------------------------------------------------------------------
+
+TERMINAL_LOGGER: Final = "opennse_terminal"
+
+LIFESPAN_START_MESSAGE: Final = f"OpenNSE terminal API starting (version {__version__})"
+
+
+class LifespanEndedError(Exception):
+    """Raised inside a lifespan block to end it with an exception."""
+
+
+def _terminal_records(caplog: pytest.LogCaptureFixture) -> list[tuple[str, int, str]]:
+    """``(logger, level, message)`` of every captured record of an ``opennse_terminal`` logger."""
+    return [
+        (record.name, record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.name == TERMINAL_LOGGER or record.name.startswith(f"{TERMINAL_LOGGER}.")
+    ]
+
+
+@pytest.mark.parametrize("ending", ["normal", "exception"])
+@pytest.mark.usefixtures("no_cached_engines")
+async def test_standalone_lifespan_disposes_the_default_engine_on_every_exit(
+    ending: str,
+    caplog: pytest.LogCaptureFixture,
+    make_settings: Callable[..., TerminalSettings],
+) -> None:
+    """Startup logs the version and leaves the engine cache as it found it; shutdown disposes the
+    cached engine and empties the cache, also when the block raises, and that exception reaches
+    the caller unchanged."""
+    caplog.set_level(logging.INFO, logger="opennse_terminal.main")
+    session_factory(make_settings())
+    cached = dict(db_session._CACHE)
+    ((engine, _factory),) = cached.values()
+    pool = engine.sync_engine.pool
+    app = create_app()
+    error = LifespanEndedError("the served block failed")
+
+    async def serve() -> None:
+        async with app.router.lifespan_context(app):
+            assert [
+                (record.levelno, record.getMessage())
+                for record in caplog.records
+                if record.name == "opennse_terminal.main"
+            ] == [(logging.INFO, LIFESPAN_START_MESSAGE)]
+            # Startup neither creates nor disposes an engine.
+            assert db_session._CACHE == cached
+            assert engine.sync_engine.pool is pool
+            if ending == "exception":
+                raise error
+
+    if ending == "exception":
+        with pytest.raises(LifespanEndedError) as raised:
+            await serve()
+        assert raised.value is error
+    else:
+        await serve()
+
+    assert db_session._CACHE == {}
+    assert engine.sync_engine.pool is not pool
+
+
+@pytest.mark.usefixtures("no_cached_engines")
+async def test_mounted_router_adds_nothing_to_the_host_lifespan(
+    caplog: pytest.LogCaptureFixture, make_settings: Callable[..., TerminalSettings]
+) -> None:
+    """A host's own lifespan runs once, start and stop, with the router mounted, which logs
+    nothing and leaves the cached default engine for the host to dispose."""
+    assert terminal_router.on_startup == []
+    assert terminal_router.on_shutdown == []
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def host_lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        events.append("start")
+        try:
+            yield
+        finally:
+            events.append("stop")
+
+    host = FastAPI(title="Host platform", lifespan=host_lifespan)
+    host.include_router(terminal_router)
+    session_factory(make_settings())
+    cached = dict(db_session._CACHE)
+    ((engine, _factory),) = cached.values()
+    pool = engine.sync_engine.pool
+    caplog.set_level(logging.DEBUG, logger=TERMINAL_LOGGER)
+    caplog.clear()
+
+    async with host.router.lifespan_context(host):
+        assert events == ["start"]
+        assert db_session._CACHE == cached
+
+    assert events == ["start", "stop"]
+    # Neither creating nor disposing an engine, nor logging anything, is the router's part.
+    assert db_session._CACHE == cached
+    assert engine.sync_engine.pool is pool
+    assert _terminal_records(caplog) == []
+
+    # The host releases the engine itself, through the re-exported shutdown hook.
+    await dispose_terminal_engine()
+    assert db_session._CACHE == {}
+    assert engine.sync_engine.pool is not pool
