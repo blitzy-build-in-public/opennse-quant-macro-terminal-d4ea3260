@@ -392,7 +392,14 @@ const GROUP_CLASS = "flex flex-wrap items-center gap-1";
 const EVENTS_GROUP_LOADING_CLASS =
   "flex min-h-[9.25rem] flex-wrap content-start items-center gap-1 min-[405px]:min-h-[7.125rem] min-[462px]:min-h-[5rem] min-[808px]:min-h-[2.875rem] min-[852px]:min-h-[1.625rem] min-[852px]:content-center";
 const GROUP_LABEL_CLASS = "me-1 text-slate-400";
-const CHIP_LIST_CLASS = "m-0 flex list-none flex-wrap items-center gap-2 p-0";
+// A chip wider than the card (a narrow card with a large text setting) narrows to it: the list,
+// its items and the chip may shrink to the card's width, and the chip's text wraps inside the
+// pill, its date dropping beneath its label and a word wider than the pill breaking, while the
+// remove button keeps its size. A chip that fits renders as one line, as before.
+const CHIP_LIST_CLASS = "m-0 flex min-w-0 list-none flex-wrap items-center gap-2 p-0";
+const CHIP_ITEM_CLASS = "min-w-0 max-w-full";
+const EVENT_CHIP_CLASS = `${CHIP_CLASS} max-w-full`;
+const CHIP_TEXT_CLASS = "flex min-w-0 flex-wrap gap-x-1 [overflow-wrap:anywhere]";
 const CHIP_DATE_CLASS = "text-slate-400";
 const ICON_CLASS = "h-3 w-3";
 const MUTED_TEXT_CLASS = "m-0 text-xs text-slate-400";
@@ -433,10 +440,13 @@ const SECTION_HEADER_CLASS = "flex flex-wrap items-baseline justify-between gap-
 // and are cased in `CanvasText` by four 1px `drop-shadow()`s, so every coloured shape is edged by
 // the system text colour, the one colour guaranteed to contrast with `Canvas`. Each rule sits
 // inside `forced-colors:`, so normal rendering is unchanged.
+// Each wrapper is an inline-size container, declared with the arbitrary property because Tailwind 3
+// has no `@container` utility without a plugin, so its floating tooltip can be capped at the
+// plot's width (see `TOOLTIP_CLASS`). Its `w-full` and `h-*` sizes are unchanged by it.
 const MAIN_CHART_CLASS =
-  "h-80 w-full [&_.recharts-surface:focus-visible]:outline-2 [&_.recharts-surface:focus-visible]:outline-offset-2 [&_.recharts-surface:focus-visible]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none forced-colors:[&_text]:fill-[CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:stroke-[color:GrayText] forced-colors:[&_.recharts-line-curve]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_g[data-testid^='marker-']]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_g[data-marker-connectors]]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
+  "[container-type:inline-size] h-80 w-full [&_.recharts-surface:focus-visible]:outline-2 [&_.recharts-surface:focus-visible]:outline-offset-2 [&_.recharts-surface:focus-visible]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none forced-colors:[&_text]:fill-[CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:stroke-[color:GrayText] forced-colors:[&_.recharts-line-curve]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_g[data-testid^='marker-']]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_g[data-marker-connectors]]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
 const OVERLAY_CHART_CLASS =
-  "h-48 w-full [&_.recharts-surface:focus-visible]:outline-2 [&_.recharts-surface:focus-visible]:outline-offset-2 [&_.recharts-surface:focus-visible]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none forced-colors:[&_text]:fill-[CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:stroke-[color:GrayText] forced-colors:[&_.recharts-line-curve]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_.recharts-active-dot]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
+  "[container-type:inline-size] h-48 w-full [&_.recharts-surface:focus-visible]:outline-2 [&_.recharts-surface:focus-visible]:outline-offset-2 [&_.recharts-surface:focus-visible]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none forced-colors:[&_text]:fill-[CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:stroke-[color:GrayText] forced-colors:[&_.recharts-line-curve]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_.recharts-active-dot]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
 // On a body narrower than the chart's minimum width, each chart wrapper scrolls horizontally
 // and, like the summary table's wrapper, is focusable for keyboard scrolling. Its overflow clips
 // whatever is drawn outside it, so the surface's focus ring is drawn inset there. The
@@ -499,14 +509,24 @@ const TICKER_ICON_CLASS =
   "h-3 w-3 shrink-0 text-slate-400 group-open/tickers:rotate-180 motion-safe:transition-transform motion-safe:duration-150 motion-safe:ease-out";
 const TICKER_LIST_CLASS =
   "mb-0 me-0 ms-auto mt-1 w-max max-w-64 whitespace-normal break-words p-0 text-start text-slate-400";
+// A floating panel is never wider than its chart's plot, the box Recharts keeps a tooltip in.
+// Recharts pins a panel that fits on neither side of the pointer to the plot's left edge, so a
+// wider one would run past the chart's right edge and, on a phone, past the screen. The plot is
+// the chart wrapper's width (`100cqi`) less the 4px left margin, the 1rem right margin and the
+// value axis: 4.75rem here, 3.5rem in `TOOLTIP_COMPACT_CLASS` (the scaled `Y_AXIS_WIDTH` and
+// `Y_AXIS_COMPACT_WIDTH`). The 12rem minimum yields to that cap. Inside it a row's value drops
+// beneath its name group, end-aligned, and text breaks rather than widen the panel, though a
+// row's day offset ("−1 d") stays whole. A panel that fits the plot is laid out as without the cap.
 const TOOLTIP_CLASS =
-  "flex min-w-[12rem] flex-col gap-1 rounded border border-slate-700 bg-slate-900 px-2.5 py-2 text-xs text-slate-300 shadow-lg";
+  "flex min-w-[min(12rem,calc(100cqi_-_5.75rem_-_4px))] max-w-[calc(100cqi_-_5.75rem_-_4px)] flex-col gap-1 rounded border border-slate-700 bg-slate-900 px-2.5 py-2 text-xs text-slate-300 shadow-lg [overflow-wrap:anywhere]";
+const TOOLTIP_COMPACT_CLASS =
+  "flex min-w-[min(12rem,calc(100cqi_-_4.5rem_-_4px))] max-w-[calc(100cqi_-_4.5rem_-_4px)] flex-col gap-1 rounded border border-slate-700 bg-slate-900 px-2.5 py-2 text-xs text-slate-300 shadow-lg [overflow-wrap:anywhere]";
 const TOOLTIP_TITLE_CLASS = "m-0 font-medium text-slate-100";
 const TOOLTIP_LIST_CLASS = "m-0 flex list-none flex-col gap-1 p-0";
-const TOOLTIP_ROW_CLASS = "flex items-center justify-between gap-3";
-const TOOLTIP_NAME_CLASS = "inline-flex items-center gap-1.5";
+const TOOLTIP_ROW_CLASS = "flex flex-wrap items-center justify-between gap-x-3";
+const TOOLTIP_NAME_CLASS = "inline-flex min-w-0 items-center gap-1.5";
 const TOOLTIP_META_CLASS = "text-slate-400";
-const TOOLTIP_VALUE_CLASS = "tabular-nums font-medium text-slate-100";
+const TOOLTIP_VALUE_CLASS = "ms-auto tabular-nums font-medium text-slate-100";
 // A marker row sits beneath its cycle's row: its glyph is centred in a slot as wide as the line
 // swatch above, so its text starts where the cycle's label does.
 const TOOLTIP_MARKER_ROW_CLASS = "flex items-center gap-1.5";
@@ -514,6 +534,74 @@ const TOOLTIP_MARKER_SLOT_CLASS = "flex w-5 shrink-0 justify-center";
 // The marker under the pointer leads the tooltip, set off from the day's rows by a rule.
 const TOOLTIP_HOVERED_MARKER_CLASS =
   "m-0 flex items-center gap-1.5 border-b border-slate-700 pb-1.5 font-medium text-slate-100";
+// While the charts scroll (a body narrower than their minimum width), a tooltip floating over the
+// plot is clipped by the chart wrapper's overflow: Recharts places it in the wide chart's
+// coordinates, and it is wider than the visible strip. Each chart's `<Tooltip>` then renders its
+// content through its `portal` prop into a readout directly beneath the wrapper, outside that
+// clip. Recharts positions nothing in a portal, so the readout sits in the section's flow, inside
+// the card. It takes no pointer events: React bubbles a portal's events to the chart, so pointer
+// moves on the readout would otherwise reach the chart's own handlers. The readout's only child is
+// Recharts' tooltip wrapper, whose sole inline style is `visibility`, hidden before any day is
+// inspected and after Escape; the readout then takes no space, so no blank gap is left in the flow.
+const READOUT_CLASS = "pointer-events-none [&:has(>[style*=hidden])]:hidden";
+
+/** The classes of a tooltip panel and its rows and marker lines, by where the panel is drawn. */
+interface TooltipClasses {
+  /** The panel. */
+  panel: string;
+  /** A series row: its name group, then its value. */
+  row: string;
+  /** A row's name group: its line swatch, its name and, on the main chart, its session. */
+  name: string;
+  /** A row's value. */
+  value: string;
+  /** The main chart's line naming the marker under the pointer. */
+  hoveredMarker: string;
+  /** A main-chart row naming a marker on the session of the row above. */
+  markerRow: string;
+  /** The slot holding a marker line's or marker row's glyph. */
+  markerSlot: string;
+}
+
+/** The tooltip floating over a chart that fits the body, beside the full-width value axis. */
+const FLOATING_TOOLTIP_CLASSES: TooltipClasses = {
+  panel: TOOLTIP_CLASS,
+  row: TOOLTIP_ROW_CLASS,
+  name: TOOLTIP_NAME_CLASS,
+  value: TOOLTIP_VALUE_CLASS,
+  hoveredMarker: TOOLTIP_HOVERED_MARKER_CLASS,
+  markerRow: TOOLTIP_MARKER_ROW_CLASS,
+  markerSlot: TOOLTIP_MARKER_SLOT_CLASS,
+};
+
+/** The floating tooltip beside the compact value axis, whose plot is wider by the difference. */
+const COMPACT_FLOATING_TOOLTIP_CLASSES: TooltipClasses = {
+  ...FLOATING_TOOLTIP_CLASSES,
+  panel: TOOLTIP_COMPACT_CLASS,
+};
+
+/**
+ * The tooltip drawn in a readout (see {@link READOUT_CLASS}). The panel spans the card without the
+ * floating panel's 12rem minimum, which a narrow card with a large text setting cannot hold, and
+ * without a shadow, as it covers nothing. Its text may break anywhere, so no word widens it past
+ * the card. A row's name group, a marker line and a marker row are each one run of text led by
+ * its swatch or glyph slot, wrapping across the panel's full width rather than in a column beside
+ * it, so each takes as few lines as it can; the swatch, the slot and the session are set off by
+ * the floating panel's 0.375rem gap, and the swatch and slot are centred on the text. A glyph's
+ * slot is only as wide as the glyph, since no column of swatches is there to align with, so a
+ * marker's first word stays beside its glyph on a narrow card. A row's value drops beneath its
+ * name group, end-aligned, when both do not fit one line.
+ */
+const READOUT_TOOLTIP_CLASSES: TooltipClasses = {
+  panel:
+    "flex min-w-0 flex-col gap-1 rounded border border-slate-700 bg-slate-900 px-2.5 py-2 text-xs text-slate-300 [overflow-wrap:anywhere]",
+  row: "flex flex-wrap items-center justify-between gap-x-3",
+  name: "min-w-0 [&>svg]:me-1.5 [&>svg]:inline-block [&>svg]:align-middle [&>span+span]:ms-1.5",
+  value: "ms-auto tabular-nums font-medium text-slate-100",
+  hoveredMarker: "m-0 min-w-0 border-b border-slate-700 pb-1.5 font-medium text-slate-100",
+  markerRow: "min-w-0",
+  markerSlot: "me-1.5 inline-flex align-middle",
+};
 
 const CHART_MARGIN = { top: 12, right: 16, bottom: 4, left: 4 };
 /**
@@ -1417,6 +1505,15 @@ function markerShape(
   };
 }
 
+/**
+ * A chart tooltip's classes: the readout's while it is drawn in the readout beneath a scrolling
+ * chart, else the floating panel's, capped at the plot width left by the value axis.
+ */
+function tooltipClasses(readout: boolean, compactYAxis: boolean): TooltipClasses {
+  if (readout) return READOUT_TOOLTIP_CLASSES;
+  return compactYAxis ? COMPACT_FLOATING_TOOLTIP_CLASSES : FLOATING_TOOLTIP_CLASSES;
+}
+
 interface CycleChartTooltipProps {
   active?: boolean;
   label?: string | number;
@@ -1424,6 +1521,8 @@ interface CycleChartTooltipProps {
   metric: Metric;
   /** The marker whose glyph is under the pointer, or null when the pointer is on none. */
   hoveredMarker: MarkerSpec | null;
+  /** The panel's and its rows' classes, by where it is drawn (see `tooltipClasses`). */
+  classes: TooltipClasses;
 }
 
 /** A main-chart tooltip row: a cycle's or projection's value, or a marker on the session above. */
@@ -1468,6 +1567,7 @@ function CycleChartTooltip({
   series,
   metric,
   hoveredMarker,
+  classes,
 }: CycleChartTooltipProps): ReactElement | null {
   const x = tooltipOffset(label);
   if (active !== true || x === null) return null;
@@ -1521,15 +1621,15 @@ function CycleChartTooltip({
   if (entries.length === 0 && hoveredMarker === null) return null;
 
   return (
-    <div className={TOOLTIP_CLASS}>
+    <div className={classes.panel}>
       <p className={TOOLTIP_TITLE_CLASS}>On or before day {formatOffset(x)} from event</p>
       {hoveredMarker !== null ? (
         <p
           data-testid="cycle-tooltip-hovered-marker"
           data-event-date={hoveredMarker.cycle.event_date}
-          className={TOOLTIP_HOVERED_MARKER_CLASS}
+          className={classes.hoveredMarker}
         >
-          <span className={TOOLTIP_MARKER_SLOT_CLASS}>
+          <span className={classes.markerSlot}>
             <svg
               viewBox="0 0 16 16"
               aria-hidden="true"
@@ -1550,9 +1650,9 @@ function CycleChartTooltip({
                 key={entry.key}
                 data-testid="cycle-tooltip-marker"
                 data-event-date={entry.eventDate}
-                className={TOOLTIP_MARKER_ROW_CLASS}
+                className={classes.markerRow}
               >
-                <span className={TOOLTIP_MARKER_SLOT_CLASS}>
+                <span className={classes.markerSlot}>
                   <svg
                     viewBox="0 0 16 16"
                     aria-hidden="true"
@@ -1570,9 +1670,9 @@ function CycleChartTooltip({
                 data-testid="cycle-tooltip-row"
                 data-event-date={entry.eventDate}
                 data-series={entry.row.kind}
-                className={TOOLTIP_ROW_CLASS}
+                className={classes.row}
               >
-                <span className={TOOLTIP_NAME_CLASS}>
+                <span className={classes.name}>
                   <LineSwatch
                     color={entry.color}
                     width={entry.width}
@@ -1583,10 +1683,10 @@ function CycleChartTooltip({
                     {entry.row.kind === "observed"
                       ? formatDate(entry.row.point.trade_date) + " \u00b7 "
                       : ""}
-                    {formatOffset(entry.row.x) + " d"}
+                    <span className={NOWRAP_CLASS}>{formatOffset(entry.row.x) + " d"}</span>
                   </span>
                 </span>
-                <span data-part="value" className={TOOLTIP_VALUE_CLASS}>
+                <span data-part="value" className={classes.value}>
                   {formatRowValue(entry.row, metric)}
                 </span>
               </li>
@@ -1602,16 +1702,23 @@ interface OverlayTooltipProps {
   active?: boolean;
   label?: string | number;
   rows: readonly OverlayRow[];
+  /** The panel's and its rows' classes, by where it is drawn (see `tooltipClasses`). */
+  classes: TooltipClasses;
 }
 
 /** Overlay-chart tooltip: the session at or before the hovered offset, in percentage points. */
-function OverlayTooltip({ active, label, rows }: OverlayTooltipProps): ReactElement | null {
+function OverlayTooltip({
+  active,
+  label,
+  rows,
+  classes,
+}: OverlayTooltipProps): ReactElement | null {
   const x = tooltipOffset(label);
   if (active !== true || x === null) return null;
   const row = rowAtOrBefore(rows, x);
   if (row === undefined) return null;
   return (
-    <div className={TOOLTIP_CLASS}>
+    <div className={classes.panel}>
       <p className={TOOLTIP_TITLE_CLASS}>
         {formatDate(row.point.trade_date)}{" "}
         <span className={TOOLTIP_META_CLASS}>({formatOffset(row.x)} d)</span>
@@ -1622,9 +1729,9 @@ function OverlayTooltip({ active, label, rows }: OverlayTooltipProps): ReactElem
             key={overlay.field}
             data-testid="cycle-overlay-tooltip-row"
             data-series={overlay.field}
-            className={TOOLTIP_ROW_CLASS}
+            className={classes.row}
           >
-            <span className={TOOLTIP_NAME_CLASS}>
+            <span className={classes.name}>
               <LineSwatch
                 color={overlay.color}
                 width={OVERLAY_STROKE_WIDTH}
@@ -1633,7 +1740,7 @@ function OverlayTooltip({ active, label, rows }: OverlayTooltipProps): ReactElem
               />
               <span>{overlay.label}</span>
             </span>
-            <span data-part="value" className={TOOLTIP_VALUE_CLASS}>
+            <span data-part="value" className={classes.value}>
               {formatDecimal(row.point[overlay.field], "pct")}
             </span>
           </li>
@@ -1907,6 +2014,12 @@ export function CycleBacktester({
   // The result body mounts only once data has loaded, so it is held in state, not a ref object.
   const [bodyElement, setBodyElement] = useState<HTMLDivElement | null>(null);
   const chartMetrics = useChartMetrics(bodyElement);
+  // Each chart's tooltip readout (see READOUT_CLASS), mounted only while the charts scroll, is
+  // held in state so that its `<Tooltip>` portals into it once it exists.
+  const [mainReadoutElement, setMainReadoutElement] = useState<HTMLDivElement | null>(null);
+  const [overlayReadoutElement, setOverlayReadoutElement] = useState<HTMLDivElement | null>(
+    null,
+  );
 
   const chipsLabelId = useId();
   const dateInputId = useId();
@@ -2211,16 +2324,18 @@ export function CycleBacktester({
               // A generic label already names the date; a stored one is followed by it.
               const shownDate = labelNamesDate(label, date) ? null : formatDate(date);
               return (
-                <li key={date}>
+                <li key={date} className={CHIP_ITEM_CLASS}>
                   <span
                     data-testid="cycle-event-chip"
                     data-event-date={date}
-                    className={CHIP_CLASS}
+                    className={EVENT_CHIP_CLASS}
                   >
-                    <span>{shownLabel}</span>
-                    {shownDate !== null ? (
-                      <span className={CHIP_DATE_CLASS}> {shownDate}</span>
-                    ) : null}
+                    <span className={CHIP_TEXT_CLASS}>
+                      <span>{shownLabel}</span>
+                      {shownDate !== null ? (
+                        <span className={CHIP_DATE_CLASS}> {shownDate}</span>
+                      ) : null}
+                    </span>
                     <button
                       type="button"
                       aria-label={
@@ -2343,6 +2458,16 @@ export function CycleBacktester({
    */
   const minChartWidth = plotInset + MIN_OFFSET_TICKS * offsetTickSpacing;
   const needsScroll = bodyWidth !== null && bodyWidth < minChartWidth;
+  // A scrolling chart's tooltip is drawn in its readout beneath the chart. Otherwise, and in the
+  // commit before the readout mounts, `portal` is null and Recharts floats it over the plot.
+  // A readout lies outside its chart and can be taller than the screen, so `active` keeps it on
+  // the last day inspected once the pointer leaves the chart: the pointer can move onto it and the
+  // page can be scrolled to read it. Escape still dismisses it until the next day is inspected.
+  // A floating tooltip leaves `active` unset and keeps following the pointer.
+  const mainTooltipPortal = needsScroll ? mainReadoutElement : null;
+  const overlayTooltipPortal = needsScroll ? overlayReadoutElement : null;
+  const mainTooltipClasses = tooltipClasses(mainTooltipPortal !== null, compactYAxis);
+  const overlayTooltipClasses = tooltipClasses(overlayTooltipPortal !== null, compactYAxis);
   const chartWidth = bodyWidth === null ? null : Math.max(bodyWidth, minChartWidth);
   const tickBudget =
     chartWidth === null
@@ -2449,6 +2574,8 @@ export function CycleBacktester({
                   isAnimationActive={false}
                   filterNull={false}
                   cursor={{ stroke: CHART_COLORS.muted }}
+                  portal={mainTooltipPortal}
+                  active={mainTooltipPortal !== null ? true : undefined}
                   content={(props) => (
                     <CycleChartTooltip
                       active={props.active}
@@ -2456,6 +2583,7 @@ export function CycleBacktester({
                       series={chartModel.series}
                       metric={metric}
                       hoveredMarker={hoveredMarker}
+                      classes={mainTooltipClasses}
                     />
                   )}
                 />
@@ -2527,6 +2655,9 @@ export function CycleBacktester({
             {noSessionsMessage("No observed or projected sessions", data)}
           </p>
         )}
+        {hasPlot && needsScroll ? (
+          <div ref={setMainReadoutElement} className={READOUT_CLASS} />
+        ) : null}
         <ul aria-label="Cycles" className={LEGEND_CLASS}>
           {chartModel.series.map((item) => (
             <li
@@ -2682,11 +2813,14 @@ export function CycleBacktester({
                     isAnimationActive={false}
                     filterNull={false}
                     cursor={{ stroke: CHART_COLORS.muted }}
+                    portal={overlayTooltipPortal}
+                    active={overlayTooltipPortal !== null ? true : undefined}
                     content={(props) => (
                       <OverlayTooltip
                         active={props.active}
                         label={props.label}
                         rows={overlayRows}
+                        classes={overlayTooltipClasses}
                       />
                     )}
                   />
@@ -2715,6 +2849,9 @@ export function CycleBacktester({
                 </LineChart>
               </ResponsiveContainer>
             </div>
+            {needsScroll ? (
+              <div ref={setOverlayReadoutElement} className={READOUT_CLASS} />
+            ) : null}
             <ul aria-label="Overlay series" className={LEGEND_CLASS}>
               {OVERLAY_SERIES.map((overlay) => (
                 <li key={overlay.field} className={LEGEND_ITEM_CLASS}>

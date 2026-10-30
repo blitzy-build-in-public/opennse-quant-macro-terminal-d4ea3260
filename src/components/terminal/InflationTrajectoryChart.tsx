@@ -89,6 +89,8 @@ const CHART_MARGIN = { top: 8, right: MONTH_TICK_WIDTH_PX / 2, bottom: 4, left: 
 // Chart width assumed until ResponsiveContainer reports the real one; it only decides which
 // months the first frame labels.
 const FALLBACK_CHART_WIDTH_PX = 480;
+// Fraction digits of a generated y-axis tick: the server's 2 dp for both rates.
+const RATE_TICK_PLACES = 2;
 
 // Every class below is a complete static string, never assembled from fragments, so Tailwind's
 // source scan and a host's `@source` directive or `content` glob find each one.
@@ -243,6 +245,24 @@ function monthTicks(rows: readonly ChartRow[], chartWidth: number): string[] {
 function formatMonthTick(value: unknown): string {
   if (typeof value === "string") return formatMonth(value);
   return typeof value === "number" ? String(value) : "";
+}
+
+/**
+ * Y-axis tick, in percentage points without the `%` that the axis title "Rate (%)" already
+ * carries: `8`, `2.5`, `−2`. A tick is a generated axis coordinate with no server string behind
+ * it, so it is written here as a plain decimal string, rounded to {@link RATE_TICK_PLACES} places
+ * with trailing fraction zeros and a bare `.` removed and never in exponent notation (`0.3` for
+ * `0.30000000000000004`), and then grouped and signed by `formatDecimal`, as the tooltip's exact
+ * rates are. A tick that is not a finite number has no label.
+ */
+function formatRateTick(value: unknown): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "";
+  // `toFixed` switches to exponent notation from 1e21; a float that large is integral, so BigInt
+  // prints all of its digits instead.
+  const fixed =
+    Math.abs(value) < 1e21 ? value.toFixed(RATE_TICK_PLACES) : BigInt(value).toString();
+  const text = fixed.replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+  return formatDecimal(text, "pct", { unit: false });
 }
 
 /** Narrows a Recharts tooltip entry's `payload`, typed `any` by Recharts, to a chart row. */
@@ -412,6 +432,7 @@ export function InflationTrajectoryChart(props: InflationTrajectoryChartProps): 
               }}
             />
             <YAxis
+              tickFormatter={formatRateTick}
               tick={AXIS_TICK}
               stroke={CHART_COLORS.axis}
               width={Y_AXIS_WIDTH_PX}
