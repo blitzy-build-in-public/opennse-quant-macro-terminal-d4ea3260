@@ -31,6 +31,7 @@ from opennse_terminal.config import TerminalSettings
 from opennse_terminal.ingestion import http as polite_http
 from opennse_terminal.ingestion.base import FetchFailed, RobotsDisallowed
 from opennse_terminal.ingestion.http import (
+    APPROVED_ORIGINS,
     ATTEMPT_DEADLINE_READ_TIMEOUTS,
     BACKOFF_CAP_SECONDS,
     MAX_REDIRECTS,
@@ -49,8 +50,10 @@ USER_AGENT = "OpenNSE-Terminal/0.1.0 (+mailto:tests@example.invalid)"
 
 CBK = "https://www.centralbank.go.ke"
 NSE = "https://www.nse.co.ke"
+# A host outside the approved origins, which only a client given other origins may request.
 OTHER = "https://other.example.net"
 CBK_ROBOTS = f"{CBK}/robots.txt"
+NSE_ROBOTS = f"{NSE}/robots.txt"
 OTHER_ROBOTS = f"{OTHER}/robots.txt"
 INFLATION_URL = f"{CBK}/inflation-rates/"
 BONDS_URL = f"{CBK}/bills-bonds/treasury-bonds/"
@@ -193,6 +196,35 @@ def make_client(
     return build
 
 
+@pytest.fixture
+def spacing_sleep(clock: FakeClock) -> FakeSleep:
+    """The per-host spacing waits of clients from ``make_backoff_client``, on the shared clock."""
+    return FakeSleep(clock)
+
+
+@pytest.fixture
+def make_backoff_client(
+    network: FakeNetwork,
+    clock: FakeClock,
+    sleep: FakeSleep,
+    spacing_sleep: FakeSleep,
+    make_settings: SettingsFactory,
+) -> ClientFactory:
+    """Builds a ``PoliteClient`` as ``make_client`` does, except that its per-host spacing (never
+    under 2.0 s) waits on ``spacing_sleep``, so ``sleep`` records the backoff waits alone. Both
+    advance the one fake clock, so requests stay spaced as they would on a real one."""
+
+    def build(**overrides: Any) -> PoliteClient:
+        return PoliteClient(
+            make_settings(**overrides),
+            transport=network.transport(),
+            sleep=sleep,
+            spacing=HostSpacing(clock=clock, sleep=spacing_sleep),
+        )
+
+    return build
+
+
 def assert_spaced(starts: list[float], interval: float = 2.0) -> None:
     for earlier, later in pairwise(starts):
         assert later - earlier >= interval
@@ -222,6 +254,7 @@ async def test_contract_constants() -> None:
     assert MAX_RESPONSE_BYTES == 25 * 1024 * 1024
     assert ATTEMPT_DEADLINE_READ_TIMEOUTS == 4
     assert ROBOTS_AGENT == "OpenNSE-Terminal"
+    assert frozenset({"https://www.centralbank.go.ke", "https://www.nse.co.ke"}) == APPROVED_ORIGINS
 
 
 async def test_user_agent_is_sent_on_robots_and_target_requests(
@@ -389,15 +422,15 @@ async def test_another_host_is_not_delayed_by_spacing(
     network: FakeNetwork, make_client: ClientFactory, sleep: FakeSleep
 ) -> None:
     network.robots(CBK)
-    network.robots(OTHER)
+    network.robots(NSE)
     network.router.get(INFLATION_URL).respond(200, text="a")
     async with make_client() as http:
         await http.fetch(INFLATION_URL)
         waits_before = len(sleep.delays)
-        await http.ensure_allowed(f"{OTHER}/files/report.csv")
+        await http.ensure_allowed(f"{NSE}/market-statistics/")
         assert len(sleep.delays) == waits_before
 
-    assert network.urls() == [CBK_ROBOTS, INFLATION_URL, OTHER_ROBOTS]
+    assert network.urls() == [CBK_ROBOTS, INFLATION_URL, NSE_ROBOTS]
     last_cbk, first_other = network.sent[1], network.sent[2]
     assert first_other.at - last_cbk.at < 2.0
 
@@ -592,7 +625,7 @@ async def test_transient_failure_is_retried_three_times_then_fails(
 
 async def test_success_on_the_third_attempt_returns_the_body(
     network: FakeNetwork,
-    make_client: ClientFactory,
+    make_backoff_client: ClientFactory,
     sleep: FakeSleep,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -605,7 +638,7 @@ async def test_success_on_the_third_attempt_returns_the_body(
         ]
     )
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        async with make_client(scraper_min_interval_seconds=0.0) as http:
+        async with make_backoff_client() as http:
             body = await http.get_bytes(CSV_URL)
 
     assert body == b"YEAR,MONTH\n"
@@ -619,14 +652,14 @@ async def test_success_on_the_third_attempt_returns_the_body(
 
 @pytest.mark.parametrize("status", [403, 404, 410, 501])
 async def test_non_retryable_status_fails_at_once_without_reading_the_body(
-    status: int, network: FakeNetwork, make_client: ClientFactory, sleep: FakeSleep
+    status: int, network: FakeNetwork, make_backoff_client: ClientFactory, sleep: FakeSleep
 ) -> None:
     network.robots(CBK)
     body = ChunkedBody(chunks=3)
     page = network.router.get(INFLATION_URL).mock(
         side_effect=lambda request: httpx.Response(status, content=body)
     )
-    async with make_client(scraper_min_interval_seconds=0.0) as http:
+    async with make_backoff_client() as http:
         with pytest.raises(FetchFailed) as caught:
             await http.fetch(INFLATION_URL)
 
@@ -642,7 +675,7 @@ async def test_configured_retry_count_bounds_the_attempts(
 ) -> None:
     network.robots(CBK)
     page = network.router.get(INFLATION_URL).respond(503)
-    async with make_client(scraper_max_retries=retries, scraper_min_interval_seconds=0.0) as http:
+    async with make_client(scraper_max_retries=retries) as http:
         with pytest.raises(FetchFailed) as caught:
             await http.fetch(INFLATION_URL)
 
@@ -728,12 +761,12 @@ async def test_backoff_from_the_sixth_retry_on_waits_the_60_s_cap(
 async def test_non_transient_transport_error_fails_without_retry(
     error: type[httpx.HTTPError],
     network: FakeNetwork,
-    make_client: ClientFactory,
+    make_backoff_client: ClientFactory,
     sleep: FakeSleep,
 ) -> None:
     network.robots(CBK)
     page = network.router.get(INFLATION_URL).mock(side_effect=error)
-    async with make_client(scraper_min_interval_seconds=0.0) as http:
+    async with make_backoff_client() as http:
         with pytest.raises(FetchFailed) as caught:
             await http.fetch(INFLATION_URL)
 
@@ -767,7 +800,7 @@ async def test_retry_after_sets_the_wait_before_the_retry(
     low: float,
     high: float,
     network: FakeNetwork,
-    make_client: ClientFactory,
+    make_backoff_client: ClientFactory,
     sleep: FakeSleep,
 ) -> None:
     network.robots(CBK)
@@ -777,7 +810,7 @@ async def test_retry_after_sets_the_wait_before_the_retry(
             httpx.Response(200, text="ok"),
         ]
     )
-    async with make_client(scraper_min_interval_seconds=0.0) as http:
+    async with make_backoff_client() as http:
         assert await http.get_text(INFLATION_URL) == "ok"
 
     assert page.call_count == 2
@@ -797,7 +830,7 @@ async def test_retry_after_http_date_waits_until_that_time(
     low: float,
     high: float,
     network: FakeNetwork,
-    make_client: ClientFactory,
+    make_backoff_client: ClientFactory,
     sleep: FakeSleep,
 ) -> None:
     network.robots(CBK)
@@ -808,7 +841,7 @@ async def test_retry_after_http_date_waits_until_that_time(
             httpx.Response(200, text="ok"),
         ]
     )
-    async with make_client(scraper_min_interval_seconds=0.0) as http:
+    async with make_backoff_client() as http:
         assert await http.get_text(INFLATION_URL) == "ok"
 
     assert len(sleep.delays) == 1
@@ -869,7 +902,7 @@ async def test_attempt_running_past_its_deadline_is_retried_then_fails(
     sent: list[str],
     deadlines_computed: list[float],
     network: FakeNetwork,
-    make_client: ClientFactory,
+    make_backoff_client: ClientFactory,
     sleep: FakeSleep,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -887,7 +920,7 @@ async def test_attempt_running_past_its_deadline_is_retried_then_fails(
     if stalled_url != CBK_ROBOTS:
         network.robots(CBK)
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        async with make_client(scraper_min_interval_seconds=0.0) as http:
+        async with make_backoff_client() as http:
             with pytest.raises(FetchFailed) as caught:
                 await http.fetch(INFLATION_URL)
 
@@ -907,7 +940,7 @@ async def test_attempt_running_past_its_deadline_is_retried_then_fails(
 
 async def test_cancelling_a_fetch_mid_attempt_propagates_without_retry(
     network: FakeNetwork,
-    make_client: ClientFactory,
+    make_backoff_client: ClientFactory,
     sleep: FakeSleep,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -921,7 +954,7 @@ async def test_cancelling_a_fetch_mid_attempt_propagates_without_retry(
 
     network.router.get(INFLATION_URL).mock(side_effect=stall)
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        async with make_client(scraper_min_interval_seconds=0.0) as http:
+        async with make_backoff_client() as http:
             fetching = asyncio.create_task(http.fetch(INFLATION_URL))
             await asyncio.wait_for(started.wait(), timeout=STALL_SECONDS)
             fetching.cancel()
@@ -1533,7 +1566,7 @@ async def test_unreachable_robots_txt_disallows_the_whole_origin(
     robots = network.router.get(CBK_ROBOTS).respond(status)
     page = network.router.get(INFLATION_URL).respond(200, text="never served")
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        async with make_client(scraper_min_interval_seconds=0.0) as http:
+        async with make_client() as http:
             with pytest.raises(RobotsDisallowed) as caught:
                 await http.fetch(INFLATION_URL)
             # The verdict is cached for the run: a second URL is refused without a new request.
@@ -1563,8 +1596,8 @@ async def test_unavailable_robots_txt_means_no_rules_apply(
 async def test_robots_txt_redirect_is_followed_and_its_rules_apply(
     network: FakeNetwork, make_client: ClientFactory
 ) -> None:
-    network.router.get(CBK_ROBOTS).respond(301, headers={"Location": OTHER_ROBOTS})
-    network.robots(OTHER, "User-agent: *\nDisallow: /statistics/\n")
+    network.router.get(CBK_ROBOTS).respond(301, headers={"Location": NSE_ROBOTS})
+    network.robots(NSE, "User-agent: *\nDisallow: /statistics/\n")
     page = network.router.get(RATES_PAGE_URL).respond(200, text="never served")
     async with make_client() as http:
         with pytest.raises(RobotsDisallowed):
@@ -1572,7 +1605,7 @@ async def test_robots_txt_redirect_is_followed_and_its_rules_apply(
 
     assert page.call_count == 0
     # The redirect target is a robots.txt itself, so it is not checked against another one.
-    assert network.urls() == [CBK_ROBOTS, OTHER_ROBOTS]
+    assert network.urls() == [CBK_ROBOTS, NSE_ROBOTS]
 
 
 async def test_robots_txt_network_failure_fails_the_fetch(
@@ -1580,7 +1613,7 @@ async def test_robots_txt_network_failure_fails_the_fetch(
 ) -> None:
     robots = network.router.get(CBK_ROBOTS).mock(side_effect=httpx.ConnectTimeout)
     page = network.router.get(INFLATION_URL).respond(200, text="never served")
-    async with make_client(scraper_min_interval_seconds=0.0) as http:
+    async with make_client() as http:
         with pytest.raises(FetchFailed) as caught:
             await http.fetch(INFLATION_URL)
 
@@ -1610,7 +1643,7 @@ async def test_robots_txt_status_granting_nothing_fails_the_fetch(
     network.router.get(CBK_ROBOTS).respond(status, headers=headers)
     page = network.router.get(INFLATION_URL).respond(200, text="never served")
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        async with make_client(scraper_min_interval_seconds=0.0) as http:
+        async with make_client() as http:
             with pytest.raises(FetchFailed) as caught:
                 await http.fetch(INFLATION_URL)
             # No allow-all verdict was kept for the origin, so a later check fails as well.
@@ -1910,6 +1943,20 @@ def hop(n: int) -> str:
     return f"{CBK}/hop/{n}"
 
 
+# URLs off the approved origins, by case: each is refused "origin_not_approved" before anything
+# is requested for it, its origin's robots.txt included.
+OFF_ORIGIN_URLS = {
+    "http-loopback": "http://127.0.0.1:8080/",
+    "http-metadata-address": "http://169.254.169.254/latest/meta-data/",
+    "https-metadata-address": "https://169.254.169.254/latest/meta-data/",
+    "https-ipv6-loopback": "https://[::1]/statistics/",
+    "foreign-https-host": f"{OTHER}/files/rates.csv",
+    "lookalike-host-suffix": "https://www.centralbank.go.ke.other.example.net/files/rates.csv",
+    "downgrade-to-http": "http://www.centralbank.go.ke/files/rates.csv",
+    "approved-host-on-another-port": "https://www.centralbank.go.ke:8443/files/rates.csv",
+}
+
+
 def mock_redirect_chain(network: FakeNetwork, redirects: int) -> respx.Route:
     """``hop(0)`` redirects to ``hop(1)`` and so on ``redirects`` times; returns the route of the
     last URL, which answers 200."""
@@ -1969,25 +2016,25 @@ async def test_cross_host_redirect_checks_the_other_hosts_robots_txt(
     network: FakeNetwork, make_client: ClientFactory
 ) -> None:
     network.robots(CBK)
-    other_robots = network.robots(OTHER, "User-agent: *\nDisallow: /private/\n")
-    mirror_url = f"{OTHER}/mirror/weekly_bulletin.pdf"
+    other_robots = network.robots(NSE, "User-agent: *\nDisallow: /private/\n")
+    mirror_url = f"{NSE}/mirror/weekly_bulletin.pdf"
     network.router.get(PDF_URL).respond(302, headers={"Location": mirror_url})
     network.router.get(mirror_url).respond(200, content=b"%PDF-1.7 bulletin")
     async with make_client() as http:
         assert await http.get_bytes(PDF_URL) == b"%PDF-1.7 bulletin"
 
     assert other_robots.call_count == 1
-    assert network.urls() == [CBK_ROBOTS, PDF_URL, OTHER_ROBOTS, mirror_url]
+    assert network.urls() == [CBK_ROBOTS, PDF_URL, NSE_ROBOTS, mirror_url]
     assert_spaced(network.starts(CBK_ROBOTS) + network.starts(PDF_URL))
-    assert_spaced(network.starts(OTHER_ROBOTS) + network.starts(mirror_url))
+    assert_spaced(network.starts(NSE_ROBOTS) + network.starts(mirror_url))
 
 
 async def test_cross_host_redirect_to_a_disallowed_url_is_not_requested(
     network: FakeNetwork, make_client: ClientFactory
 ) -> None:
     network.robots(CBK)
-    network.robots(OTHER, "User-agent: *\nDisallow: /private/\n")
-    blocked_url = f"{OTHER}/private/weekly_bulletin.pdf"
+    network.robots(NSE, "User-agent: *\nDisallow: /private/\n")
+    blocked_url = f"{NSE}/private/weekly_bulletin.pdf"
     network.router.get(PDF_URL).respond(302, headers={"Location": blocked_url})
     blocked = network.router.get(blocked_url).respond(200, content=b"%PDF-1.7")
     async with make_client() as http:
@@ -1997,7 +2044,7 @@ async def test_cross_host_redirect_to_a_disallowed_url_is_not_requested(
     assert caught.value.url == blocked_url
     assert caught.value.reason == "disallowed"
     assert blocked.call_count == 0
-    assert network.urls() == [CBK_ROBOTS, PDF_URL, OTHER_ROBOTS]
+    assert network.urls() == [CBK_ROBOTS, PDF_URL, NSE_ROBOTS]
 
 
 @pytest.mark.parametrize(
@@ -2027,28 +2074,35 @@ async def test_cross_host_redirect_to_a_disallowed_url_is_not_requested(
             "invalid_url",
             id="port-out-of-range",
         ),
+        *(
+            pytest.param({"Location": url}, "origin_not_approved", id=case)
+            for case, url in OFF_ORIGIN_URLS.items()
+        ),
     ],
 )
 async def test_unusable_redirect_fails_the_fetch(
     headers: dict[str, str],
     reason: str,
     network: FakeNetwork,
-    make_client: ClientFactory,
+    make_backoff_client: ClientFactory,
     sleep: FakeSleep,
+    spacing_sleep: FakeSleep,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     network.robots(CBK)
     network.router.get(INFLATION_URL).respond(302, headers=headers)
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        async with make_client(scraper_min_interval_seconds=0.0) as http:
+        async with make_backoff_client() as http:
             with pytest.raises(FetchFailed) as caught:
                 await http.fetch(INFLATION_URL)
 
     assert caught.value.reason == reason
     assert "SECRET" not in str(caught.value)
-    # Refused at once: one request, no retry, and the target never requested.
+    # Refused at once: one request, no retry, and the target (and its robots.txt) never
+    # requested; the one spacing wait is the page's, after robots.txt, none the target's.
     assert network.urls() == [CBK_ROBOTS, INFLATION_URL]
     assert sleep.delays == []
+    assert len(spacing_sleep.delays) == 1
     assert warnings_logged(caplog) == []
 
 
@@ -2058,20 +2112,25 @@ async def test_unusable_redirect_fails_the_fetch(
         pytest.param("data:text/plain,x", "unsupported_url", id="data"),
         pytest.param("javascript:alert(1)", "unsupported_url", id="javascript"),
         pytest.param("http://[::1", "invalid_redirect", id="unparseable"),
+        *(
+            pytest.param(url, "origin_not_approved", id=case)
+            for case, url in OFF_ORIGIN_URLS.items()
+        ),
     ],
 )
 async def test_robots_txt_redirect_to_an_unusable_location_fails_without_a_verdict(
     location: str,
     reason: str,
     network: FakeNetwork,
-    make_client: ClientFactory,
+    make_backoff_client: ClientFactory,
     sleep: FakeSleep,
+    spacing_sleep: FakeSleep,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     robots = network.router.get(CBK_ROBOTS).respond(302, headers={"Location": location})
     page = network.router.get(INFLATION_URL).respond(200, text="never served")
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        async with make_client(scraper_min_interval_seconds=0.0) as http:
+        async with make_backoff_client() as http:
             with pytest.raises(FetchFailed) as caught:
                 await http.fetch(INFLATION_URL)
             # No verdict was kept for the origin, so a later check asks again and fails again.
@@ -2081,7 +2140,11 @@ async def test_robots_txt_redirect_to_an_unusable_location_fails_without_a_verdi
     assert caught.value.reason == again.value.reason == reason
     assert robots.call_count == 2
     assert page.call_count == 0
+    # Neither the redirect target nor anything else beyond the robots.txt asked for is requested,
+    # and the one spacing wait is the second robots.txt request's, none the target's.
+    assert set(network.urls()) == {CBK_ROBOTS}
     assert sleep.delays == []
+    assert len(spacing_sleep.delays) == 1
     assert warnings_logged(caplog) == []
 
 
@@ -2140,9 +2203,20 @@ async def test_robots_txt_redirect_to_an_unusable_location_fails_without_a_verdi
             "ftp://www.centralbank.go.ke/rates.csv",
             id="ftp-with-userinfo",
         ),
+        # Userinfo is refused ahead of the origin check, so its reason names what it carries.
+        pytest.param(
+            "https://user:SECRET@other.example.net/rates.csv",
+            "url_has_userinfo",
+            f"{OTHER}/rates.csv",
+            id="userinfo-off-the-approved-origins",
+        ),
+        *(
+            pytest.param(url, "origin_not_approved", url, id=case)
+            for case, url in OFF_ORIGIN_URLS.items()
+        ),
     ],
 )
-async def test_urls_that_are_not_absolute_http_or_carry_userinfo_are_rejected_unsent(
+async def test_unusable_or_off_origin_urls_are_rejected_unsent(
     url: str, reason: str, described: str, network: FakeNetwork, make_client: ClientFactory
 ) -> None:
     async with make_client() as http:
@@ -2155,6 +2229,91 @@ async def test_urls_that_are_not_absolute_http_or_carry_userinfo_are_rejected_un
     assert caught.value.url == checked.value.url == described
     assert "SECRET" not in str(caught.value)
     assert network.sent == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param("https://WWW.CentralBank.GO.KE/inflation-rates/", id="host-in-upper-case"),
+        pytest.param("HTTPS://www.centralbank.go.ke/inflation-rates/", id="scheme-in-upper-case"),
+        pytest.param(f"{CBK}:443/inflation-rates/", id="explicit-default-port"),
+    ],
+)
+async def test_approved_origin_matches_whatever_its_case_and_on_an_explicit_default_port(
+    url: str, network: FakeNetwork, make_client: ClientFactory
+) -> None:
+    network.robots(CBK)
+    network.router.get(INFLATION_URL).respond(200, text="inflation")
+    async with make_client() as http:
+        assert await http.get_text(url) == "inflation"
+
+    assert network.urls() == [CBK_ROBOTS, INFLATION_URL]
+
+
+async def test_allowed_origins_replace_the_approved_origins(
+    network: FakeNetwork, clock: FakeClock, sleep: FakeSleep, make_settings: SettingsFactory
+) -> None:
+    idna_origin = "https://xn--bcher-kva.example"
+    network.robots(OTHER)
+    network.robots(idna_origin)
+    report_url = f"{OTHER}/files/report.csv"
+    network.router.get(report_url).respond(200, content=b"report")
+    client = PoliteClient(
+        make_settings(),
+        transport=network.transport(),
+        sleep=sleep,
+        clock=clock,
+        allowed_origins=[OTHER, "https://Bücher.Example"],
+    )
+    async with client as http:
+        assert await http.get_bytes(report_url) == b"report"
+        # An origin given by its Unicode name matches its ASCII (IDNA) form, and the reverse.
+        await http.ensure_allowed("https://bücher.example/statistics/")
+        # The default origins no longer apply.
+        with pytest.raises(FetchFailed) as caught:
+            await http.fetch(INFLATION_URL)
+
+    assert caught.value.reason == "origin_not_approved"
+    assert caught.value.url == INFLATION_URL
+    assert network.urls() == [OTHER_ROBOTS, report_url, f"{idna_origin}/robots.txt"]
+
+
+@pytest.mark.parametrize(
+    "origins",
+    [
+        pytest.param(["http://www.nse.co.ke"], id="plain-http"),
+        pytest.param(["www.nse.co.ke"], id="no-scheme"),
+        pytest.param(["https://"], id="no-host"),
+        pytest.param(["https://www.nse.co.ke/"], id="path"),
+        pytest.param(["https://www.nse.co.ke/market-statistics/"], id="longer-path"),
+        pytest.param(["https://www.nse.co.ke:443"], id="default-port"),
+        pytest.param(["https://www.nse.co.ke:8443"], id="other-port"),
+        pytest.param(["https://www.nse.co.ke?x=1"], id="query"),
+        pytest.param(["https://www.nse.co.ke#top"], id="fragment"),
+        pytest.param(["https://user:SECRET@www.nse.co.ke"], id="userinfo"),
+        pytest.param(["https://127.0.0.1"], id="ipv4-address"),
+        pytest.param(["https://2130706433"], id="ipv4-address-as-one-number"),
+        pytest.param(["https://[::1]"], id="ipv6-address"),
+        pytest.param(["https://xn--"], id="malformed-idna"),
+        pytest.param(["https://www..nse.co.ke"], id="empty-label"),
+        pytest.param([NSE, "https://www.nse.co.ke/"], id="one-malformed-among-valid"),
+        pytest.param([], id="none"),
+    ],
+)
+def test_malformed_allowed_origins_are_rejected_at_construction(
+    origins: list[str], make_settings: SettingsFactory
+) -> None:
+    with pytest.raises(ValueError, match="allowed") as caught:
+        PoliteClient(make_settings(), allowed_origins=origins)
+
+    assert "SECRET" not in str(caught.value)
+
+
+def test_one_origin_string_is_not_taken_for_a_collection_of_origins(
+    make_settings: SettingsFactory,
+) -> None:
+    with pytest.raises(TypeError, match="not one string"):
+        PoliteClient(make_settings(), allowed_origins=NSE)
 
 
 async def test_retries_and_failures_name_urls_without_userinfo_query_or_error_text(
@@ -2170,7 +2329,7 @@ async def test_retries_and_failures_name_urls_without_userinfo_query_or_error_te
     )
     network.router.get(f"{CBK}/moved/file.csv?token=SECRET").respond(404)
     with caplog.at_level(logging.DEBUG, logger=LOGGER):
-        async with make_client(scraper_min_interval_seconds=0.0) as http:
+        async with make_client() as http:
             with pytest.raises(FetchFailed) as caught:
                 await http.fetch(f"{CBK}/retry/file.csv?token=SECRET#SECRET")
 
@@ -2227,7 +2386,7 @@ async def test_library_records_of_own_requests_are_redacted_and_a_hosts_are_not(
     network.router.get(f"{CBK}/files/rates.csv?token=SECRET").respond(404)
     network.router.get(f"{CBK}/moved?api_key=SECRET").mock(side_effect=traced_redirect)
     with caplog.at_level(logging.DEBUG):
-        async with make_client(scraper_min_interval_seconds=0.0) as http:
+        async with make_client() as http:
             with pytest.raises(FetchFailed) as missing:
                 await http.fetch(f"{CBK}/files/rates.csv?token=SECRET#SECRET")
             with pytest.raises(FetchFailed) as refused:

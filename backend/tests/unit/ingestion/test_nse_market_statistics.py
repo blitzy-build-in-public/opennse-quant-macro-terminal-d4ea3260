@@ -1,8 +1,9 @@
 """Tests for the NSE market-statistics pipeline's pure stages and its browser adapter
 (``opennse_terminal.ingestion.nse.market_statistics``).
 
-Everything here runs without PostgreSQL, a browser or a network. The fixtures are reconstructed
-test fixtures for a 2026-10-27 session scenario, not live captures. Sector tables are parsed from
+Everything here but the one ``live`` test runs without PostgreSQL or a network, and all but one
+offline test without a browser. The fixtures are reconstructed test fixtures for a 2026-10-27
+session scenario, not live captures. Sector tables are parsed from
 ``fixtures/nse/sectors/<option value>.html``, each reproducing one sector's rendered table: real
 counter names and ISINs, with values reconstructed for the session as each file's header states.
 The page comes from ``fixtures/nse/page_shell.html``, a reconstruction of the page as the 07:30
@@ -16,6 +17,11 @@ place of ``async_playwright``: they emulate the page scripts it runs and serve t
 its navigation, retries, sector selection, render waits, spacing, failure mapping and cleanup are
 checked without launching a browser.
 
+One test runs the real fetcher in Playwright's Chromium, still offline: a page route serves the
+page and its sector tables from these fixtures, and a loopback UDP and TCP listener shows that
+nothing the page's script attempts (WebRTC, WebSocket, WebTransport, a fetch, an image, a frame,
+a script) reaches it. It is skipped when Chromium is not installed.
+
 The one ``live`` test renders the real public page, after its ``robots.txt`` check, and checks
 its layout only; it is skipped by default.
 
@@ -23,16 +29,20 @@ Expected values are literals from the fixtures, compared as exact ``Decimal`` an
 """
 
 import asyncio
+import contextlib
 import dataclasses
 import logging
-from collections.abc import Callable, Mapping, Sequence
+import socket
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import pytest
 from bs4 import BeautifulSoup
+from playwright.async_api import BrowserContext, Page, Route
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -1016,6 +1026,17 @@ the error it raises), then the error ``wait_for_selector`` raises, if any."""
 
 ADAPTER_LOGGER = "opennse_terminal.ingestion.nse.market_statistics"
 
+RESOLVER_RULES = "--host-resolver-rules=MAP www.nse.co.ke:443 www.nse.co.ke , MAP * ~NOTFOUND"
+"""The Chromium switch that confines the page's browser to its host: only that host on port 443
+resolves; that host on any other port, every other host and every IP literal do not."""
+
+WEBRTC_WITHOUT_UDP = "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
+"""The Chromium switch that denies WebRTC every UDP socket, since no proxy is configured: no STUN,
+no TURN over UDP, no host candidate and no connectivity check."""
+
+LAUNCH_ARGS = [RESOLVER_RULES, WEBRTC_WITHOUT_UDP]
+"""The switches the page's browser is launched with, in order."""
+
 SHELL_TABLE = '<table class="nsetable"></table>'
 """The page shell's own sector table, empty until the page renders a sector into it."""
 
@@ -1098,6 +1119,9 @@ class Scenario:
         picks: By option value, how each successive selection of it is answered; a selection
             beyond its list renders.
         navigation: The navigation attempts, in order; attempts beyond the list answer 200.
+        final_url: The URL every navigation response reports; the requested URL when ``None``.
+        requests: By call name, the requests the browser issues during each such call, announced
+            to the context's ``request`` listeners before the call answers, raises or blocks.
         raises: By call name, the error that call raises.
         hangs: By call name, a call that blocks until cancelled and then raises the given error
             or, for ``None``, lets the cancellation through.
@@ -1109,6 +1133,8 @@ class Scenario:
     page_html: str = "<html><body></body></html>"
     picks: dict[str, list[Pick]] = dataclasses.field(default_factory=dict)
     navigation: list[Navigation] = dataclasses.field(default_factory=list)
+    final_url: str | None = None
+    requests: dict[str, list["FakeRequest"]] = dataclasses.field(default_factory=dict)
     raises: dict[str, Exception] = dataclasses.field(default_factory=dict)
     hangs: dict[str, Exception | None] = dataclasses.field(default_factory=dict)
 
@@ -1124,6 +1150,7 @@ class BrowserDouble:
         self.log: list[Call] = []
         self.browsers: list[FakeBrowser] = []
         self.handles: list[FakeHandle] = []
+        self.routes: list[Callable[[FakeRoute], Awaitable[None]]] = []
         self._navigation = list(scenario.navigation)
         self._picks = {value: list(picks) for value, picks in scenario.picks.items()}
 
@@ -1136,8 +1163,14 @@ class BrowserDouble:
         self.log.append(("sleep", {"seconds": seconds}))
 
     async def call(self, name: str, **args: object) -> None:
-        """Record a call, then raise or block as the scenario scripts it."""
+        """Record a call, announce the requests the scenario issues during it, then raise or
+        block as the scenario scripts it."""
         self.log.append((name, args))
+        contexts = [context for browser in self.browsers for context in browser.contexts]
+        listeners = contexts[-1].listeners if contexts else []
+        for request in self.scenario.requests.get(name, []):
+            for listener in listeners:
+                listener(request)
         error = self.scenario.raises.get(name)
         if error is not None:
             raise error
@@ -1187,8 +1220,8 @@ class FakeChromium:
     def __init__(self, double: BrowserDouble) -> None:
         self._double = double
 
-    async def launch(self, *, headless: bool) -> "FakeBrowser":
-        await self._double.call("launch", headless=headless)
+    async def launch(self, *, headless: bool, args: Sequence[str]) -> "FakeBrowser":
+        await self._double.call("launch", headless=headless, args=list(args))
         browser = FakeBrowser(self._double)
         self._double.browsers.append(browser)
         return browser
@@ -1214,12 +1247,23 @@ class FakeBrowser:
 
 
 class FakeContext:
-    """A browser context: opens pages and records its closing."""
+    """A browser context: takes ``request`` listeners and a route handler, opens pages and
+    records its closing."""
 
     def __init__(self, double: BrowserDouble) -> None:
         self._double = double
         self.pages: list[FakePage] = []
+        self.listeners: list[Callable[[FakeRequest], None]] = []
         self.closed = False
+
+    def on(self, event: str, listener: Callable[["FakeRequest"], None]) -> None:
+        self._double.log.append(("context.on", {"event": event}))
+        if event == "request":
+            self.listeners.append(listener)
+
+    async def route(self, url: str, handler: Callable[["FakeRoute"], Awaitable[None]]) -> None:
+        await self._double.call("route", url=url)
+        self._double.routes.append(handler)
 
     async def new_page(self) -> "FakePage":
         await self._double.call("new_page")
@@ -1234,9 +1278,48 @@ class FakeContext:
 
 @dataclasses.dataclass(frozen=True)
 class FakeResponse:
-    """The navigation response; the adapter reads only its status."""
+    """The navigation response; the adapter reads its status and its final URL."""
 
     status: int
+    url: str
+
+
+@dataclasses.dataclass(frozen=True)
+class FakeRequest:
+    """A request the browser issues: its URL and, for a redirect hop, the request redirected."""
+
+    url: str
+    redirected_from: "FakeRequest | None" = None
+
+
+def hop(url: str, origin: str = NSE_MARKET_STATISTICS_URL) -> FakeRequest:
+    """The request for ``url`` that a redirect of ``origin`` makes the browser issue."""
+    return FakeRequest(url, redirected_from=FakeRequest(origin))
+
+
+class FakeRoute:
+    """A routed request: records whether the handler continued or aborted it.
+
+    Attributes:
+        request: The request being routed.
+        actions: ``("continue", None)`` or ``("abort", <error code>)``, in order.
+        error: Raised by either action, as once the page has closed.
+    """
+
+    def __init__(self, url: str, error: Exception | None = None) -> None:
+        self.request = FakeRequest(url)
+        self.actions: list[tuple[str, str | None]] = []
+        self.error = error
+
+    async def continue_(self) -> None:
+        self.actions.append(("continue", None))
+        if self.error is not None:
+            raise self.error
+
+    async def abort(self, error_code: str) -> None:
+        self.actions.append(("abort", error_code))
+        if self.error is not None:
+            raise self.error
 
 
 class FakeHandle:
@@ -1272,7 +1355,8 @@ class FakePage:
         response, self._selector_error = self._double.next_navigation()
         if isinstance(response, Exception):
             raise response
-        return None if response is None else FakeResponse(response)
+        final_url = self._scenario.final_url or url
+        return None if response is None else FakeResponse(response, final_url)
 
     async def wait_for_selector(self, selector: str, *, timeout: float) -> None:
         await self._double.call("wait_for_selector", selector=selector, timeout=timeout)
@@ -1464,9 +1548,16 @@ async def test_fetch_makes_exactly_the_expected_browser_calls_in_order(
             ("dispose", {}),
         ]
         before = scenario.rendered[slug].html
+    # The redirect listener and the route are in place before the page exists, so they see
+    # every request it makes.
     assert double.log == [
-        ("launch", {"headless": True}),
-        ("new_context", {"user_agent": build_user_agent(test_settings)}),
+        ("launch", {"headless": True, "args": LAUNCH_ARGS}),
+        (
+            "new_context",
+            {"user_agent": build_user_agent(test_settings), "service_workers": "block"},
+        ),
+        ("context.on", {"event": "request"}),
+        ("route", {"url": "**/*"}),
         ("new_page", {}),
         ("sleep", {"seconds": interval}),
         (
@@ -1507,10 +1598,10 @@ async def test_fetch_launches_chromium_headless_unless_told_otherwise(
 
     await fetcher.fetch(NSE_MARKET_STATISTICS_URL, user_agent=build_user_agent(test_settings))
 
-    assert double.calls("launch") == [{"headless": headless}]
+    assert double.calls("launch") == [{"headless": headless, "args": LAUNCH_ARGS}]
 
 
-async def test_each_fetch_gets_a_fresh_browser_and_context_with_only_the_user_agent(
+async def test_each_fetch_gets_a_fresh_browser_and_a_stateless_context_without_service_workers(
     install_browser: Callable[[Scenario], BrowserDouble],
     test_settings: TerminalSettings,
     page_shell: str,
@@ -1525,8 +1616,11 @@ async def test_each_fetch_gets_a_fresh_browser_and_context_with_only_the_user_ag
 
     assert first.sector_tables == second.sector_tables
     assert user_agent.startswith("OpenNSE-Terminal/")
-    # No storage state, cookies or other options: only the product's user agent.
-    assert double.calls("new_context") == [{"user_agent": user_agent}] * 2
+    # No storage state, cookies or other options: only the product's user agent, and service
+    # workers blocked so none can answer a request the route would refuse.
+    assert (
+        double.calls("new_context") == [{"user_agent": user_agent, "service_workers": "block"}] * 2
+    )
     first_browser, second_browser = double.browsers
     assert first_browser is not second_browser
     for browser in double.browsers:
@@ -1883,8 +1977,8 @@ async def test_only_a_changed_render_of_the_requested_sector_is_captured(
 
     assert captured.sector_tables[1] == SectorTable("bank", "Banking", sector_html["bank"])
     assert double.names() == [
-        *("launch", "new_context", "new_page", "sleep", "goto", "wait_for_selector"),
-        *("eval_on_selector_all", "evaluate"),
+        *("launch", "new_context", "context.on", "route", "new_page"),
+        *("sleep", "goto", "wait_for_selector", "eval_on_selector_all", "evaluate"),
         *bank_calls,
         *("content", "context.close", "browser.close"),
     ]
@@ -2035,6 +2129,7 @@ async def test_a_browser_that_cannot_launch_fails_the_fetch(
     ("call", "error", "reason"),
     [
         pytest.param("new_context", PlaywrightError("closed"), "browser_error: Error", id="ctx"),
+        pytest.param("route", PlaywrightError("closed"), "browser_error: Error", id="route"),
         pytest.param("new_page", PlaywrightError("crashed"), "browser_error: Error", id="page"),
         pytest.param(
             "eval_on_selector_all",
@@ -2143,6 +2238,672 @@ async def test_the_run_cap_ends_a_hung_session_as_run_timeout(
     assert names.count(call) == 1
     assert names[names.index(call) + 1 :] == ["context.close", "browser.close"]
     assert_closed(double)
+
+
+# --- Outbound request policy ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("url", "named"),
+    [
+        pytest.param(
+            "http://www.nse.co.ke/market-statistics/",
+            "http://www.nse.co.ke/market-statistics/",
+            id="http",
+        ),
+        pytest.param(
+            "https://www.nse.co.ke:8443/market-statistics/",
+            "https://www.nse.co.ke:8443/market-statistics/",
+            id="another-port",
+        ),
+        pytest.param(
+            "https://www.nse.co.ke:99999/market-statistics/",
+            "https://www.nse.co.ke:99999/market-statistics/",
+            id="port-out-of-range",
+        ),
+        pytest.param(
+            "https://user@www.nse.co.ke/market-statistics/",
+            "https://www.nse.co.ke/market-statistics/",
+            id="username",
+        ),
+        pytest.param(
+            "https://user:secret@www.nse.co.ke/market-statistics/",
+            "https://www.nse.co.ke/market-statistics/",
+            id="password",
+        ),
+        pytest.param(
+            "https://@www.nse.co.ke/market-statistics/",
+            "https://www.nse.co.ke/market-statistics/",
+            id="empty-userinfo",
+        ),
+        pytest.param(
+            "https://127.0.0.1/market-statistics/",
+            "https://127.0.0.1/market-statistics/",
+            id="ipv4-literal",
+        ),
+        pytest.param(
+            "https://[::1]/market-statistics/",
+            "https://[::1]/market-statistics/",
+            id="ipv6-literal",
+        ),
+        pytest.param(
+            "https://localhost/market-statistics/",
+            "https://localhost/market-statistics/",
+            id="single-label",
+        ),
+        pytest.param(
+            "https://www.nse.co.ke./market-statistics/",
+            "https://www.nse.co.ke./market-statistics/",
+            id="trailing-dot",
+        ),
+        pytest.param(
+            "https://www.nse.co.ke , MAP * 127.0.0.1/",
+            "https://www.nse.co.ke%20,%20map%20*%20127.0.0.1/",
+            id="resolver-rule-text-in-the-host",
+        ),
+        pytest.param("https://[::1/market-statistics/", "<invalid URL>", id="unparseable"),
+        pytest.param("https:///market-statistics/", "<https URL without a host>", id="no-host"),
+        pytest.param("wss://www.nse.co.ke/", "wss://www.nse.co.ke/", id="websocket"),
+        pytest.param("data:text/html,<p>x</p>", "<data URL without a host>", id="data"),
+    ],
+)
+async def test_a_url_that_is_not_https_on_a_named_host_is_refused_before_any_launch(
+    install_browser: Callable[[Scenario], BrowserDouble],
+    test_settings: TerminalSettings,
+    page_shell: str,
+    sector_html: Mapping[str, str],
+    url: str,
+    named: str,
+) -> None:
+    double = install_browser(fixture_scenario(page_shell, sector_html))
+    fetcher = MarketStatisticsFetcher(test_settings, sleep=double.sleep)
+
+    with pytest.raises(FetchFailed) as exc_info:
+        await fetcher.fetch(url, user_agent=build_user_agent(test_settings))
+
+    # Named as the polite client names a URL it refuses: without userinfo, query or fragment.
+    assert (exc_info.value.url, exc_info.value.reason) == (named, "unsupported_url")
+    assert "secret" not in str(exc_info.value)
+    assert double.log == []
+    assert double.browsers == []
+
+
+async def test_the_browser_resolves_only_the_urls_host_on_port_443_in_lower_case(
+    install_browser: Callable[[Scenario], BrowserDouble],
+    test_settings: TerminalSettings,
+    page_shell: str,
+    sector_html: Mapping[str, str],
+) -> None:
+    url = "https://WWW.NSE.CO.KE:443/market-statistics/"
+    double = install_browser(fixture_scenario(page_shell, sector_html, SLUGS[:2]))
+    fetcher = MarketStatisticsFetcher(test_settings, sleep=double.sleep)
+
+    captured = await fetcher.fetch(url, user_agent=build_user_agent(test_settings))
+
+    assert [table.option_value for table in captured.sector_tables] == list(SLUGS[:2])
+    assert double.calls("launch") == [{"headless": True, "args": LAUNCH_ARGS}]
+    assert [args["url"] for args in double.calls("goto")] == [url]
+
+
+@pytest.mark.parametrize(
+    ("url", "action", "logged"),
+    [
+        pytest.param(
+            "https://www.nse.co.ke/market-statistics/", ("continue", None), [], id="the-page"
+        ),
+        pytest.param(
+            "https://WWW.NSE.CO.KE/wp-content/themes/nse/js/table.js",
+            ("continue", None),
+            [],
+            id="upper-case-host",
+        ),
+        pytest.param(
+            "https://www.nse.co.ke/wp-admin/admin-ajax.php?action=sector&sector=bank",
+            ("continue", None),
+            [],
+            id="the-pages-own-request-with-a-query",
+        ),
+        pytest.param(
+            "https://www.nse.co.ke:443/market-statistics/",
+            ("continue", None),
+            [],
+            id="explicit-default-port",
+        ),
+        pytest.param(
+            "http://www.nse.co.ke/market-statistics/?token=SECRET",
+            ("abort", "blockedbyclient"),
+            ["refused a browser request to http://www.nse.co.ke/market-statistics/"],
+            id="http",
+        ),
+        pytest.param(
+            "https://www.nse.co.ke:8443/?token=SECRET",
+            ("abort", "blockedbyclient"),
+            ["refused a browser request to https://www.nse.co.ke:8443/"],
+            id="another-port",
+        ),
+        pytest.param(
+            "https://ir.nse.co.ke/?token=SECRET",
+            ("abort", "blockedbyclient"),
+            ["refused a browser request to https://ir.nse.co.ke/"],
+            id="another-host",
+        ),
+        pytest.param(
+            "https://user@www.nse.co.ke/?token=SECRET",
+            ("abort", "blockedbyclient"),
+            ["refused a browser request to https://www.nse.co.ke/"],
+            id="userinfo",
+        ),
+        pytest.param(
+            "http://127.0.0.1:8081/?token=SECRET",
+            ("abort", "blockedbyclient"),
+            ["refused a browser request to http://127.0.0.1:8081/"],
+            id="loopback",
+        ),
+        pytest.param(
+            "http://169.254.169.254/latest/meta-data/?token=SECRET",
+            ("abort", "blockedbyclient"),
+            ["refused a browser request to http://169.254.169.254/latest/meta-data/"],
+            id="link-local-metadata",
+        ),
+        pytest.param(
+            "https://www.googletagmanager.com/gtag/js?id=SECRET",
+            ("abort", "blockedbyclient"),
+            ["refused a browser request to https://www.googletagmanager.com/gtag/js"],
+            id="third-party-script",
+        ),
+    ],
+)
+async def test_the_route_lets_the_pages_origin_through_unchanged_and_aborts_every_other_request(
+    install_browser: Callable[[Scenario], BrowserDouble],
+    test_settings: TerminalSettings,
+    page_shell: str,
+    sector_html: Mapping[str, str],
+    caplog: pytest.LogCaptureFixture,
+    url: str,
+    action: tuple[str, str | None],
+    logged: list[str],
+) -> None:
+    double = install_browser(fixture_scenario(page_shell, sector_html, SLUGS[:2]))
+    await fetch_with(double, test_settings)
+    # The handler the fetch installed for every URL, driven with one more request.
+    (handler,) = double.routes
+    route = FakeRoute(url)
+    caplog.set_level(logging.DEBUG, logger=ADAPTER_LOGGER)
+
+    await handler(route)
+
+    # continue_() takes no overrides, so a request it lets through goes out unchanged.
+    assert route.actions == [action]
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == ADAPTER_LOGGER and record.levelno == logging.DEBUG
+    ] == logged
+    assert "SECRET" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("url", "action", "named"),
+    [
+        pytest.param(
+            "https://www.nse.co.ke/market-statistics/?sector=bank",
+            ("continue", None),
+            "https://www.nse.co.ke/market-statistics/",
+            id="continued",
+        ),
+        pytest.param(
+            "http://127.0.0.1:8081/?token=SECRET",
+            ("abort", "blockedbyclient"),
+            "http://127.0.0.1:8081/",
+            id="aborted",
+        ),
+    ],
+)
+async def test_a_request_whose_page_closes_while_it_is_routed_raises_nothing(
+    install_browser: Callable[[Scenario], BrowserDouble],
+    test_settings: TerminalSettings,
+    page_shell: str,
+    sector_html: Mapping[str, str],
+    caplog: pytest.LogCaptureFixture,
+    url: str,
+    action: tuple[str, str | None],
+    named: str,
+) -> None:
+    double = install_browser(fixture_scenario(page_shell, sector_html, SLUGS[:2]))
+    await fetch_with(double, test_settings)
+    (handler,) = double.routes
+    route = FakeRoute(url, error=PlaywrightError("Target page, context or browser has been closed"))
+    caplog.set_level(logging.DEBUG, logger=ADAPTER_LOGGER)
+
+    await handler(route)
+
+    assert route.actions == [action]
+    assert f"a browser request to {named} ended with its page (Error)" in caplog.messages
+    assert "SECRET" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("changes", "call", "refused"),
+    [
+        pytest.param(
+            {
+                "requests": {"goto": [hop("http://127.0.0.1:8081/nav?token=SECRET")]},
+                "navigation": [(PlaywrightError("net::ERR_NAME_NOT_RESOLVED"), None)],
+            },
+            "goto",
+            "http://127.0.0.1:8081/nav",
+            id="navigation-hop-to-loopback-that-fails-to-resolve-is-not-retried",
+        ),
+        pytest.param(
+            {
+                "requests": {"goto": [hop("http://169.254.169.254/latest/?token=SECRET")]},
+                "hangs": {"goto": None},
+            },
+            "goto",
+            "http://169.254.169.254/latest/",
+            id="navigation-hop-interrupts-the-navigation-at-once",
+        ),
+        pytest.param(
+            {
+                "requests": {"goto": [hop("http://www.nse.co.ke/market-statistics/?token=SECRET")]},
+                "final_url": "http://www.nse.co.ke/market-statistics/?token=SECRET",
+            },
+            "goto",
+            "http://www.nse.co.ke/market-statistics/",
+            id="navigation-hop-to-the-same-host-over-http",
+        ),
+        pytest.param(
+            {
+                "requests": {"goto": [hop("https://www.nse.co.ke:8443/?token=SECRET")]},
+                "final_url": "https://www.nse.co.ke:8443/?token=SECRET",
+            },
+            "goto",
+            "https://www.nse.co.ke:8443/",
+            id="navigation-hop-to-another-port",
+        ),
+        pytest.param(
+            {"final_url": "http://www.nse.co.ke/market-statistics/?token=SECRET"},
+            "goto",
+            "http://www.nse.co.ke/market-statistics/",
+            id="navigation-ending-off-the-origin-without-a-hop",
+        ),
+        pytest.param(
+            {
+                "requests": {
+                    "wait_for_selector": [
+                        hop(
+                            "http://169.254.169.254/latest/meta-data/?token=SECRET",
+                            "https://www.nse.co.ke/wp-content/themes/nse/js/table.js",
+                        )
+                    ]
+                }
+            },
+            "wait_for_selector",
+            "http://169.254.169.254/latest/meta-data/",
+            id="script-hop-while-the-page-loads",
+        ),
+        pytest.param(
+            {
+                "requests": {
+                    "wait_for_function": [
+                        hop("http://10.0.0.1/?token=SECRET", "https://www.nse.co.ke/wp-admin/")
+                    ]
+                },
+                "hangs": {"wait_for_function": None},
+            },
+            "wait_for_function",
+            "http://10.0.0.1/",
+            id="sector-request-hop-ends-the-render-wait-at-once",
+        ),
+        pytest.param(
+            {
+                "requests": {
+                    "wait_for_function": [
+                        hop("http://10.0.0.1/?token=SECRET", "https://www.nse.co.ke/wp-admin/")
+                    ]
+                },
+                "hangs": {
+                    "wait_for_function": PlaywrightError(
+                        "Target page, context or browser has been closed"
+                    )
+                },
+            },
+            "wait_for_function",
+            "http://10.0.0.1/",
+            id="interrupted-render-wait-surfacing-a-playwright-error",
+        ),
+        pytest.param(
+            {"requests": {"content": [hop("http://127.0.0.1:8081/?token=SECRET")]}},
+            "content",
+            "http://127.0.0.1:8081/",
+            id="hop-while-the-page-html-is-read-discards-the-capture",
+        ),
+    ],
+)
+async def test_a_redirect_off_the_origin_fails_the_fetch_at_once_and_closes_the_browser(
+    install_browser: Callable[[Scenario], BrowserDouble],
+    test_settings: TerminalSettings,
+    page_shell: str,
+    sector_html: Mapping[str, str],
+    caplog: pytest.LogCaptureFixture,
+    changes: dict[str, object],
+    call: str,
+    refused: str,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=ADAPTER_LOGGER)
+    scenario = fixture_scenario(page_shell, sector_html, ("agric", "bank"))
+    double = install_browser(dataclasses.replace(scenario, **changes))
+
+    with pytest.raises(FetchFailed) as exc_info:
+        # A guard so that a regression fails this test instead of hanging the suite.
+        async with asyncio.timeout(5):
+            await fetch_with(double, test_settings)
+
+    assert (exc_info.value.url, exc_info.value.reason) == (
+        NSE_MARKET_STATISTICS_URL,
+        "off_origin_redirect",
+    )
+    # What the interrupted step raised follows from the refusal, so the reason stands alone.
+    assert exc_info.value.__cause__ is None
+    # Never retried, and nothing follows the step that saw it but the cleanup.
+    names = double.names()
+    assert names.count("goto") == 1
+    assert names.count(call) == 1
+    assert names[names.index(call) + 1 :] == ["context.close", "browser.close"]
+    assert adapter_warnings(caplog) == [
+        f"the market-statistics page redirected off https://www.nse.co.ke to {refused}; "
+        "the fetch fails without retrying"
+    ]
+    assert "SECRET" not in caplog.text
+    assert_closed(double)
+
+
+@pytest.mark.parametrize(
+    "request_",
+    [
+        pytest.param(
+            hop(NSE_MARKET_STATISTICS_URL, "https://www.nse.co.ke/market-statistics"),
+            id="redirect-within-the-origin",
+        ),
+        pytest.param(
+            FakeRequest("https://www.googletagmanager.com/gtag/js?id=G-1"),
+            id="third-party-request-the-route-aborts",
+        ),
+        pytest.param(FakeRequest("http://127.0.0.1:8081/"), id="loopback-request-the-route-aborts"),
+    ],
+)
+async def test_requests_that_are_not_redirects_off_the_origin_leave_the_fetch_unaffected(
+    install_browser: Callable[[Scenario], BrowserDouble],
+    test_settings: TerminalSettings,
+    page_shell: str,
+    sector_html: Mapping[str, str],
+    caplog: pytest.LogCaptureFixture,
+    request_: FakeRequest,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=ADAPTER_LOGGER)
+    scenario = fixture_scenario(page_shell, sector_html, SLUGS[:2])
+    requests = {name: [request_] for name in ("goto", "wait_for_selector", "wait_for_function")}
+    double = install_browser(dataclasses.replace(scenario, requests=requests))
+
+    captured = await fetch_with(double, test_settings)
+
+    assert [table.option_value for table in captured.sector_tables] == list(SLUGS[:2])
+    assert adapter_warnings(caplog) == []
+    assert_closed(double)
+
+
+# --- Real Chromium, offline -------------------------------------------------------------------
+
+OUTBOUND_ATTEMPTS = (
+    "webrtc-offer",
+    "webrtc-remote-candidates",
+    "websocket",
+    "webtransport",
+    "fetch",
+    "img",
+    "iframe",
+    "script",
+)
+"""What the offline page's script attempts towards the loopback listener, by the names it records
+them under once each is under way."""
+
+OUTBOUND_PAGE_SCRIPT = r"""
+(() => {
+  const port = %PORT%;
+  const target = "127.0.0.1:" + port;
+  const record = document.getElementById("outbound-attempts");
+  const note = (key, name) => {
+    record.dataset[key] = ((record.dataset[key] || "") + " " + name).trim();
+  };
+  const attempt = (name, open) => {
+    try {
+      open();
+      note("attempted", name);
+    } catch (error) {
+      note("failed", name + ":" + error.name);
+    }
+  };
+  // Kept reachable until the browser closes, so nothing is collected before it could send.
+  window.outbound = [];
+  const webrtc = async () => {
+    const credentials = { username: "probe", credential: "probe" };
+    const offerer = new RTCPeerConnection({
+      iceServers: [
+        { urls: "stun:" + target },
+        { urls: "turn:" + target + "?transport=udp", ...credentials },
+        { urls: "turn:" + target + "?transport=tcp", ...credentials },
+        { urls: "turns:" + target + "?transport=tcp", ...credentials },
+      ],
+    });
+    window.outbound.push(offerer);
+    offerer.createDataChannel("probe");
+    const offer = await offerer.createOffer();
+    await offerer.setLocalDescription(offer);
+    note("attempted", "webrtc-offer");
+    const answerer = new RTCPeerConnection();
+    window.outbound.push(answerer);
+    await answerer.setRemoteDescription(offer);
+    await offerer.setRemoteDescription(await answerer.createAnswer());
+    // A remote peer whose only candidates are the listener, over UDP and over TCP.
+    for (const candidate of [
+      "candidate:1 1 udp 2122260223 127.0.0.1 " + port + " typ host",
+      "candidate:2 1 tcp 1518280447 127.0.0.1 " + port + " typ host tcptype passive",
+    ]) {
+      await offerer.addIceCandidate({ candidate, sdpMLineIndex: 0 });
+    }
+    note("attempted", "webrtc-remote-candidates");
+  };
+  const started = webrtc().catch((error) => note("failed", "webrtc:" + error.name));
+  attempt("websocket", () => window.outbound.push(new WebSocket("wss://" + target + "/")));
+  attempt("webtransport", () => {
+    const transport = new WebTransport("https://" + target + "/");
+    transport.ready.catch(() => {});
+    transport.closed.catch(() => {});
+    window.outbound.push(transport);
+  });
+  attempt("fetch", () => {
+    fetch("https://" + target + "/fetch").catch(() => {});
+  });
+  const insert = (tag, url) => {
+    const element = document.createElement(tag);
+    element.src = url;
+    document.body.append(element);
+  };
+  attempt("img", () => insert("img", "https://" + target + "/image.png"));
+  attempt("iframe", () => insert("iframe", "https://" + target + "/frame"));
+  attempt("script", () => insert("script", "https://" + target + "/script.js"));
+  // A sector renders only once every attempt is under way and WebRTC has had time to send, so
+  // whatever reaches the listener does so before the fetcher's capture ends.
+  const ready = started.then(() => new Promise((resolve) => setTimeout(resolve, 500)));
+  const select = document.getElementById("filtersectors");
+  select.addEventListener("change", async () => {
+    const value = select.value;
+    await ready;
+    const response = await fetch("/sectors/" + encodeURIComponent(value) + ".html");
+    const html = await response.text();
+    if (select.value === value) {
+      document.querySelector("table.nsetable").outerHTML = html;
+    }
+  });
+})();
+"""
+"""The offline page's own script: it attempts every transport towards ``127.0.0.1:%PORT%``,
+records each attempt in ``#outbound-attempts``, and renders the selected sector's table, fetched
+from the page's origin, on each change of ``#filtersectors``."""
+
+
+@dataclasses.dataclass(frozen=True)
+class LoopbackTraffic:
+    """What reached the loopback listener on :attr:`port`: the sender of every UDP datagram and
+    the peer of every TCP connection, in arrival order."""
+
+    port: int
+    datagrams: list[object]
+    connections: list[object]
+
+
+class DatagramRecorder(asyncio.DatagramProtocol):
+    """Records the sender of every datagram, and never answers."""
+
+    def __init__(self, senders: list[object]) -> None:
+        self._senders = senders
+
+    def datagram_received(self, data: bytes, addr: tuple[str | Any, int]) -> None:
+        self._senders.append(addr)
+
+
+@contextlib.asynccontextmanager
+async def loopback_listener() -> AsyncIterator[LoopbackTraffic]:
+    """A silent UDP and TCP listener on one ephemeral ``127.0.0.1`` port, recording whatever
+    reaches it until the block ends."""
+    loop = asyncio.get_running_loop()
+    datagrams: list[object] = []
+    connections: list[object] = []
+    for _ in range(20):
+        listening = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listening.bind(("127.0.0.1", 0))
+        port: int = listening.getsockname()[1]
+        try:
+            udp, _ = await loop.create_datagram_endpoint(
+                lambda: DatagramRecorder(datagrams), local_addr=("127.0.0.1", port)
+            )
+        except OSError:
+            # The TCP port is taken for UDP; another one is tried.
+            listening.close()
+            continue
+        break
+    else:
+        pytest.fail("no 127.0.0.1 port was free for both TCP and UDP")
+
+    async def accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        connections.append(writer.get_extra_info("peername"))
+        writer.close()
+
+    try:
+        tcp = await asyncio.start_server(accept, sock=listening)
+        try:
+            yield LoopbackTraffic(port, datagrams, connections)
+        finally:
+            tcp.close()
+            await tcp.wait_closed()
+    finally:
+        udp.close()
+
+
+async def test_the_real_browser_reaches_nothing_off_the_origin_and_captures_every_sector(
+    monkeypatch: pytest.MonkeyPatch,
+    test_settings: TerminalSettings,
+    page_shell: str,
+    sector_html: Mapping[str, str],
+) -> None:
+    """Run the production fetcher in Playwright's Chromium, offline, on a page whose script
+    tries to reach a loopback listener by every transport it has.
+
+    Only the page's origin is stood in for: a page route, added to each page the fetcher opens,
+    serves the page shell with that script, and every sector table, from the fixtures. A page
+    route takes precedence over the fetcher's context route, which still sees every other
+    request. The launch switches, context options, route, redirect listener and capture code are
+    the fetcher's own; only the spacing sleep is a no-op. Before it renders any sector, the
+    script attempts WebRTC (STUN and TURN over UDP, TCP and TLS to an IP literal, and a remote
+    peer whose candidates are the listener over UDP and TCP), a WebSocket, a WebTransport
+    session, a fetch, an image, a frame and a script, all to the listener. Skipped when
+    Chromium is not installed.
+    """
+    pytest.importorskip("playwright.async_api")
+    async with loopback_listener() as traffic:
+        script = OUTBOUND_PAGE_SCRIPT.replace("%PORT%", str(traffic.port))
+        served = {
+            urlsplit(NSE_MARKET_STATISTICS_URL).path: page_shell.replace(
+                "</body>",
+                f'<output id="outbound-attempts" hidden></output><script>{script}</script></body>',
+            )
+        }
+        for slug in SLUGS:
+            fragment = rendered_table(sector_html[slug])
+            # The table alone, as the page inserts it, without the fixture's header comment and
+            # marked with its sector, so the two adjacent sectors without data render different
+            # tables, as the fetcher's render wait requires.
+            served[f"/sectors/{slug}.html"] = fragment[fragment.index("<table") :].replace(
+                '<table class="nsetable"', f'<table class="nsetable" data-sector="{slug}"', 1
+            )
+
+        async def serve(route: Route) -> None:
+            body = served.get(urlsplit(route.request.url).path)
+            if body is None:
+                await route.fulfill(status=404, content_type="text/plain", body="")
+            else:
+                await route.fulfill(status=200, content_type="text/html; charset=utf-8", body=body)
+
+        open_page = BrowserContext.new_page
+
+        async def new_page_served_from_fixtures(self: BrowserContext) -> Page:
+            page = await open_page(self)
+            await page.route("https://www.nse.co.ke/**", serve)
+            return page
+
+        monkeypatch.setattr(BrowserContext, "new_page", new_page_served_from_fixtures)
+
+        async def no_wait(seconds: float) -> None:
+            return None
+
+        fetcher = MarketStatisticsFetcher(test_settings, sleep=no_wait)
+        try:
+            # A guard so that a regression fails this test instead of waiting out the run cap.
+            async with asyncio.timeout(60):
+                captured = await fetcher.fetch(
+                    NSE_MARKET_STATISTICS_URL, user_agent=build_user_agent(test_settings)
+                )
+        except FetchFailed as exc:
+            if exc.reason.startswith("browser_not_installed"):
+                pytest.skip(
+                    "Playwright's Chromium is not installed: "
+                    "run python -m playwright install --with-deps chromium"
+                )
+            raise
+        # The browser has closed; this lets whatever it sent last reach the listener.
+        await asyncio.sleep(1.5)
+
+    # Every attempt was under way before the first sector rendered.
+    attempts = BeautifulSoup(captured.page_html, "lxml").select_one("#outbound-attempts")
+    assert attempts is not None
+    assert sorted(str(attempts.get("data-attempted", "")).split()) == sorted(OUTBOUND_ATTEMPTS)
+    assert attempts.get("data-failed") is None
+    # None of them reached the listener, over UDP or TCP.
+    assert traffic.datagrams == []
+    assert traffic.connections == []
+    # And the capture is complete: every sector, in dropdown order, as the parser reads it.
+    assert [(table.option_value, table.option_label) for table in captured.sector_tables] == list(
+        zip(SLUGS, LABELS, strict=True)
+    )
+    parsed = parse_page(captured)
+    assert parsed.option_count == len(SLUGS)
+    assert parsed.option_labels == list(LABELS)
+    assert parsed.link_session == SESSION
+    assert parsed.quotes == [
+        item
+        for slug in SLUGS
+        for item in parse_sector_table(sector_html[slug], sector=LABEL_BY_SLUG[slug])
+    ]
 
 
 # --- Live source (skipped by default) ---------------------------------------------------------

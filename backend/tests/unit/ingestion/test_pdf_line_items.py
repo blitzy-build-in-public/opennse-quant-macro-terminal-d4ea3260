@@ -11,25 +11,33 @@ warnings), never recomputed with the code under test. Numbers are exact ``Decima
 throughout.
 
 Extraction cases call the in-process ``_extract``; rejections, the parse limits and a full round
-trip go through ``extract_line_items`` and its parser process. Nothing here touches the network,
-a database or the settings.
+trip go through ``extract_line_items`` and its parser process. The page-text reader of the CBK
+Weekly Bulletin is tested the same way: its page limit, failures after earlier pages and text cap
+through the in-process ``_iter_page_text``, and its streaming, early stop, document failures,
+limits and round trip through ``iter_page_text`` and the same parser process; a stand-in process
+writing fixed output checks how the caller validates that stream. Nothing here touches the
+network, a database or the settings.
 """
 
 import functools
 import hashlib
+import io
+import json
 import logging
+import re
 import subprocess
 import sys
 import threading
 import time
 import zlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from datetime import date
 from decimal import Decimal
 from typing import Any
 
 import pdfplumber
 import pytest
+from pdfminer.pdfpage import PDFPage
 from pdfplumber.utils.exceptions import PdfminerException
 
 from helpers.pdf_builder import Page, StatementRow, TextCell, build_pdf, statement_page, text_page
@@ -46,6 +54,7 @@ from opennse_terminal.ingestion.files.pdf_line_items import (
     PdfUnreadable,
     TooManyPages,
     extract_line_items,
+    iter_page_text,
 )
 
 # Column layouts. Columns sit at least 70 pt apart, wider than any value drawn under them, so
@@ -2047,8 +2056,8 @@ def _rc4(key: bytes, data: bytes) -> bytes:
     return bytes(out)
 
 
-def _empty_password_user_entry() -> bytes:
-    """The /U entry with which an empty user password opens the file (revision 2, 40-bit key)."""
+def _empty_password_key() -> bytes:
+    """The 40-bit file key an empty user password gives (revision 2)."""
     digest = hashlib.md5(
         _PASSWORD_PADDING
         + _OWNER_ENTRY
@@ -2056,7 +2065,12 @@ def _empty_password_user_entry() -> bytes:
         + _FILE_ID,
         usedforsecurity=False,
     ).digest()
-    return _rc4(digest[:5], _PASSWORD_PADDING)
+    return digest[:5]
+
+
+def _empty_password_user_entry() -> bytes:
+    """The /U entry with which an empty user password opens the file (revision 2, 40-bit key)."""
+    return _rc4(_empty_password_key(), _PASSWORD_PADDING)
 
 
 def _with_encrypt_dictionary(pdf_bytes: bytes, user_entry: bytes) -> bytes:
@@ -2664,3 +2678,555 @@ def test_parser_process_returns_the_in_process_result_exactly(
         "PDF line items: pages=3 found_or_derived=4 ambiguous=1 missing=1 detected_scale=1000 "
         "currency=KES status=partial"
     ]
+
+
+# ---------------------------------------------------------------------------------------------
+# The page-text reader (CBK Weekly Bulletin)
+# ---------------------------------------------------------------------------------------------
+
+STATEMENT_PAGE_TEXT = "Statement of profit or loss\nKShs '000\n2025 2024\nRevenue 1,234 1,100"
+"""``extract_text()`` of a page drawing ``STATEMENT_TEXT``, as pdfplumber lays it out."""
+FLATE = b"/Filter /FlateDecode "
+_BUILT_STREAM_RE = re.compile(rb"(\d+) 0 obj\n<< /Length (\d+) >>\nstream\n")
+
+
+def pages_pdf(*contents: bytes, page_entries: Mapping[int, bytes] | None = None) -> bytes:
+    """One page per content stream object body in ``contents``, page ``n`` drawing
+    ``contents[n - 1]`` and carrying ``page_entries[n]``, when given, among its own entries."""
+    entries = page_entries or {}
+    kids = b" ".join(b"%d 0 R" % (4 + 2 * index) for index in range(len(contents)))
+    objects = {
+        1: CATALOG,
+        2: b"<< /Type /Pages /Kids [" + kids + b"] /Count %d >>" % len(contents),
+        3: HELVETICA,
+    }
+    for index, content in enumerate(contents):
+        page = page_object(b"%d 0 R" % (5 + 2 * index))
+        objects[4 + 2 * index] = page.replace(
+            b"/Type /Page ", b"/Type /Page " + entries.get(index + 1, b""), 1
+        )
+        objects[5 + 2 * index] = content
+    return raw_pdf(objects)
+
+
+def encrypted_with_empty_password(pdf_bytes: bytes) -> bytes:
+    """``pdf_bytes`` (a ``build_pdf`` document) encrypted as the revision 2 standard security
+    handler does for an empty user password: each stream RC4-encrypted with its object's key,
+    which keeps every length and offset, and the /Encrypt dictionary added to the trailer."""
+    key = _empty_password_key()
+    encrypted = bytearray(pdf_bytes)
+    for match in _BUILT_STREAM_RE.finditer(pdf_bytes):
+        number, length, start = int(match[1]), int(match[2]), match.end()
+        object_key = hashlib.md5(
+            key + number.to_bytes(3, "little") + bytes(2), usedforsecurity=False
+        ).digest()[: len(key) + 5]
+        encrypted[start : start + length] = _rc4(object_key, pdf_bytes[start : start + length])
+    return _with_encrypt_dictionary(bytes(encrypted), _empty_password_user_entry())
+
+
+def counting_reader_pages(monkeypatch: pytest.MonkeyPatch) -> tuple[list[int], list[int]]:
+    """Count the pages pdfminer's generator yields to the reader and the pdfplumber pages the
+    reader builds, in that order; listing every page through pdfplumber is made to fail."""
+    forbid_whole_document_pages(monkeypatch)
+    listed: list[int] = []
+    constructed: list[int] = []
+    plumber_page = pdf_line_items._PlumberPage
+
+    class CountingPages:
+        @staticmethod
+        def create_pages(document: Any) -> Iterator[PDFPage]:
+            for page in PDFPage.create_pages(document):
+                listed.append(len(listed) + 1)
+                yield page
+
+    def counting_page(*args: object, **kwargs: object) -> object:
+        constructed.append(len(constructed) + 1)
+        return plumber_page(*args, **kwargs)
+
+    monkeypatch.setattr(pdf_line_items, "PDFPage", CountingPages)
+    monkeypatch.setattr(pdf_line_items, "_PlumberPage", counting_page)
+    return listed, constructed
+
+
+def read_through(pages: Iterator[str]) -> tuple[list[str], tuple[type[Exception], str] | None]:
+    """The pages a reader yields and how it ends: ``None`` once it is exhausted, otherwise the
+    type and message of the :class:`PdfEncrypted` or :class:`PdfUnreadable` it raises."""
+    read: list[str] = []
+    try:
+        for page in pages:
+            read.append(page)
+    except (PdfEncrypted, PdfUnreadable) as exc:
+        return read, (type(exc), str(exc))
+    return read, None
+
+
+def slow_content() -> bytes:
+    """4 MiB of "q Q" operators: within the content budget, but several seconds of pdfminer work
+    for the page that draws them."""
+    return stream_object(flate_of_repeated(b"q Q\n", 4 * MIB), FLATE)
+
+
+def stand_in_parser_process(
+    monkeypatch: pytest.MonkeyPatch, output: bytes, ending: str
+) -> list[subprocess.Popen[bytes]]:
+    """Start, in place of the parser process, one that reads its whole request, writes ``output``
+    and then runs the statement ``ending`` (an exit or a signal); return the processes started."""
+    started: list[subprocess.Popen[bytes]] = []
+    real_popen = subprocess.Popen
+    script = (
+        "import os, signal, sys\n"
+        "sys.stdin.buffer.read()\n"
+        f"sys.stdout.buffer.write({output!r})\n"
+        "sys.stdout.buffer.flush()\n"
+        f"{ending}\n"
+    )
+
+    def popen(_args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        process: subprocess.Popen[bytes] = real_popen([sys.executable, "-c", script], **kwargs)
+        started.append(process)
+        return process
+
+    monkeypatch.setattr(pdf_line_items.subprocess, "Popen", popen)
+    return started
+
+
+@pytest.mark.parametrize(
+    ("page_count", "max_pages"),
+    [(2000, 2), (3, 50)],
+    ids=["longer_than_the_limit", "shorter_than_the_limit"],
+)
+def test_page_text_lists_no_page_past_its_page_limit(
+    monkeypatch: pytest.MonkeyPatch, page_count: int, max_pages: int
+) -> None:
+    listed, constructed = counting_reader_pages(monkeypatch)
+    read = min(page_count, max_pages)
+
+    pages = list(pdf_line_items._iter_page_text(many_pages_pdf(page_count, b""), max_pages))
+
+    # A longer document is not an error: its first max_pages pages are read and no later one is
+    # listed.
+    assert pages == [STATEMENT_PAGE_TEXT] * read
+    assert listed == list(range(1, read + 1))
+    assert constructed == list(range(1, read + 1))
+
+
+@pytest.mark.parametrize(
+    ("second_page", "page_entries", "error"),
+    [
+        (
+            stream_object(STATEMENT_TEXT, b"/Filter /LZWDecode "),
+            None,
+            "page 2 of the PDF could not be parsed",
+        ),
+        (
+            stream_object(flate_of_repeated(b" ", 16 * MIB), FLATE),
+            None,
+            "page 2 has more than 8 MiB of decoded content",
+        ),
+        (
+            stream_object(STATEMENT_TEXT),
+            {2: b"/Rotate /x "},
+            "page 2 of the PDF could not be parsed",
+        ),
+    ],
+    ids=["undecodable_content", "over_the_content_budget", "cannot_be_listed"],
+)
+def test_page_text_fails_at_the_first_page_it_cannot_read_after_the_pages_before_it(
+    monkeypatch: pytest.MonkeyPatch,
+    second_page: bytes,
+    page_entries: Mapping[int, bytes] | None,
+    error: str,
+) -> None:
+    listed, _ = counting_reader_pages(monkeypatch)
+    statement = stream_object(STATEMENT_TEXT)
+    pages = pdf_line_items._iter_page_text(
+        pages_pdf(statement, second_page, statement, page_entries=page_entries), 50
+    )
+
+    assert next(pages) == STATEMENT_PAGE_TEXT
+    with pytest.raises(PdfUnreadable) as raised:
+        next(pages)
+
+    assert type(raised.value) is PdfUnreadable
+    assert str(raised.value) == error
+    # Nothing after the failing page is listed.
+    assert len(listed) <= 2
+
+
+def test_page_text_fails_at_the_page_that_passes_the_text_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limit = 2 * len(STATEMENT_PAGE_TEXT)
+    monkeypatch.setattr(pdf_line_items, "_MAX_PAGE_TEXT_CHARS", limit)
+
+    # Two pages reach the limit exactly and are yielded; the third would pass it.
+    assert read_through(pdf_line_items._iter_page_text(many_pages_pdf(3, b""), 50)) == (
+        [STATEMENT_PAGE_TEXT] * 2,
+        (PdfUnreadable, f"the PDF's text passes {limit} characters on page 3"),
+    )
+
+
+def test_page_text_reads_a_pdf_that_opens_with_an_empty_password() -> None:
+    pdf_bytes = encrypted_with_empty_password(build_pdf([text_page(["Revenue 1,234"])]))
+
+    assert list(pdf_line_items._iter_page_text(pdf_bytes, 50)) == ["Revenue 1,234"]
+    # The upload extractor still rejects the same file.
+    with pytest.raises(PdfEncrypted):
+        pdf_line_items._extract(pdf_bytes, ["revenue"], None, 400)
+
+
+@pytest.mark.parametrize(
+    ("pdf_bytes", "max_pages", "ending"),
+    [
+        (
+            build_pdf(
+                [
+                    text_page(["Borrowings \u2013 current 2,000", "Note (a) \u2014 \u20ac 5"]),
+                    Page(cells=()),
+                    text_page(["Revenue 1,234"]),
+                ]
+            ),
+            50,
+            None,
+        ),
+        (
+            pages_pdf(
+                stream_object(STATEMENT_TEXT),
+                stream_object(flate_of_repeated(b" ", 16 * MIB), FLATE),
+            ),
+            50,
+            (PdfUnreadable, "page 2 has more than 8 MiB of decoded content"),
+        ),
+        (encrypted_with_empty_password(build_pdf([text_page(["Revenue 1,234"])])), 50, None),
+        (many_pages_pdf(2000, b"/Count 2000"), 2, None),
+    ],
+    ids=["three_pages", "error_after_page_one", "empty_password", "longer_than_the_limit"],
+)
+def test_page_text_from_the_parser_process_is_the_in_process_reading(
+    pdf_bytes: bytes, max_pages: int, ending: tuple[type[Exception], str] | None
+) -> None:
+    in_process = read_through(pdf_line_items._iter_page_text(pdf_bytes, max_pages))
+
+    # Pages, their order and text, and a failure after them, all cross unchanged.
+    assert read_through(iter_page_text(pdf_bytes, max_pages=max_pages)) == in_process
+    assert in_process[0]
+    assert in_process[1] == ending
+
+
+def test_page_text_is_yielded_as_read_and_closing_the_reader_kills_its_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = recording_popen(monkeypatch)
+    # Pages 2 to 4 take the parser process several seconds each.
+    pdf_bytes = pages_pdf(stream_object(STATEMENT_TEXT), *[slow_content()] * 3)
+    began = time.monotonic()
+
+    pages = iter_page_text(pdf_bytes, max_pages=50)
+    first = next(pages)
+    pages.close()
+
+    assert first == STATEMENT_PAGE_TEXT
+    # Page 1 arrived while page 2 was being read, and closing stopped the reading there: the
+    # process was killed by a signal and reaped, and its helper thread joined.
+    assert time.monotonic() - began < 5
+    [process] = started
+    assert process.returncode is not None and process.returncode < 0
+    assert "pdf-parser-page-text" not in [thread.name for thread in threading.enumerate()]
+
+
+@pytest.mark.parametrize(
+    ("pdf_bytes", "error", "message"),
+    [
+        (
+            b"%PDF-1.4\nthis is not a PDF body\n",
+            PdfUnreadable,
+            "the PDF could not be parsed (PDFSyntaxError)",
+        ),
+        (
+            xref_stream_pdf(b"1 1 1", b"\x01\x00\x00", 999_999_999, b""),
+            PdfUnreadable,
+            XREF_STREAM_SHORT,
+        ),
+        (
+            raw_pdf({1: CATALOG, 2: b"<< /Type /Pages /Kids [] /Count 0 >>"}),
+            PdfUnreadable,
+            "the PDF has no pages",
+        ),
+        (
+            _with_encrypt_dictionary(build_pdf([text_page(["Revenue 1,234"])]), bytes(32)),
+            PdfEncrypted,
+            "the PDF is encrypted and does not open without a password",
+        ),
+    ],
+    ids=["unparseable", "cross_reference_stream_claiming_absent_objects", "no_pages", "password"],
+)
+def test_page_text_of_a_document_that_does_not_open_is_an_error(
+    pdf_bytes: bytes, error: type[ValueError], message: str
+) -> None:
+    started = time.monotonic()
+
+    with pytest.raises(error) as raised:
+        next(iter_page_text(pdf_bytes, max_pages=50))
+
+    assert type(raised.value) is error
+    assert str(raised.value) == message
+    assert time.monotonic() - started < 10
+
+
+def test_page_text_over_its_time_limit_is_a_timeout(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    sized: list[int] = []
+
+    def one_second(max_pages: int) -> float:
+        sized.append(max_pages)
+        return 1.0
+
+    monkeypatch.setattr(pdf_line_items, "_parse_time_limit", one_second)
+    started = recording_popen(monkeypatch)
+    # 4 MiB of "q Q" is within the content budget but takes pdfminer several seconds.
+    pdf_bytes = flood_pdf("content_stream", b"q Q\n", 4 * MIB)
+    began = time.monotonic()
+
+    with (
+        caplog.at_level(logging.WARNING, logger="opennse_terminal.ingestion.files.pdf_line_items"),
+        pytest.raises(PdfParseTimeout) as raised,
+    ):
+        list(iter_page_text(pdf_bytes, max_pages=50))
+
+    assert raised.value.time_limit == 1.0
+    assert time.monotonic() - began < 5
+    assert sized == [50]
+    assert caplog.messages == ["PDF parse stopped at the time limit of 1 seconds"]
+    [process] = started
+    assert process.returncode is not None and process.returncode < 0
+
+
+def test_page_text_cancel_kills_the_running_parser_process_promptly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The flood takes the parser process about 8 seconds; the event is set half a second into it.
+    pdf_bytes = flood_pdf("content_stream", b"q Q\n", 4 * MIB)
+    started = recording_popen(monkeypatch)
+    cancel = threading.Event()
+    cancelled_at: list[float] = []
+
+    def cancel_while_reading() -> None:
+        deadline = time.monotonic() + 10
+        while not started and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.5)
+        cancelled_at.append(time.monotonic())
+        cancel.set()
+
+    canceller = threading.Thread(target=cancel_while_reading)
+    canceller.start()
+    try:
+        with pytest.raises(ParseCancelledError):
+            list(iter_page_text(pdf_bytes, max_pages=50, cancel=cancel))
+        stopped_at = time.monotonic()
+    finally:
+        canceller.join()
+
+    assert stopped_at - cancelled_at[0] < 2
+    [process] = started
+    assert process.returncode is not None and process.returncode < 0
+
+
+def test_page_text_with_cancel_set_starts_no_parser_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = recording_popen(monkeypatch)
+    cancel = threading.Event()
+    cancel.set()
+
+    with pytest.raises(ParseCancelledError):
+        next(iter_page_text(build_pdf([text_page(["Revenue 1,234"])]), max_pages=50, cancel=cancel))
+
+    assert started == []
+
+
+def test_page_text_page_limit_below_one_is_a_value_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    started = recording_popen(monkeypatch)
+
+    # Raised by the call itself, before any page is asked for.
+    with pytest.raises(ValueError, match="max_pages must be at least 1, got 0") as raised:
+        iter_page_text(build_pdf([text_page(["Revenue 1,234"])]), max_pages=0)
+
+    assert type(raised.value) is ValueError
+    assert started == []
+
+
+MALFORMED = "the PDF parser process sent a malformed reply"
+END_RECORD = b'{"end":true}\n'
+EXIT = "sys.exit(0)"
+CONTENT_BUDGET_ERROR = (
+    json.dumps(
+        pdf_line_items._failure_reply(
+            PdfUnreadable("page 2 has more than 8 MiB of decoded content"), 1 << 30
+        )
+    ).encode("ascii")
+    + b"\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("output", "ending", "max_pages", "limits", "pages", "error", "message"),
+    [
+        (b"not json\n", EXIT, 2, {}, [], RuntimeError, MALFORMED),
+        (b'{"page":1}\n' + END_RECORD, EXIT, 2, {}, [], RuntimeError, MALFORMED),
+        (b'{"page":"a","end":true}\n', EXIT, 2, {}, [], RuntimeError, MALFORMED),
+        (b'{"end":1}\n', EXIT, 2, {}, [], RuntimeError, MALFORMED),
+        (b'{"pages":["a"]}\n', EXIT, 2, {}, [], RuntimeError, MALFORMED),
+        (
+            b'{"error":{"kind":"unknown","type":"X","message":"m","page_count":null,'
+            b'"max_pages":null}}\n',
+            EXIT,
+            2,
+            {},
+            [],
+            RuntimeError,
+            MALFORMED,
+        ),
+        (b'{"page":"a"}\n{"page":"b"}\n' + END_RECORD, EXIT, 1, {}, ["a"], RuntimeError, MALFORMED),
+        (
+            b'{"page":"ab"}\n{"page":"cd"}\n' + END_RECORD,
+            EXIT,
+            2,
+            {"_MAX_PAGE_TEXT_CHARS": 3},
+            ["ab"],
+            RuntimeError,
+            MALFORMED,
+        ),
+        (
+            b'{"page":"' + b"a" * 64 + b'"}\n' + END_RECORD,
+            EXIT,
+            2,
+            {"_page_text_output_limit": lambda _max_pages: 32},
+            [],
+            RuntimeError,
+            MALFORMED,
+        ),
+        (b'{"page":"a"}\n', EXIT, 2, {}, ["a"], RuntimeError, MALFORMED),
+        (b'{"page":"a"}\n{"pa', EXIT, 2, {}, ["a"], RuntimeError, MALFORMED),
+        (
+            b'{"page":"a"}\n',
+            "sys.exit(3)",
+            2,
+            {},
+            ["a"],
+            RuntimeError,
+            "the PDF parser process exited with status 3",
+        ),
+        (
+            b'{"page":"a"}\n',
+            "os.kill(os.getpid(), signal.SIGKILL)",
+            2,
+            {},
+            ["a"],
+            PdfUnreadable,
+            "the PDF could not be parsed within 20.8 seconds and 1024 MiB of memory",
+        ),
+        (
+            b'{"page":"a"}\n' + CONTENT_BUDGET_ERROR,
+            EXIT,
+            2,
+            {},
+            ["a"],
+            PdfUnreadable,
+            "page 2 has more than 8 MiB of decoded content",
+        ),
+    ],
+    ids=[
+        "not_json",
+        "page_not_text",
+        "two_fields",
+        "end_not_true",
+        "unknown_record",
+        "unknown_error_kind",
+        "more_pages_than_read",
+        "more_text_than_the_limit",
+        "longer_than_any_valid_output",
+        "no_end_record",
+        "ends_mid_line",
+        "nonzero_exit_before_the_end_record",
+        "killed_by_a_signal_before_the_end_record",
+        "error_record_after_a_page",
+    ],
+)
+def test_page_text_stream_outside_the_reader_contract_fails_after_the_pages_before_it(
+    monkeypatch: pytest.MonkeyPatch,
+    output: bytes,
+    ending: str,
+    max_pages: int,
+    limits: Mapping[str, object],
+    pages: list[str],
+    error: type[Exception],
+    message: str,
+) -> None:
+    for name, value in limits.items():
+        monkeypatch.setattr(pdf_line_items, name, value)
+    started = stand_in_parser_process(monkeypatch, output, ending)
+    read: list[str] = []
+
+    with pytest.raises(error) as raised:
+        for page in iter_page_text(build_pdf([text_page(["Revenue 1,234"])]), max_pages=max_pages):
+            read.append(page)
+
+    assert type(raised.value) is error
+    assert str(raised.value) == message
+    assert read == pages
+    [process] = started
+    assert process.returncode is not None
+
+
+def test_page_text_the_caller_cannot_trust_is_a_server_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The parser process imports this module afresh, with the real text limit, so its second
+    # statement page passes the limit lowered here in the caller only.
+    monkeypatch.setattr(pdf_line_items, "_MAX_PAGE_TEXT_CHARS", len(STATEMENT_PAGE_TEXT))
+    read: list[str] = []
+
+    with pytest.raises(RuntimeError, match=MALFORMED):
+        for page in iter_page_text(many_pages_pdf(2, b""), max_pages=50):
+            read.append(page)
+
+    assert read == [STATEMENT_PAGE_TEXT]
+
+
+@pytest.mark.parametrize(
+    ("task", "items", "period_end_date"),
+    [
+        (None, ["revenue", "ebitda"], date(2025, 12, 31)),
+        ("line_items", ["revenue", "ebitda"], date(2025, 12, 31)),
+        ("page_text", [], None),
+    ],
+    ids=["no_task_from_an_earlier_server", "line_items", "page_text"],
+)
+def test_parse_request_header_names_its_task(
+    task: str | None, items: list[str], period_end_date: date | None
+) -> None:
+    # A header without a task is what a server started before page_text existed writes: a
+    # package upgraded under that server must still serve its uploads.
+    pdf_bytes = build_pdf([text_page(["Revenue 1,234"])])
+    header: dict[str, object] = {
+        "max_pages": 50,
+        "length": len(pdf_bytes),
+        "time_limit": 40.0,
+        "memory_limit": 1 << 30,
+    }
+    if task != "page_text":
+        header |= {"items": ["revenue", "ebitda"], "period_end_date": "2025-12-31"}
+    if task is not None:
+        header["task"] = task
+    stream = io.BytesIO(json.dumps(header).encode("ascii") + b"\n" + pdf_bytes)
+
+    request = pdf_line_items._read_request(stream)
+
+    assert (request.task, request.items, request.period_end_date) == (
+        task or "line_items",
+        items,
+        period_end_date,
+    )
+    assert (request.pdf_bytes, request.max_pages) == (pdf_bytes, 50)

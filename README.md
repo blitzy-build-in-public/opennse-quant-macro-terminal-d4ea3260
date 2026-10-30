@@ -616,7 +616,7 @@ which pytest reads only from the process environment (see the note after the tab
 | `TERMINAL_TIMEZONE` | `Africa/Nairobi` | Exchange calendar and scheduler timezone (IANA name) |
 | `TERMINAL_FUNDAMENTALS_LAG_DAYS` | `90` | Days after `period_end_date` before a fundamentals row is treated as published |
 | `TERMINAL_SCRAPER_CONTACT` | `ops@example.invalid` | Contact address in the scrapers' user agent; set a real address, `local@domain` in visible ASCII with no spaces or control characters |
-| `TERMINAL_SCRAPER_MIN_INTERVAL_SECONDS` | `2.0` | Minimum spacing between requests to the same host |
+| `TERMINAL_SCRAPER_MIN_INTERVAL_SECONDS` | `2.0` | Minimum spacing between requests to the same host, in seconds; at least 2.0, the politeness minimum, so a lower value is rejected at load |
 | `TERMINAL_SCRAPER_TIMEOUT_SECONDS` | `30` | Read timeout per request (the connect timeout is fixed at 10 s) |
 | `TERMINAL_SCRAPER_MAX_RETRIES` | `3` | Retries on timeouts and HTTP 429, 500, 502, 503 and 504 |
 | `TERMINAL_PDF_MAX_BYTES` | `20971520` | Per-file PDF upload limit (20 MiB), at most 1073741824 (1 GiB); the whole request may carry 1 MiB more |
@@ -667,9 +667,16 @@ Compliance:
 - **CBK attribution.** CBK data is attributed "Source: Central Bank of Kenya", as its files state.
 - **Polite scraping.** Scrapers identify themselves as
   `OpenNSE-Terminal/<version> (+mailto:<TERMINAL_SCRAPER_CONTACT>)`, check `robots.txt` before every
-  URL, space requests to each host 2 s apart by default (`TERMINAL_SCRAPER_MIN_INTERVAL_SECONDS`),
-  retry with exponential backoff that honours `Retry-After`, follow at most 5 redirects, abort
-  responses above 25 MB, and keep no cookies or browser state between runs.
+  URL, space requests to each host at least 2 s apart (`TERMINAL_SCRAPER_MIN_INTERVAL_SECONDS` can
+  raise the spacing but not lower it), retry with exponential backoff that honours `Retry-After`,
+  follow at most 5 redirects, abort responses above 25 MB, and keep no cookies or browser state
+  between runs.
+- **Approved origins.** Fetches, their redirects and `robots.txt` requests go only to the approved
+  HTTPS origins `https://www.centralbank.go.ke` and `https://www.nse.co.ke`, on the default port:
+  a URL or redirect to any other host, an IP address, plain HTTP or another port is refused
+  before it is requested, and the run ends `failed` (logged as
+  `fetch_failed:origin_not_approved`). The NSE browser session requests nothing outside
+  `https://www.nse.co.ke`.
 
 Known limitations:
 

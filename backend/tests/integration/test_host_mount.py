@@ -3523,11 +3523,15 @@ async def test_failed_round_trip_answers_coded_503_and_logs_only_the_type_name(
 # Settings: ``TerminalSettings`` (``opennse_terminal.config``) duration and PDF limit bounds, repr
 #
 # ``scraper_min_interval_seconds`` feeds ``asyncio.sleep`` and ``scraper_timeout_seconds`` feeds
-# ``httpx.Timeout`` in the polite client, so both must load as finite numbers: zero spacing is
-# allowed, the timeout must be positive, and neither has an upper bound. ``pdf_max_bytes`` is at
-# most 1 GiB, the parser process's memory limit, which also keeps the upload's file read inside
-# the index range; ``pdf_max_concurrency`` is at most 32, so admitted parses never hold every
-# worker thread of the API process. A larger value is rejected at load, naming the field.
+# ``httpx.Timeout`` in the polite client, so both must load as finite numbers: the spacing is at
+# least 2.0 s, the scrapers' politeness minimum between requests to one host, the timeout must be
+# positive, and neither has an upper bound. ``pdf_max_bytes`` is at most 1 GiB, the parser
+# process's memory limit, which also keeps the upload's file read inside the index range.
+# ``pdf_max_concurrency`` caps the parses one mounted router admits at once, each holding a worker
+# thread, and is at most 32, below the 40 tokens of anyio's default thread pool. That bounds one
+# router's admitted parses; it does not guarantee free threads across several mounts, each
+# counting its own admissions, or under a host's own thread limit. A value above either PDF bound
+# is rejected at load, naming the field.
 # ``repr()`` and ``str()`` must leave out ``database_url``, which carries the database password.
 # Every case runs through keyword arguments and through the ``TERMINAL_*`` environment variables,
 # with ``_env_file=None`` so the checkout's ``.env`` is never read. Offline and synchronous: no
@@ -3592,8 +3596,8 @@ def test_non_finite_duration_is_rejected(
 @pytest.mark.parametrize(
     ("field", "raw", "expected"),
     [
-        (INTERVAL, "0", 0.0),
-        (INTERVAL, "0.5", 0.5),
+        (INTERVAL, "2", 2.0),
+        (INTERVAL, "2.5", 2.5),
         (INTERVAL, LARGEST_FINITE, sys.float_info.max),
         (TIMEOUT, "0.001", 0.001),
         (TIMEOUT, LARGEST_FINITE, sys.float_info.max),
@@ -3612,6 +3616,9 @@ def test_finite_duration_in_range_is_accepted(
 @pytest.mark.parametrize(
     ("field", "raw", "error_type"),
     [
+        (INTERVAL, "1.999", "greater_than_equal"),
+        (INTERVAL, "0.5", "greater_than_equal"),
+        (INTERVAL, "0", "greater_than_equal"),
         (INTERVAL, "-0.001", "greater_than_equal"),
         (INTERVAL, "-1", "greater_than_equal"),
         (TIMEOUT, "0", "greater_than"),

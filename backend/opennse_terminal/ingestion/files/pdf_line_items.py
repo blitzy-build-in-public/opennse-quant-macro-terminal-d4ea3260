@@ -16,6 +16,14 @@ which kills the process (:class:`ParseCancelledError`). The caller is never hung
 /ingest/pdf``. It reads no settings and keeps no module-level mutable state; the bytes go to that
 process through a pipe and are never written to disk.
 
+:func:`iter_page_text` streams the plain text layer of a PDF's first pages from that same
+process, under the same limits, for the downloaded CBK Weekly Bulletin (``ingestion.cbk.reserves``).
+Each page's text is yielded as soon as the process has read it. Pages are enumerated one at a time
+and only up to the page limit, an encrypted file that opens with an empty password is read, and the
+text is capped at 1 Mi characters, so the caller's copy stays bounded. A page that cannot be read
+raises when the caller reaches it, after the pages before it. Closing the generator early kills the
+process, so a caller that has found what it needs is neither held up nor failed by a later page.
+
 How a value is chosen:
 
 * Pages are classified by their title region (first 8 lines) as income statement, statement of
@@ -59,6 +67,7 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -67,7 +76,7 @@ import time
 import types
 import zlib
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date
 from decimal import (
@@ -113,6 +122,7 @@ __all__ = [
     "PdfUnreadable",
     "TooManyPages",
     "extract_line_items",
+    "iter_page_text",
 ]
 
 logger = logging.getLogger("opennse_terminal.ingestion.files.pdf_line_items")
@@ -159,7 +169,8 @@ FilingStatus = Literal["extracted", "partial", "no_items"]
 
 
 class PdfEncrypted(ValueError):  # noqa: N818 - names the condition, as in the error code
-    """The PDF is encrypted. It is rejected even when an empty user password would open it."""
+    """The PDF is encrypted. :func:`extract_line_items` rejects it even when an empty user
+    password would open it; :func:`iter_page_text` only when it does not open without one."""
 
     def __init__(self, message: str = "the PDF is encrypted; upload an unencrypted copy") -> None:
         super().__init__(message)
@@ -183,8 +194,9 @@ class TooManyPages(ValueError):  # noqa: N818 - names the condition, as in the e
 
 class PdfParseTimeout(ValueError):  # noqa: N818 - names the condition, as in the error code
     """The parse did not finish within its wall-clock limit of ``time_limit`` seconds: its parser
-    process was killed and nothing was extracted. The limit is the server's time budget, so this
-    is never a :class:`PdfUnreadable`."""
+    process was killed and nothing was extracted (:func:`iter_page_text`: nothing after the pages
+    already yielded). The limit is the server's time budget, so this is never a
+    :class:`PdfUnreadable`."""
 
     def __init__(self, time_limit: float) -> None:
         super().__init__(f"the PDF could not be parsed within {time_limit:g} seconds")
@@ -193,8 +205,8 @@ class PdfParseTimeout(ValueError):  # noqa: N818 - names the condition, as in th
 
 class ParseCancelledError(Exception):
     """The caller set the parse's ``cancel`` event: the parser process was killed, or never
-    started, and nothing was extracted. It reports the caller's own request, never a property of
-    the PDF."""
+    started, and nothing was extracted (:func:`iter_page_text`: nothing after the pages already
+    yielded). It reports the caller's own request, never a property of the PDF."""
 
     def __init__(self, message: str = "the PDF parse was cancelled") -> None:
         super().__init__(message)
@@ -273,7 +285,11 @@ _MIB: Final = 1 << 20
 _MAX_PAGE_CONTENT_BYTES: Final = 8 * _MIB
 """Largest decoded size of one page's content streams plus every Form XObject they can draw,
 each stream counted once. Statement pages hold tens of KiB; a page over this is rejected before
-pdfminer decodes or interprets it, which bounds decompression bombs and operator floods."""
+pdfminer interprets it, which bounds operator floods. A FlateDecode-only stream of an unencrypted
+document is measured by bounded zlib decoding, no stage producing more than this limit plus one
+byte, so a Flate decompression bomb is never expanded. A stream with any other filter chain, or
+one that must be decrypted first, is decoded whole by ``stream.get_data()`` to be measured; only
+the parser process's memory limit (``_PARSE_MEMORY_LIMIT_BYTES``) bounds that decoding."""
 _PARSE_TIME_BASE_SECONDS: Final = 20.0
 """Fixed part of one parse's wall-clock limit, the PDF parser process's start included; the limit
 is this plus :data:`_PARSE_SECONDS_PER_PAGE` for each page the parse admits (``max_pages``)."""
@@ -297,6 +313,12 @@ _MEMORY_RESERVE_BYTES: Final = 4 * _MIB
 # the memory limit can still be reported.
 _MAX_REQUEST_HEADER_BYTES: Final = 4096
 _MAX_ERROR_MESSAGE_CHARS: Final = 500
+_MAX_PAGE_TEXT_CHARS: Final = 1 << 20
+"""Most characters of text one :func:`iter_page_text` reading yields, its pages together. Each
+character crosses as at most 12 bytes of ASCII JSON, so what the caller reads stays within about
+12 MiB (:func:`_page_text_output_limit`); the page whose text would pass this is not sent, and
+the reading fails there with :class:`PdfUnreadable`."""
+_LOCKED_PDF_MESSAGE: Final = "the PDF is encrypted and does not open without a password"
 _LITERAL_FORM: Final = LIT("Form")
 
 
@@ -855,9 +877,11 @@ def _flate_size(data: bytes, stages: int, limit: int) -> int | None:
 def _decoded_size(stream: PDFStream, limit: int) -> int:
     """The decoded size of ``stream``, or more than ``limit`` once it is known to exceed it.
 
-    A FlateDecode-only stream is measured without decoding past ``limit``, so a decompression
-    bomb is never expanded. Any other filter chain is decoded as pdfminer would decode it for the
-    page anyway; the parser process's memory limit bounds that.
+    A FlateDecode-only stream of an unencrypted document is measured without decoding past
+    ``limit``, so a decompression bomb is never expanded. Any other stream (another filter chain,
+    a stream that must be decrypted first, or zlib data pdfminer has to recover) is decoded whole
+    with ``stream.get_data()``, as pdfminer would decode it for the page anyway; the parser
+    process's memory limit bounds that.
     """
     if stream.data is not None:
         return len(stream.data)
@@ -915,8 +939,12 @@ def _page_content_size(page: PDFPage, limit: int) -> int:
 
 def _check_page_content(page: PDFPage, number: int) -> None:
     """Reject page ``number`` when its decoded content exceeds ``_MAX_PAGE_CONTENT_BYTES``,
-    before pdfminer decodes and interprets it; a stream that cannot be decoded makes the page
-    unreadable."""
+    before pdfminer interprets it; a stream that cannot be decoded makes the page unreadable.
+
+    How each stream is measured (:func:`_decoded_size`): FlateDecode-only streams of an
+    unencrypted document by bounded zlib decoding, so a Flate bomb is never expanded; streams
+    with any other filter chain, encrypted streams and invalid zlib data by decoding them whole
+    with ``stream.get_data()``, which only the parser process's memory limit bounds."""
     try:
         size = _page_content_size(page, _MAX_PAGE_CONTENT_BYTES)
     except Exception as exc:
@@ -971,6 +999,84 @@ def _read_pages(pdf_bytes: bytes, max_pages: int) -> list[list[_Word]]:
         _check_page_content(page_obj, number)
         page_words.append(_page_words(text_page, number))
     return page_words
+
+
+@contextlib.contextmanager
+def _reading_page(number: int) -> Iterator[None]:
+    """Turn a failure while listing or reading page ``number`` into :class:`PdfUnreadable`
+    ``"page <number> of the PDF could not be parsed"``. A :class:`PdfUnreadable` with its own
+    fixed reason, and running out of memory, are raised as they are."""
+    try:
+        yield
+    except Exception as exc:
+        if isinstance(exc, PdfUnreadable) or _is_memory_exhaustion(exc):
+            raise
+        raise PdfUnreadable(f"page {number} of the PDF could not be parsed") from exc
+
+
+def _iter_page_text(pdf_bytes: bytes, max_pages: int) -> Iterator[str]:
+    """Open the PDF, apply the cross-reference and page-content guards, and yield the text of its
+    first ``max_pages`` pages one at a time: the work :func:`iter_page_text` runs in the parser
+    process, which sends each page as it is yielded.
+
+    An encrypted file that opens with an empty user password is read; one that needs a password
+    fails to open (:class:`PdfEncrypted`). Pages are taken from pdfminer's page generator one at
+    a time, each only once the page before it has been yielded, so a longer document is not an
+    error and no page after ``max_pages`` is listed. Each page's decoded content is bounded before
+    pdfplumber builds the page and extracts its text with ``extract_text()``'s default arguments,
+    the same page objects, page numbers and ``doctop`` offsets that ``pdf.pages`` would give.
+
+    Neither ``pdf.pages`` nor ``pdf.close()`` is used, because both list every page of the
+    document (see :func:`_read_pages`); each page is closed once its text is read.
+
+    Raises:
+        PdfEncrypted: The PDF needs a password to open.
+        PdfUnreadable: Before the first page: the bytes cannot be opened as a PDF, a
+            cross-reference section lists more objects than the file holds, or the document has
+            no pages. After the pages before it: a page cannot be listed, its decoded content
+            exceeds 8 MiB, it cannot be built or its text extracted, or its text would take the
+            total past :data:`_MAX_PAGE_TEXT_CHARS`.
+        MemoryError: Raised through, possibly wrapped, when reading needs more memory than the
+            process's limit; :func:`_failure_reply` reports it as an unreadable PDF.
+    """
+    try:
+        pdf = pdfplumber.open(io.BytesIO(pdf_bytes))
+    except Exception as exc:
+        failure = _open_failure(exc)
+        if isinstance(failure, PdfEncrypted):
+            raise PdfEncrypted(_LOCKED_PDF_MESSAGE) from exc
+        raise failure from exc
+    document: object = getattr(pdf, "doc", None)
+    if not isinstance(document, PDFDocument):
+        raise PdfUnreadable()
+    _check_cross_references(document, len(pdf_bytes))
+    page_objects = PDFPage.create_pages(document)
+    characters = 0
+    doctop: float = 0.0
+    for number in range(1, max_pages + 1):
+        with _reading_page(number):
+            page_obj = next(page_objects, None)
+        if page_obj is None:
+            if number == 1:
+                raise PdfUnreadable("the PDF has no pages")
+            return
+        with _reading_page(number):
+            _check_page_content(page_obj, number)
+            page = _PlumberPage(pdf, page_obj, page_number=number, initial_doctop=doctop)
+            doctop += page.height
+            try:
+                text: object = page.extract_text()
+            finally:
+                # Drops the page's cached layout objects, so memory stays bounded by one page.
+                page.close()
+        if not isinstance(text, str):
+            raise PdfUnreadable(f"page {number} of the PDF could not be parsed")
+        characters += len(text)
+        if characters > _MAX_PAGE_TEXT_CHARS:
+            raise PdfUnreadable(
+                f"the PDF's text passes {_MAX_PAGE_TEXT_CHARS} characters on page {number}"
+            )
+        yield text
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1975,12 +2081,17 @@ _Choice = TypeVar("_Choice", bound=str)
 _ITEM_STATUSES: Final[tuple[ItemStatus, ...]] = get_args(ItemStatus)
 _ITEM_UNITS: Final[tuple[ItemUnit, ...]] = get_args(ItemUnit)
 _FILING_STATUSES: Final[tuple[FilingStatus, ...]] = get_args(FilingStatus)
+# The parser process's tasks: "line_items" runs _extract, "page_text" runs _iter_page_text.
+_Task = Literal["line_items", "page_text"]
+_TASKS: Final[tuple[_Task, ...]] = get_args(_Task)
 
 
 @dataclass(frozen=True, slots=True)
 class _ParseRequest:
-    """What the parser process is asked to do: :func:`_extract`'s arguments and its limits."""
+    """What the parser process is asked to do: the task, its arguments and its limits. ``items``
+    and ``period_end_date`` are :func:`_extract`'s and stay empty for ``page_text``."""
 
+    task: _Task
     pdf_bytes: bytes
     items: list[str]
     period_end_date: date | None
@@ -2175,9 +2286,32 @@ def _decode_failure(error: Mapping[str, object], memory_limit: int) -> Exception
     raise ValueError(f"the error kind {kind!r} is unknown")
 
 
+def _page_text_record(line: bytes, memory_limit: int) -> str | Exception | None:
+    """Decode one line a ``page_text`` parser process wrote: a page's text for
+    ``{"page": "<text>"}``, ``None`` for the end record ``{"end": true}``, or, for
+    ``{"error": ...}``, the exception :func:`_decode_failure` rebuilds.
+
+    Raises:
+        ValueError: The line is not exactly one of those records.
+    """
+    record = _record(json.loads(line), "a page text record")
+    if len(record) != 1:
+        raise ValueError("a page text record holds exactly one field")
+    if "page" in record:
+        return _text(record, "page")
+    if "end" in record:
+        if record["end"] is not True:
+            raise ValueError("the field 'end' is not true")
+        return None
+    return _decode_failure(_record(_get(record, "error"), "the parse error"), memory_limit)
+
+
 def _read_request(stream: BinaryIO) -> _ParseRequest:
-    """Read the request :func:`_run_isolated` writes: one JSON header line, then exactly
-    ``length`` PDF bytes."""
+    """Read the request :func:`_run_isolated` or :func:`_stream_page_text` writes: one JSON
+    header line, then exactly ``length`` PDF bytes. The header's ``task`` decides which arguments
+    it carries: ``items`` and ``period_end_date`` for ``line_items`` only. A header without
+    ``task`` is a ``line_items`` request, the form a server started before ``page_text`` existed
+    writes, so a package upgraded under a running server still serves that server's uploads."""
     line = stream.readline(_MAX_REQUEST_HEADER_BYTES)
     if not line.endswith(b"\n"):
         raise ValueError("the parse request has no header line")
@@ -2186,11 +2320,18 @@ def _read_request(stream: BinaryIO) -> _ParseRequest:
     pdf_bytes = stream.read(length)
     if len(pdf_bytes) != length:
         raise ValueError(f"the parse request holds {len(pdf_bytes)} of {length} PDF bytes")
-    period = _optional_text(header, "period_end_date")
+    task: _Task = _choice(header, "task", _TASKS) if "task" in header else "line_items"
+    items: list[str] = []
+    period_end_date: date | None = None
+    if task == "line_items":
+        items = _requested_items(_texts(header, "items"))
+        period = _optional_text(header, "period_end_date")
+        period_end_date = None if period is None else date.fromisoformat(period)
     return _ParseRequest(
+        task=task,
         pdf_bytes=pdf_bytes,
-        items=_requested_items(_texts(header, "items")),
-        period_end_date=None if period is None else date.fromisoformat(period),
+        items=items,
+        period_end_date=period_end_date,
         max_pages=_integer(header, "max_pages"),
         time_limit=_number(header, "time_limit"),
         memory_limit=_integer(header, "memory_limit"),
@@ -2218,13 +2359,26 @@ def _apply_limits(time_limit: float, memory_limit: int) -> None:
             resource.setrlimit(kind, (value, value))
 
 
-def _child_main() -> None:
-    """Entry point of the PDF parser process that :func:`_run_isolated` starts.
+def _write_record(stream: BinaryIO, record: Mapping[str, object]) -> None:
+    """Write ``record`` to the parser process's output as one line of ASCII JSON, decimals as
+    exact strings, and flush it, so the caller can read it at once."""
+    line = json.dumps(record, default=_json_default, separators=(",", ":")).encode("ascii")
+    stream.write(line + b"\n")
+    stream.flush()
 
-    Reads one request from standard input, limits the process, runs :func:`_extract` and writes
-    one JSON reply to standard output: ``{"result": ...}`` with the result's fields, decimals as
-    exact strings, or ``{"error": ...}`` (see :func:`_failure_reply`). Logging is disabled in
-    this process; the caller logs the outcome.
+
+def _child_main() -> None:
+    """Entry point of the PDF parser process that :func:`_run_isolated` and
+    :func:`_stream_page_text` start.
+
+    Reads one request from standard input, limits the process, runs the request's task and writes
+    JSON records to standard output, one per line, each flushed as it is written. ``line_items``
+    runs :func:`_extract` and writes one ``{"result": ...}`` record with the result's fields.
+    ``page_text`` writes ``{"page": "<text>"}`` for each page :func:`_iter_page_text` yields, as
+    soon as it is read, then ``{"end": true}``. A failure at any point, the request included,
+    ends the output with one ``{"error": ...}`` record instead (see :func:`_failure_reply`),
+    after any pages already written. Logging is disabled in this process; the caller logs the
+    outcome.
     """
     logging.disable(logging.CRITICAL)
     reply_stream = sys.stdout.buffer
@@ -2237,18 +2391,20 @@ def _child_main() -> None:
         request = _read_request(sys.stdin.buffer)
         memory_limit = request.memory_limit
         _apply_limits(request.time_limit, request.memory_limit)
-        result = _extract(
-            request.pdf_bytes, request.items, request.period_end_date, request.max_pages
-        )
-        reply = {"result": asdict(result)}
+        if request.task == "page_text":
+            for text in _iter_page_text(request.pdf_bytes, request.max_pages):
+                _write_record(reply_stream, {"page": text})
+            reply = {"end": True}
+        else:
+            result = _extract(
+                request.pdf_bytes, request.items, request.period_end_date, request.max_pages
+            )
+            reply = {"result": asdict(result)}
     except BaseException as exc:
         # Gives back address space, so a failure at the memory limit can still be reported.
         reserve.clear()
         reply = _failure_reply(exc, memory_limit)
-    reply_stream.write(
-        json.dumps(reply, default=_json_default, separators=(",", ":")).encode("ascii")
-    )
-    reply_stream.flush()
+    _write_record(reply_stream, reply)
 
 
 def _child_environment() -> dict[str, str]:
@@ -2326,6 +2482,56 @@ def _exchange(
     return replies[0]
 
 
+def _start_parser_process() -> subprocess.Popen[bytes]:
+    """Start the PDF parser process: :func:`_child_main` in this interpreter, importing this same
+    package (:func:`_child_environment`), with its standard input and output piped to the caller
+    and its error stream discarded.
+
+    Raises:
+        RuntimeError: The process could not be started.
+    """
+    try:
+        return subprocess.Popen(
+            [
+                sys.executable,
+                "-B",
+                "-P",
+                "-c",
+                "from opennse_terminal.ingestion.files.pdf_line_items import _child_main; "
+                "_child_main()",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=_child_environment(),
+        )
+    except OSError as exc:
+        raise RuntimeError("the PDF parser process could not be started") from exc
+
+
+def _check_exit_status(returncode: int, time_limit: float, memory_limit: int) -> None:
+    """Raise for a parser process that did not exit with status 0.
+
+    Raises:
+        PdfUnreadable: A signal stopped the process (its CPU-time backstop included); a warning
+            names the signal and the limits.
+        RuntimeError: The process exited with a nonzero status: a fault of the server.
+    """
+    if returncode < 0:
+        logger.warning(
+            "PDF parse stopped by signal %d at the limits of %g seconds and %d MiB",
+            -returncode,
+            time_limit,
+            memory_limit // _MIB,
+        )
+        raise PdfUnreadable(
+            f"the PDF could not be parsed within {time_limit:g} seconds and "
+            f"{memory_limit // _MIB} MiB of memory"
+        )
+    if returncode != 0:
+        raise RuntimeError(f"the PDF parser process exited with status {returncode}")
+
+
 def _run_isolated(
     pdf_bytes: bytes,
     requested: Sequence[str],
@@ -2369,6 +2575,7 @@ def _run_isolated(
         else date(period_end_date.year, period_end_date.month, period_end_date.day)
     )
     header = {
+        "task": "line_items",
         "items": list(requested),
         "period_end_date": None if period is None else period.isoformat(),
         "max_pages": max_pages,
@@ -2377,38 +2584,10 @@ def _run_isolated(
         "memory_limit": memory_limit,
     }
     request = json.dumps(header, separators=(",", ":")).encode("ascii") + b"\n" + pdf_bytes
-    try:
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-B",
-                "-P",
-                "-c",
-                "from opennse_terminal.ingestion.files.pdf_line_items import _child_main; "
-                "_child_main()",
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            env=_child_environment(),
-        )
-    except OSError as exc:
-        raise RuntimeError("the PDF parser process could not be started") from exc
+    process = _start_parser_process()
     with process:
         output = _exchange(process, request, time_limit, cancel)
-    if process.returncode < 0:
-        logger.warning(
-            "PDF parse stopped by signal %d at the limits of %g seconds and %d MiB",
-            -process.returncode,
-            time_limit,
-            memory_limit // _MIB,
-        )
-        raise PdfUnreadable(
-            f"the PDF could not be parsed within {time_limit:g} seconds and "
-            f"{memory_limit // _MIB} MiB of memory"
-        )
-    if process.returncode != 0:
-        raise RuntimeError(f"the PDF parser process exited with status {process.returncode}")
+    _check_exit_status(process.returncode, time_limit, memory_limit)
     outcome: ExtractionResult | Exception
     try:
         reply = _record(json.loads(output), "the parse reply")
@@ -2423,8 +2602,222 @@ def _run_isolated(
     raise outcome
 
 
+def _page_text_output_limit(max_pages: int) -> int:
+    """Most bytes a valid ``page_text`` output of ``max_pages`` pages can hold: every character
+    of text at its longest ASCII JSON form (12 bytes, an escaped surrogate pair) up to
+    :data:`_MAX_PAGE_TEXT_CHARS`, the 12 bytes ``{"page":""}`` and its newline add per page, and
+    1 MiB for the last record, whose message is a fixed reason or at most
+    ``_MAX_ERROR_MESSAGE_CHARS`` characters."""
+    return 12 * _MAX_PAGE_TEXT_CHARS + 12 * max_pages + _MIB
+
+
+def _pump_page_text(
+    process: subprocess.Popen[bytes],
+    request: bytes,
+    limit: int,
+    lines: queue.SimpleQueue[bytes | Exception],
+) -> None:
+    """The helper thread of :func:`_stream_page_text`: write ``request`` to the parser process,
+    then put each line of its output on ``lines`` as soon as it arrives.
+
+    The process reads its whole request before it writes, so the writing never waits on the
+    reading. A process that stops reading early, because it failed or was killed, is not an
+    error here: its output or its exit status says why. The last item put is a line without a
+    trailing newline (``b""`` at the end of the output, or what the process wrote before ending
+    mid-line); a ``ValueError`` once the output would pass ``limit`` bytes, which no valid output
+    reaches (:func:`_page_text_output_limit`), so neither a line nor the queue grows past it; or
+    the exception that stopped the writing or reading.
+    """
+    stdin, stdout = process.stdin, process.stdout
+    try:
+        if stdin is None or stdout is None:
+            raise RuntimeError("the PDF parser process has no request or reply pipe")
+        with contextlib.suppress(BrokenPipeError):
+            try:
+                stdin.write(request)
+            finally:
+                stdin.close()
+        remaining = limit
+        while True:
+            line = stdout.readline(remaining + 1)
+            if len(line) > remaining:
+                lines.put(ValueError(f"the PDF parser process wrote more than {limit} bytes"))
+                return
+            remaining -= len(line)
+            lines.put(line)
+            if not line.endswith(b"\n"):
+                return
+    except Exception as exc:
+        # Handed to the supervising thread, which raises it as a server fault.
+        lines.put(exc)
+
+
+def _supervision_slice(deadline: float, time_limit: float, cancel: threading.Event | None) -> float:
+    """How long the thread reading a page-text stream may wait next: at most
+    :data:`_SUPERVISION_SLICE_SECONDS`, and never past ``deadline``.
+
+    Raises:
+        ParseCancelledError: ``cancel`` is set.
+        PdfParseTimeout: ``deadline``, ``time_limit`` seconds after the process started, has
+            passed; the warning :func:`_exchange` logs at its deadline is logged.
+    """
+    if cancel is not None and cancel.is_set():
+        raise ParseCancelledError
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        logger.warning("PDF parse stopped at the time limit of %g seconds", time_limit)
+        raise PdfParseTimeout(time_limit)
+    return min(remaining, _SUPERVISION_SLICE_SECONDS)
+
+
+def _next_line(
+    lines: queue.SimpleQueue[bytes | Exception],
+    deadline: float,
+    time_limit: float,
+    cancel: threading.Event | None,
+) -> bytes:
+    """The next line :func:`_pump_page_text` read, waited for in slices of
+    :func:`_supervision_slice`, which raises at the deadline or once ``cancel`` is set.
+
+    Raises:
+        PdfParseTimeout, ParseCancelledError: From :func:`_supervision_slice`.
+        RuntimeError: The output passed its byte limit (a malformed reply), or the request could
+            not be written or the output read: a fault of the server.
+    """
+    while True:
+        wait = _supervision_slice(deadline, time_limit, cancel)
+        try:
+            item = lines.get(timeout=wait)
+        except queue.Empty:
+            continue
+        if isinstance(item, ValueError):
+            raise RuntimeError("the PDF parser process sent a malformed reply") from item
+        if isinstance(item, Exception):
+            raise RuntimeError(
+                "the PDF parser process could not be sent its request or its reply read"
+            ) from item
+        return item
+
+
+def _wait_for_exit(
+    process: subprocess.Popen[bytes],
+    deadline: float,
+    time_limit: float,
+    cancel: threading.Event | None,
+) -> None:
+    """Wait, in slices of :func:`_supervision_slice`, for a parser process that has ended its
+    output to exit, and reap it.
+
+    Raises:
+        PdfParseTimeout, ParseCancelledError: From :func:`_supervision_slice`.
+    """
+    while True:
+        wait = _supervision_slice(deadline, time_limit, cancel)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(wait)
+            return
+
+
+def _stream_page_text(
+    pdf_bytes: bytes,
+    max_pages: int,
+    *,
+    time_limit: float,
+    memory_limit: int = _PARSE_MEMORY_LIMIT_BYTES,
+    cancel: threading.Event | None = None,
+) -> Generator[str, None, None]:
+    """Run :func:`_iter_page_text` in a separate Python process and yield each page's text as the
+    process sends it.
+
+    Nothing starts until the first ``next()``. The process gets ``time_limit`` seconds of wall
+    time from its start and ``memory_limit`` bytes of address space. A helper thread
+    (:func:`_pump_page_text`) writes the request (a JSON header line, then the PDF bytes, so the
+    PDF never touches the disk) and reads the output; the calling thread waits for each line in
+    slices of :data:`_SUPERVISION_SLICE_SECONDS`, checking the deadline and ``cancel`` between
+    them, and validates every record: at most ``max_pages`` pages of at most
+    :data:`_MAX_PAGE_TEXT_CHARS` characters together, then the end or error record. However the
+    generator ends (its last record, an error, a limit, or the caller closing it after any page),
+    the process is killed if still running, the helper joined and the process reaped before the
+    generator returns, so no process outlives the reading and no page after the one the caller
+    stopped at can delay or decide its outcome.
+
+    Raises:
+        PdfEncrypted, PdfUnreadable: As :func:`_iter_page_text` raised them, rebuilt, after the
+            pages read before the failure.
+        PdfUnreadable: Also when the reading needed more memory than its limit allows, or the
+            process was stopped by a signal (its CPU-time backstop included).
+        PdfParseTimeout: The reading was still going ``time_limit`` seconds after the process
+            started.
+        ParseCancelledError: ``cancel`` was set while the process ran; when it is set already,
+            no process is started.
+        RuntimeError: The process could not be started, failed, or sent a malformed reply: a
+            fault of the server, not of the PDF.
+    """
+    if not sys.executable:
+        raise RuntimeError("no Python interpreter is available to start the PDF parser process")
+    if cancel is not None and cancel.is_set():
+        raise ParseCancelledError
+    header = {
+        "task": "page_text",
+        "max_pages": max_pages,
+        "length": len(pdf_bytes),
+        "time_limit": time_limit,
+        "memory_limit": memory_limit,
+    }
+    request = json.dumps(header, separators=(",", ":")).encode("ascii") + b"\n" + pdf_bytes
+    lines: queue.SimpleQueue[bytes | Exception] = queue.SimpleQueue()
+    process = _start_parser_process()
+    helper = threading.Thread(
+        target=_pump_page_text,
+        args=(process, request, _page_text_output_limit(max_pages), lines),
+        name="pdf-parser-page-text",
+        daemon=True,
+    )
+    deadline = time.monotonic() + time_limit
+    with process:
+        helper.start()
+        try:
+            pages = 0
+            characters = 0
+            while True:
+                line = _next_line(lines, deadline, time_limit, cancel)
+                if not line.endswith(b"\n"):
+                    # The output ended before its last record: the exit status says why.
+                    _wait_for_exit(process, deadline, time_limit, cancel)
+                    _check_exit_status(process.returncode, time_limit, memory_limit)
+                    raise RuntimeError("the PDF parser process sent a malformed reply")
+                try:
+                    record = _page_text_record(line, memory_limit)
+                    if isinstance(record, str):
+                        pages += 1
+                        characters += len(record)
+                        if pages > max_pages:
+                            raise ValueError(f"the reply holds more than {max_pages} pages")
+                        if characters > _MAX_PAGE_TEXT_CHARS:
+                            raise ValueError(
+                                f"the reply holds more than {_MAX_PAGE_TEXT_CHARS} characters"
+                            )
+                except (ValueError, RecursionError) as exc:
+                    raise RuntimeError("the PDF parser process sent a malformed reply") from exc
+                if not isinstance(record, str):
+                    break
+                yield record
+            # The end or error record is the process's last output; it exits after writing it.
+            _wait_for_exit(process, deadline, time_limit, cancel)
+            _check_exit_status(process.returncode, time_limit, memory_limit)
+            # Raised outside the try: the rebuilt rejections are ValueErrors too, never
+            # malformed replies.
+            if record is not None:
+                raise record
+        finally:
+            # A no-op for a process already reaped. Any other is killed here, so the helper
+            # reaches the end of its output and leaving the with block reaps the process.
+            process.kill()
+            helper.join()
+
+
 # ---------------------------------------------------------------------------------------------
-# Public entry point
+# Public entry points
 # ---------------------------------------------------------------------------------------------
 
 
@@ -2461,14 +2854,21 @@ def extract_line_items(
             is set already, the arguments are still validated but no parse starts.
 
     Returns:
-        One :class:`ExtractedLineItem` per requested item. Monetary values are whole KES after
-        the page scale, or whole USD when a statement header is in USD (``currency="USD"`` and
-        the warning ``non_kes_currency``; never converted). ``shares_outstanding`` is an
-        integral count, scaled only by its own unit hint. Values are exact ``Decimal`` values.
-        Item statuses are ``found``, ``derived`` (summed from component lines listed in
-        ``derivation``), ``ambiguous`` (insufficient evidence, with up to five ``candidates``;
-        never to be committed) and ``not_found``. Warnings: ``no_text_layer`` (pages without a
-        word; no OCR is attempted), ``scale_not_detected`` and ``non_kes_currency``.
+        An :class:`ExtractionResult` whose ``items`` hold one :class:`ExtractedLineItem` per
+        requested name, in the caller's order with duplicates dropped. Beside them it carries
+        ``page_count``, the PDF's page count; ``detected_scale``, the most frequent page scale (1
+        with the warning ``scale_not_detected`` when no page carries a marker, ``None`` only
+        without a text layer); ``currency``, ``"KES"`` or ``"USD"``; ``status``, which is
+        ``extracted`` when no item is ``not_found``, ``no_items`` when every one is and
+        ``partial`` otherwise; ``missing_items``, the ``not_found`` names in order; and
+        ``warnings``. Monetary values are whole KES after the page scale, or whole USD when a
+        statement header is in USD (``currency="USD"`` and the warning ``non_kes_currency``;
+        never converted). ``shares_outstanding`` is an integral count, scaled only by its own
+        unit hint. Values are exact ``Decimal`` values. Item statuses are ``found``,
+        ``derived`` (summed from component lines listed in ``derivation``), ``ambiguous``
+        (insufficient evidence, with up to five ``candidates``; never to be committed) and
+        ``not_found``. Warnings: ``no_text_layer`` (pages without a word; no OCR is
+        attempted), ``scale_not_detected`` and ``non_kes_currency``.
 
     Raises:
         ValueError: An unknown item name, no item, or ``max_pages`` below 1.
@@ -2496,3 +2896,66 @@ def extract_line_items(
     )
     _log_result(result)
     return result
+
+
+def iter_page_text(
+    pdf_bytes: bytes, *, max_pages: int, cancel: threading.Event | None = None
+) -> Generator[str, None, None]:
+    """Stream the text layer of a PDF's first ``max_pages`` pages, page by page.
+
+    Written for the downloaded, untrusted CBK Weekly Bulletin. The PDF is read in the separate
+    Python process :func:`extract_line_items` uses, under the same limits: wall time
+    ``_PARSE_TIME_BASE_SECONDS`` plus ``_PARSE_SECONDS_PER_PAGE`` per page of ``max_pages`` (20
+    s + 0.4 s x ``max_pages``, 40 s at 50 pages) from the process's start, 1 GiB of address space
+    (``_PARSE_MEMORY_LIMIT_BYTES``), cross-reference sections listing more objects than the file
+    holds rejected before any page is listed, and each page's decoded content bounded to 8 MiB
+    (``_MAX_PAGE_CONTENT_BYTES``) before pdfminer interprets it. Pages are listed one at a time:
+    a document with more pages is not an error, and no page after ``max_pages`` is listed. An
+    encrypted PDF that opens with an empty user password is read.
+
+    The process starts at the first ``next()`` and sends each page's text as soon as it has read
+    it, so page 1 is yielded while later pages are still being read. Once the generator is
+    exhausted, raises or is closed, the process is killed if still running and reaped, and its
+    helper thread joined, before control returns: a caller that stops early, closing the
+    generator (``contextlib.closing``), stops the reading at once, so no later page can hold it
+    up or decide its outcome. Each ``next()`` waits for the process, so an event loop consumes
+    this in a worker thread; another thread stops it by setting ``cancel``. Only the limit
+    warnings are logged, and nothing is shared between concurrent readings.
+
+    Args:
+        pdf_bytes: The whole PDF. Its size and ``%PDF-`` magic bytes are the caller's checks;
+            nothing but these bytes is read, and they are never written to disk.
+        max_pages: Most pages read, at least 1; it also sizes the wall-clock limit.
+        cancel: An event another thread sets to stop the reading: the parser process is killed
+            within 0.25 s (``_SUPERVISION_SLICE_SECONDS``) of the next wait and
+            :class:`ParseCancelledError` is raised. When it is set already, no process starts.
+
+    Yields:
+        Each page's text as pdfplumber's ``extract_text()`` lays it out with its default
+        arguments (lines joined by ``"\\n"``; ``""`` for a page without text), page 1 first: at
+        most ``max_pages`` pages and 1 Mi characters (``_MAX_PAGE_TEXT_CHARS``) in all.
+
+    Raises:
+        ValueError: ``max_pages`` is below 1, raised by this call itself.
+        PdfEncrypted: The PDF does not open without a password.
+        PdfUnreadable: The bytes cannot be opened as a PDF; a cross-reference section lists more
+            objects than the file holds; the PDF has no pages; or the reading exceeds its memory
+            limit or is stopped by a signal. Raised after the pages before it, when the reading
+            reaches a page that cannot be listed or parsed, whose decoded content exceeds 8 MiB,
+            or whose text would pass 1 Mi characters in all, with a fixed reason such as
+            ``"page 3 has more than 8 MiB of decoded content"``.
+        PdfParseTimeout: The reading was still going at its wall-clock limit; its
+            ``time_limit`` names the seconds allowed.
+        ParseCancelledError: ``cancel`` was set before the reading finished.
+        RuntimeError: The parser process could not run, failed or sent a malformed reply: a
+            server fault.
+    """
+    if max_pages < 1:
+        raise ValueError(f"max_pages must be at least 1, got {max_pages}")
+    return _stream_page_text(
+        pdf_bytes,
+        max_pages,
+        time_limit=_parse_time_limit(max_pages),
+        memory_limit=_PARSE_MEMORY_LIMIT_BYTES,
+        cancel=cancel,
+    )

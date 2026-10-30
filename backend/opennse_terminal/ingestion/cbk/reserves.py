@@ -5,6 +5,20 @@ bulletin are fetched through the run's ``PoliteClient`` (``robots.txt``, per-hos
 retries, 25 MiB cap), the listing is parsed with BeautifulSoup4 and the PDF text layer read with
 pdfplumber. No browser, OCR or third-party API is involved.
 
+Bulletin reading. A downloaded bulletin is untrusted, so its text layer is read by
+``ingestion.files.pdf_line_items.iter_page_text`` in the separate parser process the PDF upload
+uses, never in the pipeline's own process. That process has 40 seconds of wall time for the first
+50 pages and 1 GiB of address space; it rejects cross-reference sections that list more objects
+than the file holds, bounds each page's decoded content to 8 MiB before the page is interpreted,
+lists pages one at a time so a longer page tree is never walked past page 50, and sends at most 1
+Mi characters of text. It sends each page as soon as it has read it, and the pages are searched in
+order: reading stops at the page holding the reserves table, where the process is killed, so a
+later page can neither delay nor decide the outcome. Before the table, a bulletin that does not
+open, or a page the reader cannot get past (unparseable, over 8 MiB of content, past the text
+cap, beyond the memory limit), ends the run ``layout_changed`` ("bulletin unreadable: <reason>")
+with nothing written; reaching the time limit, or a fault of the parser process, ends it
+``failed``.
+
 Listing and publication dates. ``GET https://www.centralbank.go.ke/releases/weekly-bulletin/``
 lists each bulletin as a link whose path contains ``/uploads/weekly_bulletin/`` and ends ``.pdf``;
 only links on the CBK origin (HTTPS, default port, no userinfo) are followed. A link's
@@ -45,11 +59,10 @@ Upsert. Conflict key ``observation_date``: ``fx_reserves_usd_m = COALESCE(EXCLUD
 weeks, so bulletins are parsed oldest first and the newest bulletin's value for a header date
 wins, within a run and, through the default selection rule, across runs.
 
-pdfplumber is imported inside :func:`parse_reserves_bulletin` only, so importing this module does
-not load it.
+``ingestion.files.pdf_line_items``, which loads pdfplumber, is imported only when a bulletin is
+parsed, so importing this module loads neither.
 """
 
-import io
 import logging
 import re
 import uuid
@@ -58,6 +71,7 @@ from contextlib import closing
 from dataclasses import dataclass, field, replace
 from datetime import date
 from decimal import Decimal
+from itertools import count
 from types import MappingProxyType
 from typing import Final
 from urllib.parse import SplitResult, quote, unquote, urljoin, urlsplit
@@ -406,8 +420,11 @@ def select_bulletins(
     The default rule reads "the newest bulletin not listed in an earlier successful run" as "the
     newest bulletin, if newer than everything already ingested". Picking an older, never-ingested
     bulletin instead would let its provisional figures overwrite a newer bulletin's values for the
-    header dates both carry, because the incoming value wins the COALESCE merge. Nothing is lost:
-    consecutive bulletins repeat their weeks, so a missed bulletin's dates arrive with the next.
+    header dates both carry, because the incoming value wins the COALESCE merge. A bulletin
+    repeats only a rolling window of recent weekly header dates, so the newest bulletin supplies
+    a missed bulletin's dates only while they fall inside its window. After a longer gap the
+    earlier dates are not written until a backfill with ``limit=N`` (``opennse-terminal ingest
+    cbk_reserves --limit N``) fetches the older bulletins that carry them.
 
     Raises:
         ValueError: ``limit`` is below 1.
@@ -429,42 +446,48 @@ def select_bulletins(
 # ---------------------------------------------------------------------------------------------
 
 
-def _unreadable(exc: BaseException) -> SourceLayoutChanged:
-    name = type(exc).__name__
+def _unreadable(reason: str) -> SourceLayoutChanged:
+    """The layout change for a bulletin the PDF reader could not read, ``reason`` being the
+    reader's own fixed text (never text taken from the document)."""
     return SourceLayoutChanged(
-        expected=["PDF with a text layer"], found=[name], message=f"bulletin unreadable: {name}"
+        expected=["PDF with a text layer"], found=[reason], message=f"bulletin unreadable: {reason}"
     )
 
 
 def _iter_page_lines(pdf_bytes: bytes) -> Generator[tuple[int, list[str]], None, None]:
     """Yield ``(page number, non-empty cleaned text lines)`` for the first
-    :data:`MAX_SCANNED_PAGES` pages, one page at a time.
+    :data:`MAX_SCANNED_PAGES` pages, page 1 first, each as soon as the reader has read it.
 
-    Each page is closed once its text is read, and the document when the generator is closed, so
-    a caller that stops at the reserves table reads no further page. Only errors raised by
-    pdfplumber (or pdfminer beneath it) become :class:`SourceLayoutChanged`
-    ``"bulletin unreadable: <type>"``.
+    The pages stream from ``pdf_line_items.iter_page_text`` and its time- and memory-limited
+    parser process (see the module docstring); a longer bulletin is read to page
+    :data:`MAX_SCANNED_PAGES` only. Closing this generator, as :func:`parse_reserves_bulletin`
+    does at the reserves table, closes the reader, which kills that process at once, so a caller
+    that stops at the table reads no further page and no later page decides the outcome. A page
+    the reader cannot get past raises when it is reached, after the pages before it.
+
+    Raises:
+        SourceLayoutChanged: ``"bulletin unreadable: <reason>"``, with the reader's fixed reason
+            as ``found``, when the PDF does not open (unparseable, encrypted with a password,
+            cross-reference sections listing more objects than it holds, no pages), or the
+            reading reaches a page it cannot get past (unparseable, over 8 MiB of decoded
+            content, past the text cap, beyond the memory limit or stopped by a signal).
+        PdfParseTimeout: The reading was still going at its wall-clock limit.
+        RuntimeError: The parser process could not run or failed: a server fault.
     """
-    import pdfplumber  # Deferred: only this pipeline needs pdfplumber.
+    # Deferred: only this pipeline reads PDFs, and the reader's module loads pdfplumber.
+    from opennse_terminal.ingestion.files import pdf_line_items
 
-    try:
-        pdf = pdfplumber.open(io.BytesIO(pdf_bytes))
-    except Exception as exc:
-        raise _unreadable(exc) from exc
-    with pdf:
-        try:
-            pages = pdf.pages[:MAX_SCANNED_PAGES]
-        except Exception as exc:
-            raise _unreadable(exc) from exc
-        for page in pages:
+    reader = pdf_line_items.iter_page_text(pdf_bytes, max_pages=MAX_SCANNED_PAGES)
+    with closing(reader) as pages:
+        for number in count(start=1):
             try:
-                text: str = page.extract_text() or ""
-            except Exception as exc:
-                raise _unreadable(exc) from exc
-            finally:
-                page.close()
+                text = next(pages, None)
+            except (pdf_line_items.PdfUnreadable, pdf_line_items.PdfEncrypted) as exc:
+                raise _unreadable(str(exc)) from exc
+            if text is None:
+                return
             lines = [line for line in (clean_text(raw) for raw in text.splitlines()) if line]
-            yield page.page_number, lines
+            yield number, lines
 
 
 def _header_dates(matches: Sequence[re.Match[str]]) -> list[tuple[date, str]]:
@@ -589,21 +612,29 @@ def _parse_reserves_page(
 def parse_reserves_bulletin(pdf_bytes: bytes) -> list[MacroRecord]:
     """Parse one Weekly Bulletin PDF into ``fx_reserves_usd_m`` records, one per header date.
 
-    Pages are read in order, through pdfplumber's text layer, until the reserves table is found
+    The text layer of the first :data:`MAX_SCANNED_PAGES` pages is read with pdfplumber in the
+    limited parser process of ``pdf_line_items.iter_page_text``, and its pages are searched in
+    order, each as soon as it arrives, until the reserves table is found. The reading stops at
+    that page and the process is killed, so a later page can neither delay nor decide the result
     (see the module docstring). The value row holds one whitespace-separated cell per header
     date. Each cell is parsed exactly (``"12,384"`` gives ``Decimal("12384.00")``), quantized to
     0.01 ``ROUND_HALF_UP`` and dated at its column's header date; ``raw`` keeps the date and value
-    texts and the page number. A cell that is not a plain, comma-grouped, signed or parenthesized
-    number (:data:`VALUE_TOKEN_RE`), or does not convert, becomes a record with an
-    ``unparsable`` error for validation to reject; a negative value (``-12,384``, ``(12,384)``)
-    is parsed as negative and rejected by the bounds, never read as its magnitude.
+    texts and the page number (1 for the first page). A cell that is not a plain, comma-grouped,
+    signed or parenthesized number (:data:`VALUE_TOKEN_RE`), or does not convert, becomes a record
+    with an ``unparsable`` error for validation to reject; a negative value (``-12,384``,
+    ``(12,384)``) is parsed as negative and rejected by the bounds, never read as its magnitude.
 
     Raises:
-        SourceLayoutChanged: The bytes do not start with ``%PDF-``; pdfplumber cannot read the
-            document; no title line is followed by a date row ("reserves table not found",
-            ``found`` holding up to ten lines that mention foreign exchange reserves); a header
-            date is invalid or the dates do not ascend; the value row is missing; or the row's
-            cell count differs from the date count.
+        SourceLayoutChanged: The bytes do not start with ``%PDF-``; the reader cannot open the
+            document, or reaches a page it cannot get past before the table is found ("bulletin
+            unreadable: <reason>"); no title line is followed by a date row ("reserves table not
+            found", ``found`` holding up to ten lines that mention foreign exchange reserves); a
+            header date is invalid or the dates do not ascend; the value row is missing; or the
+            row's cell count differs from the date count.
+        PdfParseTimeout: The reserves table was not reached within the reading's wall-clock
+            limit, 40 seconds for :data:`MAX_SCANNED_PAGES` pages; the run ends ``failed``.
+        RuntimeError: The parser process could not run or failed: a server fault, so the run
+            ends ``failed``.
     """
     if not pdf_bytes.startswith(_PDF_MAGIC):
         raise SourceLayoutChanged(

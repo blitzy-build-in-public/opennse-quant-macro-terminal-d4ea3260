@@ -4,11 +4,13 @@ Source: the "Equity Statistics" tab of https://www.nse.co.ke/market-statistics/.
 script injects the equity table one sector at a time, through the ``#filtersectors`` dropdown, so
 :class:`MarketStatisticsFetcher` renders the page in headless Chromium (Playwright), selects each
 sector in turn and captures the rendered ``table.nsetable``; BeautifulSoup4 then parses each
-captured fragment (:func:`parse_sector_table`). Only the rendered public page is read: no request
-the page's script makes is called or intercepted, and the image-only "Daily Equity Price List"
-PDF is never downloaded, only the date in its link's file name is read. Per the NSE terms, data
-from this page is for personal or internal business use only unless the operator is licensed to
-distribute it.
+captured fragment (:func:`parse_sector_table`). Only the rendered public page is read: the
+pipeline never calls the requests the page's script makes, and those to the page's own HTTPS
+origin go out unchanged; the browser contacts nothing else, over any transport (WebSocket,
+WebTransport and WebRTC included), refusing every other destination (see
+:class:`MarketStatisticsFetcher`); and the image-only "Daily Equity Price List" PDF is never
+downloaded, only the date in its link's file name is read. Per the NSE terms, data from this page
+is for personal or internal business use only unless the operator is licensed to distribute it.
 
 Units and columns written to ``terminal_daily_prices`` (conflict key ``(ticker, trade_date)``):
 ``close_price`` is the last traded price in KES per share, ``volume`` whole shares and
@@ -29,13 +31,14 @@ with ``opennse-terminal ingest nse_market_statistics --trade-date YYYY-MM-DD``.
 """
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
 import re
 import uuid
 from collections import Counter, defaultdict
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal
@@ -66,12 +69,13 @@ from opennse_terminal.ingestion.base import (
     parse_decimal_text,
 )
 from opennse_terminal.ingestion.calendar import ExchangeCalendar
+from opennse_terminal.ingestion.http import describe_url
 from opennse_terminal.models import TerminalDailyPrice, TerminalEquity
 
 if TYPE_CHECKING:
     # Type-only: Playwright is imported inside MarketStatisticsFetcher's methods, so the
     # registry, the CLI and the parser tests import this module without loading a browser driver.
-    from playwright.async_api import Browser, Page
+    from playwright.async_api import Browser, Page, Request, Route
 
 __all__ = [
     "CHANGE_PCT_BOUND",
@@ -151,6 +155,14 @@ NAVIGATION_TIMEOUT_MS: Final = 30_000
 
 NAVIGATION_RETRIES: Final = 2
 """Navigation attempts made after the first one fails."""
+
+_HTTPS_DEFAULT_PORT: Final = 443
+# An ASCII DNS name of at least two labels whose last label starts with a letter: no IPv4 or IPv6
+# literal, no single label such as "localhost", and nothing that could alter the resolver rule the
+# browser is launched with.
+_DNS_NAME_RE: Final = re.compile(
+    r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?"
+)
 
 SELECTOR_SECTORS: Final = "#filtersectors"
 SELECTOR_TABLE: Final = "table.nsetable"
@@ -273,7 +285,10 @@ class NseQuote:
     """One row of a sector table, as parsed.
 
     Attributes:
-        company: The company cell, trimmed (logged for unmapped ISINs, never stored).
+        company: The company cell, trimmed. It is kept only as run evidence: in
+            ``details.unmapped_isins``, with its ISIN and sector, when no tracked equity carries
+            the ISIN, and in ``details.rejected`` through ``raw``. It is never written to
+            ``terminal_equities`` or ``terminal_daily_prices``.
         isin: The ISIN cell, trimmed and upper-cased; the join key to ``terminal_equities``.
         volume: Shares traded; ``0`` for a dash; ``None`` when the cell does not convert.
         close_price: Last traded price in KES per share; ``None`` when it does not convert.
@@ -396,10 +411,148 @@ class _SectorState:
         return self.value == option.value and self.rows > 0
 
 
+def _https_host(url: str) -> str | None:
+    """The host of ``url``, lower-cased, when ``url`` is ``https`` on the scheme's default port,
+    carries no userinfo and names its host by an ASCII DNS name (no IP literal, no single label
+    such as ``localhost``); ``None`` for any other URL, an unparseable one included."""
+    try:
+        parts = urlsplit(url)
+        # Reading port raises ValueError for a port that is not a number from 0 to 65535.
+        port = parts.port
+    except ValueError:
+        return None
+    host = parts.hostname
+    if (
+        parts.scheme != "https"
+        or port not in (None, _HTTPS_DEFAULT_PORT)
+        or "@" in parts.netloc
+        or host is None
+        or _DNS_NAME_RE.fullmatch(host) is None
+    ):
+        return None
+    return host
+
+
+class _OriginPolicy:
+    """The outbound request policy of one browser session: the browser may request only
+    ``https://<host>`` on the default port without userinfo, the origin of the page it renders.
+
+    :meth:`route`, installed on the browser context for every URL, lets each such request go out
+    unchanged and aborts every other one before it is sent. Chromium does not pass redirect hops
+    to that handler, so :meth:`watch`, the context's ``request`` listener, and the navigation's
+    final URL check catch a redirect off the origin, which :meth:`refuse` records as the session's
+    violation; inside :meth:`enforced` that ends the session at once.
+
+    Attributes:
+        host: The approved host, lower-cased.
+        violation: The first off-origin redirect hop or final URL, named by ``describe_url``, or
+            ``None`` while there is none.
+    """
+
+    def __init__(self, host: str) -> None:
+        self.host = host
+        self.violation: str | None = None
+        self._guard: asyncio.Timeout | None = None
+
+    def allows(self, url: str) -> bool:
+        """Whether the browser may request ``url``."""
+        return _https_host(url) == self.host
+
+    async def route(self, route: "Route") -> None:
+        """Continue a request on the origin unchanged; abort any other before it is sent."""
+        from playwright.async_api import Error as PlaywrightError
+
+        url = route.request.url
+        try:
+            if self.allows(url):
+                await route.continue_()
+            else:
+                logger.debug("refused a browser request to %s", describe_url(url))
+                await route.abort("blockedbyclient")
+        except PlaywrightError as exc:
+            # The page or context closed while the request was being routed, so nothing is sent.
+            logger.debug(
+                "a browser request to %s ended with its page (%s)",
+                describe_url(url),
+                type(exc).__name__,
+            )
+
+    def watch(self, request: "Request") -> None:
+        """Refuse a redirect hop off the origin, which Chromium follows without routing it."""
+        if request.redirected_from is not None and not self.allows(request.url):
+            self.refuse(request.url)
+
+    def refuse(self, url: str) -> None:
+        """Record ``url``, a redirect hop or final URL off the origin, as the session's violation
+        and cancel the steps :meth:`enforced` guards; only the first violation is recorded."""
+        if self.violation is not None:
+            return
+        self.violation = describe_url(url)
+        logger.warning(
+            "the market-statistics page redirected off https://%s to %s; the fetch fails "
+            "without retrying",
+            self.host,
+            self.violation,
+        )
+        guard, self._guard = self._guard, None
+        if guard is not None:
+            guard.reschedule(asyncio.get_running_loop().time())
+
+    @contextlib.asynccontextmanager
+    async def enforced(self, url: str) -> AsyncIterator[None]:
+        """Guard the session's steps: once a violation is recorded, whatever the block awaits is
+        cancelled and the block raises :class:`FetchFailed` for ``url`` with reason
+        ``off_origin_redirect``, whether it would have completed or failed for another reason, so
+        nothing the page showed is used."""
+        try:
+            async with asyncio.timeout(None) as guard:
+                self._guard = guard
+                try:
+                    yield
+                finally:
+                    self._guard = None
+        except Exception:
+            if self.violation is None:
+                raise
+            # What the interrupted step raised follows from the refusal; it is not the cause.
+            raise FetchFailed(url, "off_origin_redirect") from None
+        if self.violation is not None:
+            raise FetchFailed(url, "off_origin_redirect")
+
+
 class Fetcher(Protocol):
     """Produces a :class:`MarketStatisticsSnapshot`; tests substitute recorded fixtures."""
 
-    async def fetch(self, url: str, *, user_agent: str) -> MarketStatisticsSnapshot: ...
+    async def fetch(self, url: str, *, user_agent: str) -> MarketStatisticsSnapshot:
+        """Render the public market-statistics page and capture the equity table of every sector.
+
+        Args:
+            url: The public page (:data:`NSE_MARKET_STATISTICS_URL`): ``https`` on the default
+                port, with a DNS host and no userinfo. The caller has already checked it against
+                ``robots.txt``, and its origin is the only destination contacted, over any
+                transport.
+            user_agent: The product's contact user agent
+                (:attr:`~opennse_terminal.ingestion.http.PoliteClient.user_agent`), sent with every
+                request.
+
+        Returns:
+            The final page HTML (the sector options, the price-list link and the "Statistics as
+            of" label) and one :class:`SectorTable` per real ``#filtersectors`` option
+            (placeholders and disabled options excluded), in dropdown order; ``fetched_at`` is
+            timezone-aware UTC. A snapshot is complete or not returned: never one missing a
+            sector.
+
+        Raises:
+            FetchFailed: The page could not be fetched completely, for example after the
+                navigation retries, on a redirect off the page's origin or at the run cap; the
+                run ends ``failed`` with the reason (the codes are listed on
+                :class:`MarketStatisticsFetcher`).
+            SourceLayoutChanged: The page prevents a complete capture, for example with a
+                paginated sector table; the run ends ``layout_changed``.
+
+        No browser or other library exception escapes, and no cookie, cache or other browser
+        state outlives the call.
+        """
 
 
 class MarketStatisticsFetcher:
@@ -413,11 +566,23 @@ class MarketStatisticsFetcher:
     ``scraper_min_interval_seconds`` apart. The whole session is capped at
     :data:`RUN_CAP_SECONDS`.
 
-    Failures surface as :class:`FetchFailed` (``failed``) with the reasons
-    ``browser_not_installed``, ``browser_launch_failed``, ``navigation_failed``,
-    ``sector_render_timeout:<label>``, ``run_timeout`` or ``browser_error``, and as
-    :class:`SourceLayoutChanged` when a sector table turns out to be paginated. No Playwright
-    exception escapes.
+    The browser contacts only the page's own origin, ``https://<host>`` on the default port,
+    over any transport. It is launched resolving only that host on port 443: the same host on
+    another port, plain ``http`` on port 80 included, every other host name and every IP literal
+    fail to resolve before a connection is made, which confines WebSocket and WebTransport as
+    well as requests. WebRTC, which opens its own sockets and needs no resolution for an IP
+    literal, is launched without UDP (no STUN, no TURN over UDP, no host candidate and no
+    connectivity check), so its only path, TURN over TCP or TLS, meets the same resolver rule.
+    Service workers are blocked, every other request is aborted before it is sent, and a
+    redirect off that origin, or a navigation ending off it, fails the fetch at once. Requests to
+    the origin, the page's own script included, go out unchanged.
+
+    Failures surface as :class:`FetchFailed` (``failed``) with the reasons ``unsupported_url``
+    (``url`` is not ``https`` on the default port with a DNS host and no userinfo; nothing is
+    launched), ``browser_not_installed``, ``browser_launch_failed``, ``navigation_failed``,
+    ``off_origin_redirect`` (never retried), ``sector_render_timeout:<label>``, ``run_timeout``
+    or ``browser_error``, and as :class:`SourceLayoutChanged` when a sector table turns out to be
+    paginated. No Playwright exception escapes.
 
     Args:
         settings: Supplies the per-host spacing.
@@ -437,7 +602,15 @@ class MarketStatisticsFetcher:
         self._headless = headless
 
     async def fetch(self, url: str, *, user_agent: str) -> MarketStatisticsSnapshot:
-        """Render ``url`` and return the page HTML plus one captured table per sector option."""
+        """Render ``url`` and return the page HTML plus one captured table per sector option.
+
+        ``url``'s origin is the only destination the browser contacts, over any transport;
+        ``user_agent`` is sent on every request. Raises as the class describes.
+        """
+        host = _https_host(url)
+        if host is None:
+            raise FetchFailed(describe_url(url), "unsupported_url")
+
         from playwright.async_api import Error as PlaywrightError
         from playwright.async_api import async_playwright
 
@@ -445,7 +618,27 @@ class MarketStatisticsFetcher:
         try:
             async with deadline, async_playwright() as playwright:
                 try:
-                    browser = await playwright.chromium.launch(headless=self._headless)
+                    # Only the approved host on port 443 resolves inside the browser: the same
+                    # host on any other port (plain http on port 80 included), every other host
+                    # name and every IP literal fail to resolve before a connection is made, so
+                    # no request, redirect hop, frame, worker, prefetch, WebSocket or
+                    # WebTransport reaches one. Chromium applies the first matching rule, and a
+                    # "host:port" pattern matches only that port, so the approved host's rule
+                    # precedes the catch-all.
+                    # WebRTC opens its own sockets, and an IP-literal STUN or TURN server or
+                    # remote candidate needs no resolution, so WebRTC may use UDP only through a
+                    # proxy, and none is configured: it sends no STUN or TURN over UDP, gathers
+                    # no host candidate and makes no connectivity check. What it has left, TURN
+                    # over TCP or TLS, connects through the network stack and so meets the
+                    # resolver rule.
+                    browser = await playwright.chromium.launch(
+                        headless=self._headless,
+                        args=[
+                            f"--host-resolver-rules=MAP {host}:{_HTTPS_DEFAULT_PORT} {host}"
+                            " , MAP * ~NOTFOUND",
+                            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                        ],
+                    )
                 except PlaywrightError as exc:
                     message = str(exc).lower()
                     if "executable doesn't exist" in message or "playwright install" in message:
@@ -456,7 +649,9 @@ class MarketStatisticsFetcher:
                         ) from exc
                     raise FetchFailed(url, f"browser_launch_failed: {type(exc).__name__}") from exc
                 try:
-                    return await self._capture(browser, url, user_agent=user_agent)
+                    return await self._capture(
+                        browser, url, user_agent=user_agent, policy=_OriginPolicy(host)
+                    )
                 finally:
                     await browser.close()
         except (TimeoutError, PlaywrightError) as exc:
@@ -469,25 +664,29 @@ class MarketStatisticsFetcher:
             raise
 
     async def _capture(
-        self, browser: "Browser", url: str, *, user_agent: str
+        self, browser: "Browser", url: str, *, user_agent: str, policy: _OriginPolicy
     ) -> MarketStatisticsSnapshot:
-        context = await browser.new_context(user_agent=user_agent)
+        # A service worker could answer the page's requests without the route below seeing them.
+        context = await browser.new_context(user_agent=user_agent, service_workers="block")
         try:
-            page = await context.new_page()
-            await self._navigate(page, url)
-            tables: list[SectorTable] = []
-            for index, option in enumerate(await self._read_options(page)):
-                if index:
-                    await self._sleep(self._settings.scraper_min_interval_seconds)
-                tables.append(await self._capture_sector(page, url, option))
-            page_html = await page.content()
+            context.on("request", policy.watch)
+            await context.route("**/*", policy.route)
+            async with policy.enforced(url):
+                page = await context.new_page()
+                await self._navigate(page, url, policy)
+                tables: list[SectorTable] = []
+                for index, option in enumerate(await self._read_options(page)):
+                    if index:
+                        await self._sleep(self._settings.scraper_min_interval_seconds)
+                    tables.append(await self._capture_sector(page, url, option))
+                page_html = await page.content()
         finally:
             await context.close()
         return MarketStatisticsSnapshot(
             page_html=page_html, sector_tables=tuple(tables), fetched_at=datetime.now(UTC)
         )
 
-    async def _navigate(self, page: "Page", url: str) -> None:
+    async def _navigate(self, page: "Page", url: str, policy: _OriginPolicy) -> None:
         from playwright.async_api import Error as PlaywrightError
 
         attempts = 1 + NAVIGATION_RETRIES
@@ -495,16 +694,24 @@ class MarketStatisticsFetcher:
             # The robots.txt check has just requested this host, and a retry follows a failed
             # request to it, so every attempt first waits out the per-host spacing.
             await self._sleep(self._settings.scraper_min_interval_seconds)
+            failure: str | None = None
             try:
                 response = await page.goto(
                     url, timeout=NAVIGATION_TIMEOUT_MS, wait_until="domcontentloaded"
                 )
-                if response is None or response.status < 400:
+                if response is not None and not policy.allows(response.url):
+                    policy.refuse(response.url)
+                elif response is not None and response.status >= 400:
+                    failure = f"http_{response.status}"
+                else:
                     await page.wait_for_selector(SELECTOR_SECTORS, timeout=NAVIGATION_TIMEOUT_MS)
-                    return
-                failure = f"http_{response.status}"
             except PlaywrightError as exc:
                 failure = type(exc).__name__
+            if policy.violation is not None:
+                # A redirect off the origin is the page's answer, not a transient failure.
+                raise FetchFailed(url, "off_origin_redirect")
+            if failure is None:
+                return
             logger.warning(
                 "navigation attempt %d of %d to the market-statistics page failed (%s)%s",
                 attempt,

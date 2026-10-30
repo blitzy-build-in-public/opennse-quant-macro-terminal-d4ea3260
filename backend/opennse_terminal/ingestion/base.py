@@ -1081,6 +1081,7 @@ _FETCH_FAILED_CODES: Final = frozenset(
         "too_many_redirects",
         "invalid_redirect",
         "response_too_large",
+        "origin_not_approved",
         # ingestion/files/tabular_import.py
         "too_many_rows",
         "file_too_large",
@@ -1097,6 +1098,7 @@ _FETCH_FAILED_CODES: Final = frozenset(
         "browser_not_installed",
         "browser_launch_failed",
         "navigation_failed",
+        "off_origin_redirect",
         "sector_render_timeout",
         "run_timeout",
         "browser_error",

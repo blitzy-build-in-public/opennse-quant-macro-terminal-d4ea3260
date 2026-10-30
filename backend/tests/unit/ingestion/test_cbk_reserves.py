@@ -9,7 +9,10 @@ bytes, and a line on its page marks it as a reconstructed test fixture. Its five
 its first and last reserves values (12,384 and 12,387) are that bulletin's reference figures; the
 three middle-week values (12,341, 12,296 and 12,352) and the other rows are invented. Parser
 coverage of the real bulletin layout therefore rests on this reconstruction and on the ``live``
-test. Every other PDF is written in the test by the same helper.
+test. Every other PDF is written in the test by the same helper, except the hostile bulletins
+(decompression bombs, an undecodable page, a lying cross-reference stream, a password lock, a
+2,000-page tree), which ``raw_pdf`` below writes object by object, compressed in the test. Every
+bulletin is read through the PDF reader's separate, limited parser process, as in production.
 
 Full runs are served by respx at the real CBK URLs with ``assert_all_mocked=True``, so nothing
 reaches the network, and the run's ``PoliteClient`` spaces its requests on a fake clock that only
@@ -23,7 +26,13 @@ by the root conftest. The one ``live`` test reads the real listing and newest bu
 deselected by default.
 """
 
-from collections.abc import Callable, Iterator, Sequence
+import functools
+import subprocess
+import sys
+import time
+import zlib
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from contextlib import closing
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from itertools import pairwise
@@ -32,7 +41,6 @@ from typing import Any, Protocol
 import httpx
 import pytest
 import respx
-from pdfplumber.page import Page
 from sqlalchemy import event, insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
@@ -48,6 +56,7 @@ from opennse_terminal.ingestion.cbk.reserves import (
     BOUNDS,
     BULLETIN_PATH_MARKER,
     MAX_LIMIT,
+    MAX_SCANNED_PAGES,
     ROW_LABEL,
     TABLE_TITLE,
     WEEKLY_BULLETIN_URL,
@@ -59,6 +68,7 @@ from opennse_terminal.ingestion.cbk.reserves import (
     parse_reserves_bulletin,
     select_bulletins,
 )
+from opennse_terminal.ingestion.files import pdf_line_items
 from opennse_terminal.ingestion.http import PoliteClient
 from opennse_terminal.models import TerminalIngestionRun, TerminalMacroIndicator
 from opennse_terminal.models.macro import MACRO_INDICATOR_COLUMNS
@@ -115,6 +125,144 @@ def bulletin_pdf(*lines: str) -> bytes:
 def bulletin_url(link: BulletinLink) -> str:
     """The URL as httpx requests it, which is the form respx routes and the request log hold."""
     return str(httpx.URL(link.url))
+
+
+# ---------------------------------------------------------------------------------------------
+# Hostile bulletins, written object by object and compressed in the test so each file is small
+# ---------------------------------------------------------------------------------------------
+
+MIB = 1 << 20
+HELVETICA = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+FLATE = b"/Filter /FlateDecode "
+# The PDF reader's fixed reasons at its limits: 8 MiB of decoded content per page and 1 GiB of
+# address space for the whole parse.
+CONTENT_BUDGET_REASON = "page 1 has more than 8 MiB of decoded content"
+MEMORY_LIMIT_REASON = "the PDF needs more than 1024 MiB of memory to parse"
+
+
+def raw_pdf(objects: Mapping[int, bytes]) -> bytes:
+    """A PDF 1.4 file of the numbered object bodies (object 1 the catalog) with an exact classic
+    cross-reference table."""
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: dict[int, int] = {}
+    for number in sorted(objects):
+        offsets[number] = len(out)
+        out += b"%d 0 obj\n%s\nendobj\n" % (number, objects[number])
+    size = max(objects) + 1
+    xref_offset = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % size
+    for number in range(1, size):
+        if number in offsets:
+            out += b"%010d 00000 n \n" % offsets[number]
+        else:
+            out += b"0000000000 65535 f \n"
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (size, xref_offset)
+    return bytes(out)
+
+
+def stream_object(data: bytes, entries: bytes = b"") -> bytes:
+    return b"<< %s/Length %d >>\nstream\n%s\nendstream" % (entries, len(data), data)
+
+
+def text_operators(*lines: str) -> bytes:
+    """Content-stream operators drawing the ASCII ``lines`` in Helvetica, one line each."""
+    escaped = (line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)") for line in lines)
+    return b"".join(
+        b"BT /F1 9 Tf 1 0 0 1 50 %d Tm (%s) Tj ET\n" % (780 - 14 * index, line.encode("ascii"))
+        for index, line in enumerate(escaped)
+    )
+
+
+def paged_pdf(streams: Sequence[bytes], pages: Sequence[int]) -> bytes:
+    """A PDF whose page ``n`` draws ``streams[pages[n - 1]]``; ``streams`` are content stream
+    object bodies, each written once however many pages draw it."""
+    first_page = 4 + len(streams)
+    kids = b" ".join(b"%d 0 R" % (first_page + index) for index in range(len(pages)))
+    objects = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, len(pages)),
+        3: HELVETICA,
+    }
+    objects |= {4 + index: stream for index, stream in enumerate(streams)}
+    objects |= {
+        first_page + index: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+        b"/Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>" % (4 + stream)
+        for index, stream in enumerate(pages)
+    }
+    return raw_pdf(objects)
+
+
+@functools.cache
+def flate_of_repeated(unit: bytes, size: int) -> bytes:
+    """zlib data decoding to ``unit`` repeated to ``size`` bytes, compressed a mebibyte at a time
+    so the decoded form is never held."""
+    compressor = zlib.compressobj(9)
+    piece = unit * (MIB // len(unit))
+    parts = [compressor.compress(piece[: size - written]) for written in range(0, size, MIB)]
+    parts.append(compressor.flush())
+    return b"".join(parts)
+
+
+TABLE_PAGE = stream_object(text_operators(TITLE_LINE, DATE_ROW, VALUE_ROW))
+"""The reserves table of the reconstructed fixture: five weeks, 12,384 to 12,387."""
+FILLER_PAGE = stream_object(text_operators("Weekly Bulletin", "Commentary on the money markets"))
+UNDECODABLE_PAGE = stream_object(text_operators("Weekly Bulletin"), b"/Filter /LZWDecode ")
+"""Content that its declared LZW filter cannot decode."""
+
+
+def decompression_bomb_page() -> bytes:
+    """16 MiB of whitespace, Flate-compressed to about 16 KB."""
+    return stream_object(flate_of_repeated(b" ", 16 * MIB), FLATE)
+
+
+def hex_wrapped_bomb_page() -> bytes:
+    """1.25 GiB of whitespace behind an ASCIIHex-then-Flate filter chain, about 2.6 MB: not a
+    Flate-only chain, so the content guard decodes it whole, within the memory limit."""
+    flood = flate_of_repeated(b" ", 1280 * MIB).hex().encode("ascii") + b">"
+    return stream_object(flood, b"/Filter [/ASCIIHexDecode /FlateDecode] ")
+
+
+def slow_page() -> bytes:
+    """4 MiB of "q Q" operators: within the content budget, but several seconds of pdfminer
+    work for each page that draws it."""
+    return stream_object(flate_of_repeated(b"q Q\n", 4 * MIB), FLATE)
+
+
+def recording_popen(monkeypatch: pytest.MonkeyPatch) -> list[subprocess.Popen[bytes]]:
+    """Record every parser process the PDF reader starts, in start order."""
+    started: list[subprocess.Popen[bytes]] = []
+    real_popen = subprocess.Popen
+
+    def popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        process: subprocess.Popen[bytes] = real_popen(*args, **kwargs)
+        started.append(process)
+        return process
+
+    monkeypatch.setattr(pdf_line_items.subprocess, "Popen", popen)
+    return started
+
+
+def xref_stream_claiming(claimed: int) -> bytes:
+    """The table bulletin with its cross-reference table replaced by a stream that lists
+    ``claimed`` objects from 0 and holds one entry."""
+    bulletin = bulletin_pdf(TITLE_LINE, DATE_ROW, VALUE_ROW)
+    body = bulletin[: bulletin.index(b"xref")]
+    xref = stream_object(
+        b"\x01\x00\x00",
+        b"/Type /XRef /Size %d /W [1 1 1] /Index [0 %d] /Root 1 0 R " % (claimed, claimed),
+    )
+    return body + b"9 0 obj\n%s\nendobj\nstartxref\n%d\n%%%%EOF\n" % (xref, len(body))
+
+
+def password_locked(pdf_bytes: bytes) -> bytes:
+    """``pdf_bytes`` behind a standard security handler whose user password is not empty, so it
+    does not open without one. The dictionary goes into the trailer, after every object."""
+    owner, user, file_id = (bytes(range(32)).hex(), bytes(32).hex(), bytes(range(16)).hex())
+    encrypt = (
+        f"/Encrypt << /Filter /Standard /V 1 /R 2 /O <{owner}> /U <{user}> /P -4 >> "
+        f"/ID [<{file_id}> <{file_id}>]"
+    ).encode("ascii")
+    return pdf_bytes.replace(b"/Root 1 0 R >>", b"/Root 1 0 R " + encrypt + b" >>")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -432,13 +580,16 @@ def test_minus_sign_in_the_text_layer_reads_as_negative_and_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Embedded fonts with a ToUnicode map give pdfplumber U+2212 for a minus glyph; the test
-    # PDF's WinAnsi font cannot draw it, so its extracted text is made to report one.
-    extract_text = Page.extract_text
-    monkeypatch.setattr(
-        Page,
-        "extract_text",
-        lambda page, **kwargs: extract_text(page, **kwargs).replace("-12,384", "\u221212,384"),
-    )
+    # PDF's WinAnsi font cannot draw it, so the text the reader's parser process sends is made to
+    # report one.
+    iter_page_text = pdf_line_items.iter_page_text
+
+    def with_minus_sign(pdf_bytes: bytes, **kwargs: Any) -> Generator[str, None, None]:
+        with closing(iter_page_text(pdf_bytes, **kwargs)) as pages:
+            for page in pages:
+                yield page.replace("-12,384", "\u221212,384")
+
+    monkeypatch.setattr(pdf_line_items, "iter_page_text", with_minus_sign)
 
     records = parse_reserves_bulletin(
         bulletin_pdf(TITLE_LINE, "08-Jan-26 15-Jan-26", f"{VALUE_LABEL} -12,384 12,390")
@@ -451,6 +602,150 @@ def test_minus_sign_in_the_text_layer_reads_as_negative_and_is_rejected(
     assert [row.reason for row in outcome.rejected] == [f"out_of_range:{RESERVES}:-12384.00"]
     assert outcome.valid == [second]
     assert second.values == {RESERVES: Decimal("12390")}
+
+
+# The bulletin is read in a separate parser process, so each of these files is rejected there,
+# within seconds, and the pipeline's own process never decodes it.
+@pytest.mark.parametrize(
+    ("build", "reason"),
+    [
+        pytest.param(
+            lambda: paged_pdf([decompression_bomb_page()], [0]),
+            CONTENT_BUDGET_REASON,
+            id="decompression-bomb",
+        ),
+        pytest.param(
+            lambda: paged_pdf([UNDECODABLE_PAGE, TABLE_PAGE], [0, 1]),
+            "page 1 of the PDF could not be parsed",
+            id="undecodable-page-before-the-table",
+        ),
+        pytest.param(
+            lambda: xref_stream_claiming(999_999_999),
+            "the PDF's cross-reference stream lists more objects than it holds entries for",
+            id="cross-reference-stream-claiming-a-billion-objects",
+        ),
+        pytest.param(
+            lambda: password_locked(bulletin_pdf(TITLE_LINE, DATE_ROW, VALUE_ROW)),
+            "the PDF is encrypted and does not open without a password",
+            id="needs-a-password",
+        ),
+        pytest.param(
+            lambda: b"%PDF-1.4\nthis is not a PDF body\n",
+            "the PDF could not be parsed (PDFSyntaxError)",
+            id="not-a-pdf-body",
+        ),
+        pytest.param(
+            lambda: raw_pdf(
+                {
+                    1: b"<< /Type /Catalog /Pages 2 0 R >>",
+                    2: b"<< /Type /Pages /Kids [] /Count 0 >>",
+                }
+            ),
+            "the PDF has no pages",
+            id="no-pages",
+        ),
+    ],
+)
+def test_unreadable_bulletin_is_a_layout_change(build: Callable[[], bytes], reason: str) -> None:
+    content = build()
+    started = time.monotonic()
+
+    with pytest.raises(SourceLayoutChanged) as excinfo:
+        parse_reserves_bulletin(content)
+
+    assert time.monotonic() - started < 10
+    assert excinfo.value.message == f"bulletin unreadable: {reason}"
+    assert excinfo.value.expected == ["PDF with a text layer"]
+    assert excinfo.value.found == [reason]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is enforced on Linux")
+def test_bulletin_beyond_the_memory_limit_is_a_layout_change() -> None:
+    # Only a Flate-only stream is measured without being expanded; this chain is decoded whole by
+    # the parser process, which reaches its address-space limit instead of the pipeline's.
+    content = paged_pdf([hex_wrapped_bomb_page()], [0])
+    started = time.monotonic()
+
+    with pytest.raises(SourceLayoutChanged) as excinfo:
+        parse_reserves_bulletin(content)
+
+    assert time.monotonic() - started < 30
+    assert excinfo.value.message == f"bulletin unreadable: {MEMORY_LIMIT_REASON}"
+    assert excinfo.value.found == [MEMORY_LIMIT_REASON]
+
+
+@pytest.mark.parametrize(
+    ("hostile_page", "hostile_pages"),
+    [
+        pytest.param(decompression_bomb_page, 1, id="decompression-bomb"),
+        pytest.param(lambda: UNDECODABLE_PAGE, 1, id="undecodable"),
+        pytest.param(hex_wrapped_bomb_page, 1, id="beyond-the-memory-limit"),
+        # Read through, these pages would pass the 40-second limit of the default reading.
+        pytest.param(slow_page, MAX_SCANNED_PAGES - 1, id="past-the-time-limit"),
+    ],
+)
+def test_pages_after_the_reserves_table_neither_delay_nor_decide_the_parse(
+    monkeypatch: pytest.MonkeyPatch, hostile_page: Callable[[], bytes], hostile_pages: int
+) -> None:
+    content = paged_pdf([TABLE_PAGE, hostile_page()], [0] + [1] * hostile_pages)
+    started = recording_popen(monkeypatch)
+    began = time.monotonic()
+
+    records = parse_reserves_bulletin(content)
+
+    # The default limits apply: the reading stops at the table on page 1.
+    assert time.monotonic() - began < 10
+    assert {record.observation_date: record.values[RESERVES] for record in records} == (
+        EXPECTED_RESERVES
+    )
+    assert {record.raw["page"] for record in records} == {"1"}
+    # The parser process was stopped and reaped before the parse returned.
+    [process] = started
+    assert process.returncode is not None
+
+
+@pytest.mark.parametrize("table_page", [1, MAX_SCANNED_PAGES])
+def test_reserves_table_on_the_first_fifty_of_two_thousand_pages_is_parsed(
+    table_page: int,
+) -> None:
+    pages = [1] * 2000
+    pages[table_page - 1] = 0
+    content = paged_pdf([TABLE_PAGE, FILLER_PAGE], pages)
+
+    records = parse_reserves_bulletin(content)
+
+    assert {record.observation_date: record.values[RESERVES] for record in records} == (
+        EXPECTED_RESERVES
+    )
+    assert {record.raw["page"] for record in records} == {str(table_page)}
+
+
+def test_reserves_table_past_the_scanned_pages_is_not_found() -> None:
+    pages = [1] * 2000
+    pages[MAX_SCANNED_PAGES] = 0
+    content = paged_pdf([TABLE_PAGE, FILLER_PAGE], pages)
+
+    with pytest.raises(SourceLayoutChanged) as excinfo:
+        parse_reserves_bulletin(content)
+
+    assert excinfo.value.message == "reserves table not found"
+    assert excinfo.value.found == []
+
+
+def test_bulletin_read_over_its_time_limit_raises_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 26 bulletins at 40 seconds each stay inside the run's 30-minute idle-in-transaction bound.
+    assert pdf_line_items._parse_time_limit(MAX_SCANNED_PAGES) == 40
+    monkeypatch.setattr(pdf_line_items, "_parse_time_limit", lambda _max_pages: 1.0)
+    content = paged_pdf([slow_page()], [0])
+    started = time.monotonic()
+
+    with pytest.raises(pdf_line_items.PdfParseTimeout) as excinfo:
+        parse_reserves_bulletin(content)
+
+    assert excinfo.value.time_limit == 1.0
+    assert time.monotonic() - started < 5
 
 
 # ---------------------------------------------------------------------------------------------
@@ -551,7 +846,8 @@ def test_publication_date_from_anchor_text_or_file_name(text: str, expected: dat
         ),
         # The default rule never reaches back past an ingested newest bulletin: an older
         # bulletin's provisional figures would overwrite the newer one's values for the weeks
-        # both carry. The weeks of a skipped bulletin arrive with the next one.
+        # both carry. A later bulletin repeats a skipped bulletin's weeks only inside its rolling
+        # window, so the earlier weeks of a longer gap need an explicit --limit backfill.
         pytest.param({NEWEST}, None, [], id="newest-ingested-selects-nothing"),
         pytest.param(set(LISTED_DATES), None, [], id="all-ingested-selects-nothing"),
         pytest.param(
@@ -721,22 +1017,43 @@ async def test_newest_bulletin_wins_for_weeks_two_bulletins_repeat(
     assert await stored_reserves(engine, list(expected)) == expected
 
 
+@pytest.mark.parametrize(
+    ("content", "error_message", "expected"),
+    [
+        pytest.param(
+            lambda: bulletin_pdf(
+                "Table 1: Interbank Market Rates", "Average weekly interbank rate (%) 9.18 9.16"
+            ),
+            "reserves table not found",
+            [f"{TABLE_TITLE} (any table number)", "date row of DD-Mon-YY dates"],
+            id="no-reserves-table",
+        ),
+        pytest.param(
+            lambda: paged_pdf([decompression_bomb_page()], [0]),
+            f"bulletin unreadable: {CONTENT_BUDGET_REASON}",
+            ["PDF with a text layer"],
+            id="decompression-bomb",
+        ),
+    ],
+)
 async def test_bulletin_without_the_reserves_table_writes_nothing(
-    seeded_database: SeededDatabase, cbk: FakeCbk
+    seeded_database: SeededDatabase,
+    cbk: FakeCbk,
+    content: Callable[[], bytes],
+    error_message: str,
+    expected: list[str],
 ) -> None:
     engine = seeded_database.engine
     newest_url = bulletin_url(cbk.links[0])
-    cbk.pdf_content[newest_url] = bulletin_pdf(
-        "Table 1: Interbank Market Rates", "Average weekly interbank rate (%) 9.18 9.16"
-    )
+    cbk.pdf_content[newest_url] = content()
 
     changed = await run(seeded_database, cbk)
 
     assert changed.status is RunStatus.LAYOUT_CHANGED
     assert (changed.rows_fetched, changed.rows_written) == (0, 0)
-    assert changed.error_message == "reserves table not found"
+    assert changed.error_message == error_message
     assert changed.details["bulletins"] == ["2026-02-06"]
-    assert changed.details["expected"][0].startswith(TABLE_TITLE)
+    assert changed.details["expected"] == expected
     assert (await stored_run(engine, changed)).status == "layout_changed"
     assert await stored_rows(engine, list(EXPECTED_RESERVES)) == {}
 

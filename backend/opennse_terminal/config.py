@@ -124,12 +124,17 @@ class TerminalSettings(BaseSettings):
     )
     # The two *_seconds fields are durations, not money, so float is appropriate for them. They
     # must be finite: allow_inf_nan=False rejects "inf" and overflowing strings such as "1e309",
-    # which would otherwise reach asyncio.sleep and httpx.Timeout and stall ingestion.
+    # which would otherwise reach asyncio.sleep and httpx.Timeout and stall ingestion. The
+    # spacing may be raised but never set below 2.0 s, the scrapers' politeness minimum between
+    # requests to one host, which both the HTTP client and the NSE browser session wait.
     scraper_min_interval_seconds: float = Field(
         default=2.0,
-        ge=0,
+        ge=2.0,
         allow_inf_nan=False,
-        description="Minimum spacing between requests to the same host, in seconds.",
+        description=(
+            "Minimum spacing between requests to the same host, in seconds; at least 2.0, the "
+            "scrapers' politeness minimum, which this setting can raise but not lower."
+        ),
     )
     scraper_timeout_seconds: float = Field(
         default=30.0,

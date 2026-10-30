@@ -17,34 +17,48 @@ Politeness contract:
   body byte, is also abandoned once it has run for 10 s plus four read timeouts (130 s at the
   default), so a source sending a byte just inside the read timeout cannot hold a fetch open; an
   abandoned attempt is retried as a read timeout is.
-* **Spacing.** At least ``TERMINAL_SCRAPER_MIN_INTERVAL_SECONDS`` (2.0 s) between the starts of two
-  requests to the same host, counting retries, redirect hops and ``robots.txt`` fetches. The
-  spacing also holds across runs whose clients share one :class:`HostSpacing`, as the runs of a
-  pipeline sequence do, while each run keeps its own ``httpx`` client, cookie jar and
-  ``robots.txt`` cache.
+* **Spacing.** At least ``TERMINAL_SCRAPER_MIN_INTERVAL_SECONDS`` between the starts of two
+  requests to the same host, counting retries, redirect hops and ``robots.txt`` fetches; the
+  setting defaults to 2.0 s and cannot be set lower, so requests to a host always start at least
+  2.0 s apart. The spacing also holds across runs whose clients share one :class:`HostSpacing`,
+  as the runs of a pipeline sequence do, while each run keeps its own ``httpx`` client, cookie
+  jar and ``robots.txt`` cache.
 * **Retries.** Up to ``TERMINAL_SCRAPER_MAX_RETRIES`` (3) on connect or read timeouts, other
   transient network failures and HTTP 429, 500, 502, 503 and 504. The wait before retry *n* is
   the server's ``Retry-After`` when it sends one, otherwise 2^n s plus up to 1 s of jitter, and
   never more than 60 s.
-* **Redirects and size.** At most 5 redirects, followed by hand so that every hop is spaced and
-  checked against its own origin's ``robots.txt``. Every request asks for an unencoded body
-  (``Accept-Encoding: identity``); a ``gzip`` or ``deflate`` body sent anyway is decoded as it
-  streams, and any other content coding fails the fetch. Bodies are abandoned once the bytes
-  received or the bytes decoded would exceed 25 MiB, before the excess is held in memory.
+* **Redirects and size.** At most 5 redirects, followed by hand so that every hop is held to the
+  approved origins, spaced and checked against its own origin's ``robots.txt``. Every request asks
+  for an unencoded body (``Accept-Encoding: identity``); a ``gzip`` or ``deflate`` body sent
+  anyway is decoded as it streams, and any other content coding fails the fetch. Bodies are
+  abandoned once the bytes received or the bytes decoded would exceed 25 MiB, before the excess
+  is held in memory.
 * **robots.txt.** Fetched once per origin per run through this client, its status interpreted as
   RFC 9309 §2.3.1 sets out, and checked for the ``OpenNSE-Terminal`` product token before every
   URL. ``urllib.robotparser`` parses the file; its rules are matched as RFC 9309 §2.2 requires:
   every group naming the product token applies (case-insensitively), else every ``*`` group; the
   longest matching ``Allow`` or ``Disallow`` path wins, ``Allow`` on a tie; ``*`` matches any
   characters and a final ``$`` anchors the end.
+* **Approved origins.** Requests go only to the client's approved HTTPS origins:
+  :data:`APPROVED_ORIGINS` (``https://www.centralbank.go.ke`` and ``https://www.nse.co.ke``, the
+  public sources the pipelines read) unless the client is given others. A URL is approved when
+  its scheme is ``https``, its host equals an approved host (in its ASCII form, whatever its case)
+  and its port is absent or 443. Every URL the client would request is held to this before any
+  network access: the URL passed in, each redirect hop, the ``robots.txt`` of its origin and each
+  hop of a ``robots.txt`` redirect. One that fails is refused with ``FetchFailed`` reason
+  ``"origin_not_approved"`` at once: it is never requested, retried or waited for. An approved
+  origin names its host by DNS name, never by IP address, so a URL whose host is an IP literal
+  (loopback, private, link-local or a cloud metadata address) never matches, nor does any other
+  name. The policy rests on these exact names alone: it does not resolve them, so the addresses
+  they reach are those the approved names' DNS records give.
 * **No credentials.** No source needs any, so a URL carrying userinfo (``user:password@``),
-  whether passed in or reached by a redirect, is refused before it is requested. Logs and
-  exceptions name a URL only by :func:`describe_url`: scheme, host, port and path, never its
-  userinfo, query or fragment, and never the text of a transport error. The records the httpx
-  and httpcore loggers write for this client's own requests are redacted the same way: httpx's
-  request line names its URL by :func:`describe_url`, and each httpcore trace keeps only its
-  event name. Their levels and handlers stay as the host set them, and their records of any
-  other client pass unchanged.
+  whether passed in or reached by a redirect, is refused before it is requested, with reason
+  ``"url_has_userinfo"`` ahead of the origin check. Logs and exceptions name a URL only by
+  :func:`describe_url`: scheme, host, port and path, never its userinfo, query or fragment, and
+  never the text of a transport error. The records the httpx and httpcore loggers write for this
+  client's own requests are redacted the same way: httpx's request line names its URL by
+  :func:`describe_url`, and each httpcore trace keeps only its event name. Their levels and
+  handlers stay as the host set them, and their records of any other client pass unchanged.
 
 Failures surface as the ingestion exceptions the run executor maps to run statuses:
 :class:`~opennse_terminal.ingestion.base.RobotsDisallowed` (``blocked_by_robots``) and
@@ -74,6 +88,7 @@ from opennse_terminal.config import TerminalSettings
 from opennse_terminal.ingestion.base import FetchFailed, RobotsDisallowed
 
 __all__ = [
+    "APPROVED_ORIGINS",
     "ATTEMPT_DEADLINE_READ_TIMEOUTS",
     "BACKOFF_CAP_SECONDS",
     "CONNECT_TIMEOUT_SECONDS",
@@ -92,6 +107,12 @@ logger = logging.getLogger("opennse_terminal.ingestion.http")
 
 ROBOTS_AGENT: Final = "OpenNSE-Terminal"
 """Product token of the user agent, matched against the ``User-agent`` lines of ``robots.txt``."""
+
+APPROVED_ORIGINS: Final = frozenset({"https://www.centralbank.go.ke", "https://www.nse.co.ke"})
+"""The origins, as ``https://<host>``, a :class:`PoliteClient` requests unless it is given others:
+the CBK statistics site and the NSE market-statistics site, the public sources the pipelines read.
+Every URL the client requests, redirect hops and ``robots.txt`` included, must be HTTPS on one of
+these hosts, on the default port."""
 
 MAX_RESPONSE_BYTES: Final = 25 * 1024 * 1024
 """Largest response body accepted, in bytes, both as received and after any ``Content-Encoding``
@@ -123,6 +144,17 @@ _TRANSIENT_ERRORS: Final = (httpx.TimeoutException, httpx.NetworkError, httpx.Re
 
 _REDIRECT_STATUSES: Final = frozenset({301, 302, 303, 307, 308})
 _ALLOWED_SCHEMES: Final = frozenset({"http", "https"})
+# An approved origin as written: "https://" and a host, with no userinfo, port, path, query or
+# fragment, and so no IPv6 literal either, whose brackets and colons the host excludes.
+_ORIGIN_ENTRY: Final = re.compile(r"(?i:https)://[^/?#@:\[\]\\%\s]+")
+# A DNS host name in its lowercase ASCII form: dot-separated labels of letters, digits and inner
+# hyphens, 1 to 63 characters each, with an optional final dot.
+_DNS_NAME: Final = re.compile(
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.?"
+)
+# A last host label that a URL parser reads as part of an IPv4 address ("127.0.0.1",
+# "2130706433", "0x7f.1"), so the host is an address, not a DNS name.
+_NUMERIC_LABEL: Final = re.compile(r"[0-9]+|0[xX][0-9A-Fa-f]*")
 
 _GZIP_CODINGS: Final = frozenset({"gzip", "x-gzip"})
 _DECODED_CODINGS: Final = _GZIP_CODINGS | {"deflate"}
@@ -680,6 +712,40 @@ def _parse_url(url: str) -> httpx.URL:
     return parsed
 
 
+def _approved_host(origin: object) -> str:
+    """The host of the approved origin ``origin``, ``https://<host>``, in the lowercase ASCII
+    (IDNA) form httpx gives a URL's host: ``https://WWW.NSE.CO.KE`` gives ``www.nse.co.ke``.
+
+    Raises:
+        ValueError: ``origin`` is not a string of that form: it has a port, path, query,
+            fragment or userinfo, a scheme other than ``https``, a host that is not a DNS name
+            (an empty or malformed label, an IP address). The message repeats ``origin``, or
+            names it by :func:`describe_url` when it may carry userinfo, which is not echoed.
+    """
+    host = ""
+    if isinstance(origin, str) and _ORIGIN_ENTRY.fullmatch(origin):
+        try:
+            parsed = httpx.URL(origin)
+            # Reading host decodes an IDNA ("xn--") label, raising for a malformed one.
+            host = parsed.raw_host.decode("ascii") if parsed.host else ""
+        except (httpx.InvalidURL, UnicodeError):
+            host = ""
+        if not _DNS_NAME.fullmatch(host) or _NUMERIC_LABEL.fullmatch(
+            host.removesuffix(".").rpartition(".")[2]
+        ):
+            host = ""
+    if not host:
+        if not isinstance(origin, str):
+            described = type(origin).__name__
+        else:
+            described = repr(describe_url(origin) if "@" in origin else origin)
+        raise ValueError(
+            f"allowed origin {described} is not https://<host> with a DNS host name and no "
+            "port, path, query, fragment or userinfo"
+        )
+    return host
+
+
 def _origin(url: httpx.URL) -> str:
     """``<scheme>://<host>[:<port>]``, the scope of one ``robots.txt`` (RFC 9309 §2.3)."""
     return f"{url.scheme}://{url.netloc.decode('ascii')}"
@@ -944,6 +1010,15 @@ class PoliteClient:
             the clients of the runs before and after this one so that their requests to a host
             stay ``scraper_min_interval_seconds`` apart too; when omitted, the client builds its
             own :class:`HostSpacing` on ``clock`` and ``sleep``.
+        allowed_origins: The origins the client may request, each ``https://<host>``;
+            :data:`APPROVED_ORIGINS` when omitted. Any URL on another origin, a redirect hop or
+            a ``robots.txt`` included, is refused without being requested (see the module
+            docstring).
+
+    Raises:
+        TypeError: ``allowed_origins`` is a single string rather than a collection of origins.
+        ValueError: An entry of ``allowed_origins`` is not ``https://<host>`` naming its host by
+            DNS name with no port, path, query, fragment or userinfo, or it names no origin.
     """
 
     def __init__(
@@ -954,7 +1029,14 @@ class PoliteClient:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
         spacing: HostSpacing | None = None,
+        allowed_origins: Iterable[str] = APPROVED_ORIGINS,
     ) -> None:
+        if isinstance(allowed_origins, str):
+            # A string is an iterable of its characters, none of which is an origin.
+            raise TypeError("allowed_origins must be a collection of origins, not one string")
+        self._approved_hosts = frozenset(_approved_host(origin) for origin in allowed_origins)
+        if not self._approved_hosts:
+            raise ValueError("allowed_origins must name at least one origin")
         self._settings = settings
         self._transport = transport
         self._sleep = sleep
@@ -1039,15 +1121,17 @@ class PoliteClient:
                 ``"robots_unreachable"`` when ``robots.txt`` was unreachable. Logged at WARNING.
             RuntimeError: When ``urllib.robotparser`` no longer builds the internals the rules
                 are read from; no verdict is kept for the origin.
-            FetchFailed: When ``url`` is not an absolute http(s) URL or carries userinfo
-                (``"url_has_userinfo"``), ``robots.txt`` could not be fetched at all (network
-                failure or the attempt deadline after retries, too many redirects, a redirect
-                whose target is invalid or not http(s), oversize, an undecodable body; with the
-                reasons :meth:`fetch` lists), or its final status is none of 2xx, 4xx and 5xx
-                (reason ``"robots_http_<status>"`` with the ``robots.txt`` URL; logged at
-                WARNING). No verdict is kept for the origin.
+            FetchFailed: When ``url`` is not an absolute http(s) URL, carries userinfo
+                (``"url_has_userinfo"``) or is not on an approved origin
+                (``"origin_not_approved"``), in which case nothing is requested;
+                ``robots.txt`` could not be fetched at all (network failure or the attempt
+                deadline after retries, too many redirects, a redirect whose target is invalid,
+                not http(s) or not on an approved origin and is then not requested, oversize,
+                an undecodable body; with the reasons :meth:`fetch` lists), or its final status
+                is none of 2xx, 4xx and 5xx (reason ``"robots_http_<status>"`` with the
+                ``robots.txt`` URL; logged at WARNING). No verdict is kept for the origin.
         """
-        parsed = _parse_url(url)
+        parsed = self._approved_url(url)
         origin = _origin(parsed)
         described = describe_url(parsed)
         rules = await self._robots_rules(origin)
@@ -1064,8 +1148,9 @@ class PoliteClient:
     async def fetch(self, url: str) -> FetchedResponse:
         """GET ``url`` politely and return the final 2xx response.
 
-        Checks ``robots.txt`` first and again for every redirect hop; spaces every request to a
-        host; retries transient failures and retryable statuses with backoff; follows at most
+        Holds ``url`` and every redirect hop to the approved origins, and checks ``robots.txt``
+        first and again for every hop, before requesting it; spaces every request to a host;
+        retries transient failures and retryable statuses with backoff; follows at most
         :data:`MAX_REDIRECTS` redirects; asks for an unencoded body and decodes a ``gzip`` or
         ``deflate`` one as it streams, reading and keeping at most :data:`MAX_RESPONSE_BYTES`.
 
@@ -1088,9 +1173,12 @@ class PoliteClient:
                 target is malformed: an unparseable host or a port outside 1-65535),
                 ``"unsupported_url"`` (it is not an absolute http(s) URL with a host, as a
                 ``data:`` or ``javascript:`` redirect is not), ``"url_has_userinfo"`` (it
-                carries userinfo), and ``"robots_http_<status>"`` when ``robots.txt`` grants
-                nothing (see :meth:`ensure_allowed`). A refused redirect fails at once and its
-                target is never requested.
+                carries userinfo), ``"origin_not_approved"`` (it, or the URL a ``robots.txt``
+                request is redirected to, is not HTTPS on an approved host on the default port:
+                plain HTTP, another host or IP address, or another port), and
+                ``"robots_http_<status>"`` when ``robots.txt`` grants nothing (see
+                :meth:`ensure_allowed`). A refused URL or redirect fails at once, with no retry
+                or wait, and its target is never requested.
 
         ``RobotsDisallowed`` and ``FetchFailed``, and every log line, name the URL by
         :func:`describe_url`.
@@ -1158,11 +1246,31 @@ class PoliteClient:
         )
         raise FetchFailed(robots_url, f"robots_http_{status}")
 
+    def _approved_url(self, url: str) -> httpx.URL:
+        """``url`` parsed by :func:`_parse_url`, whose refusals (``"invalid_url"``,
+        ``"unsupported_url"``, ``"url_has_userinfo"``) come first, then held to the approved
+        origins: HTTPS, an approved host and the default port. Any other URL raises FetchFailed
+        with reason ``"origin_not_approved"``, naming it by :func:`describe_url`, before anything
+        is requested for it."""
+        parsed = _parse_url(url)
+        # httpx lowercases the scheme and host, gives the host in its ASCII (IDNA) form and
+        # drops a port equal to the scheme's default, so an explicit ":443" reads as no port.
+        if (
+            parsed.scheme != "https"
+            or parsed.port is not None
+            or parsed.raw_host.decode("ascii", errors="replace") not in self._approved_hosts
+        ):
+            raise FetchFailed(describe_url(parsed), "origin_not_approved")
+        return parsed
+
     async def _get(self, url: str, *, check_robots: bool) -> FetchedResponse:
         """GET ``url``, following redirects by hand, and return the final response whatever its
-        status. Each hop is a separately spaced and retried request; with ``check_robots`` each
-        hop's URL is checked against its origin's ``robots.txt`` before it is requested."""
-        current = _parse_url(url)
+        status. ``url`` and every redirect target are held to the approved origins (see
+        :meth:`_approved_url`) before they are requested, so a ``robots.txt`` request and its
+        redirects are too; a refused one fails the fetch at once. Each hop is a separately
+        spaced and retried request; with ``check_robots`` each hop's URL is checked against its
+        origin's ``robots.txt`` before it is requested."""
+        current = self._approved_url(url)
         redirects = 0
         while True:
             if check_robots:
@@ -1178,7 +1286,7 @@ class PoliteClient:
                 target = current.join(location)
             except httpx.InvalidURL as exc:
                 raise FetchFailed(describe_url(url), "invalid_redirect") from exc
-            current = _parse_url(str(target))
+            current = self._approved_url(str(target))
 
     async def _send(self, url: httpx.URL) -> FetchedResponse:
         """One request with up to ``scraper_max_retries`` retries. Returns the last response,
