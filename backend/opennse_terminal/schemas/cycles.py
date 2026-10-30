@@ -22,6 +22,7 @@ from typing import Final, Literal
 from pydantic import Field
 
 from opennse_terminal.schemas.common import (
+    OptionalRequestInt,
     SectorName,
     TerminalRequestModel,
     TerminalResponseModel,
@@ -100,7 +101,7 @@ class BacktestParams(TerminalRequestModel):
         max_length=MAX_EVENT_DATES,
         description="Event dates T (repeatable). Defaults to every terminal_cycles row.",
     )
-    pre_days: int | None = Field(
+    pre_days: OptionalRequestInt = Field(
         default=None,
         ge=1,
         le=MAX_WINDOW_DAYS,
@@ -109,7 +110,7 @@ class BacktestParams(TerminalRequestModel):
             "parameter is given; cannot be combined with pre_months or post_months."
         ),
     )
-    post_days: int | None = Field(
+    post_days: OptionalRequestInt = Field(
         default=None,
         ge=1,
         le=MAX_WINDOW_DAYS,
@@ -118,7 +119,7 @@ class BacktestParams(TerminalRequestModel):
             "parameter is given; cannot be combined with pre_months or post_months."
         ),
     )
-    pre_months: int | None = Field(
+    pre_months: OptionalRequestInt = Field(
         default=None,
         ge=1,
         le=MAX_WINDOW_MONTHS,
@@ -128,7 +129,7 @@ class BacktestParams(TerminalRequestModel):
             "180 days each side; cannot be combined with pre_days or post_days."
         ),
     )
-    post_months: int | None = Field(
+    post_months: OptionalRequestInt = Field(
         default=None,
         ge=1,
         le=MAX_WINDOW_MONTHS,

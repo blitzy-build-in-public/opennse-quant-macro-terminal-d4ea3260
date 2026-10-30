@@ -301,7 +301,9 @@ export interface ScreenerRow {
    * `turnover_kes` are in it, never converted. The computed metrics are KES-only and flag
    * `currency_mismatch` otherwise: a non-KES equity has a null `market_cap_kes`, and a non-KES
    * equity or non-KES fundamentals give null `eps_kes`, `pe`, `pb`, `ev_ebitda`,
-   * `dividend_yield_pct` and `fundamentals_period_end`.
+   * `dividend_yield_pct` and `fundamentals_period_end`. A non-KES equity's turnover is not scored
+   * either: null `turnover_z` with `turnover_z:currency_mismatch` and a false
+   * `is_turnover_anomaly`, while its volume, in shares, is still scored for `volume_z`.
    */
   currency: string;
   /** Date of the latest close on or before `as_of`. */
@@ -328,7 +330,10 @@ export interface ScreenerRow {
   turnover_kes: DecimalString;
   /** Rolling volume Z-score on `trade_date` (standard deviations). */
   volume_z: DecimalString | null;
-  /** Rolling turnover Z-score on `trade_date` (standard deviations). */
+  /**
+   * Rolling turnover Z-score on `trade_date` (standard deviations), scored only for an equity
+   * listed in KES, as in the anomaly feed; null with `turnover_z:currency_mismatch` for any other.
+   */
   turnover_z: DecimalString | null;
   /**
    * True when the unrounded volume Z-score is at or above the threshold (positive side only).
@@ -338,7 +343,8 @@ export interface ScreenerRow {
   is_volume_anomaly: boolean;
   /**
    * True when the unrounded turnover Z-score is at or above the threshold (positive side only);
-   * comparing the 2 dp `turnover_z` instead can differ, as for `is_volume_anomaly`.
+   * comparing the 2 dp `turnover_z` instead can differ, as for `is_volume_anomaly`. Always false
+   * for an equity not listed in KES, whose turnover is not scored.
    */
   is_turnover_anomaly: boolean;
   /** Free float as a percentage of shares outstanding. */

@@ -27,9 +27,11 @@ returned as stored and never converted, so the screener carries a non-KES equity
 turnover in its own currency, named by the row's ``currency``. Market cap, EPS, P/E, P/B,
 EV/EBITDA, dividend yield and their sector aggregates are computed in KES only: the quant layer
 refuses a non-KES equity outright, and a KES equity's fundamentals not in KES (its market cap
-stands), both with ``currency_mismatch``. The anomaly feed, whose items name no currency, scores
-volume for every equity but turnover only for equities listed in KES, so its turnover is always
-KES; and net flows sum the KES-listed constituents only, leaving any other out with
+stands), both with ``currency_mismatch``. The screener and the anomaly feed, whose Z-scores and
+items name no currency, score volume for every equity but turnover only for equities listed in
+KES, so a scored turnover is always KES: a non-KES screener row has a null ``turnover_z`` with
+``turnover_z:currency_mismatch`` and is never a turnover anomaly, as it is never a turnover item
+of the feed. Net flows sum the KES-listed constituents only, leaving any other out with
 ``currency_mismatch``.
 
 Business-rule errors are coded ``HTTPException`` bodies ``{code, message, field}`` (see
@@ -613,13 +615,15 @@ def _screener_row(
     history: Sequence[PriceRow],
     valuation: ValuationResult,
     volume_point: ZScorePoint,
-    turnover_point: ZScorePoint,
+    turnover_point: ZScorePoint | None,
     threshold: Decimal,
 ) -> ScreenerRow:
     """Build one screener row, quantizing every value once.
 
     The spike flags apply :func:`~opennse_terminal.quant.zscore.is_spike` to the unrounded
-    Z-scores, the one rule the anomaly feed uses too.
+    Z-scores, the one rule the anomaly feed uses too. ``turnover_point`` is ``None`` for an
+    equity not listed in KES, whose turnover is not scored: ``turnover_z`` is null with
+    ``turnover_z:currency_mismatch`` and the row is never a turnover anomaly.
     """
     latest = history[-1]
     previous_close = history[-2].close_price if len(history) > 1 else None
@@ -628,7 +632,12 @@ def _screener_row(
     if change.flag is not None:
         flags.append(f"change_pct:{change.flag}")
     flags.extend(f"volume_z:{code}" for code in volume_point.flags)
-    flags.extend(f"turnover_z:{code}" for code in turnover_point.flags)
+    turnover_z: Decimal | None = None
+    if turnover_point is None:
+        flags.append("turnover_z:currency_mismatch")
+    else:
+        flags.extend(f"turnover_z:{code}" for code in turnover_point.flags)
+        turnover_z = turnover_point.z
     return ScreenerRow(
         ticker=equity.ticker,
         company_name=equity.company_name,
@@ -646,9 +655,9 @@ def _screener_row(
         volume=latest.volume,
         turnover_kes=quantize_out(latest.turnover_kes, "money"),
         volume_z=quantize_out(volume_point.z, "z"),
-        turnover_z=quantize_out(turnover_point.z, "z"),
+        turnover_z=quantize_out(turnover_z, "z"),
         is_volume_anomaly=is_spike(volume_point.z, threshold),
-        is_turnover_anomaly=is_spike(turnover_point.z, threshold),
+        is_turnover_anomaly=is_spike(turnover_z, threshold),
         free_float_pct=quantize_out(equity.free_float_pct, "pct"),
         fundamentals_period_end=valuation.fundamentals_period_end,
         flags=flags,
@@ -707,6 +716,7 @@ def _screener_rows(
     Returns the valuations by ticker, for the sector aggregates, and one quantized row per
     valued equity in ``equities`` order. Only the latest session is scored (``score_from``),
     against the up to ``z_window`` rows before it, which serve as its window observations.
+    Volume is scored for every equity, turnover only for one listed in KES.
     """
     valuations: dict[str, ValuationResult] = {}
     rows: list[ScreenerRow] = []
@@ -736,12 +746,20 @@ def _screener_rows(
             window=params.z_window,
             score_from=latest.trade_date,
         )[-1]
-        turnover_point = rolling_zscores(
-            _observations(history, "turnover"),
-            sessions,
-            window=params.z_window,
-            score_from=latest.trade_date,
-        )[-1]
+        # Turnover is an amount in the listing currency and turnover_z names no currency, so, as
+        # in the anomaly feed, only a KES-listed equity's turnover is scored, never a converted
+        # one; volume, in shares, is scored for every equity. One rule then decides both the
+        # screener's turnover anomalies and the feed's turnover items.
+        turnover_point = (
+            rolling_zscores(
+                _observations(history, "turnover"),
+                sessions,
+                window=params.z_window,
+                score_from=latest.trade_date,
+            )[-1]
+            if equity.currency == ANALYTICS_CURRENCY
+            else None
+        )
         rows.append(
             _screener_row(
                 equity, history, valuation, volume_point, turnover_point, params.anomaly_threshold
@@ -768,7 +786,10 @@ async def get_screener(
     ``currency`` (KES by default), as stored and never converted. Market cap, EPS, the multiples
     and dividend yield are KES-only: a non-KES equity has them all null with
     ``currency_mismatch``, and a KES equity whose fundamentals are not in KES has all but the
-    market cap null with it. Fundamentals are the fiscal year available
+    market cap null with it. The turnover Z-score is KES-only too, as in the anomaly feed: a
+    non-KES equity's turnover is not scored, so its ``turnover_z`` is null with
+    ``turnover_z:currency_mismatch`` and it is never a turnover anomaly, while its volume
+    (shares) is scored. Fundamentals are the fiscal year available
     ``settings.fundamentals_lag_days`` after period end. Banking equities have a
     null EV/EBITDA with ``ev_not_meaningful_for_banks``. A null change carries its reason
     prefixed ``change_pct:``, as in ``change_pct:no_previous_close`` on a counter's first

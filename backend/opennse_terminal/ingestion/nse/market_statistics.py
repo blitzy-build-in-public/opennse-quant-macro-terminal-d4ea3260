@@ -221,13 +221,21 @@ _NO_DATA_PLACEHOLDERS: Final = frozenset(
         "no entries",
     }
 )
+# How long, in whole milliseconds, a re-rendered sector table without data rows, or one identical
+# to the table shown before the selection, must stay unchanged before it counts as rendered. A
+# table the page clears and fills again within that time is captured filled; an empty sector is
+# captured empty, and MIN_ROWS then judges the snapshot as a whole.
+_RENDER_SETTLE_MS: Final = 2_000
+# The window property under which _JS_WATCH keeps its count of sector-table mutations.
+_SECTOR_WATCH: Final = "__opennseTerminalSectorWatch"
 
 # Browser-side helpers shared by the fetcher's page scripts. The page holds bond and derivative
 # tables besides the equity one, each after its own <select> filter, and until the default sector
 # has rendered the derivatives table is the page's first table.nsetable. The sector table is
 # therefore the first table.nsetable after #filtersectors in document order, before any other
 # <select>.
-_JS_HELPERS: Final = r"""
+_JS_HELPERS: Final = (
+    r"""
 const sectorSelect = () => document.querySelector(%SECTORS%);
 const sectorTable = () => {
   const select = sectorSelect();
@@ -252,26 +260,66 @@ const isPaginated = (table) => {
 const sectorState = () => {
   const select = sectorSelect();
   const table = sectorTable();
+  const watch = window[%WATCH%];
   return {
     value: select ? select.value : null,
     rows: table ? dataRows(table) : 0,
     html: table ? table.outerHTML : "",
     paginated: table ? isPaginated(table) : false,
+    renders: watch ? watch.renders : 0,
+    quiet: watch ? Math.floor(performance.now() - watch.changed) : 0,
   };
 };
-""".replace("%SECTORS%", json.dumps(SELECTOR_SECTORS)).replace(
-    "%TABLE%", json.dumps(SELECTOR_TABLE)
+""".replace("%SECTORS%", json.dumps(SELECTOR_SECTORS))
+    .replace("%TABLE%", json.dumps(SELECTOR_TABLE))
+    .replace("%WATCH%", json.dumps(_SECTOR_WATCH))
 )
 _JS_STATE: Final = "() => {" + _JS_HELPERS + "return sectorState(); }"
-# Truthy (the state itself) once the sector table differs from what was there before the
-# selection, has data rows, and sits beside a select showing the requested sector; the page
-# re-renders the select with each sector, so a late response for another sector never passes.
+# Evaluated right before each selection: from then on it counts the mutations of the sector
+# table, so a re-render that leaves the table empty, or byte-identical to the previous sector's,
+# is still seen. A mutation record counts when its target is inside the sector table or a node
+# it adds is or holds that table (the table replaced); attributes are not observed, and the
+# select's own re-render touches neither. sectorState() reports the count as renders and the
+# whole milliseconds since the last counted mutation, or since the watch began, as quiet. A
+# newer watch disconnects the one it replaces.
+_JS_WATCH: Final = (
+    "() => {"
+    + _JS_HELPERS
+    + r"""
+const previous = window[%WATCH%];
+if (previous && previous.observer instanceof MutationObserver) previous.observer.disconnect();
+const watch = { renders: 0, changed: performance.now(), observer: null };
+const touches = (record) => {
+  const table = sectorTable();
+  return !!table && (table.contains(record.target)
+    || Array.from(record.addedNodes).some((node) => node === table || node.contains(table)));
+};
+watch.observer = new MutationObserver((records) => {
+  const counted = records.filter(touches).length;
+  if (counted) {
+    watch.renders += counted;
+    watch.changed = performance.now();
+  }
+});
+watch.observer.observe(document.body, { childList: true, characterData: true, subtree: true });
+window[%WATCH%] = watch;
+}"""
+).replace("%WATCH%", json.dumps(_SECTOR_WATCH))
+# Truthy (the state itself) once the select shows the requested sector beside a sector table
+# that has re-rendered since the selection: at once when the table differs from the one shown
+# before it and has data rows; otherwise, for a table left empty or identical to the previous
+# one, once it differs or _JS_WATCH counted a mutation of it, and it has then stayed unchanged
+# for expected.settle ms (_RENDER_SETTLE_MS). The page re-renders the select with each sector,
+# so a late response for another sector never passes.
 _JS_RENDERED: Final = (
     "(expected) => {"
     + _JS_HELPERS
     + "const state = sectorState();"
-    + "return state.html !== expected.before && state.rows > 0"
-    + " && state.value === expected.value ? state : false; }"
+    + "if (state.value !== expected.value || !state.html) return false;"
+    + "const changed = state.html !== expected.before;"
+    + "if (changed && state.rows > 0) return state;"
+    + "return (changed || state.renders > 0) && state.quiet >= expected.settle"
+    + " ? state : false; }"
 )
 _JS_OPTIONS: Final = (
     r"(options) => options.map((option) => ({value: option.value,"
@@ -389,26 +437,52 @@ class _SectorOption:
 
 @dataclass(frozen=True, slots=True)
 class _SectorState:
-    """The sector select's value and the sector table as the page shows them now."""
+    """The sector select's value and the sector table as the page shows them now, with the
+    mutations of that table counted since the latest selection began (``_JS_WATCH``):
+    ``renders``, and ``quiet_ms``, the whole milliseconds since the last of them or, without one,
+    since the selection began; both are 0 before the first selection."""
 
     value: str | None
     rows: int
     html: str
     paginated: bool
+    renders: int
+    quiet_ms: int
 
     @classmethod
     def from_js(cls, payload: object) -> "_SectorState":
         data: Mapping[str, object] = payload if isinstance(payload, dict) else {}
         value, rows, html = data.get("value"), data.get("rows"), data.get("html")
+        renders, quiet = data.get("renders"), data.get("quiet")
         return cls(
             value=value if isinstance(value, str) else None,
             rows=rows if isinstance(rows, int) else 0,
             html=html if isinstance(html, str) else "",
             paginated=data.get("paginated") is True,
+            renders=renders if isinstance(renders, int) else 0,
+            quiet_ms=quiet if isinstance(quiet, int) else 0,
         )
 
     def shows(self, option: _SectorOption) -> bool:
+        """Whether ``option``'s table is already shown with data rows, so it needs no selection.
+
+        Stricter than :meth:`rendered`: the page shell's own empty table beside the default
+        value must never be captured, so an empty default sector is selected like any other and
+        then accepted by the render wait.
+        """
         return self.value == option.value and self.rows > 0
+
+    def rendered(self, option: _SectorOption, before: str) -> bool:
+        """Whether ``option``'s table has rendered since ``before`` was shown, by the test of
+        ``_JS_RENDERED``: the select shows ``option`` beside a sector table that differs from
+        ``before`` and has data rows, or that differs or has a counted mutation and has stayed
+        unchanged for at least :data:`_RENDER_SETTLE_MS`."""
+        if self.value != option.value or not self.html:
+            return False
+        changed = self.html != before
+        if changed and self.rows > 0:
+            return True
+        return (changed or self.renders > 0) and self.quiet_ms >= _RENDER_SETTLE_MS
 
 
 def _https_host(url: str) -> str | None:
@@ -520,6 +594,52 @@ class _OriginPolicy:
             raise FetchFailed(url, "off_origin_redirect")
 
 
+class _Cancellation:
+    """Tells the cancellation of one fetch apart from a failed browser step.
+
+    Playwright answers the cancellation of an awaited call by aborting the call and re-raising
+    the ``CancelledError``, but when that abort fails it raises a Playwright error instead, so the
+    cancellation arrives as an ordinary-looking failure and, once caught, is spent. Every step
+    that catches a Playwright error and carries on (a navigation retry, a repeated selection) or
+    starts a further step (the next sector, the page HTML) calls :meth:`check` first, so neither
+    the run cap nor a cancellation of the fetch is ever lost, retried or worked past.
+
+    Args:
+        cap: The fetch's run cap (:data:`RUN_CAP_SECONDS`), entered or not yet entered.
+
+    Raises:
+        RuntimeError: Not built inside an asyncio task, where no cap can run either.
+    """
+
+    def __init__(self, cap: asyncio.Timeout) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("the market-statistics fetch must run inside an asyncio task")
+        self._cap = cap
+        self._task = task
+        self._cancelling = task.cancelling()
+
+    def check(self, url: str, cause: BaseException | None = None) -> None:
+        """Return while the fetch is not being cancelled; otherwise raise its cancellation.
+
+        Args:
+            url: The page fetched, for the :class:`FetchFailed` raised.
+            cause: The Playwright error the cancellation surfaced as, if any; it becomes the
+                ``__cause__`` of what is raised.
+
+        Raises:
+            FetchFailed: The run cap has expired (reason ``run_timeout``).
+            asyncio.CancelledError: The fetch's task has otherwise been cancelled since the
+                fetch began, by its caller (on SIGTERM, for example) or by the origin guard of
+                :meth:`_OriginPolicy.enforced`, which turns its own into ``off_origin_redirect``;
+                either then unwinds as if Playwright had let the cancellation through.
+        """
+        if self._cap.expired():
+            raise FetchFailed(url, "run_timeout") from cause
+        if self._task.cancelling() > self._cancelling:
+            raise asyncio.CancelledError from cause
+
+
 class Fetcher(Protocol):
     """Produces a :class:`MarketStatisticsSnapshot`; tests substitute recorded fixtures."""
 
@@ -562,9 +682,12 @@ class MarketStatisticsFetcher:
     Each run gets a fresh browser context with the product's user agent and no stored state, so
     no cookie outlives it. The page is loaded once (up to ``1 + NAVIGATION_RETRIES`` attempts),
     then each ``#filtersectors`` option is selected in dropdown order and the table it renders is
-    captured; consecutive selections and navigation attempts are at least
+    captured (a table left without rows, or identical to the one shown before, once it has also
+    stayed unchanged for 2 s); consecutive selections and navigation attempts are at least
     ``scraper_min_interval_seconds`` apart. The whole session is capped at
-    :data:`RUN_CAP_SECONDS`.
+    :data:`RUN_CAP_SECONDS`. Neither the cap nor a cancellation of the fetch is ever taken for a
+    failed step, retried or worked past, even when Playwright surfaces it as one of its own
+    errors: the cap ends the fetch as ``run_timeout`` and a cancellation ends it cancelled.
 
     The browser contacts only the page's own origin, ``https://<host>`` on the default port,
     over any transport. It is launched resolving only that host on port 443: the same host on
@@ -615,6 +738,7 @@ class MarketStatisticsFetcher:
         from playwright.async_api import async_playwright
 
         deadline = asyncio.timeout(RUN_CAP_SECONDS)
+        cancellation = _Cancellation(deadline)
         try:
             async with deadline, async_playwright() as playwright:
                 try:
@@ -640,6 +764,8 @@ class MarketStatisticsFetcher:
                         ],
                     )
                 except PlaywrightError as exc:
+                    # A launch the cap or a cancellation cut short has not failed.
+                    cancellation.check(url, exc)
                     message = str(exc).lower()
                     if "executable doesn't exist" in message or "playwright install" in message:
                         raise FetchFailed(
@@ -650,7 +776,11 @@ class MarketStatisticsFetcher:
                     raise FetchFailed(url, f"browser_launch_failed: {type(exc).__name__}") from exc
                 try:
                     return await self._capture(
-                        browser, url, user_agent=user_agent, policy=_OriginPolicy(host)
+                        browser,
+                        url,
+                        user_agent=user_agent,
+                        policy=_OriginPolicy(host),
+                        cancellation=cancellation,
                     )
                 finally:
                     await browser.close()
@@ -660,11 +790,19 @@ class MarketStatisticsFetcher:
             if deadline.expired():
                 raise FetchFailed(url, "run_timeout") from exc
             if isinstance(exc, PlaywrightError):
+                # So may a cancellation of the fetch, which then ends it cancelled.
+                cancellation.check(url, exc)
                 raise FetchFailed(url, f"browser_error: {type(exc).__name__}") from exc
             raise
 
     async def _capture(
-        self, browser: "Browser", url: str, *, user_agent: str, policy: _OriginPolicy
+        self,
+        browser: "Browser",
+        url: str,
+        *,
+        user_agent: str,
+        policy: _OriginPolicy,
+        cancellation: _Cancellation,
     ) -> MarketStatisticsSnapshot:
         # A service worker could answer the page's requests without the route below seeing them.
         context = await browser.new_context(user_agent=user_agent, service_workers="block")
@@ -673,12 +811,15 @@ class MarketStatisticsFetcher:
             await context.route("**/*", policy.route)
             async with policy.enforced(url):
                 page = await context.new_page()
-                await self._navigate(page, url, policy)
+                await self._navigate(page, url, policy, cancellation)
                 tables: list[SectorTable] = []
                 for index, option in enumerate(await self._read_options(page)):
+                    # A cancellation spent inside the previous step ends the session here.
+                    cancellation.check(url)
                     if index:
                         await self._sleep(self._settings.scraper_min_interval_seconds)
-                    tables.append(await self._capture_sector(page, url, option))
+                    tables.append(await self._capture_sector(page, url, option, cancellation))
+                cancellation.check(url)
                 page_html = await page.content()
         finally:
             await context.close()
@@ -686,7 +827,9 @@ class MarketStatisticsFetcher:
             page_html=page_html, sector_tables=tuple(tables), fetched_at=datetime.now(UTC)
         )
 
-    async def _navigate(self, page: "Page", url: str, policy: _OriginPolicy) -> None:
+    async def _navigate(
+        self, page: "Page", url: str, policy: _OriginPolicy, cancellation: _Cancellation
+    ) -> None:
         from playwright.async_api import Error as PlaywrightError
 
         attempts = 1 + NAVIGATION_RETRIES
@@ -695,6 +838,7 @@ class MarketStatisticsFetcher:
             # request to it, so every attempt first waits out the per-host spacing.
             await self._sleep(self._settings.scraper_min_interval_seconds)
             failure: str | None = None
+            error: PlaywrightError | None = None
             try:
                 response = await page.goto(
                     url, timeout=NAVIGATION_TIMEOUT_MS, wait_until="domcontentloaded"
@@ -706,10 +850,13 @@ class MarketStatisticsFetcher:
                 else:
                     await page.wait_for_selector(SELECTOR_SECTORS, timeout=NAVIGATION_TIMEOUT_MS)
             except PlaywrightError as exc:
-                failure = type(exc).__name__
+                failure, error = type(exc).__name__, exc
             if policy.violation is not None:
                 # A redirect off the origin is the page's answer, not a transient failure.
                 raise FetchFailed(url, "off_origin_redirect")
+            if error is not None:
+                # Nor is the cap, or a cancellation of the fetch, surfacing as this error.
+                cancellation.check(url, error)
             if failure is None:
                 return
             logger.warning(
@@ -736,12 +883,14 @@ class MarketStatisticsFetcher:
             )
         return options
 
-    async def _capture_sector(self, page: "Page", url: str, option: _SectorOption) -> SectorTable:
+    async def _capture_sector(
+        self, page: "Page", url: str, option: _SectorOption, cancellation: _Cancellation
+    ) -> SectorTable:
         state = await self._state(page)
         # The page renders its default sector itself; selecting the option it already shows
         # would only request the same table again.
         if not state.shows(option):
-            state = await self._select(page, url, option, before=state.html)
+            state = await self._select(page, url, option, cancellation, before=state.html)
         if state.paginated:
             # A paginated table would yield only its first page; a partial sector is a layout
             # change to fail on, not data to write.
@@ -754,7 +903,13 @@ class MarketStatisticsFetcher:
         return SectorTable(option_value=option.value, option_label=option.label, html=state.html)
 
     async def _select(
-        self, page: "Page", url: str, option: _SectorOption, *, before: str
+        self,
+        page: "Page",
+        url: str,
+        option: _SectorOption,
+        cancellation: _Cancellation,
+        *,
+        before: str,
     ) -> _SectorState:
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -762,8 +917,8 @@ class MarketStatisticsFetcher:
         for attempt in (1, 2):
             if attempt == 2:
                 current = await self._state(page)
-                if current.shows(option) and current.html != before:
-                    # It rendered just after the wait gave up.
+                if current.rendered(option, before):
+                    # It rendered, or settled, just after the wait gave up.
                     return current
                 logger.warning(
                     "NSE sector %s did not render within %d ms; selecting it again",
@@ -773,6 +928,9 @@ class MarketStatisticsFetcher:
                 await self._sleep(self._settings.scraper_min_interval_seconds)
                 previous = current.html
             try:
+                # Counted from here on, the table's mutations tell a re-render that leaves it
+                # empty or unchanged-looking from no render at all.
+                await page.evaluate(_JS_WATCH)
                 # Playwright dispatches input and change events even when the value is already
                 # selected, so a repeat selection makes the page render the sector again.
                 await page.select_option(
@@ -780,10 +938,12 @@ class MarketStatisticsFetcher:
                 )
                 handle = await page.wait_for_function(
                     _JS_RENDERED,
-                    arg={"before": previous, "value": option.value},
+                    arg={"before": previous, "value": option.value, "settle": _RENDER_SETTLE_MS},
                     timeout=NAVIGATION_TIMEOUT_MS,
                 )
-            except PlaywrightTimeoutError:
+            except PlaywrightTimeoutError as exc:
+                # Selecting again would work past the cap or a cancellation surfaced as this.
+                cancellation.check(url, exc)
                 continue
             try:
                 return _SectorState.from_js(await handle.json_value())

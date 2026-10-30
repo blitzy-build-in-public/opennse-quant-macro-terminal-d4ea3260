@@ -186,8 +186,11 @@ async def get_screener(
     (KES), EPS (KES per share), P/E, P/B and EV/EBITDA (x) and dividend yield (percentage
     points) are computed in KES only: a non-KES equity has them all null with
     ``currency_mismatch``, and a KES equity whose fundamentals are not in KES has all but the
-    market cap null with it. A row is an anomaly, and ``anomalies_only`` keeps it, when its
-    unrounded Z-score is at or above ``anomaly_threshold`` (default 2.0, positive side only).
+    market cap null with it. The turnover Z-score is KES-only as well, as in the anomaly feed: a
+    non-KES equity's turnover is not scored, so its ``turnover_z`` is null with
+    ``turnover_z:currency_mismatch`` and it is never a turnover anomaly; its volume is scored. A
+    row is an anomaly, and ``anomalies_only`` keeps it, when its unrounded Z-score is at or
+    above ``anomaly_threshold`` (default 2.0, positive side only).
     Banking equities have a null EV/EBITDA with ``ev_not_meaningful_for_banks``. A null metric
     fails every filter on it; rows sort by ``sort`` (default ``market_cap_kes``) in ``order``
     (default ``desc``). The metric filters, ``min_volume_z`` included, and ``sort`` compare the

@@ -31,6 +31,7 @@ from opennse_terminal.schemas.common import (
     Pct,
     Ratio,
     RequestDecimal,
+    RequestInt,
     SectorName,
     SeriesPoint,
     TerminalRequestModel,
@@ -219,7 +220,7 @@ class ScreenerParams(TerminalRequestModel):
             "anomaly."
         ),
     )
-    z_window: int = Field(
+    z_window: RequestInt = Field(
         default=DEFAULT_Z_WINDOW,
         ge=Z_WINDOW_MIN,
         le=Z_WINDOW_MAX,
@@ -245,7 +246,9 @@ class ScreenerRow(TerminalResponseModel):
             "turnover_kes are in it, never converted. The computed metrics are KES-only and "
             "flag currency_mismatch otherwise: a non-KES equity has a null market_cap_kes, and "
             "a non-KES equity or non-KES fundamentals give null eps_kes, pe, pb, ev_ebitda, "
-            "dividend_yield_pct and fundamentals_period_end."
+            "dividend_yield_pct and fundamentals_period_end. A non-KES equity's turnover is "
+            "not scored either: null turnover_z with turnover_z:currency_mismatch and a false "
+            "is_turnover_anomaly, while its volume, in shares, is still scored for volume_z."
         ),
     )
     trade_date: dt.date = Field(description="Date of the latest close on or before as_of.")
@@ -284,7 +287,11 @@ class ScreenerRow(TerminalResponseModel):
         description="Rolling volume Z-score on trade_date (standard deviations).",
     )
     turnover_z: Decimal | None = Field(
-        description="Rolling turnover Z-score on trade_date (standard deviations).",
+        description=(
+            "Rolling turnover Z-score on trade_date (standard deviations), scored only for an "
+            "equity listed in KES, as in the anomaly feed; null with "
+            "turnover_z:currency_mismatch for any other."
+        ),
     )
     is_volume_anomaly: bool = Field(
         description=(
@@ -297,7 +304,8 @@ class ScreenerRow(TerminalResponseModel):
         description=(
             "True when the unrounded turnover Z-score is at or above the threshold (positive "
             "side only); comparing the 2 dp turnover_z instead can give a different answer, as "
-            "for is_volume_anomaly."
+            "for is_volume_anomaly. Always false for an equity not listed in KES, whose "
+            "turnover is not scored."
         ),
     )
     free_float_pct: Decimal | None = Field(
@@ -407,7 +415,7 @@ class SectorHeatmapParams(TerminalRequestModel):
             "period is thus clamped to as_of and can be month-to-date or week-to-date."
         ),
     )
-    periods: int = Field(
+    periods: RequestInt = Field(
         default=DEFAULT_HEATMAP_PERIODS,
         ge=1,
         le=HEATMAP_PERIODS_MAX,
@@ -439,7 +447,7 @@ class ValuationBandsParams(TerminalRequestModel):
         description="Sector name as stored, for example Banking; an unknown sector is a 404.",
     )
     metric: BandMetric = Field(default="pe", description="The banded multiple: pe or pb.")
-    lookback_years: int = Field(
+    lookback_years: RequestInt = Field(
         default=DEFAULT_LOOKBACK_YEARS,
         ge=1,
         le=LOOKBACK_YEARS_MAX,
@@ -581,7 +589,7 @@ class AnomaliesParams(TerminalRequestModel):
     metric: AnomalyMetric = Field(
         default="both", description="Metric to scan: volume, turnover or both."
     )
-    window: int = Field(
+    window: RequestInt = Field(
         default=DEFAULT_Z_WINDOW,
         ge=Z_WINDOW_MIN,
         le=Z_WINDOW_MAX,
@@ -595,7 +603,7 @@ class AnomaliesParams(TerminalRequestModel):
             "Spike threshold in standard deviations: an unrounded Z-score >= threshold is a spike."
         ),
     )
-    lookback_sessions: int = Field(
+    lookback_sessions: RequestInt = Field(
         default=DEFAULT_LOOKBACK_SESSIONS,
         ge=1,
         le=LOOKBACK_SESSIONS_MAX,
@@ -641,7 +649,7 @@ class FlowsParams(TerminalRequestModel):
         default=None,
         description="Last date of the range (YYYY-MM-DD); defaults to as_of.",
     )
-    rolling_window: int = Field(
+    rolling_window: RequestInt = Field(
         default=DEFAULT_ROLLING_WINDOW,
         ge=Z_WINDOW_MIN,
         le=Z_WINDOW_MAX,

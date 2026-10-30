@@ -21,6 +21,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import logging
+import threading
 import time
 import uuid
 from bisect import bisect_right
@@ -75,6 +76,7 @@ from opennse_terminal.schemas.macro import IndicatorSnapshot, YieldCurvePoint
 from opennse_terminal.schemas.market import (
     AnomalyMetric,
     ScreenerParams,
+    ScreenerRow,
     ScreenerSort,
     SortOrder,
 )
@@ -87,7 +89,7 @@ from opennse_terminal.services.macro_service import (
     get_macro_overview,
     yield_curve_at,
 )
-from opennse_terminal.services.offload import CLIENT_CLOSED_REQUEST, RequestAbandonedError
+from opennse_terminal.services.offload import CLIENT_CLOSED_REQUEST, RequestAbandonedError, compute
 
 BASE: Final[str] = "/api/v1/terminal"
 
@@ -482,6 +484,74 @@ async def test_non_canonical_decimal_query_is_the_standard_422(
             }
         ]
     }
+
+
+@pytest.mark.parametrize(
+    ("path", "required", "parameter", "value", "canonical"),
+    [
+        pytest.param("/market/screener", {}, "z_window", "2_0", "20", id="z_window-underscore"),
+        pytest.param("/market/screener", {}, "z_window", " 5", "5", id="z_window-padded"),
+        pytest.param("/market/screener", {}, "z_window", "5.0", "5", id="z_window-fraction"),
+        pytest.param("/market/screener", {}, "z_window", "+10", "10", id="z_window-plus"),
+        pytest.param(
+            "/macro/overview", {}, "history_months", "+10", "10", id="history_months-plus"
+        ),
+        pytest.param("/market/sector-heatmap", {}, "periods", "1_2", "12", id="periods-underscore"),
+        pytest.param(
+            "/market/valuation-bands",
+            {"ticker": "SCOM"},
+            "lookback_years",
+            " 5",
+            "5",
+            id="lookback_years-padded",
+        ),
+        pytest.param("/market/anomalies", {}, "window", " 5", "5", id="window-padded"),
+        pytest.param(
+            "/market/anomalies",
+            {},
+            "lookback_sessions",
+            "5.0",
+            "5",
+            id="lookback_sessions-fraction",
+        ),
+        pytest.param(
+            "/market/flows", {}, "rolling_window", "2_0", "20", id="rolling_window-underscore"
+        ),
+        pytest.param("/cycles/backtest", {}, "pre_days", "5.0", "5", id="pre_days-fraction"),
+        pytest.param("/cycles/backtest", {}, "post_days", "+10", "10", id="post_days-plus"),
+        pytest.param("/cycles/backtest", {}, "pre_months", " 3", "3", id="pre_months-padded"),
+        pytest.param(
+            "/cycles/backtest", {}, "post_months", "1_2", "12", id="post_months-underscore"
+        ),
+    ],
+)
+async def test_non_canonical_integer_query_is_the_standard_422(
+    client: httpx.AsyncClient,
+    path: str,
+    required: Mapping[str, str],
+    parameter: str,
+    value: str,
+    canonical: str,
+) -> None:
+    """An integer query parameter must be ASCII integer text: ``_`` separators, surrounding
+    whitespace, a zero fraction and a ``+`` sign, which Pydantic's lax integers read, are
+    FastAPI's ``int_parsing``, while the canonical spelling of the same number is served.
+    ``required`` holds the other parameters the endpoint needs to answer at all."""
+    response = await client.get(f"{BASE}{path}", params={**required, parameter: value})
+
+    assert response.status_code == 422, response.text
+    assert response.json() == {
+        "detail": [
+            {
+                "type": "int_parsing",
+                "loc": ["query", parameter],
+                "msg": "Input should be a valid integer, unable to parse string as an integer",
+                "input": value,
+            }
+        ]
+    }
+    accepted = await client.get(f"{BASE}{path}", params={**required, parameter: canonical})
+    assert accepted.status_code == 200, accepted.text
 
 
 async def test_sector_heatmap_covers_four_sectors_over_twelve_month_ends(
@@ -3584,6 +3654,61 @@ async def test_anomaly_feed_scores_no_turnover_of_an_equity_not_listed_in_kes(
     assert kes_turnover_spikes <= {(name, day) for name, day, kind in found if kind == "turnover"}
 
 
+async def eabl_row_agreeing_with_the_feed(
+    session: AsyncSession, settings: TerminalSettings, day: date
+) -> ScreenerRow:
+    """EABL's screener row as of ``day``, once the one spike rule is checked on that session:
+    every row's volume and turnover anomaly flags match the default feed's items dated ``day``,
+    and ``anomalies_only`` keeps exactly the flagged rows, in screener order."""
+    screener = await ms.get_screener(session, ScreenerParams(as_of=day), LOCAL, settings)
+    kept = await ms.get_screener(
+        session, ScreenerParams(as_of=day, anomalies_only=True), LOCAL, settings
+    )
+    feed = await ms.get_anomalies(session)
+    spikes = {(item.ticker, item.metric) for item in feed.items if item.trade_date == day}
+
+    assert len(screener.rows) == len(SEEDED_ROWS)
+    for row in screener.rows:
+        assert row.trade_date == day
+        assert row.is_volume_anomaly == ((row.ticker, "volume") in spikes)
+        assert row.is_turnover_anomaly == ((row.ticker, "turnover") in spikes)
+    flagged = [row for row in screener.rows if row.is_volume_anomaly or row.is_turnover_anomaly]
+    assert kept.rows == flagged
+    assert {row.ticker for row in kept.rows} == {ticker for ticker, _ in spikes}
+    return next(row for row in screener.rows if row.ticker == "EABL")
+
+
+async def test_screener_and_feed_agree_on_the_turnover_of_an_equity_not_listed_in_kes(
+    session: AsyncSession, settings: TerminalSettings
+) -> None:
+    """One spike rule drives the screener's anomaly flags, its ``anomalies_only`` filter and the
+    feed, before and after EABL is switched to USD on this clone. Listed in KES, EABL's planted
+    2026-09-29 spike is a volume and a turnover anomaly in both. Listed in USD, neither scores its
+    turnover: the row has a null ``turnover_z`` with ``turnover_z:currency_mismatch``, and
+    ``anomalies_only`` keeps EABL through its volume spike alone, scored as before, which the
+    feed keeps too. The turnover is returned as stored, never converted."""
+    day = date(2026, 9, 29)
+    kes = await eabl_row_agreeing_with_the_feed(session, settings, day)
+    assert (kes.currency, kes.is_volume_anomaly, kes.is_turnover_anomaly) == ("KES", True, True)
+    assert kes.turnover_z is not None
+    assert not any(flag.startswith("turnover_z:") for flag in kes.flags)
+
+    await session.execute(
+        update(TerminalEquity).where(TerminalEquity.ticker == "EABL").values(currency="USD")
+    )
+    await session.commit()
+    usd = await eabl_row_agreeing_with_the_feed(session, settings, day)
+
+    assert (usd.currency, usd.turnover_z, usd.is_turnover_anomaly) == ("USD", None, False)
+    assert "turnover_z:currency_mismatch" in usd.flags
+    assert usd.is_volume_anomaly
+    assert (usd.volume, usd.volume_z, usd.turnover_kes) == (
+        kes.volume,
+        kes.volume_z,
+        kes.turnover_kes,
+    )
+
+
 # ---------------------------------------------------------------------------------------------
 # Market service: GET /market/flows
 # ---------------------------------------------------------------------------------------------
@@ -3859,10 +3984,17 @@ async def test_equity_not_listed_in_kes_is_never_converted(
     session: AsyncSession, settings: TerminalSettings
 ) -> None:
     """With SBIC switched to USD on this clone nothing is converted. Its screener row keeps the
-    close but has no market cap or multiple, with ``currency_mismatch``, and the Banking
-    aggregate is flagged and valued over the other four. The heatmap leaves it out (Banking 4
-    constituents, market 7). Its own P/E band has no value (``no_positive_earnings`` plus
-    ``currency_mismatch``), and the Banking band is flagged and ends at the four-bank P/E."""
+    close, volume and turnover as stored and its volume Z-score, but has no market cap or
+    multiple, with ``currency_mismatch``, and no turnover Z-score or turnover anomaly, with
+    ``turnover_z:currency_mismatch``; the Banking aggregate is flagged and valued over the other
+    four. The heatmap leaves it out (Banking 4 constituents, market 7). Its own P/E band has no
+    value (``no_positive_earnings`` plus ``currency_mismatch``), and the Banking band is flagged
+    and ends at the four-bank P/E."""
+    listed_in_kes = await ms.get_screener(
+        session, ScreenerParams(sector="Banking"), LOCAL, settings
+    )
+    kes_row = next(row for row in listed_in_kes.rows if row.ticker == "SBIC")
+    assert kes_row.turnover_z is not None
     await session.execute(
         update(TerminalEquity).where(TerminalEquity.ticker == "SBIC").values(currency="USD")
     )
@@ -3877,7 +4009,19 @@ async def test_equity_not_listed_in_kes_is_never_converted(
         None,
         None,
     )
-    assert sbic.flags == ["currency_mismatch", "ev_not_meaningful_for_banks"]
+    assert (sbic.volume, sbic.turnover_kes, sbic.volume_z, sbic.is_volume_anomaly) == (
+        kes_row.volume,
+        kes_row.turnover_kes,
+        kes_row.volume_z,
+        kes_row.is_volume_anomaly,
+    )
+    assert sbic.volume_z is not None
+    assert (sbic.turnover_z, sbic.is_turnover_anomaly) == (None, False)
+    assert sbic.flags == [
+        "currency_mismatch",
+        "ev_not_meaningful_for_banks",
+        "turnover_z:currency_mismatch",
+    ]
     banking = next(a for a in screener.sector_aggregates if a.sector == "Banking")
     assert banking.flags == ["currency_mismatch", "ev_not_meaningful_for_banks"]
     assert (banking.constituent_count, banking.pe_eligible_count) == (5, 4)
@@ -5396,6 +5540,12 @@ async def test_debug_summary_escapes_stored_labels(
 # Analytic services: computation in a worker thread and abandoned requests (services/offload.py)
 # ---------------------------------------------------------------------------------------------
 #
+# ``offload.compute(abandoned, func, /, *args, **kwargs)`` awaits ``abandoned`` (when given) on
+# the event loop first. When it reports that the client went away, ``RequestAbandonedError`` is
+# raised and ``func`` never runs; otherwise ``func`` runs in a Starlette threadpool worker, so the
+# event loop keeps running other tasks meanwhile, and its result is returned unchanged. The tests
+# of ``compute`` alone, last in this section, touch no database, network or filesystem.
+#
 # The screener, valuation bands, anomalies, flows and backtest read on the event loop, then run
 # their pure quant computation in a worker thread through ``offload.compute``, in chunks: one per
 # ticker series for the anomaly feed and one per cycle for the backtest. Before each chunk they
@@ -5579,6 +5729,99 @@ async def test_event_loop_keeps_running_while_a_series_is_scored(
     assert len(observed) == 2
     for before, after in observed:
         assert after > before
+
+
+OFFLOAD_LOGGER = "opennse_terminal.services.offload"
+
+
+async def test_func_runs_in_a_worker_thread_while_the_loop_keeps_running() -> None:
+    """While ``func`` sleeps 0.3 s in another thread, a 10 ms ticker on the loop keeps ticking.
+
+    Run inline, the sleep would hold the event loop and the ticker could not tick until it ended.
+    """
+    loop_thread = threading.get_ident()
+    ticks = 0
+    seen: list[tuple[int, int, int]] = []
+
+    def blocking(value: int, *, scale: int) -> int:
+        before = ticks
+        time.sleep(0.3)
+        seen.append((threading.get_ident(), before, ticks))
+        return value * scale
+
+    async def ticker(stop: asyncio.Event) -> None:
+        nonlocal ticks
+        while not stop.is_set():
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    stop = asyncio.Event()
+    ticking = asyncio.create_task(ticker(stop))
+    try:
+        result = await compute(None, blocking, 7, scale=6)
+    finally:
+        stop.set()
+        await ticking
+
+    assert result == 42
+    ((worker_thread, before, after),) = seen
+    assert worker_thread != loop_thread
+    assert after > before
+
+
+@pytest.mark.parametrize("checks", [None, 1], ids=["no-check", "client-still-there"])
+async def test_func_runs_with_its_arguments_unless_abandoned(checks: int | None) -> None:
+    """Without a check, or with one answering ``False``, ``func`` gets every argument as given.
+
+    The check, when given, is awaited exactly once, before ``func`` runs.
+    """
+    probe = None if checks is None else AbandonAfter(checks)
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def record(*args: object, **kwargs: object) -> str:
+        calls.append((args, kwargs))
+        return "done"
+
+    # ``abandoned`` is positional-only, so func may take a keyword of that name itself.
+    result = await compute(probe, record, 1, "two", abandoned="kept", window=20)
+
+    assert result == "done"
+    assert calls == [((1, "two"), {"abandoned": "kept", "window": 20})]
+    if probe is not None:
+        assert probe.calls == 1
+
+
+async def test_abandoned_request_raises_before_func_runs(caplog: pytest.LogCaptureFixture) -> None:
+    """A check answering ``True`` raises ``RequestAbandonedError``; ``func`` is never called.
+
+    One DEBUG record names the function that was not started.
+    """
+    caplog.set_level(logging.DEBUG, logger=OFFLOAD_LOGGER)
+    calls: list[None] = []
+
+    def never() -> None:
+        calls.append(None)
+
+    probe = AbandonAfter(0)
+
+    with pytest.raises(RequestAbandonedError):
+        await compute(probe, never)
+
+    assert probe.calls == 1
+    assert calls == []
+    (record,) = [record for record in caplog.records if record.name == OFFLOAD_LOGGER]
+    assert record.levelno == logging.DEBUG
+    assert "never" in record.getMessage()
+
+
+async def test_func_exception_propagates_unchanged() -> None:
+    """An exception raised by ``func`` in the worker thread reaches the caller as raised."""
+
+    def fail() -> None:
+        raise ValueError("window must be between 5 and 250, got 4")
+
+    with pytest.raises(ValueError, match="window must be between 5 and 250, got 4"):
+        await compute(AbandonAfter(1), fail)
 
 
 # ---------------------------------------------------------------------------------------------

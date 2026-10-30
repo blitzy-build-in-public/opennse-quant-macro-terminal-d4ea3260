@@ -10,7 +10,8 @@ FastAPI, SQLAlchemy, the models or the services. It holds:
 * the OpenAPI documentation of FastAPI's standard 422 list: :class:`ValidationErrorItem` and
   :class:`ValidationErrorResponse`;
 * :data:`Flag`, the base reason codes that accompany null or qualified metric values;
-* bounded request aliases (:data:`RequestDecimal`, :data:`Kes`, :data:`ShareCount`, ...);
+* bounded request aliases (:data:`RequestDecimal`, :data:`Kes`, :data:`RequestInt`,
+  :data:`ShareCount`, ...);
 * :class:`NoQueryParams`, the query-parameter model of an endpoint that declares none;
 * the shared response shapes :class:`CoverageMeta`, :class:`SeriesPoint` and
   :class:`HealthResponse`;
@@ -21,7 +22,8 @@ Pydantic serializes every ``Decimal`` as a JSON string and keeps its exponent, s
 ``Decimal("7.50")`` becomes ``"7.50"``. Services quantize each value once, with
 ``quant.numeric.quantize_out``, before building a response model; this module adds no custom
 serializer. Requests accept a ``Decimal`` as a JSON number or as a string of canonical ASCII
-decimal text (:data:`CanonicalDecimalText`), and a share count only as a JSON integer.
+decimal text (:data:`CanonicalDecimalText`), an integer query parameter only as canonical ASCII
+integer text (:data:`CanonicalIntegerText`), and a share count only as a JSON integer.
 """
 
 import datetime as dt
@@ -47,6 +49,7 @@ __all__ = [
     "ERROR_CODES",
     "FLAG_CODES",
     "CanonicalDecimalText",
+    "CanonicalIntegerText",
     "CoverageMeta",
     "ErrorCode",
     "ErrorDetail",
@@ -56,10 +59,12 @@ __all__ = [
     "Kes",
     "NoQueryParams",
     "NonNegativeKes",
+    "OptionalRequestInt",
     "Pct",
     "PositiveShareCount",
     "Ratio",
     "RequestDecimal",
+    "RequestInt",
     "SectorName",
     "SeriesPoint",
     "ShareCount",
@@ -503,6 +508,57 @@ Pct = Annotated[Decimal, Field(max_digits=28, allow_inf_nan=False), CanonicalDec
 
 Ratio = Annotated[Decimal, Field(max_digits=28, allow_inf_nan=False), CanonicalDecimalText]
 """A dimensionless multiple (x), such as P/E or EV/EBITDA."""
+
+_CANONICAL_INTEGER_PATTERN: Final = re.compile(r"-?[0-9]+")
+"""Canonical integer text: ASCII digits with an optional leading minus, and nothing else. The
+minus is kept so that a negative value is refused by the field's lower bound
+(``greater_than_equal``) rather than as unreadable text."""
+
+
+def _require_canonical_integer_text(value: object) -> object:
+    """Pass ``value`` on to the integer validator only if it is a canonical integer input.
+
+    Pydantic's lax integer validator also reads surrounding whitespace, ``_`` digit separators, a
+    leading ``+`` and a zero fraction, so ``" 5"``, ``"2_0"``, ``"+10"`` and ``"5.0"`` would
+    validate as 5, 20, 10 and 5. A string passes only when it is canonical integer text; any other
+    string is refused as ``int_parsing``, the integer validator's own error for text it cannot
+    read. An ``int`` passes, and so does ``None``, which an optional field accepts and any other
+    field's integer validator refuses as ``int_type``. Every other value is refused as
+    ``int_type``, as the strict body integers of :data:`ShareCount` refuse it: a ``bool``, which
+    the lax validator would read as 0 or 1, a float, even ``5.0``, and a ``Decimal``.
+    """
+    if isinstance(value, str):
+        if _CANONICAL_INTEGER_PATTERN.fullmatch(value) is None:
+            raise PydanticKnownError("int_parsing")
+        return value
+    if value is None or (isinstance(value, int) and not isinstance(value, bool)):
+        return value
+    raise PydanticKnownError("int_type")
+
+
+CanonicalIntegerText: Final = BeforeValidator(_require_canonical_integer_text)
+"""The last metadata of every request integer alias: a string must be canonical integer text.
+
+It refuses a non-canonical string (whitespace, ``_`` separators, a ``+`` sign, a fraction,
+non-ASCII digits) with FastAPI's standard 422 entry ``int_parsing``, and a value that is neither
+a string nor an ``int`` (a boolean, a float) with ``int_type``, before the integer validator
+reads it. Like :data:`CanonicalDecimalText` it goes after every bound, so a field's own
+``Field(ge=..., le=...)`` is merged ahead of it: OpenAPI documents the bounds as ``minimum`` and
+``maximum``, and a value outside them is refused as ``greater_than_equal`` or
+``less_than_equal``."""
+
+RequestInt = Annotated[int, CanonicalIntegerText]
+"""Base of every integer query parameter, bounded by its field's own ``Field(ge=..., le=...)``.
+Accepts an ``int``, or a string of canonical ASCII integer text such as ``"20"`` or ``"-3"``
+(:data:`CanonicalIntegerText`); a query parameter always arrives as a string."""
+
+OptionalRequestInt = Annotated[int | None, CanonicalIntegerText]
+"""An integer query parameter that defaults to ``None``: a :data:`RequestInt` or ``None``.
+
+Write an optional request integer this way, never as ``RequestInt | None``: inside a union,
+Pydantic applies the field's ``ge`` and ``le`` after the validator, as separate checks that
+OpenAPI documents with non-standard ``ge`` and ``le`` keywords instead of ``minimum`` and
+``maximum``."""
 
 ShareCount = Annotated[int, Field(ge=0, le=MAX_SHARE_COUNT, strict=True)]
 """A share count or traded volume in shares, 0 to 10^12, so the JSON integer is exact in

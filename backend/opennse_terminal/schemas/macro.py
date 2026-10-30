@@ -15,6 +15,7 @@ from pydantic import Field
 
 from opennse_terminal.schemas.common import (
     CoverageMeta,
+    RequestInt,
     SeriesPoint,
     TerminalRequestModel,
     TerminalResponseModel,
@@ -84,7 +85,7 @@ class MacroOverviewParams(TerminalRequestModel):
     parameter is FastAPI's standard 422 ``extra_forbidden``.
     """
 
-    history_months: int = Field(
+    history_months: RequestInt = Field(
         default=DEFAULT_HISTORY_MONTHS,
         ge=1,
         le=HISTORY_MONTHS_MAX,

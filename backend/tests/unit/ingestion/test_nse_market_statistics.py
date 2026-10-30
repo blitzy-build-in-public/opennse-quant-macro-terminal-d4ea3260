@@ -60,6 +60,8 @@ from opennse_terminal.ingestion.nse.market_statistics import (
     _JS_OPTIONS,
     _JS_RENDERED,
     _JS_STATE,
+    _JS_WATCH,
+    _RENDER_SETTLE_MS,
     CHANGE_PCT_BOUND,
     EXPECTED_HEADERS,
     ISIN_RE,
@@ -1017,7 +1019,8 @@ Pick = Literal["renders", "renders_late", "stale", "other_sector", "select_times
 the table renders only once the adapter's wait for it has timed out. ``stale``: the select
 changes but the table does not. ``other_sector``: a late response for another sector re-renders
 the select and the table for that sector instead. ``select_times_out``: ``select_option`` itself
-times out and nothing changes.
+times out and nothing changes. The watch ``_JS_WATCH`` installed counts every re-render of the
+table, ``renders_late``'s once it happens; ``stale`` and ``select_times_out`` re-render nothing.
 """
 
 Navigation = tuple[int | Exception | None, Exception | None]
@@ -1046,7 +1049,12 @@ DATATABLES_EMPTY_ROW = (
 )
 """The body row DataTables renders in a table without data."""
 
-PAGE_SCRIPTS = {_JS_OPTIONS: "_JS_OPTIONS", _JS_RENDERED: "_JS_RENDERED", _JS_STATE: "_JS_STATE"}
+PAGE_SCRIPTS = {
+    _JS_OPTIONS: "_JS_OPTIONS",
+    _JS_RENDERED: "_JS_RENDERED",
+    _JS_STATE: "_JS_STATE",
+    _JS_WATCH: "_JS_WATCH",
+}
 """The adapter's page scripts by module name: the doubles emulate these and no other."""
 
 
@@ -1059,16 +1067,19 @@ def data_rows(html: str) -> int:
     return sum(1 for row in table.find_all("tr") if row.find("td", recursive=False) is not None)
 
 
-def rendered_table(html: str) -> str:
-    """A reconstructed sector table as the page renders it.
+def table_alone(html: str) -> str:
+    """A sector fixture's table without the fixture's header comment, as the page inserts it.
 
-    The page script counts a sector as rendered only once its table holds a data row, and
-    DataTables gives a table without data its "No data available in table" row, which
-    :func:`parse_sector_table` skips. A fixture with an empty body is served with that row.
+    The two fixtures with an empty body, ``real.html`` and ``exchange.html``, differ only in that
+    comment, so their tables alone are byte-identical.
     """
-    if data_rows(html) > 0:
-        return html
-    return html.replace("</tbody>", f"{DATATABLES_EMPTY_ROW}</tbody>")
+    return html[html.index("<table") :]
+
+
+def datatables_empty(html: str) -> str:
+    """The table alone of a sector fixture with an empty body, as DataTables renders it: with its
+    "No data available in table" row, which :func:`parse_sector_table` skips."""
+    return table_alone(html).replace("</tbody>", f"{DATATABLES_EMPTY_ROW}</tbody>")
 
 
 def script_name(expression: str) -> str:
@@ -1093,7 +1104,8 @@ class Shown:
         return data_rows(self.html)
 
     def state(self) -> dict[str, object]:
-        """The ``_JS_STATE`` payload of this view."""
+        """This view's part of the ``_JS_STATE`` payload; :meth:`FakePage.state` adds the
+        watch's."""
         return {
             "value": self.value,
             "rows": self.rows,
@@ -1123,8 +1135,14 @@ class Scenario:
         requests: By call name, the requests the browser issues during each such call, announced
             to the context's ``request`` listeners before the call answers, raises or blocks.
         raises: By call name, the error that call raises.
-        hangs: By call name, a call that blocks until cancelled and then raises the given error
-            or, for ``None``, lets the cancellation through.
+        hangs: By call name, the first call of that name blocks until cancelled and then raises
+            the given error or, for ``None``, lets the cancellation through; later calls of that
+            name answer as usual, so a fetch that carries on past the cancellation completes or
+            fails an assertion instead of hanging.
+        quiet_ms: The whole milliseconds the page reports its sector table unchanged for
+            (``quiet``) while a watch (``_JS_WATCH``) is installed; by default exactly
+            :data:`_RENDER_SETTLE_MS`, so a render that leaves the table empty or identical to
+            the one before has settled.
     """
 
     options: object
@@ -1137,6 +1155,7 @@ class Scenario:
     requests: dict[str, list["FakeRequest"]] = dataclasses.field(default_factory=dict)
     raises: dict[str, Exception] = dataclasses.field(default_factory=dict)
     hangs: dict[str, Exception | None] = dataclasses.field(default_factory=dict)
+    quiet_ms: int = _RENDER_SETTLE_MS
 
 
 class BrowserDouble:
@@ -1153,6 +1172,7 @@ class BrowserDouble:
         self.routes: list[Callable[[FakeRoute], Awaitable[None]]] = []
         self._navigation = list(scenario.navigation)
         self._picks = {value: list(picks) for value, picks in scenario.picks.items()}
+        self._hung: set[str] = set()
 
     def async_playwright(self) -> "FakePlaywright":
         """The replacement for ``playwright.async_api.async_playwright``."""
@@ -1174,7 +1194,8 @@ class BrowserDouble:
         error = self.scenario.raises.get(name)
         if error is not None:
             raise error
-        if name in self.scenario.hangs:
+        if name in self.scenario.hangs and name not in self._hung:
+            self._hung.add(name)
             surfaced = self.scenario.hangs[name]
             try:
                 await asyncio.Event().wait()
@@ -1349,6 +1370,39 @@ class FakePage:
         # Rendered once the adapter's current wait for a render times out (Pick "renders_late").
         self._pending: Shown | None = None
         self._selector_error: Exception | None = None
+        # The table re-renders counted since the latest _JS_WATCH; None before the first.
+        self._renders: int | None = None
+
+    def state(self) -> dict[str, object]:
+        """The ``_JS_STATE`` payload: the view shown, with what the watch reports."""
+        renders, quiet = self._watched()
+        return {**self.shown.state(), "renders": renders, "quiet": quiet}
+
+    def _watched(self) -> tuple[int, int]:
+        """The watch's ``renders`` and ``quiet``, as ``sectorState()`` reports them: both 0
+        before the first ``_JS_WATCH``."""
+        if self._renders is None:
+            return 0, 0
+        return self._renders, self._scenario.quiet_ms
+
+    def _render(self, shown: Shown) -> None:
+        """Re-render the select and the sector table as ``shown``; the watch counts it."""
+        self.shown = shown
+        if self._renders is not None:
+            self._renders += 1
+
+    def _rendered(self, expected: Mapping[str, object]) -> bool:
+        """``_JS_RENDERED``'s test, as the page runs it on what it shows now."""
+        shown = self.shown
+        if shown.value != expected["value"] or not shown.html:
+            return False
+        changed = shown.html != expected["before"]
+        if changed and shown.rows > 0:
+            return True
+        renders, quiet = self._watched()
+        settle = expected.get("settle")
+        # A missing settle time compares as undefined does in the page: nothing has settled.
+        return (changed or renders > 0) and isinstance(settle, int) and quiet >= settle
 
     async def goto(self, url: str, *, timeout: float, wait_until: str) -> FakeResponse | None:
         await self._double.call("goto", url=url, timeout=timeout, wait_until=wait_until)
@@ -1369,9 +1423,14 @@ class FakePage:
         )
         return self._scenario.options
 
-    async def evaluate(self, expression: str) -> dict[str, object]:
-        await self._double.call("evaluate", script=script_name(expression))
-        return self.shown.state()
+    async def evaluate(self, expression: str) -> dict[str, object] | None:
+        name = script_name(expression)
+        await self._double.call("evaluate", script=name)
+        if name == "_JS_WATCH":
+            # A new watch replaces the previous one and counts from zero.
+            self._renders = 0
+            return None
+        return self.state()
 
     async def select_option(self, selector: str, value: str, *, timeout: float) -> list[str]:
         await self._double.call("select_option", selector=selector, value=value, timeout=timeout)
@@ -1379,9 +1438,9 @@ class FakePage:
         if pick == "select_times_out":
             raise PlaywrightTimeoutError(f"Timeout {timeout}ms exceeded.")
         if pick == "renders":
-            self.shown = self._scenario.rendered[value]
+            self._render(self._scenario.rendered[value])
         elif pick == "other_sector":
-            self.shown = LATE_RESPONSE
+            self._render(LATE_RESPONSE)
         else:
             # The select shows the requested sector at once; its table has not changed yet.
             self.shown = dataclasses.replace(self.shown, value=value)
@@ -1395,14 +1454,13 @@ class FakePage:
         await self._double.call(
             "wait_for_function", script=script_name(expression), arg=dict(arg), timeout=timeout
         )
-        shown = self.shown
-        # _JS_RENDERED: a changed table, with data rows, beside the requested sector's value.
-        if shown.html != arg["before"] and shown.rows > 0 and shown.value == arg["value"]:
-            handle = FakeHandle(self._double, shown.state())
+        if self._rendered(arg):
+            handle = FakeHandle(self._double, self.state())
             self._double.handles.append(handle)
             return handle
         if self._pending is not None:
-            self.shown, self._pending = self._pending, None
+            pending, self._pending = self._pending, None
+            self._render(pending)
         raise PlaywrightTimeoutError(f"Timeout {timeout}ms exceeded.")
 
     async def content(self) -> str:
@@ -1418,11 +1476,12 @@ def option_payload(slugs: Sequence[str]) -> list[object]:
 def fixture_scenario(
     page_shell: str, sector_html: Mapping[str, str], slugs: Sequence[str] = SLUGS
 ) -> Scenario:
-    """The reconstructed page: its shell, the listed sectors' tables, and the first listed sector
-    selected beside the shell's empty table, as the page loads."""
+    """The reconstructed page: its shell, the listed sectors' tables as the fixtures hold them
+    (``real`` and ``exchange`` with an empty body), and the first listed sector selected beside
+    the shell's empty table, as the page loads."""
     return Scenario(
         options=option_payload(slugs),
-        rendered={slug: Shown(slug, rendered_table(sector_html[slug])) for slug in slugs},
+        rendered={slug: Shown(slug, sector_html[slug]) for slug in slugs},
         initial=Shown(slugs[0], SHELL_TABLE),
         page_html=page_shell,
     )
@@ -1527,7 +1586,9 @@ async def test_fetch_makes_exactly_the_expected_browser_calls_in_order(
     await fetch_with(double, test_settings)
 
     # The page loads with Agricultural selected and the table empty, so every sector, the first
-    # included, is selected, and each wait expects the table shown just before its selection.
+    # included, is selected, each after a watch of the table's mutations is installed, and each
+    # wait expects the table shown just before its selection. The two sectors without data
+    # render with one selection each, like every other.
     selections: list[Call] = []
     before = SHELL_TABLE
     for index, slug in enumerate(SLUGS):
@@ -1535,12 +1596,13 @@ async def test_fetch_makes_exactly_the_expected_browser_calls_in_order(
             selections.append(("sleep", {"seconds": interval}))
         selections += [
             ("evaluate", {"script": "_JS_STATE"}),
+            ("evaluate", {"script": "_JS_WATCH"}),
             ("select_option", {"selector": "#filtersectors", "value": slug, "timeout": 30_000}),
             (
                 "wait_for_function",
                 {
                     "script": "_JS_RENDERED",
-                    "arg": {"before": before, "value": slug},
+                    "arg": {"before": before, "value": slug, "settle": 2_000},
                     "timeout": 30_000,
                 },
             ),
@@ -1883,6 +1945,7 @@ async def test_the_sector_the_page_already_shows_is_captured_without_selecting_i
     assert double.calls("wait_for_function")[0]["arg"] == {
         "before": initial.html,
         "value": selected[0],
+        "settle": 2_000,
     }
     assert len(double.handles) == len(selected)
     assert all(handle.disposed for handle in double.handles)
@@ -1913,7 +1976,7 @@ async def test_spacing_waits_the_configured_interval_before_navigation_and_betwe
     [
         pytest.param(
             ["renders_late"],
-            ["sleep", "evaluate", "select_option", "wait_for_function", "evaluate"],
+            ["sleep", "evaluate", "evaluate", "select_option", "wait_for_function", "evaluate"],
             ["agric"],
             False,
             id="renders-just-after-the-wait-gives-up",
@@ -1921,8 +1984,9 @@ async def test_spacing_waits_the_configured_interval_before_navigation_and_betwe
         pytest.param(
             ["stale", "renders"],
             [
-                *("sleep", "evaluate", "select_option", "wait_for_function", "evaluate"),
-                *("sleep", "select_option", "wait_for_function", "json_value", "dispose"),
+                *("sleep", "evaluate", "evaluate", "select_option", "wait_for_function"),
+                *("evaluate", "sleep", "evaluate", "select_option", "wait_for_function"),
+                *("json_value", "dispose"),
             ],
             ["agric", "agric"],
             True,
@@ -1931,8 +1995,9 @@ async def test_spacing_waits_the_configured_interval_before_navigation_and_betwe
         pytest.param(
             ["other_sector", "renders"],
             [
-                *("sleep", "evaluate", "select_option", "wait_for_function", "evaluate"),
-                *("sleep", "select_option", "wait_for_function", "json_value", "dispose"),
+                *("sleep", "evaluate", "evaluate", "select_option", "wait_for_function"),
+                *("evaluate", "sleep", "evaluate", "select_option", "wait_for_function"),
+                *("json_value", "dispose"),
             ],
             ["agric", "late"],
             True,
@@ -1941,8 +2006,9 @@ async def test_spacing_waits_the_configured_interval_before_navigation_and_betwe
         pytest.param(
             ["select_times_out", "renders"],
             [
-                *("sleep", "evaluate", "select_option", "evaluate"),
-                *("sleep", "select_option", "wait_for_function", "json_value", "dispose"),
+                *("sleep", "evaluate", "evaluate", "select_option", "evaluate"),
+                *("sleep", "evaluate", "select_option", "wait_for_function", "json_value"),
+                "dispose",
             ],
             ["agric"],
             True,
@@ -1964,7 +2030,8 @@ async def test_only_a_changed_render_of_the_requested_sector_is_captured(
     caplog.set_level(logging.WARNING, logger=ADAPTER_LOGGER)
     interval = test_settings.scraper_min_interval_seconds
     # Agricultural is already rendered, so a stale table seen once Banking is selected has data
-    # rows beside the requested value: only its unchanged HTML tells it apart.
+    # rows beside the requested value: only its unchanged HTML, with no re-render counted, tells
+    # it apart.
     scenario = dataclasses.replace(
         fixture_scenario(page_shell, sector_html, ("agric", "bank")),
         initial=Shown("agric", sector_html["agric"]),
@@ -1986,8 +2053,14 @@ async def test_only_a_changed_render_of_the_requested_sector_is_captured(
         args == {"selector": "#filtersectors", "value": "bank", "timeout": 30_000}
         for args in double.calls("select_option")
     )
+    # Each selection, a repeated one included, follows a fresh watch of the table's mutations.
+    assert all(
+        double.log[index - 1] == ("evaluate", {"script": "_JS_WATCH"})
+        for index, (name, _) in enumerate(double.log)
+        if name == "select_option"
+    )
     assert [args["arg"] for args in double.calls("wait_for_function")] == [
-        {"before": befores[name], "value": "bank"} for name in wait_befores
+        {"before": befores[name], "value": "bank", "settle": 2_000} for name in wait_befores
     ]
     assert double.calls("sleep") == [{"seconds": interval}] * (3 if warned else 2)
     assert adapter_warnings(caplog) == (
@@ -2031,6 +2104,109 @@ async def test_a_sector_that_never_renders_fails_the_fetch_and_closes_the_browse
     assert [args["value"] for args in double.calls("select_option")] == ["bank", "bank"]
     assert adapter_warnings(caplog) == [
         "NSE sector Banking did not render within 30000 ms; selecting it again"
+    ]
+    assert "content" not in double.names()
+    assert_closed(double)
+
+
+@pytest.mark.parametrize(
+    ("empty_table", "slugs"),
+    [
+        pytest.param(None, ("tele", "real"), id="empty-body-after-a-sector-with-rows"),
+        pytest.param(
+            table_alone, ("tele", "real", "exchange"), id="identical-adjacent-empty-bodies"
+        ),
+        pytest.param(
+            datatables_empty,
+            ("tele", "real", "exchange"),
+            id="identical-adjacent-datatables-placeholder-tables",
+        ),
+    ],
+)
+async def test_a_sector_rendered_empty_or_identical_to_the_one_before_is_captured_once_settled(
+    install_browser: Callable[[Scenario], BrowserDouble],
+    test_settings: TerminalSettings,
+    page_shell: str,
+    sector_html: Mapping[str, str],
+    caplog: pytest.LogCaptureFixture,
+    empty_table: Callable[[str], str] | None,
+    slugs: tuple[str, ...],
+) -> None:
+    caplog.set_level(logging.WARNING, logger=ADAPTER_LOGGER)
+    # The sectors after Telecommunication have no data; without a form given, they render as
+    # their fixtures hold them.
+    scenario = fixture_scenario(page_shell, sector_html, slugs)
+    if empty_table is not None:
+        for slug in slugs[1:]:
+            scenario.rendered[slug] = Shown(slug, empty_table(sector_html[slug]))
+    # Where there are two, their tables are byte-identical.
+    assert len({scenario.rendered[slug].html for slug in slugs[1:]}) == 1
+    double = install_browser(scenario)
+
+    captured = await fetch_with(double, test_settings)
+
+    assert captured.sector_tables == tuple(
+        SectorTable(slug, LABEL_BY_SLUG[slug], scenario.rendered[slug].html) for slug in slugs
+    )
+    # One selection and one render wait per sector: nothing is selected again or warned about.
+    assert [args["value"] for args in double.calls("select_option")] == list(slugs)
+    assert len(double.handles) == len(slugs)
+    assert all(handle.disposed for handle in double.handles)
+    assert adapter_warnings(caplog) == []
+    # The empty sectors yield no rows; the row-count threshold judges the snapshot as a whole.
+    assert all(parse_sector_table(table.html) == [] for table in captured.sector_tables[1:])
+    assert_closed(double)
+
+
+@pytest.mark.parametrize(
+    ("empty_table", "changes", "selected", "label"),
+    [
+        pytest.param(
+            datatables_empty,
+            {"picks": {"exchange": ["stale", "stale"]}},
+            ["tele", "real", "exchange", "exchange"],
+            "Exchange Traded Funds",
+            id="table-identical-to-the-one-before-that-never-re-renders",
+        ),
+        pytest.param(
+            None,
+            {"quiet_ms": _RENDER_SETTLE_MS - 1},
+            ["tele", "real", "real"],
+            "Real Estate Investment Trust",
+            id="empty-re-render-that-never-settles",
+        ),
+    ],
+)
+async def test_an_empty_or_identical_table_that_never_settles_as_a_render_fails_the_fetch(
+    install_browser: Callable[[Scenario], BrowserDouble],
+    test_settings: TerminalSettings,
+    page_shell: str,
+    sector_html: Mapping[str, str],
+    caplog: pytest.LogCaptureFixture,
+    empty_table: Callable[[str], str] | None,
+    changes: dict[str, object],
+    selected: list[str],
+    label: str,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=ADAPTER_LOGGER)
+    slugs = ("tele", "real", "exchange")
+    scenario = dataclasses.replace(fixture_scenario(page_shell, sector_html, slugs), **changes)
+    if empty_table is not None:
+        for slug in slugs[1:]:
+            scenario.rendered[slug] = Shown(slug, empty_table(sector_html[slug]))
+    double = install_browser(scenario)
+
+    with pytest.raises(FetchFailed) as exc_info:
+        await fetch_with(double, test_settings)
+
+    # Neither the previous sector's table nor a table still changing is captured for it.
+    assert (exc_info.value.url, exc_info.value.reason) == (
+        NSE_MARKET_STATISTICS_URL,
+        f"sector_render_timeout:{label}",
+    )
+    assert [args["value"] for args in double.calls("select_option")] == selected
+    assert adapter_warnings(caplog) == [
+        f"NSE sector {label} did not render within 30000 ms; selecting it again"
     ]
     assert "content" not in double.names()
     assert_closed(double)
@@ -2191,6 +2367,28 @@ async def test_a_browser_error_mid_session_fails_the_fetch_and_closes_the_browse
     ("call", "surfaces"),
     [
         pytest.param("goto", None, id="navigation"),
+        # Playwright surfaces the cap's cancellation as its own error when aborting the
+        # interrupted call fails; caught where a failed step is retried, it still ends the fetch.
+        pytest.param(
+            "goto",
+            PlaywrightError("Page.goto: Target page, context or browser has been closed"),
+            id="navigation-surfaces-a-playwright-error",
+        ),
+        pytest.param(
+            "wait_for_selector",
+            PlaywrightTimeoutError("Page.wait_for_selector: Timeout 30000ms exceeded."),
+            id="dropdown-wait-surfaces-a-playwright-timeout",
+        ),
+        pytest.param(
+            "select_option",
+            PlaywrightTimeoutError("Page.select_option: Timeout 30000ms exceeded."),
+            id="selection-surfaces-a-playwright-timeout",
+        ),
+        pytest.param(
+            "wait_for_function",
+            PlaywrightTimeoutError("Page.wait_for_function: Timeout 30000ms exceeded."),
+            id="render-wait-surfaces-a-playwright-timeout",
+        ),
         pytest.param("evaluate", None, id="state"),
         pytest.param("wait_for_function", None, id="render-wait"),
         pytest.param(
@@ -2234,6 +2432,94 @@ async def test_the_run_cap_ends_a_hung_session_as_run_timeout(
         assert isinstance(exc_info.value.__cause__, TimeoutError)
     else:
         assert exc_info.value.__cause__ is surfaces
+    names = double.names()
+    assert names.count(call) == 1
+    assert names[names.index(call) + 1 :] == ["context.close", "browser.close"]
+    assert_closed(double)
+
+
+@pytest.mark.parametrize(
+    "surfaces",
+    [
+        pytest.param(None, id="cancellation"),
+        pytest.param(
+            PlaywrightError("BrowserType.launch: Target page, context or browser has been closed"),
+            id="playwright-error",
+        ),
+    ],
+)
+async def test_the_run_cap_ends_a_hung_launch_as_run_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    install_browser: Callable[[Scenario], BrowserDouble],
+    test_settings: TerminalSettings,
+    page_shell: str,
+    sector_html: Mapping[str, str],
+    surfaces: PlaywrightError | None,
+) -> None:
+    # A launch error raised while the cap cancels the launch is the cap's, not a launch failure.
+    monkeypatch.setattr("opennse_terminal.ingestion.nse.market_statistics.RUN_CAP_SECONDS", 0)
+    scenario = fixture_scenario(page_shell, sector_html, ("agric", "bank"))
+    double = install_browser(dataclasses.replace(scenario, hangs={"launch": surfaces}))
+
+    with pytest.raises(FetchFailed) as exc_info:
+        # A guard so that a regression fails this test instead of hanging the suite.
+        async with asyncio.timeout(5):
+            await fetch_with(double, test_settings)
+
+    assert (exc_info.value.url, exc_info.value.reason) == (NSE_MARKET_STATISTICS_URL, "run_timeout")
+    if surfaces is None:
+        assert isinstance(exc_info.value.__cause__, TimeoutError)
+    else:
+        assert exc_info.value.__cause__ is surfaces
+    # Nothing was opened, so there is nothing to close.
+    assert double.names() == ["launch"]
+    assert double.browsers == []
+
+
+@pytest.mark.parametrize(
+    ("call", "surfaced"),
+    [
+        pytest.param(
+            "goto",
+            PlaywrightError("Page.goto: Target page, context or browser has been closed"),
+            id="navigation-is-not-retried",
+        ),
+        pytest.param(
+            "wait_for_function",
+            PlaywrightTimeoutError("Page.wait_for_function: Timeout 30000ms exceeded."),
+            id="sector-is-not-selected-again",
+        ),
+        pytest.param(
+            "content",
+            PlaywrightError("Page.content: Target page, context or browser has been closed"),
+            id="page-html-is-not-a-browser-error",
+        ),
+    ],
+)
+async def test_a_cancellation_playwright_surfaces_as_its_error_ends_the_fetch_cancelled(
+    install_browser: Callable[[Scenario], BrowserDouble],
+    test_settings: TerminalSettings,
+    page_shell: str,
+    sector_html: Mapping[str, str],
+    call: str,
+    surfaced: PlaywrightError,
+) -> None:
+    # The caller cancels the fetch, as SIGTERM does, while ``call`` is under way, and Playwright
+    # surfaces that cancellation as its own error: the fetch ends cancelled, nothing after it.
+    scenario = fixture_scenario(page_shell, sector_html, ("agric", "bank"))
+    double = install_browser(dataclasses.replace(scenario, hangs={call: surfaced}))
+    task = asyncio.create_task(fetch_with(double, test_settings))
+    async with asyncio.timeout(5):
+        while call not in double.names():
+            await asyncio.sleep(0)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        # A guard so that a regression fails this test instead of hanging the suite.
+        async with asyncio.timeout(5):
+            await task
+
+    assert task.cancelled()
     names = double.names()
     assert names.count(call) == 1
     assert names[names.index(call) + 1 :] == ["context.close", "browser.close"]
@@ -2573,6 +2859,23 @@ async def test_a_request_whose_page_closes_while_it_is_routed_raises_nothing(
             id="interrupted-render-wait-surfacing-a-playwright-error",
         ),
         pytest.param(
+            {
+                "requests": {
+                    "wait_for_function": [
+                        hop("http://10.0.0.1/?token=SECRET", "https://www.nse.co.ke/wp-admin/")
+                    ]
+                },
+                "hangs": {
+                    "wait_for_function": PlaywrightTimeoutError(
+                        "Page.wait_for_function: Timeout 30000ms exceeded."
+                    )
+                },
+            },
+            "wait_for_function",
+            "http://10.0.0.1/",
+            id="interrupted-render-wait-surfacing-a-playwright-timeout-is-not-selected-again",
+        ),
+        pytest.param(
             {"requests": {"content": [hop("http://127.0.0.1:8081/?token=SECRET")]}},
             "content",
             "http://127.0.0.1:8081/",
@@ -2839,13 +3142,9 @@ async def test_the_real_browser_reaches_nothing_off_the_origin_and_captures_ever
             )
         }
         for slug in SLUGS:
-            fragment = rendered_table(sector_html[slug])
-            # The table alone, as the page inserts it, without the fixture's header comment and
-            # marked with its sector, so the two adjacent sectors without data render different
-            # tables, as the fetcher's render wait requires.
-            served[f"/sectors/{slug}.html"] = fragment[fragment.index("<table") :].replace(
-                '<table class="nsetable"', f'<table class="nsetable" data-sector="{slug}"', 1
-            )
+            # The table alone, as the page inserts it: the two adjacent sectors without data
+            # render byte-identical tables with an empty body, as their fixtures hold them.
+            served[f"/sectors/{slug}.html"] = table_alone(sector_html[slug])
 
         async def serve(route: Route) -> None:
             body = served.get(urlsplit(route.request.url).path)
