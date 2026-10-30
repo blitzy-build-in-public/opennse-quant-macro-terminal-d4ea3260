@@ -189,6 +189,9 @@ flowchart LR
 | Scheduler | `opennse-terminal scheduler` | Exactly one dedicated process; never started inside web workers, where every job would run once per worker |
 | Web | `npm run start` | Next.js server; same-origin rewrites to the API |
 
+The API runs analytic computation in a worker thread, so the event loop keeps serving other
+requests meanwhile; CPU-bound throughput scales with uvicorn workers (`--workers N`).
+
 Repository layout:
 
 ```text

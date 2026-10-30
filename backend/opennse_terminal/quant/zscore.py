@@ -133,6 +133,7 @@ def rolling_zscores(
     *,
     window: int = DEFAULT_Z_WINDOW,
     min_periods: int | None = None,
+    score_from: date | None = None,
 ) -> list[ZScorePoint]:
     """Score each of one ticker's observations against its own trailing window.
 
@@ -153,10 +154,16 @@ def rolling_zscores(
     * ``sd(W) == 0``: ``z`` is ``None``, flag ``zero_variance``; the mean and standard deviation
       are still returned.
 
-    A day without a row produces no point: the output has exactly one point per input row, in
-    input order. ``z`` is dimensionless; ``rolling_mean`` and ``rolling_stdev`` are in the metric's
-    unit (shares for volume; for turnover, the equity's listing currency, KES by default, never
-    converted). Nothing is rounded.
+    A day without a row produces no point: the output has exactly one point per scored input row,
+    in input order. ``z`` is dimensionless; ``rolling_mean`` and ``rolling_stdev`` are in the
+    metric's unit (shares for volume; for turnover, the equity's listing currency, KES by default,
+    never converted). Nothing is rounded.
+
+    ``score_from`` limits which rows are scored, not which rows are observations: a row dated
+    before it gets no point but still enters the windows of the scored rows after it, so each
+    point equals the one an unrestricted call returns for the same row. A caller that needs only
+    the latest days passes the first of them instead of scoring the whole lead-in and discarding
+    it.
 
     Args:
         rows: One ticker's ``(trade_date, value)`` pairs, such as :class:`Observation` records,
@@ -167,9 +174,12 @@ def rolling_zscores(
         window: ``N``, the most observations ``W`` may hold, within ``MIN_Z_WINDOW..MAX_Z_WINDOW``.
         min_periods: Fewest observations a defined ``z`` needs, within ``2..window``; defaults to
             :func:`default_min_periods` of ``window`` (15 for 20).
+        score_from: Earliest date scored, inclusive; ``None`` scores every row. A date after the
+            last row scores none.
 
     Returns:
-        One :class:`ZScorePoint` per row.
+        One :class:`ZScorePoint` per row dated on or after ``score_from``, or per row when it is
+        ``None``.
 
     Raises:
         ValueError: If ``window`` or ``min_periods`` is out of range, ``rows`` or ``sessions`` is
@@ -190,8 +200,11 @@ def rolling_zscores(
     dates = [trade_date for trade_date, _ in rows]
     values = [value for _, value in rows]
     span = 2 * window
+    first_scored = 0 if score_from is None else bisect_left(dates, score_from)
     points: list[ZScorePoint] = []
-    for position, (trade_date, value) in enumerate(rows):
+    for position in range(first_scored, len(rows)):
+        trade_date = dates[position]
+        value = values[position]
         # Rows are strictly ascending, so rows[:position] are exactly those dated before t.
         sessions_before = bisect_left(sessions, trade_date)
         if sessions_before == 0:

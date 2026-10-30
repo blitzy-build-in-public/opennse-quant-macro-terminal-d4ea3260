@@ -290,12 +290,16 @@ async def owned_watchlist_tickers(
 async def list_watchlists(session: AsyncSession, principal: OwnerPrincipal) -> list[Watchlist]:
     """Return every watchlist of ``principal``, ordered by name, each with sorted tickers.
 
+    Names are compared under collation ``"C"``, which on the UTF-8 database is Unicode code-point
+    order: the order of Python's ``sorted`` and of the widgets' own sort, identical on every
+    PostgreSQL whatever the database's default collation, which may fold case, accents and
+    punctuation differently from host to host. Names are unique per owner, so the order is total.
     An owner without watchlists gets an empty list. Read-only; raises nothing.
     """
     result = await session.execute(
         select(TerminalWatchlist)
         .where(TerminalWatchlist.owner_key == principal.subject)
-        .order_by(TerminalWatchlist.name)
+        .order_by(TerminalWatchlist.name.collate("C"))
         .options(selectinload(TerminalWatchlist.items))
     )
     return [_to_schema(row) for row in result.scalars().all()]

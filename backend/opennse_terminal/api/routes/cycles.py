@@ -14,13 +14,19 @@ relates two parameters and every unknown entity, raising the coded body
 also rounds every value exactly once, and the response serializes each ``Decimal`` as a JSON
 string. The service is called through its module so that tests can replace it.
 
+The service backtests each cycle in a worker thread after its reads, so the event loop keeps
+serving other requests. The route passes ``request.is_disconnected``, which the service checks
+before each cycle; once the client has gone away the service raises ``RequestAbandonedError``
+and the route answers 499 (client closed request), a response the server discards. ``Request``
+is not a query parameter and does not appear in the OpenAPI document.
+
 Annotations are evaluated at runtime (no ``from __future__ import annotations``), because FastAPI
 reads the ``Annotated`` metadata of every route signature.
 """
 
 from typing import Annotated, Any, Final
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request, Response
 
 from opennse_terminal.api.deps import SessionDep, SettingsDep
 from opennse_terminal.schemas import (
@@ -30,6 +36,7 @@ from opennse_terminal.schemas import (
     ValidationErrorResponse,
 )
 from opennse_terminal.services import cycle_service
+from opennse_terminal.services.offload import CLIENT_CLOSED_REQUEST, RequestAbandonedError
 
 __all__ = ["SECTOR_MAX_LENGTH", "TICKER_MAX_LENGTH", "get_cycle_backtest", "router"]
 
@@ -62,10 +69,11 @@ router = APIRouter()
     responses=_BACKTEST_RESPONSES,
 )
 async def get_cycle_backtest(
+    request: Request,
     session: SessionDep,
     settings: SettingsDep,
     params: Annotated[BacktestParams, Query()],
-) -> BacktestResponse:
+) -> BacktestResponse | Response:
     """Map NSE price, turnover, P/E and foreign-flow paths around each event date T.
 
     The window is given either in calendar days (``pre_days``/``post_days``, 1-365, default 180
@@ -87,14 +95,18 @@ async def get_cycle_backtest(
     are repeatable, and an unknown parameter, alone or beside declared ones, is a standard 422
     with one ``extra_forbidden`` entry per unknown name, and the service does not run.
     """
-    return await cycle_service.get_backtest(
-        session,
-        settings,
-        event_dates=params.event_dates,
-        pre_days=params.pre_days,
-        post_days=params.post_days,
-        pre_months=params.pre_months,
-        post_months=params.post_months,
-        tickers=params.tickers,
-        sector=params.sector,
-    )
+    try:
+        return await cycle_service.get_backtest(
+            session,
+            settings,
+            event_dates=params.event_dates,
+            pre_days=params.pre_days,
+            post_days=params.post_days,
+            pre_months=params.pre_months,
+            post_months=params.post_months,
+            tickers=params.tickers,
+            sector=params.sector,
+            abandoned=request.is_disconnected,
+        )
+    except RequestAbandonedError:
+        return Response(status_code=CLIENT_CLOSED_REQUEST)

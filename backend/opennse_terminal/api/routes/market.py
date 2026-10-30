@@ -17,6 +17,13 @@ value exactly once, and the responses serialize each ``Decimal`` as a JSON strin
 parameters are bound as ``Decimal``, never ``float``. The service is called through its module so
 that tests can replace it.
 
+The screener, valuation bands, anomalies and flows compute in a worker thread after their reads,
+so the event loop keeps serving other requests. Each of these routes passes
+``request.is_disconnected`` to its service, which checks it before each chunk of computation;
+once the client has gone away the service raises ``RequestAbandonedError`` and the route answers 499
+(client closed request), a response the server discards. ``Request`` is not a query parameter
+and does not appear in the OpenAPI document.
+
 Annotations are evaluated at runtime (no ``from __future__ import annotations``), because FastAPI
 reads the ``Annotated`` metadata of every route signature.
 """
@@ -24,7 +31,7 @@ reads the ``Annotated`` metadata of every route signature.
 from decimal import Decimal
 from typing import Annotated, Any, Final
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request, Response
 
 from opennse_terminal.api.deps import PrincipalDep, SessionDep, SettingsDep
 from opennse_terminal.schemas import (
@@ -55,6 +62,7 @@ from opennse_terminal.schemas import (
     ValuationBandsResponse,
 )
 from opennse_terminal.services import market_service
+from opennse_terminal.services.offload import CLIENT_CLOSED_REQUEST, RequestAbandonedError
 
 __all__ = [
     "DEFAULT_ANOMALY_THRESHOLD",
@@ -164,11 +172,12 @@ router = APIRouter()
     responses=_SCREENER_RESPONSES,
 )
 async def get_screener(
+    request: Request,
     session: SessionDep,
     settings: SettingsDep,
     principal: PrincipalDep,
     params: Annotated[ScreenerParams, Query()],
-) -> ScreenerResponse:
+) -> ScreenerResponse | Response:
     """Value every equity as of ``as_of`` (default the latest stored trade date), filter and sort.
 
     Each row carries the latest close (per share) and that session's turnover in the equity's
@@ -189,7 +198,12 @@ async def get_screener(
     ``watchlist_id`` resolves only among the caller principal's own watchlists. Every parameter
     and bound is declared by ``ScreenerParams``; an unknown parameter is a standard 422.
     """
-    return await market_service.get_screener(session, params, principal, settings)
+    try:
+        return await market_service.get_screener(
+            session, params, principal, settings, abandoned=request.is_disconnected
+        )
+    except RequestAbandonedError:
+        return Response(status_code=CLIENT_CLOSED_REQUEST)
 
 
 @router.get(
@@ -229,10 +243,11 @@ async def get_sector_heatmap(
     responses=_BANDS_RESPONSES,
 )
 async def get_valuation_bands(
+    request: Request,
     session: SessionDep,
     settings: SettingsDep,
     params: Annotated[ValuationBandsParams, Query()],
-) -> ValuationBandsResponse:
+) -> ValuationBandsResponse | Response:
     """Return the daily ``metric`` (default ``pe``) bands over ``lookback_years`` (default 5).
 
     Give exactly one of ``ticker`` and ``sector``. The multiple (x) is computed on each market
@@ -249,15 +264,19 @@ async def get_valuation_bands(
     start. Every parameter and bound is declared by ``ValuationBandsParams``; an unknown
     parameter is a standard 422.
     """
-    return await market_service.get_valuation_bands(
-        session,
-        settings,
-        ticker=params.ticker,
-        sector=params.sector,
-        metric=params.metric,
-        lookback_years=params.lookback_years,
-        as_of=params.as_of,
-    )
+    try:
+        return await market_service.get_valuation_bands(
+            session,
+            settings,
+            ticker=params.ticker,
+            sector=params.sector,
+            metric=params.metric,
+            lookback_years=params.lookback_years,
+            as_of=params.as_of,
+            abandoned=request.is_disconnected,
+        )
+    except RequestAbandonedError:
+        return Response(status_code=CLIENT_CLOSED_REQUEST)
 
 
 @router.get(
@@ -267,9 +286,10 @@ async def get_valuation_bands(
     responses=_ANOMALIES_RESPONSES,
 )
 async def get_anomalies(
+    request: Request,
     session: SessionDep,
     params: Annotated[AnomaliesParams, Query()],
-) -> AnomaliesResponse:
+) -> AnomaliesResponse | Response:
     """Return the spikes of the last ``lookback_sessions`` (default 20) market sessions.
 
     Each row is scored against up to ``window`` (default 20) of the ticker's own rows from the
@@ -283,15 +303,19 @@ async def get_anomalies(
     the equities of ``sector``. Every parameter and bound is declared by ``AnomaliesParams``, the
     threshold as a ``Decimal``; an unknown parameter is a standard 422.
     """
-    return await market_service.get_anomalies(
-        session,
-        metric=params.metric,
-        window=params.window,
-        threshold=params.threshold,
-        lookback_sessions=params.lookback_sessions,
-        ticker=params.ticker,
-        sector=params.sector,
-    )
+    try:
+        return await market_service.get_anomalies(
+            session,
+            metric=params.metric,
+            window=params.window,
+            threshold=params.threshold,
+            lookback_sessions=params.lookback_sessions,
+            ticker=params.ticker,
+            sector=params.sector,
+            abandoned=request.is_disconnected,
+        )
+    except RequestAbandonedError:
+        return Response(status_code=CLIENT_CLOSED_REQUEST)
 
 
 @router.get(
@@ -301,10 +325,11 @@ async def get_anomalies(
     responses=_FLOWS_RESPONSES,
 )
 async def get_flows(
+    request: Request,
     session: SessionDep,
     settings: SettingsDep,
     params: Annotated[FlowsParams, Query()],
-) -> FlowsResponse:
+) -> FlowsResponse | Response:
     """Return the daily foreign and local net flows of a ticker, a sector or the whole market.
 
     Give at most one of ``ticker`` and ``sector``; neither means the whole market. Foreign net
@@ -318,13 +343,17 @@ async def get_flows(
     """
     # settings is passed so that the no-data fallback as_of uses the configured (or host
     # supplied) timezone rather than the service's Africa/Nairobi default.
-    return await market_service.get_flows(
-        session,
-        ticker=params.ticker,
-        sector=params.sector,
-        as_of=params.as_of,
-        start=params.start,
-        end=params.end,
-        rolling_window=params.rolling_window,
-        settings=settings,
-    )
+    try:
+        return await market_service.get_flows(
+            session,
+            ticker=params.ticker,
+            sector=params.sector,
+            as_of=params.as_of,
+            start=params.start,
+            end=params.end,
+            rolling_window=params.rolling_window,
+            settings=settings,
+            abandoned=request.is_disconnected,
+        )
+    except RequestAbandonedError:
+        return Response(status_code=CLIENT_CLOSED_REQUEST)

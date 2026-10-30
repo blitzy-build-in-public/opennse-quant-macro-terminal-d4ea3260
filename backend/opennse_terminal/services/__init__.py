@@ -5,7 +5,9 @@ Each service queries PostgreSQL through SQLAlchemy 2.0 async sessions, calls the
 ``opennse_terminal.schemas`` models. The modules are ``health_service``, ``macro_service``,
 ``market_service``, ``cycle_service``, ``ipo_service``, ``filings_service`` and
 ``watchlist_service``; ``health_service`` only probes the database with ``SELECT 1`` and computes
-nothing.
+nothing. ``offload`` is their shared helper: it runs a chunk of pure computation in a worker
+thread, so the event loop keeps serving other requests, and stops before the next chunk once the
+requesting client has gone away.
 
 Callers import a submodule explicitly (``from opennse_terminal.services import market_service``).
 This package imports none of them, so loading one service never loads the others: in particular

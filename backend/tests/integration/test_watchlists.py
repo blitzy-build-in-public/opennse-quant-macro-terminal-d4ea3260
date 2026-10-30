@@ -525,8 +525,9 @@ async def test_delete_returns_204_and_cascades_items(
 #   itself. These tests use a session bound to no engine, so any query would raise
 #   ``UnboundExecutionError`` instead: the guard's exception shows it runs first, and a
 #   255-character subject reaching ``UnboundExecutionError`` shows the bound is inclusive.
-# - **Reads.** ``list_watchlists`` returns the caller's lists ordered by name, each with sorted
-#   tickers and UTC timestamps, and ``[]`` for an owner without lists. ``get_owned_watchlist`` and
+# - **Reads.** ``list_watchlists`` returns the caller's lists ordered by name in code-point order
+#   (Python's ``sorted``), whatever the database's collation, each with sorted tickers and UTC
+#   timestamps, and ``[]`` for an owner without lists. ``get_owned_watchlist`` and
 #   ``owned_watchlist_tickers`` return the seeded "NSE Core 8" of ``local`` with its eight tickers.
 # - **Ownership.** Another subject's list is answered exactly like a missing id: 404
 #   ``watchlist_not_found`` (``field="watchlist_id"``) from every function taking a watchlist id,
@@ -783,6 +784,28 @@ async def test_list_is_ordered_by_name_and_scoped_to_the_owner(
     assert await list_watchlists(session, OTHER) == [other]
     assert other.id != core_id
     assert await list_watchlists(session, HostPrincipal("nobody")) == []
+
+
+async def test_list_order_is_code_point_order_whatever_the_database_collation(
+    session: AsyncSession,
+) -> None:
+    """Names come back in code-point order, the order of Python's ``sorted`` and of the widget's
+    own sort, not in the database's linguistic collation: case, punctuation and accents are not
+    folded, and a character beyond U+FFFF sorts after U+E000-U+FFFF, unlike UTF-16 order."""
+    created = [
+        "' OR '1'='1",
+        "'; DROP TABLE terminal_equities;--",
+        "alpha",
+        "Beta",
+        "\u00c9mergents",
+        "\uff21 Fullwidth",
+        "\U0001f4c8 Momentum",
+    ]
+    for name in created:
+        await create_watchlist(session, LOCAL, WatchlistCreate(name=name))
+
+    listed = [item.name for item in await list_watchlists(session, LOCAL)]
+    assert listed == sorted([*created, SEEDED_NAME])
 
 
 async def test_get_and_tickers_return_the_owned_watchlist(

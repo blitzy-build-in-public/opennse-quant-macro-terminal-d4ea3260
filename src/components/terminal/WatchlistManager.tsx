@@ -45,6 +45,13 @@ const MAX_TICKER_LENGTH = 16;
 /** Separators of the creation form's ticker list: commas and any whitespace. */
 const TICKER_SEPARATORS = /[\s,]+/;
 /**
+ * Tickers that are not valid. As the `{ticker}` segment of `/watchlists/{id}/items/{ticker}`, a
+ * `.` or `..` is resolved as a path step, so the request would leave that route, and a `/` is
+ * decoded from `%2F` by the server before routing, splitting the segment. No NSE ticker is made
+ * only of dots or holds a `/`, so both forms are refused beside their input before any request.
+ */
+const INVALID_TICKER = /^\.+$|\//;
+/**
  * How long after a successful create or ticker addition a submit of the same form, holding
  * nothing or exactly the text just saved, is taken as a repeat of the activation that saved it
  * (the second click of a double click, or a doubled Enter) and ignored. 500 ms is the common
@@ -167,7 +174,8 @@ function characterCount(text: string): number {
 
 /**
  * Parse comma- or whitespace-separated tickers: upper-cased, de-duplicated in input order, each
- * 1–16 characters, at most 100. Empty text gives no tickers.
+ * 1–16 characters and none made only of dots or holding a `/` ({@link INVALID_TICKER}), at most
+ * 100. Empty text gives no tickers.
  */
 function parseTickers(text: string): ParsedTickers {
   const tickers: string[] = [];
@@ -177,6 +185,9 @@ function parseTickers(text: string): ParsedTickers {
     if (ticker === "" || seen.has(ticker)) continue;
     if (characterCount(ticker) > MAX_TICKER_LENGTH) {
       return { ok: false, message: `${ticker} is longer than ${MAX_TICKER_LENGTH} characters.` };
+    }
+    if (INVALID_TICKER.test(ticker)) {
+      return { ok: false, message: `${ticker} is not a valid ticker.` };
     }
     seen.add(ticker);
     tickers.push(ticker);
@@ -202,17 +213,37 @@ function tickerProblem(ticker: string): string | null {
   if (characterCount(ticker) > MAX_TICKER_LENGTH) {
     return `Use at most ${MAX_TICKER_LENGTH} characters.`;
   }
+  if (INVALID_TICKER.test(ticker)) return "Enter a valid ticker.";
   return null;
 }
 
-/** Order watchlists by name, as `GET /watchlists` does. Runs in event handlers only. */
+/**
+ * Compare two strings by Unicode code point, as PostgreSQL's `"C"` collation compares UTF-8 text
+ * and Python's `sorted` compares `str`. The operator `<` compares UTF-16 units instead, which
+ * puts a character beyond U+FFFF before one in U+E000–U+FFFF, so the walk reads whole code
+ * points and steps over both units of a surrogate pair. A string that is a prefix of the other
+ * sorts first.
+ */
+function compareCodePoints(a: string, b: string): number {
+  for (let index = 0; ; ) {
+    const left = a.codePointAt(index);
+    const right = b.codePointAt(index);
+    if (left === undefined || right === undefined) {
+      if (left === right) return 0;
+      return left === undefined ? -1 : 1;
+    }
+    if (left !== right) return left < right ? -1 : 1;
+    index += left > 0xffff ? 2 : 1;
+  }
+}
+
+/**
+ * Order watchlists by name in code-point order, the collation-`"C"` order `GET /watchlists`
+ * returns and the screener's watchlist selector shows, whatever the database's own collation.
+ * Names are unique per owner, so no tie-break is needed. Runs in event handlers only.
+ */
 function sortByName(lists: Watchlist[]): Watchlist[] {
-  return [...lists].sort((a, b) => {
-    const byLocale = a.name.localeCompare(b.name, "en");
-    if (byLocale !== 0) return byLocale;
-    if (a.name === b.name) return 0;
-    return a.name < b.name ? -1 : 1;
-  });
+  return [...lists].sort((a, b) => compareCodePoints(a.name, b.name));
 }
 
 /** Replace the watchlist with the server's copy, or add it when it is not shown yet. */

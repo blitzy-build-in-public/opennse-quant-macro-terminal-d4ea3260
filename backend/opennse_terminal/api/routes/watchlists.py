@@ -97,7 +97,9 @@ async def list_watchlists(
 ) -> list[Watchlist]:
     """List the watchlists owned by the caller's principal subject, ordered by name.
 
-    Each watchlist's ``tickers`` are sorted ascending. A caller without watchlists gets ``[]``.
+    Names are in Unicode code-point order (collation ``"C"``), whatever the database's default
+    collation. Each watchlist's ``tickers`` are sorted ascending. A caller without watchlists gets
+    ``[]``.
 
     The endpoint takes no query parameter: ``params`` carries none and is not read, and any query
     parameter, for example ``?foo=1``, is FastAPI's standard 422 list with one

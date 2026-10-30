@@ -13,15 +13,23 @@
  * 6. Then `npm run test:e2e`; playwright.config.ts serves the build on :3000 (project
  *    `standalone`).
  *
- * The suite is read-only against the database: it never creates, renames or deletes a watchlist
- * and never uploads a PDF. Its only POST is `/ipo/valuation`, which is stateless, so repeated
+ * The suite is read-only against the database: no watchlist write reaches the API and no PDF is
+ * uploaded. The only POST the API receives is `/ipo/valuation`, which is stateless, so repeated
  * runs see the same seeded state. Every request goes to the app's own origin, which proxies the
  * terminal API; no external URL is involved. Some tests answer API requests themselves through
- * `page.route` with in-memory bodies, such as a valuation-bands multiple no seeded counter has,
- * or the empty results and injected outages of the widget-state tests, and one cycle test blanks
- * overlay rates in a fetched backtest response before the page receives it. Those tests are
- * read-only against the database as well: a handler answers a request from memory or passes a
- * GET request through to the real API, and the widget-state handlers block every other method.
+ * `page.route`, and every such handler is read-only against the database as well: it answers a
+ * request from memory or passes a GET request through to the real API.
+ * - The watchlist tests answer every `/watchlists` request from an in-memory store, which reads
+ *   the seeded lists once through `GET /watchlists` and never forwards a request.
+ * - A screener request filtered by one of those in-memory lists is sent to the API without its
+ *   `watchlist_id` and answered with that list's rows only.
+ * - The anomalies-only request is answered by the API for 2026-09-29, the planted EABL spike's
+ *   session, because the latest seeded session has no spike.
+ * - One test answers the valuation-bands request with a multiple no seeded counter has.
+ * - The widget-state tests answer with empty results and injected outages, and their handlers
+ *   block every other method.
+ * - One cycle test blanks overlay rates in a fetched backtest response before the page receives
+ *   it.
  */
 import { expect, test } from "@playwright/test";
 import type { Locator, Page } from "@playwright/test";
@@ -37,6 +45,7 @@ import type {
   IpoScenario,
   MacroOverviewResponse,
   ScreenerResponse,
+  ScreenerRow,
   SectorHeatmapResponse,
   ValuationBandsResponse,
   Watchlist,
@@ -48,6 +57,7 @@ const READY_TIMEOUT = 20_000;
 const SLOW_READY_TIMEOUT = 30_000;
 
 const MACRO_OVERVIEW_PATH = "/api/v1/terminal/macro/overview";
+const FLOWS_PATH = "/api/v1/terminal/market/flows";
 
 /** U+2212, the minus sign `lib/format.ts` renders for negative values. */
 const MINUS_SIGN = "\u2212";
@@ -102,6 +112,132 @@ function withAttributes(
     .map(([name, value]) => `[${name}="${value}"]`)
     .join("");
   return root.getByTestId(testId).and(root.page().locator(selector));
+}
+
+/**
+ * A decimal string reduced to its sign and digits, the form in which two decimals are compared:
+ * leading zeros of the integer part dropped, the fraction kept as written and no sign on zero,
+ * so `"-0240111043.36"` becomes `"-240111043.36"`. Throws on text that is not a plain decimal.
+ */
+function canonicalDecimal(value: string): string {
+  const match = /^([+-]?)(\d+)(?:\.(\d+))?$/.exec(value);
+  if (match === null) {
+    throw new Error(`Not a decimal string: ${JSON.stringify(value)}`);
+  }
+  const integer = (match[2] ?? "").replace(/^0+(?=\d)/, "");
+  const digits = match[3] === undefined ? integer : `${integer}.${match[3]}`;
+  return match[1] === "-" && /[1-9]/.test(digits) ? `-${digits}` : digits;
+}
+
+/**
+ * The first number of a displayed text, such as `"KES −1,234.50"` or `"+6.78×"`, in
+ * {@link canonicalDecimal} form: grouping commas dropped, U+2212 read as the minus sign and `+`
+ * dropped. An ASCII hyphen is not the displayed minus, so it is not read as one. `null` when the
+ * text holds no number, as for the em dash of a null value.
+ */
+function displayedDecimal(text: string | null): string | null {
+  const match = /([+\u2212]?)(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?/.exec(text ?? "");
+  if (match === null) {
+    return null;
+  }
+  const sign = match[1] === MINUS_SIGN ? "-" : "";
+  return canonicalDecimal(sign + (match[2] ?? "").replace(/,/g, "") + (match[3] ?? ""));
+}
+
+/** A decimal string as an integer count of 10^-scale units, exact at any magnitude. */
+function scaledDecimal(value: string, scale: number): bigint {
+  const canonical = canonicalDecimal(value);
+  const [integer = "0", fraction = ""] = canonical.replace("-", "").split(".");
+  const magnitude = BigInt(integer + fraction.padEnd(scale, "0"));
+  return canonical.startsWith("-") ? -magnitude : magnitude;
+}
+
+/** −1, 0 or 1 as decimal string `left` is below, equal to or above `right`, compared exactly. */
+function compareDecimals(left: string, right: string): number {
+  const fractionLength = (value: string): number => value.split(".")[1]?.length ?? 0;
+  const scale = Math.max(fractionLength(left), fractionLength(right));
+  const a = scaledDecimal(left, scale);
+  const b = scaledDecimal(right, scale);
+  if (a === b) {
+    return 0;
+  }
+  return a < b ? -1 : 1;
+}
+
+const MONTH_ABBREVIATIONS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+] as const;
+
+/** An ISO date as the widgets display it: `"2025-09-30"` → `"30 Sep 2025"`. */
+function displayedDate(iso: string): string {
+  const [year = "", month = "", day = ""] = iso.split("-");
+  const monthName = MONTH_ABBREVIATIONS[Number.parseInt(month, 10) - 1];
+  if (monthName === undefined) {
+    throw new Error(`Not an ISO date: ${JSON.stringify(iso)}`);
+  }
+  return `${Number.parseInt(day, 10)} ${monthName} ${year}`;
+}
+
+/** Whether `url` is a `GET /market/flows` for `ticker`, or for the whole market when `null`. */
+function isFlowsUrl(url: string, ticker: string | null): boolean {
+  const parsed = new URL(url);
+  return (
+    parsed.pathname === FLOWS_PATH &&
+    parsed.searchParams.get("ticker") === ticker &&
+    !parsed.searchParams.has("sector")
+  );
+}
+
+/**
+ * Asserts that the net-flow widget shows `body`, read back from the page: the subject the chart
+ * surface names, the plotted bars and cumulative line, the range, the coverage, both totals and
+ * the session counts. Every number is compared exactly as a decimal string (Rule 4), never as a
+ * float; each read is retried until it matches, since the previous subject's flows stay on screen
+ * while a new one loads.
+ */
+async function expectFlowsReadouts(flows: Locator, body: FlowsResponse): Promise<void> {
+  const totals = body.totals;
+  if (totals === null) {
+    throw new Error(`The ${body.subject} flows have no totals to compare`);
+  }
+  const range = `${displayedDate(body.start)} – ${displayedDate(body.end)}`;
+  const subject = body.subject === "market" ? "Market" : body.subject;
+  const chart = flows.getByTestId("flows-chart");
+  await expect(chart.locator("svg.recharts-surface > title")).toHaveText(
+    `Foreign net flow — ${subject}, ${range}`,
+  );
+  await expect(flows.getByTestId("flows-range")).toContainText(range);
+  const readDecimal = (testId: string) => async (): Promise<string | null> =>
+    displayedDecimal(await flows.getByTestId(testId).textContent());
+  await expect.poll(readDecimal("flows-coverage")).toBe(canonicalDecimal(body.coverage_pct));
+  await expect
+    .poll(readDecimal("flows-total-foreign"))
+    .toBe(canonicalDecimal(totals.foreign_net_kes));
+  await expect.poll(readDecimal("flows-total-local")).toBe(canonicalDecimal(totals.local_net_kes));
+  await expect
+    .poll(async () => {
+      const text = (await flows.getByTestId("flows-sessions").textContent()) ?? "";
+      const match = /^([\d,]+) \/ ([\d,]+)$/.exec(text.trim());
+      return match === null ? text : [match[1], match[2]].map((n) => n?.replace(/,/g, ""));
+    })
+    .toEqual([String(totals.sessions_with_data), String(totals.sessions_in_range)]);
+
+  // Plotted data: at least one drawn daily bar and a cumulative line through several sessions.
+  await expect(chart.locator(".recharts-bar-rectangle path").first()).toHaveAttribute("d", /\d/);
+  const line = chart.locator("path.recharts-line-curve");
+  await expect(line).toHaveCount(1);
+  await expect(line).toHaveAttribute("d", /^M[^L]+L[^L]+L/);
 }
 
 // Uncaught page errors fail the test. Console errors do not: the cross-field IPO test receives a
@@ -1397,6 +1533,332 @@ test.describe("IPO valuation sandbox (/ipo)", () => {
   });
 });
 
+const WATCHLISTS_PATH = "/api/v1/terminal/watchlists";
+const SCREENER_PATH = "/api/v1/terminal/market/screener";
+const BANDS_PATH = "/api/v1/terminal/market/valuation-bands";
+
+/** The eight seeded counters, the only tickers `terminal_equities` holds. */
+const SEEDED_TICKERS: ReadonlySet<string> = new Set([
+  "ABSA",
+  "COOP",
+  "EABL",
+  "EQTY",
+  "KCB",
+  "KEGN",
+  "SBIC",
+  "SCOM",
+]);
+
+/**
+ * Orders strings by Unicode code point, the order PostgreSQL's `"C"` collation gives watchlist
+ * names in `GET /watchlists`. Each string is split into whole code points first, so a character
+ * beyond U+FFFF is compared as one value rather than as two UTF-16 units.
+ */
+function compareCodePoints(a: string, b: string): number {
+  const left = Array.from(a, (character) => character.codePointAt(0) ?? 0);
+  const right = Array.from(b, (character) => character.codePointAt(0) ?? 0);
+  for (let index = 0; index < Math.min(left.length, right.length); index += 1) {
+    const difference = (left[index] ?? 0) - (right[index] ?? 0);
+    if (difference !== 0) {
+      return difference;
+    }
+  }
+  return left.length - right.length;
+}
+
+/** One request the in-memory watchlist API answered. */
+interface RecordedRequest {
+  method: string;
+  /** The URL path with every segment percent-decoded. */
+  path: string;
+  /** The parsed JSON body, or `null` for a request without one. */
+  body: unknown;
+}
+
+/** The watchlists of one test, answered in memory; see {@link installWatchlistStore}. */
+interface WatchlistStore {
+  /** Every request answered, in arrival order. */
+  readonly requests: readonly RecordedRequest[];
+  /** The requests other than `GET`, in arrival order. */
+  mutations(): RecordedRequest[];
+  /** The stored lists in `GET /watchlists` order. */
+  lists(): Watchlist[];
+  /** The stored list with `id`, if any. */
+  find(id: string): Watchlist | undefined;
+  /** The stored list named `name`; throws when there is none. */
+  byName(name: string): Watchlist;
+}
+
+/** The `POST /watchlists` body, or `null` when it is not `{name: string, tickers?: string[]}`. */
+function parseWatchlistCreate(body: unknown): { name: string; tickers: string[] } | null {
+  if (typeof body !== "object" || body === null || !("name" in body)) {
+    return null;
+  }
+  const name: unknown = body.name;
+  const tickers: unknown = "tickers" in body ? body.tickers : [];
+  if (typeof name !== "string" || !Array.isArray(tickers)) {
+    return null;
+  }
+  const items: unknown[] = tickers;
+  const names = items.filter((item): item is string => typeof item === "string");
+  return names.length === items.length ? { name: name.trim(), tickers: names } : null;
+}
+
+/**
+ * Answers every `/watchlists` request of `page` from memory, so a test can create, edit and
+ * delete watchlists without writing to the seeded database. The store starts from the API's own
+ * `GET /watchlists`, read once before the page loads; nothing else reaches the API, whatever the
+ * method or path. It follows the API's watchlist contract:
+ * - `GET /watchlists`: 200 with the lists ordered by name in code-point order;
+ * - `POST /watchlists`: 201 with the new list, its tickers trimmed, upper-cased, de-duplicated and
+ *   sorted; 422 `unknown_ticker` (`field` "tickers") for a ticker outside the eight seeded ones;
+ *   409 `watchlist_name_taken` (`field` "name") for a name already used;
+ * - `DELETE /watchlists/{id}`: 204, or 404 `watchlist_not_found` (`field` "watchlist_id");
+ * - `PUT` and `DELETE /watchlists/{id}/items/{ticker}`: 200 with the list, idempotent, advancing
+ *   `updated_at` only on a change; 404 `watchlist_not_found`, then 404 `unknown_ticker` (`field`
+ *   "ticker").
+ * Ids and timestamps come from counters, so every run produces the same values.
+ */
+async function installWatchlistStore(page: Page): Promise<WatchlistStore> {
+  const seed = await page.request.get(WATCHLISTS_PATH);
+  expect(seed.status()).toBe(200);
+  const stored = new Map<string, Watchlist>();
+  for (const list of (await seed.json()) as Watchlist[]) {
+    stored.set(list.id, list);
+  }
+  const requests: RecordedRequest[] = [];
+  let created = 0;
+  let clock = 0;
+  const now = (): string => {
+    clock += 1;
+    return new Date(Date.UTC(2026, 9, 30, 12, 0, clock)).toISOString();
+  };
+  const ordered = (): Watchlist[] =>
+    [...stored.values()].sort((a, b) => compareCodePoints(a.name, b.name));
+  const sortedTickers = (tickers: Iterable<string>): string[] =>
+    [...new Set(tickers)].sort(compareCodePoints);
+  const codedError = (status: number, code: string, message: string, field: string) => ({
+    status,
+    json: { detail: { code, message, field } },
+  });
+
+  await page.route("**/api/v1/terminal/watchlists**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const method = request.method();
+    const body: unknown = request.postData() === null ? null : request.postDataJSON();
+    const decodedPath = url.pathname.split("/").map(decodeURIComponent).join("/");
+    requests.push({ method, path: decodedPath, body });
+
+    // The pattern also matches a path such as `/watchlistsX`, which is no route of the API.
+    const rest = url.pathname.slice(WATCHLISTS_PATH.length);
+    if (rest !== "" && !rest.startsWith("/")) {
+      await route.fulfill({ status: 404, json: { detail: "Not Found" } });
+      return;
+    }
+    const segments = rest === "" ? [] : rest.slice(1).split("/").map(decodeURIComponent);
+    const [id, items, rawTicker, ...extra] = segments;
+
+    if (id === undefined && method === "GET") {
+      await route.fulfill({ json: ordered() });
+      return;
+    }
+    if (id === undefined && method === "POST") {
+      const create = parseWatchlistCreate(body);
+      if (create === null || create.name === "") {
+        await route.fulfill({
+          status: 422,
+          json: { detail: [{ type: "invalid", loc: ["body"], msg: "Invalid body", input: body }] },
+        });
+        return;
+      }
+      const tickers = [...new Set(create.tickers.map((ticker) => ticker.trim().toUpperCase()))];
+      const unknown = tickers.filter((ticker) => !SEEDED_TICKERS.has(ticker));
+      if (unknown.length > 0) {
+        await route.fulfill(
+          codedError(422, "unknown_ticker", `Unknown tickers: ${unknown.join(", ")}.`, "tickers"),
+        );
+        return;
+      }
+      if ([...stored.values()].some((list) => list.name === create.name)) {
+        await route.fulfill(
+          codedError(
+            409,
+            "watchlist_name_taken",
+            `A watchlist named '${create.name}' already exists.`,
+            "name",
+          ),
+        );
+        return;
+      }
+      created += 1;
+      const timestamp = now();
+      const list: Watchlist = {
+        id: `00000000-0000-4000-8000-${String(created).padStart(12, "0")}`,
+        name: create.name,
+        tickers: sortedTickers(tickers),
+        created_at: timestamp,
+        updated_at: timestamp,
+      };
+      stored.set(list.id, list);
+      await route.fulfill({ status: 201, json: list });
+      return;
+    }
+
+    const list = id === undefined ? undefined : stored.get(id);
+    const isDelete = method === "DELETE" && items === undefined;
+    const isItem = (method === "PUT" || method === "DELETE") && items === "items";
+    if (
+      id === undefined ||
+      (!isDelete && !isItem) ||
+      (isItem && rawTicker === undefined) ||
+      extra.length > 0
+    ) {
+      await route.fulfill({ status: 405, json: { detail: "Method Not Allowed" } });
+      return;
+    }
+    if (list === undefined) {
+      await route.fulfill(
+        codedError(404, "watchlist_not_found", `Watchlist ${id} was not found.`, "watchlist_id"),
+      );
+      return;
+    }
+    if (isDelete) {
+      stored.delete(list.id);
+      await route.fulfill({ status: 204 });
+      return;
+    }
+    const ticker = (rawTicker ?? "").trim().toUpperCase();
+    if (!SEEDED_TICKERS.has(ticker)) {
+      await route.fulfill(
+        codedError(404, "unknown_ticker", `Ticker '${ticker}' is not a known equity.`, "ticker"),
+      );
+      return;
+    }
+    const tickers =
+      method === "PUT"
+        ? sortedTickers([...list.tickers, ticker])
+        : list.tickers.filter((item) => item !== ticker);
+    const changed = tickers.length !== list.tickers.length;
+    const updated: Watchlist = changed ? { ...list, tickers, updated_at: now() } : list;
+    stored.set(updated.id, updated);
+    await route.fulfill({ json: updated });
+  });
+
+  return {
+    requests,
+    mutations: () => requests.filter((request) => request.method !== "GET"),
+    lists: ordered,
+    find: (id) => stored.get(id),
+    byName: (name) => {
+      const list = [...stored.values()].find((item) => item.name === name);
+      if (list === undefined) {
+        throw new Error(`No stored watchlist is named ${JSON.stringify(name)}`);
+      }
+      return list;
+    },
+  };
+}
+
+/**
+ * Answers `GET /market/screener` for a watchlist held by `store`, which the API cannot know: the
+ * same request is sent without `watchlist_id`, and only the list's rows are returned, with
+ * `count` to match. Any other screener request goes to the API unchanged, so an id the store
+ * does not hold gets the API's own `watchlist_not_found`.
+ */
+async function routeScreenerToStore(page: Page, store: WatchlistStore): Promise<void> {
+  await page.route("**/api/v1/terminal/market/screener**", async (route) => {
+    const url = new URL(route.request().url());
+    const id = url.searchParams.get("watchlist_id");
+    const list = id === null ? undefined : store.find(id);
+    if (list === undefined) {
+      await route.continue();
+      return;
+    }
+    const upstream = new URL(url);
+    upstream.searchParams.delete("watchlist_id");
+    const response = await route.fetch({ url: upstream.toString() });
+    if (response.status() !== 200) {
+      await route.fulfill({ response });
+      return;
+    }
+    const body = (await response.json()) as ScreenerResponse;
+    const rows = body.rows.filter((row) => list.tickers.includes(row.ticker));
+    await route.fulfill({ response, json: { ...body, count: rows.length, rows } });
+  });
+}
+
+/** The query of a request URL as an object, for comparing a whole query at once. */
+function queryOf(url: string): Record<string, string> {
+  return Object.fromEntries(new URL(url).searchParams);
+}
+
+/** Whether `url` is a `GET /market/screener` whose query has `key`, set to `value` if given. */
+function isScreenerUrl(url: string, key?: string, value?: string): boolean {
+  const parsed = new URL(url);
+  if (parsed.pathname !== SCREENER_PATH) {
+    return false;
+  }
+  if (key === undefined) {
+    return true;
+  }
+  return value === undefined
+    ? parsed.searchParams.has(key)
+    : parsed.searchParams.get(key) === value;
+}
+
+/** The tickers of the shown screener rows, in table order. */
+async function rowTickers(screener: Locator): Promise<string[]> {
+  return screener
+    .getByTestId("screener-row")
+    .evaluateAll((rows) => rows.map((row) => row.getAttribute("data-ticker") ?? ""));
+}
+
+/** Each shown row's `column` cell read back as a canonical decimal, `null` for the em dash. */
+async function columnValues(
+  screener: Locator,
+  column: string,
+): Promise<{ ticker: string; value: string | null }[]> {
+  const cells = await screener.getByTestId("screener-row").evaluateAll(
+    (rows, name) =>
+      rows.map((row) => ({
+        ticker: row.getAttribute("data-ticker") ?? "",
+        text: row.querySelector(`[data-column="${name}"]`)?.textContent ?? "",
+      })),
+    column,
+  );
+  return cells.map(({ ticker, text }) => ({ ticker, value: displayedDecimal(text) }));
+}
+
+/** Waits for the screener to show `count` rows from a settled request, none of them dimmed. */
+async function expectSettledRows(screener: Locator, count: number): Promise<void> {
+  await expectReady(screener, SLOW_READY_TIMEOUT);
+  await expect(screener.locator('[aria-busy="true"]')).toHaveCount(0, {
+    timeout: SLOW_READY_TIMEOUT,
+  });
+  await expect(screener.getByTestId("screener-row")).toHaveCount(count);
+}
+
+/** A watchlist card of the manager, by its name. */
+function watchlistCard(manager: Locator, name: string): Locator {
+  return withAttributes(manager, "watchlist-item", { "data-watchlist-name": name });
+}
+
+/** Creates a watchlist through the manager's form and waits for its card. */
+async function createWatchlist(manager: Locator, name: string, tickers: string): Promise<Locator> {
+  await manager.getByTestId("watchlist-name-input").fill(name);
+  await manager.getByTestId("watchlist-tickers-input").fill(tickers);
+  await manager.getByTestId("watchlist-create-button").click();
+  const card = watchlistCard(manager, name);
+  await expect(card).toHaveCount(1);
+  return card;
+}
+
+/** The ticker chips of a watchlist card, in order. */
+function chipsOf(card: Locator): Locator {
+  return card.getByTestId("watchlist-ticker-chip");
+}
+
 test.describe("Custom watchlists and screener (/screener)", () => {
   /**
    * An `ok` SCOM P/E body of 60 weekly values alternating between 100,000,000,000,000.00 and
@@ -1515,14 +1977,29 @@ test.describe("Custom watchlists and screener (/screener)", () => {
   });
 
   test("selecting SCOM loads its valuation bands and net flows", async ({ page }) => {
+    const marketFlowsResponse = page.waitForResponse((response) =>
+      isFlowsUrl(response.url(), null),
+    );
     await page.goto("/screener");
 
     const bands = page.getByTestId("terminal-valuation-bands-chart");
     const flows = page.getByTestId("terminal-net-flow-chart");
     await expect(bands).toHaveAttribute("data-state", "empty");
 
+    // Before any selection the flows are the whole market's.
+    const marketResponse = await marketFlowsResponse;
+    expect(marketResponse.status()).toBe(200);
+    const market = (await marketResponse.json()) as FlowsResponse;
+    expect(market.subject).toBe("market");
+    await expectReady(flows, SLOW_READY_TIMEOUT);
+    await expectFlowsReadouts(flows, market);
+
     const screener = page.getByTestId("terminal-equity-screener");
     await expectReady(screener, SLOW_READY_TIMEOUT);
+    // Registered before the click, so SCOM's own response is the one observed.
+    const scomFlowsResponse = page.waitForResponse((response) =>
+      isFlowsUrl(response.url(), "SCOM"),
+    );
     // Scoped to the screener row: the anomaly feed lists SCOM as well.
     await withAttributes(screener, "screener-row", { "data-ticker": "SCOM" })
       .getByRole("button", { name: "SCOM", exact: true })
@@ -1533,16 +2010,28 @@ test.describe("Custom watchlists and screener (/screener)", () => {
     await expect(bands.getByTestId("bands-meta")).toContainText("SCOM");
     await expect(bands.getByTestId("bands-chart")).toBeVisible();
 
+    const scomResponse = await scomFlowsResponse;
+    expect(scomResponse.status()).toBe(200);
+    const scom = (await scomResponse.json()) as FlowsResponse;
+    expect(scom.subject).toBe("SCOM");
+    expect(scom.totals).not.toBeNull();
+    // The readouts can tell SCOM's flows from the market's only because their totals differ.
+    expect(scom.totals?.foreign_net_kes).not.toBe(market.totals?.foreign_net_kes);
+    expect(scom.totals?.local_net_kes).not.toBe(market.totals?.local_net_kes);
+
     // The market-wide flows stay on screen, marked "Updating…", until SCOM's arrive.
     await expectReady(flows, SLOW_READY_TIMEOUT);
     await expect(flows.getByText("Updating…")).toHaveCount(0, { timeout: SLOW_READY_TIMEOUT });
+    await expectFlowsReadouts(flows, scom);
     await expect(flows.getByTestId("flows-coverage")).toContainText("100.00");
   });
 
   test("a near-constant 10^14 P/E still draws a few distinct, finite axis ticks", async ({
     page,
   }) => {
+    const bandsRequests: URL[] = [];
     await page.route("**/api/v1/terminal/market/valuation-bands**", async (route) => {
+      bandsRequests.push(new URL(route.request().url()));
       await route.fulfill({ json: nearConstantHighRatioBands() });
     });
     await page.goto("/screener");
@@ -1559,6 +2048,16 @@ test.describe("Custom watchlists and screener (/screener)", () => {
     const chart = bands.getByTestId("bands-chart");
     await expect(chart).toBeVisible();
 
+    // The handler above answered SCOM's P/E request, and its extreme value reached the widget.
+    expect(bandsRequests.length).toBeGreaterThanOrEqual(1);
+    for (const url of bandsRequests) {
+      expect(url.searchParams.get("ticker")).toBe("SCOM");
+      expect(url.searchParams.get("metric")).toBe("pe");
+    }
+    await expect(bands.getByTestId("bands-stat-current").locator("dd")).toHaveText(
+      "100,000,000,000,000.01\u00d7",
+    );
+
     // Recharts 3 draws the tick labels in a z-index layer of their own, outside `.recharts-yAxis`.
     // Each is a grouped 2 dp decimal such as "100,000,000,000,000.00", read back without its
     // grouping to prove it is a finite number.
@@ -1567,12 +2066,655 @@ test.describe("Custom watchlists and screener (/screener)", () => {
     );
     await expect.poll(() => tickLabels.count()).toBeGreaterThanOrEqual(2);
     const labels = await tickLabels.allTextContents();
+    // The axis spans the fixture's 10^14 values: every tick's integer part, read exactly as a
+    // BigInt, is at least the band floor's 99,999,999,999,999.
+    const axisFloor = BigInt("99999999999999");
+    for (const label of labels) {
+      const integerPart = /^(\d{1,3}(?:,\d{3})*)\.\d+$/.exec(label)?.[1];
+      expect(integerPart, `tick label ${JSON.stringify(label)}`).toBeDefined();
+      expect(BigInt((integerPart ?? "").replace(/,/g, "")) >= axisFloor).toBe(true);
+    }
     expect(labels.length).toBeLessThanOrEqual(12);
     expect(new Set(labels).size).toBe(labels.length);
     for (const label of labels) {
       expect(label).toMatch(/^\u2212?\d{1,3}(?:,\d{3})*\.\d{2,}$/);
       expect(Number.isFinite(Number(label.replace(MINUS_SIGN, "-").replace(/,/g, "")))).toBe(true);
     }
+  });
+
+  // Watchlist mutations below are answered by the in-memory store, never by the API, so the
+  // seeded database is never written.
+
+  test("a created watchlist gets its card, chips and screener option, then is edited and deleted", async ({
+    page,
+  }) => {
+    const store = await installWatchlistStore(page);
+    await page.goto("/screener");
+
+    const manager = page.getByTestId("terminal-watchlist-manager");
+    const screener = page.getByTestId("terminal-equity-screener");
+    await expectReady(manager);
+    await expectReady(screener, SLOW_READY_TIMEOUT);
+    const watchlistSelect = screener.getByTestId("screener-filter-watchlist");
+
+    const name = "Banking pair";
+    const card = await createWatchlist(manager, name, "KCB, EQTY");
+    const list = store.byName(name);
+    const listPath = `${WATCHLISTS_PATH}/${list.id}`;
+    const create = {
+      method: "POST",
+      path: WATCHLISTS_PATH,
+      body: { name, tickers: ["KCB", "EQTY"] },
+    };
+    expect(store.mutations()).toEqual([create]);
+    await expect(card).toHaveAttribute("data-watchlist-id", list.id);
+    await expect(chipsOf(card)).toHaveText(["EQTY", "KCB"]);
+    // The screener offers the new list without a reload.
+    await expect(watchlistSelect.locator(`option[value="${list.id}"]`)).toHaveText(name);
+
+    await card.getByTestId("watchlist-add-input").fill("scom");
+    await card.getByTestId("watchlist-add-button").click();
+    await expect(chipsOf(card)).toHaveText(["EQTY", "KCB", "SCOM"]);
+    const add = { method: "PUT", path: `${listPath}/items/SCOM`, body: null };
+    expect(store.mutations()).toEqual([create, add]);
+
+    await chipsOf(card)
+      .and(page.locator('[data-ticker="KCB"]'))
+      .getByTestId("watchlist-ticker-remove")
+      .click();
+    await expect(chipsOf(card)).toHaveText(["EQTY", "SCOM"]);
+    const remove = { method: "DELETE", path: `${listPath}/items/KCB`, body: null };
+    expect(store.mutations()).toEqual([create, add, remove]);
+
+    // Delete asks for a confirmation first; Cancel keeps the list and sends nothing.
+    const deleteButton = card.getByTestId("watchlist-delete-button");
+    await deleteButton.click();
+    await expect(deleteButton).toHaveText("Confirm");
+    await card.getByTestId("watchlist-delete-cancel").click();
+    await expect(deleteButton).toHaveText("Delete");
+    await expect(card.getByTestId("watchlist-delete-cancel")).toHaveCount(0);
+    await expect(chipsOf(card)).toHaveText(["EQTY", "SCOM"]);
+    expect(store.mutations()).toEqual([create, add, remove]);
+
+    await deleteButton.click();
+    await expect(deleteButton).toHaveText("Confirm");
+    await deleteButton.click();
+    await expect(card).toHaveCount(0);
+    await expect(watchlistSelect.locator(`option[value="${list.id}"]`)).toHaveCount(0);
+    expect(store.mutations()).toEqual([
+      create,
+      add,
+      remove,
+      { method: "DELETE", path: listPath, body: null },
+    ]);
+    expect(store.find(list.id)).toBeUndefined();
+  });
+
+  test("watchlist errors appear beside their inputs, and invalid tickers send no request", async ({
+    page,
+  }) => {
+    const store = await installWatchlistStore(page);
+    await page.goto("/screener");
+
+    const manager = page.getByTestId("terminal-watchlist-manager");
+    const screener = page.getByTestId("terminal-equity-screener");
+    await expectReady(manager);
+    const core = store.byName("NSE Core 8");
+    // Both widgets have loaded their lists, so every later request comes from the steps below.
+    await expect(
+      screener.getByTestId("screener-filter-watchlist").locator(`option[value="${core.id}"]`),
+    ).toHaveCount(1);
+    const coreCard = watchlistCard(manager, core.name);
+    const nameInput = manager.getByTestId("watchlist-name-input");
+    const tickersInput = manager.getByTestId("watchlist-tickers-input");
+    const createButton = manager.getByTestId("watchlist-create-button");
+
+    // A taken name: 409 watchlist_name_taken, beneath the name.
+    await nameInput.fill(core.name);
+    await createButton.click();
+    await expect(manager.getByTestId("field-error-name")).toHaveText(
+      `A watchlist named '${core.name}' already exists.`,
+    );
+    expect(store.mutations()).toEqual([
+      { method: "POST", path: WATCHLISTS_PATH, body: { name: core.name } },
+    ]);
+
+    // A ticker the API does not hold: 422 unknown_ticker, beneath the ticker list.
+    await nameInput.fill("Unknown pick");
+    await tickersInput.fill("SCOM, ZZZZ");
+    await createButton.click();
+    await expect(manager.getByTestId("field-error-tickers")).toHaveText("Unknown tickers: ZZZZ.");
+    expect(store.mutations().at(-1)).toEqual({
+      method: "POST",
+      path: WATCHLISTS_PATH,
+      body: { name: "Unknown pick", tickers: ["SCOM", "ZZZZ"] },
+    });
+    await expect(watchlistCard(manager, "Unknown pick")).toHaveCount(0);
+
+    // Adding a ticker the API does not hold: 404 unknown_ticker, beneath that list's input.
+    const addInput = coreCard.getByTestId("watchlist-add-input");
+    const addButton = coreCard.getByTestId("watchlist-add-button");
+    const addError = coreCard.getByTestId(`field-error-ticker-${core.id}`);
+    await addInput.fill("ZZZZ");
+    await addButton.click();
+    await expect(addError).toHaveText("Ticker 'ZZZZ' is not a known equity.");
+    expect(store.mutations().at(-1)).toEqual({
+      method: "PUT",
+      path: `${WATCHLISTS_PATH}/${core.id}/items/ZZZZ`,
+      body: null,
+    });
+    await expect(chipsOf(coreCard)).toHaveCount(8);
+
+    // Tickers that cannot travel as one path segment are refused before any request is sent.
+    for (const ticker of ["..", "A/B"]) {
+      const sent = store.requests.length;
+      await addInput.fill(ticker);
+      // Editing the input clears its previous error, so the message below is a new one.
+      await expect(addError).toHaveCount(0);
+      await addButton.click();
+      await expect(addError).toHaveText("Enter a valid ticker.");
+      expect(store.requests).toHaveLength(sent);
+    }
+    const sent = store.requests.length;
+    await nameInput.fill("Dotted");
+    await tickersInput.fill("SCOM, ..");
+    await createButton.click();
+    await expect(manager.getByTestId("field-error-tickers")).toHaveText(
+      ".. is not a valid ticker.",
+    );
+    expect(store.requests).toHaveLength(sent);
+    await expect(watchlistCard(manager, "Dotted")).toHaveCount(0);
+  });
+
+  test("watchlists keep code-point order in the manager and the screener selector", async ({
+    page,
+  }) => {
+    const store = await installWatchlistStore(page);
+    await page.goto("/screener");
+
+    const manager = page.getByTestId("terminal-watchlist-manager");
+    const screener = page.getByTestId("terminal-equity-screener");
+    await expectReady(manager);
+    await expectReady(screener, SLOW_READY_TIMEOUT);
+    const created = ["alpha", "Beta", "' OR '1'='1"];
+    for (const name of created) {
+      await createWatchlist(manager, name, "");
+    }
+
+    // Code-point order puts the apostrophe first and upper case before lower case.
+    const expected = ["' OR '1'='1", "Beta", "NSE Core 8", "alpha"];
+    expect([...created, "NSE Core 8"].sort(compareCodePoints)).toEqual(expected);
+    expect(store.lists().map((list) => list.name)).toEqual(expected);
+    // A locale-aware sort orders the same names differently, so the checks below tell them apart.
+    expect([...expected].sort((a, b) => a.localeCompare(b, "en"))).not.toEqual(expected);
+
+    const managerNames = (): Promise<string[]> =>
+      manager
+        .getByTestId("watchlist-item")
+        .evaluateAll((items) =>
+          items.map((item) => item.getAttribute("data-watchlist-name") ?? ""),
+        );
+    const optionNames = (): Promise<string[]> =>
+      screener
+        .getByTestId("screener-filter-watchlist")
+        .locator('option:not([value=""])')
+        .allTextContents();
+    await expect.poll(managerNames).toEqual(expected);
+    await expect.poll(optionNames).toEqual(expected);
+
+    // A reload shows the order of `GET /watchlists` itself in both widgets.
+    await page.reload();
+    await expectReady(manager);
+    await expectReady(screener, SLOW_READY_TIMEOUT);
+    await expect.poll(managerNames).toEqual(expected);
+    await expect.poll(optionNames).toEqual(expected);
+  });
+
+  test("the screener follows a watchlist the manager creates, extends and deletes", async ({
+    page,
+  }) => {
+    const store = await installWatchlistStore(page);
+    await routeScreenerToStore(page, store);
+    await page.goto("/screener");
+
+    const manager = page.getByTestId("terminal-watchlist-manager");
+    const screener = page.getByTestId("terminal-equity-screener");
+    await expectReady(manager);
+    await expectSettledRows(screener, 8);
+
+    const name = "Telco and brewer";
+    const card = await createWatchlist(manager, name, "SCOM, EABL");
+    const list = store.byName(name);
+    const select = screener.getByTestId("screener-filter-watchlist");
+    await expect(select.locator(`option[value="${list.id}"]`)).toHaveText(name);
+
+    const filtered = page.waitForResponse((response) =>
+      isScreenerUrl(response.url(), "watchlist_id", list.id),
+    );
+    await select.selectOption(list.id);
+    const filteredResponse = await filtered;
+    expect(queryOf(filteredResponse.url())).toEqual({ watchlist_id: list.id });
+    await expectSettledRows(screener, 2);
+    expect((await rowTickers(screener)).sort()).toEqual(["EABL", "SCOM"]);
+    await expect(screener.getByTestId("screener-context-watchlist")).toHaveText(
+      `Watchlist: ${name}`,
+    );
+
+    // A ticker added in the manager refetches the filtered counters.
+    const refetched = page.waitForResponse((response) =>
+      isScreenerUrl(response.url(), "watchlist_id", list.id),
+    );
+    await card.getByTestId("watchlist-add-input").fill("KCB");
+    await card.getByTestId("watchlist-add-button").click();
+    await expect(chipsOf(card)).toHaveText(["EABL", "KCB", "SCOM"]);
+    expect(((await (await refetched).json()) as ScreenerResponse).count).toBe(3);
+    await expectSettledRows(screener, 3);
+    expect((await rowTickers(screener)).sort()).toEqual(["EABL", "KCB", "SCOM"]);
+
+    // Deleting the applied list in the manager clears the filter with a notice naming it.
+    const unfiltered = page.waitForResponse(
+      (response) => isScreenerUrl(response.url()) && new URL(response.url()).search === "",
+    );
+    const deleteButton = card.getByTestId("watchlist-delete-button");
+    await deleteButton.click();
+    await expect(deleteButton).toHaveText("Confirm");
+    await deleteButton.click();
+    await expect(card).toHaveCount(0);
+    expect((await unfiltered).status()).toBe(200);
+    await expect(select).toHaveValue("");
+    await expect(select.locator(`option[value="${list.id}"]`)).toHaveCount(0);
+    await expect(screener.getByTestId("screener-watchlist-notice")).toHaveText(
+      `\u201c${name}\u201d was deleted. Showing all counters.`,
+    );
+    await expectSettledRows(screener, 8);
+    await expect(screener.getByTestId("screener-context-watchlist")).toHaveCount(0);
+  });
+
+  /** A numeric screener filter, its typed bound and the row column it bounds. */
+  const NUMERIC_FILTER_CASES = [
+    { key: "min_pe", value: "6", column: "pe" },
+    { key: "max_pe", value: "5", column: "pe" },
+    { key: "min_pb", value: "1", column: "pb" },
+    { key: "max_pb", value: "0.8", column: "pb" },
+    { key: "min_ev_ebitda", value: "7", column: "ev_ebitda" },
+    { key: "max_ev_ebitda", value: "7", column: "ev_ebitda" },
+    { key: "min_dividend_yield", value: "8", column: "dividend_yield_pct" },
+    { key: "min_volume_z", value: "-0.5", column: "volume_z" },
+  ] as const satisfies ReadonlyArray<{
+    key: string;
+    value: string;
+    column: "pe" | "pb" | "ev_ebitda" | "dividend_yield_pct" | "volume_z";
+  }>;
+
+  /**
+   * Whether `value` passes the inclusive bound of filter `key`, compared exactly. A null value
+   * fails any bound on its metric, as the API filters.
+   */
+  function withinBound(value: string | null, key: string, bound: string): boolean {
+    if (value === null) {
+      return false;
+    }
+    const comparison = compareDecimals(value, bound);
+    return key.startsWith("min_") ? comparison >= 0 : comparison <= 0;
+  }
+
+  /** Loads the screener and returns its first, unfiltered response. */
+  async function openScreener(
+    page: Page,
+  ): Promise<{ screener: Locator; initial: ScreenerResponse }> {
+    const initialResponse = page.waitForResponse((response) => isScreenerUrl(response.url()));
+    await page.goto("/screener");
+    const response = await initialResponse;
+    expect(queryOf(response.url())).toEqual({});
+    const screener = page.getByTestId("terminal-equity-screener");
+    await expectSettledRows(screener, 8);
+    return { screener, initial: (await response.json()) as ScreenerResponse };
+  }
+
+  for (const filter of NUMERIC_FILTER_CASES) {
+    test(`${filter.key}=${filter.value} is sent as typed and keeps only the counters within it`, async ({
+      page,
+    }) => {
+      const { screener, initial } = await openScreener(page);
+      const expected = initial.rows
+        .filter((row) => withinBound(row[filter.column], filter.key, filter.value))
+        .map((row) => row.ticker)
+        .sort();
+      // The bound keeps some counters but not all, so the filter visibly narrows the table.
+      expect(expected.length).toBeGreaterThan(0);
+      expect(expected.length).toBeLessThan(initial.rows.length);
+
+      const filtered = page.waitForResponse((response) =>
+        isScreenerUrl(response.url(), filter.key),
+      );
+      const input = screener.getByTestId(`screener-filter-${filter.key}`);
+      await input.fill(filter.value);
+      await input.press("Enter");
+      const response = await filtered;
+      expect(response.status()).toBe(200);
+      expect(queryOf(response.url())).toEqual({ [filter.key]: filter.value });
+
+      await expectSettledRows(screener, expected.length);
+      expect((await rowTickers(screener)).sort()).toEqual(expected);
+      for (const { ticker, value } of await columnValues(screener, filter.column)) {
+        expect(withinBound(value, filter.key, filter.value), `${ticker} ${value}`).toBe(true);
+      }
+    });
+  }
+
+  test("anomalies only sends anomalies_only=true and shows only flagged counters", async ({
+    page,
+  }) => {
+    // The latest seeded session, 2026-09-30, has no spike, so the filter alone would leave no row
+    // to check. Its request is answered by the API for the session of the planted EABL spike.
+    const eablSpike = PLANTED_SPIKES[2];
+    const anomalyRequests: string[] = [];
+    const answered: ScreenerResponse[] = [];
+    await page.route("**/api/v1/terminal/market/screener**", async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get("anomalies_only") !== "true") {
+        await route.continue();
+        return;
+      }
+      anomalyRequests.push(url.toString());
+      url.searchParams.set("as_of", eablSpike.tradeDate);
+      const response = await route.fetch({ url: url.toString() });
+      if (response.status() === 200) {
+        answered.push((await response.json()) as ScreenerResponse);
+      }
+      await route.fulfill({ response });
+    });
+    const { screener } = await openScreener(page);
+
+    await screener.getByTestId("screener-filter-anomalies_only").check();
+    await expect.poll(() => answered.length).toBe(1);
+    expect(anomalyRequests.map(queryOf)).toEqual([{ anomalies_only: "true" }]);
+    const body = answered[0];
+    if (body === undefined) {
+      throw new Error("The anomalies-only request was not answered");
+    }
+    expect(body.rows.map((row) => row.ticker)).toContain(eablSpike.ticker);
+    for (const row of body.rows) {
+      expect(row.is_volume_anomaly || row.is_turnover_anomaly, row.ticker).toBe(true);
+    }
+
+    await expectSettledRows(screener, body.rows.length);
+    expect(await rowTickers(screener)).toEqual(body.rows.map((row) => row.ticker));
+    const rows = screener.getByTestId("screener-row");
+    for (let index = 0; index < body.rows.length; index += 1) {
+      await expect(rows.nth(index)).toContainText(/Vol spike|T\/O spike/);
+    }
+    await expect(screener.getByTestId("screener-filter-anomalies_only")).toBeChecked();
+  });
+
+  test("sector, P/E and dividend-yield filters combine into one request", async ({ page }) => {
+    const { screener, initial } = await openScreener(page);
+    const query = { sector: "Banking", max_pe: "5", min_dividend_yield: "7" };
+    const inSector = (row: ScreenerRow): boolean => row.sector === query.sector;
+    const lowPe = (row: ScreenerRow): boolean => withinBound(row.pe, "max_pe", query.max_pe);
+    const highYield = (row: ScreenerRow): boolean =>
+      withinBound(row.dividend_yield_pct, "min_dividend_yield", query.min_dividend_yield);
+    const expected = initial.rows
+      .filter((row) => inSector(row) && lowPe(row) && highYield(row))
+      .map((row) => row.ticker)
+      .sort();
+    // Each filter alone keeps more counters than the three together.
+    expect(expected.length).toBeGreaterThan(0);
+    for (const single of [inSector, lowPe, highYield]) {
+      expect(expected.length).toBeLessThan(initial.rows.filter(single).length);
+    }
+
+    const combined = page.waitForResponse(
+      (response) =>
+        isScreenerUrl(response.url(), "sector") &&
+        isScreenerUrl(response.url(), "max_pe") &&
+        isScreenerUrl(response.url(), "min_dividend_yield"),
+    );
+    await screener.getByTestId("screener-filter-sector").selectOption({ label: query.sector });
+    for (const key of ["max_pe", "min_dividend_yield"] as const) {
+      const input = screener.getByTestId(`screener-filter-${key}`);
+      await input.fill(query[key]);
+      await input.press("Enter");
+    }
+    expect(queryOf((await combined).url())).toEqual(query);
+
+    await expectSettledRows(screener, expected.length);
+    expect((await rowTickers(screener)).sort()).toEqual(expected);
+    const sectors = await screener
+      .getByTestId("screener-row")
+      .locator('[data-column="sector"]')
+      .allTextContents();
+    expect(new Set(sectors)).toEqual(new Set([query.sector]));
+    for (const { ticker, value } of await columnValues(screener, "pe")) {
+      expect(withinBound(value, "max_pe", query.max_pe), `${ticker} ${value}`).toBe(true);
+    }
+    for (const { ticker, value } of await columnValues(screener, "dividend_yield_pct")) {
+      expect(
+        withinBound(value, "min_dividend_yield", query.min_dividend_yield),
+        `${ticker} ${value}`,
+      ).toBe(true);
+    }
+  });
+
+  /** The screener's sortable columns, ticker first so each later press starts that column. */
+  const SORT_COLUMNS = [
+    "ticker",
+    "market_cap_kes",
+    "pe",
+    "pb",
+    "ev_ebitda",
+    "dividend_yield_pct",
+    "volume_z",
+  ] as const satisfies ReadonlyArray<keyof ScreenerRow>;
+
+  /**
+   * Asserts that the shown rows are ordered by `column` in `order` as the API sorts: tickers in
+   * code-point order; metrics compared exactly, nulls last in either order and ties by ticker.
+   */
+  async function expectRowsSorted(
+    screener: Locator,
+    column: (typeof SORT_COLUMNS)[number],
+    order: "asc" | "desc",
+  ): Promise<void> {
+    const direction = order === "asc" ? 1 : -1;
+    const cells =
+      column === "ticker"
+        ? (await rowTickers(screener)).map((ticker) => ({ ticker, value: null }))
+        : await columnValues(screener, column);
+    for (let index = 1; index < cells.length; index += 1) {
+      const previous = cells[index - 1];
+      const current = cells[index];
+      if (previous === undefined || current === undefined) {
+        continue;
+      }
+      const pair = `${previous.ticker} ${previous.value} before ${current.ticker} ${current.value}`;
+      if (column === "ticker") {
+        const step = direction * compareCodePoints(previous.ticker, current.ticker);
+        expect(step, pair).toBeLessThan(0);
+      } else if (previous.value === null) {
+        // Nulls come last in either order, among themselves by ticker.
+        expect(current.value, pair).toBeNull();
+        expect(compareCodePoints(previous.ticker, current.ticker), pair).toBeLessThan(0);
+      } else if (current.value !== null) {
+        const step = direction * compareDecimals(previous.value, current.value);
+        expect(step, pair).toBeLessThanOrEqual(0);
+        if (step === 0) {
+          expect(compareCodePoints(previous.ticker, current.ticker), pair).toBeLessThan(0);
+        }
+      }
+    }
+  }
+
+  /** Asserts that `column`'s header is the one sorted header, in `order`. */
+  async function expectActiveSort(
+    screener: Locator,
+    column: (typeof SORT_COLUMNS)[number],
+    order: "asc" | "desc",
+  ): Promise<void> {
+    await expect(screener.locator("thead th[aria-sort]")).toHaveCount(1);
+    // A `has` locator is queried inside each header, so it is built from the page.
+    const button = screener.page().getByTestId(`screener-sort-${column}`);
+    await expect(screener.locator("thead th", { has: button })).toHaveAttribute(
+      "aria-sort",
+      order === "asc" ? "ascending" : "descending",
+    );
+  }
+
+  test("each sort header requests its order, flips when pressed again and marks aria-sort", async ({
+    page,
+  }) => {
+    const { screener, initial } = await openScreener(page);
+    // Before any press the API's default, market cap descending, is the sorted header.
+    expect(await rowTickers(screener)).toEqual(initial.rows.map((row) => row.ticker));
+    await expectActiveSort(screener, "market_cap_kes", "desc");
+    await expectRowsSorted(screener, "market_cap_kes", "desc");
+
+    for (const column of SORT_COLUMNS) {
+      // A newly pressed column starts ascending for tickers and descending for metrics.
+      const first = column === "ticker" ? "asc" : "desc";
+      for (const order of [first, first === "asc" ? "desc" : "asc"] as const) {
+        const sorted = page.waitForResponse(
+          (response) =>
+            isScreenerUrl(response.url(), "sort", column) &&
+            isScreenerUrl(response.url(), "order", order),
+        );
+        await screener.getByTestId(`screener-sort-${column}`).click();
+        const response = await sorted;
+        expect(queryOf(response.url())).toEqual({ sort: column, order });
+        const body = (await response.json()) as ScreenerResponse;
+        await expectSettledRows(screener, 8);
+        await expect.poll(() => rowTickers(screener)).toEqual(body.rows.map((row) => row.ticker));
+        await expectActiveSort(screener, column, order);
+        await expectRowsSorted(screener, column, order);
+      }
+    }
+  });
+
+  test("Reset sends the default request, clears every filter and restores the eight counters", async ({
+    page,
+  }) => {
+    const { screener, initial } = await openScreener(page);
+    const sectorSelect = screener.getByTestId("screener-filter-sector");
+    const minPe = screener.getByTestId("screener-filter-min_pe");
+    const anomaliesOnly = screener.getByTestId("screener-filter-anomalies_only");
+
+    await sectorSelect.selectOption({ label: "Banking" });
+    await expectSettledRows(screener, 5);
+    await minPe.fill("4.5");
+    await minPe.press("Enter");
+    const sorted = page.waitForResponse((response) =>
+      isScreenerUrl(response.url(), "sort", "pe"),
+    );
+    await screener.getByTestId("screener-sort-pe").click();
+    expect(queryOf((await sorted).url())).toEqual({
+      sector: "Banking",
+      min_pe: "4.5",
+      sort: "pe",
+      order: "desc",
+    });
+    await expectSettledRows(screener, 3);
+    const narrowed = page.waitForResponse((response) =>
+      isScreenerUrl(response.url(), "anomalies_only", "true"),
+    );
+    await anomaliesOnly.check();
+    expect(queryOf((await narrowed).url())).toEqual({
+      sector: "Banking",
+      min_pe: "4.5",
+      anomalies_only: "true",
+      sort: "pe",
+      order: "desc",
+    });
+    await expect(screener).toHaveAttribute("data-state", "empty", {
+      timeout: SLOW_READY_TIMEOUT,
+    });
+
+    const reset = page.waitForResponse(
+      (response) => isScreenerUrl(response.url()) && new URL(response.url()).search === "",
+    );
+    await screener.getByTestId("screener-reset").click();
+    expect((await reset).status()).toBe(200);
+    await expectSettledRows(screener, 8);
+    expect(await rowTickers(screener)).toEqual(initial.rows.map((row) => row.ticker));
+    await expectActiveSort(screener, "market_cap_kes", "desc");
+    await expect(sectorSelect).toHaveValue("");
+    await expect(screener.getByTestId("screener-filter-watchlist")).toHaveValue("");
+    await expect(anomaliesOnly).not.toBeChecked();
+    for (const { key } of NUMERIC_FILTER_CASES) {
+      await expect(screener.getByTestId(`screener-filter-${key}`)).toHaveValue("");
+    }
+  });
+
+  test("selecting KCB in the anomaly feed loads its valuation bands and net flows", async ({
+    page,
+  }) => {
+    const marketFlowsResponse = page.waitForResponse((response) =>
+      isFlowsUrl(response.url(), null),
+    );
+    await page.goto("/screener");
+
+    const feed = page.getByTestId("terminal-anomaly-feed");
+    const bands = page.getByTestId("terminal-valuation-bands-chart");
+    const flows = page.getByTestId("terminal-net-flow-chart");
+    await expectReady(feed, SLOW_READY_TIMEOUT);
+    await expect(bands).toHaveAttribute("data-state", "empty");
+    const market = (await (await marketFlowsResponse).json()) as FlowsResponse;
+    await expectReady(flows, SLOW_READY_TIMEOUT);
+    await expectFlowsReadouts(flows, market);
+
+    const kcbSpike = PLANTED_SPIKES[1];
+    const bandsResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return url.pathname === BANDS_PATH && url.searchParams.get("ticker") === kcbSpike.ticker;
+    });
+    const kcbFlowsResponse = page.waitForResponse((response) =>
+      isFlowsUrl(response.url(), kcbSpike.ticker),
+    );
+    await withAttributes(feed, "anomaly-item", {
+      "data-ticker": kcbSpike.ticker,
+      "data-trade-date": kcbSpike.tradeDate,
+      "data-metric": "volume",
+    })
+      .getByRole("button", { name: `Select ${kcbSpike.ticker}`, exact: true })
+      .click();
+
+    await expect(page.getByTestId("screener-selected-ticker")).toHaveText(
+      `Selected counter: ${kcbSpike.ticker}`,
+    );
+    const bandsAnswer = await bandsResponse;
+    expect(bandsAnswer.status()).toBe(200);
+    const kcbBands = (await bandsAnswer.json()) as ValuationBandsResponse;
+    expect(kcbBands.subject).toBe(kcbSpike.ticker);
+    expect(kcbBands.stats).not.toBeNull();
+    await expectReady(bands, SLOW_READY_TIMEOUT);
+    await expect(bands.getByTestId("bands-meta")).toContainText(`Counter ${kcbSpike.ticker} · `);
+    await expect
+      .poll(async () =>
+        displayedDecimal(await bands.getByTestId("bands-stat-current").locator("dd").textContent()),
+      )
+      .toBe(canonicalDecimal(kcbBands.stats?.current ?? ""));
+
+    const flowsAnswer = await kcbFlowsResponse;
+    expect(flowsAnswer.status()).toBe(200);
+    const kcbFlows = (await flowsAnswer.json()) as FlowsResponse;
+    expect(kcbFlows.subject).toBe(kcbSpike.ticker);
+    expect(kcbFlows.totals?.foreign_net_kes).not.toBe(market.totals?.foreign_net_kes);
+    await expectReady(flows, SLOW_READY_TIMEOUT);
+    await expect(flows.getByText("Updating…")).toHaveCount(0, { timeout: SLOW_READY_TIMEOUT });
+    await expectFlowsReadouts(flows, kcbFlows);
+
+    // The selection is marked in both lists that offer it.
+    await expect(
+      withAttributes(page.getByTestId("terminal-equity-screener"), "screener-row", {
+        "data-ticker": kcbSpike.ticker,
+      }),
+    ).toHaveAttribute("data-selected", "true");
+    await expect(
+      withAttributes(feed, "anomaly-item", {
+        "data-ticker": kcbSpike.ticker,
+        "data-trade-date": kcbSpike.tradeDate,
+        "data-metric": "volume",
+      }),
+    ).toHaveAttribute("data-selected", "true");
   });
 });
 

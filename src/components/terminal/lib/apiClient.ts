@@ -198,8 +198,18 @@ export function buildUrl(apiBaseUrl: string | undefined, path: string, query?: o
 /**
  * Percent-encode one path segment, such as a watchlist id or ticker in
  * `/watchlists/{watchlist_id}/items/{ticker}`.
+ *
+ * Throws a `RangeError` for a value that cannot travel as one segment, a programmer error: the
+ * caller validates user input first. That is `""`, which would leave an empty segment; `.` or
+ * `..`, which URL parsing resolves as path steps, so the request would reach another route
+ * (encoding cannot prevent it, because the URL standard treats `%2E` as a dot too); and any
+ * value holding a `/`, which the server decodes from `%2F` before routing, splitting the
+ * segment. Every other character is encoded and reaches the route as given.
  */
 export function pathSegment(value: string): string {
+  if (value === "" || value === "." || value === ".." || value.includes("/")) {
+    throw new RangeError(`pathSegment: ${JSON.stringify(value)} cannot be one URL path segment`);
+  }
   return encodeURIComponent(value);
 }
 

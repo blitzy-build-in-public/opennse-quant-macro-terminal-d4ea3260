@@ -17,9 +17,11 @@ its own clone; the rest need no database. Each section opens with the contract i
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import hashlib
 import logging
+import time
 import uuid
 from bisect import bisect_right
 from calendar import monthrange
@@ -29,13 +31,14 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from statistics import mean
+from types import ModuleType
 from typing import Any, Final, Protocol
 from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
 import pytest_asyncio
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 from sqlalchemy import Executable, delete, event, select, update
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -84,6 +87,7 @@ from opennse_terminal.services.macro_service import (
     get_macro_overview,
     yield_curve_at,
 )
+from opennse_terminal.services.offload import CLIENT_CLOSED_REQUEST, RequestAbandonedError
 
 BASE: Final[str] = "/api/v1/terminal"
 
@@ -2713,6 +2717,42 @@ async def test_load_price_rows_groups_history_per_requested_ticker(
     assert await ms.load_price_rows(session, [], None, None) == {}
 
 
+async def test_load_price_rows_in_ranges_reads_only_the_ranges_in_one_statement(
+    seeded_database: SeededDatabase, session: AsyncSession
+) -> None:
+    """Two distant ranges come back as each ticker's rows of both, ascending, exactly the rows
+    the two single-range reads give, from one statement; every requested ticker is a key, an
+    unknown one empty. No tickers, or no ranges, run no statement."""
+    ranges = [(date(2013, 1, 2), date(2013, 1, 8)), (date(2026, 9, 28), LATEST)]
+    with captured_statements(seeded_database.engine) as statements:
+        prices = await ms.load_price_rows_in_ranges(session, ["kcb", "SCOM", "NOPE"], ranges)
+
+    assert len(reads_of(statements, "FROM terminal_daily_prices")) == 1
+    assert list(prices) == ["KCB", "NOPE", "SCOM"]
+    assert prices["NOPE"] == []
+    for ticker in ("KCB", "SCOM"):
+        separately = [
+            row
+            for start, end in ranges
+            for row in (await ms.load_price_rows(session, [ticker], start, end))[ticker]
+        ]
+        assert prices[ticker] == separately
+        assert [row.trade_date for row in prices[ticker]][-3:] == [
+            date(2026, 9, 28),
+            date(2026, 9, 29),
+            LATEST,
+        ]
+        assert all(row.trade_date.year in (2013, 2026) for row in prices[ticker])
+
+    with captured_statements(seeded_database.engine) as statements:
+        assert await ms.load_price_rows_in_ranges(session, [], ranges) == {}
+        assert await ms.load_price_rows_in_ranges(session, ["scom", "kcb"], []) == {
+            "KCB": [],
+            "SCOM": [],
+        }
+    assert statements == []
+
+
 async def test_load_fundamentals_rows_returns_every_period_per_ticker(
     session: AsyncSession,
 ) -> None:
@@ -4551,15 +4591,24 @@ async def test_boundary_dates_build_the_overview_without_raising(
 # ---------------------------------------------------------------------------------------------
 #
 # ``services/cycle_service.py`` reads the stored history with bound ``select()`` statements,
-# runs the pure ``quant.backtest.run_cycle_backtest`` once per event and rounds each output once
-# with ``quantize_out``. The contract held here:
+# runs the pure ``quant.backtest.run_cycle_backtest`` once per event in a worker thread and
+# rounds each output once with ``quantize_out``. The contract held here:
 #
-# - **Bounded session reads.** Each cycle reads its own observed sessions: one ``DISTINCT
-#   trade_date`` statement over ``[window_start, min(window_end, data_available_through)]``
-#   and, when that window holds a session, one backward ``DISTINCT trade_date`` statement
-#   before ``window_start`` with ``LIMIT 30`` (the 20-session turnover mean and the 10-session
-#   base close). No statement reads ``terminal_daily_prices`` without a predicate, and a cycle
-#   whose window holds no data reads no lead-in and no price row.
+# - **Bounded session reads, one statement each for every cycle.** One ``DISTINCT trade_date``
+#   statement reads every cycle's own sessions, one ``BETWEEN`` per cycle's
+#   ``[window_start, min(window_end, data_available_through)]``, overlapping or adjacent ranges
+#   merged. One more reads the lead-ins: one backward ``DISTINCT trade_date`` query before each
+#   ``window_start`` whose window holds a session, with ``LIMIT 30`` (the 20-session turnover
+#   mean and the 10-session base close), joined by ``UNION``.
+# - **Bounded price read, one statement for every cycle.** One Core column statement reads the
+#   candidates' rows over each cycle's span, from its first lead-in session to its last observed
+#   session, spans merged where they overlap or touch, and each cycle gets the rows of its own
+#   span.
+# - **Constant statement count.** The number of ``terminal_daily_prices`` statements does not
+#   grow with the number of events: 2, 4 and 8 events issue the same four (the candidates'
+#   latest date, sessions, lead-ins, prices). No statement reads ``terminal_daily_prices``
+#   without a predicate, the history between distant events is never read, and a cycle whose
+#   window holds no data reads no lead-in and no price row.
 # - **Bounded overlay read.** One statement reads the overlay rows over each observed cycle's
 #   ``[window_start - 62 days, last observed session]``, overlapping or adjacent ranges merged,
 #   so the history between distant events is never read; a request with no observed cycle
@@ -4636,7 +4685,8 @@ def assert_daily_price_reads_bounded(statements: Sequence[Statement]) -> None:
 async def test_distant_events_read_only_their_windows_and_lead_in(
     seeded_database: SeededDatabase, session: AsyncSession, settings: TerminalSettings
 ) -> None:
-    """2013 and 2022 read their own sessions, 30-session lead-ins and overlays, not 2014-2021."""
+    """2013 and 2022 read their own sessions, 30-session lead-ins, prices and overlays, each in
+    one statement for both cycles, and nothing of 2014-2021."""
     with captured_statements(seeded_database.engine) as statements:
         response = await cs.get_backtest(
             session, settings, event_dates=[date(2022, 8, 9), date(2013, 3, 4)]
@@ -4644,17 +4694,22 @@ async def test_distant_events_read_only_their_windows_and_lead_in(
 
     assert [cycle.status for cycle in response.cycles] == ["complete", "complete"]
     assert_daily_price_reads_bounded(statements)
-    session_reads = reads_of(statements, SESSION_READ)
-    assert [params for _, params in session_reads] == [
+    (in_window_sql, in_window_params), (lead_in_sql, lead_in_params) = reads_of(
+        statements, SESSION_READ
+    )
+    in_window = list(zip(in_window_params[::2], in_window_params[1::2], strict=True))
+    assert in_window == [
         (date(2012, 9, 5), date(2013, 8, 31)),
-        (date(2012, 9, 5), 30),
         (date(2022, 2, 10), date(2023, 2, 5)),
-        (date(2022, 2, 10), 30),
     ]
-    for sql, _ in session_reads[1::2]:
-        assert "WHERE terminal_daily_prices.trade_date < " in sql
-        assert "ORDER BY terminal_daily_prices.trade_date DESC" in sql
-        assert "LIMIT " in sql
+    assert not any(start <= date(2016, 1, 1) <= end for start, end in in_window)
+    assert in_window_sql.count("terminal_daily_prices.trade_date BETWEEN ") == 2
+    assert " LIMIT " not in in_window_sql
+    assert lead_in_params == (date(2012, 9, 5), 30, date(2022, 2, 10), 30)
+    assert " UNION " in lead_in_sql
+    assert lead_in_sql.count("WHERE terminal_daily_prices.trade_date < ") == 2
+    assert lead_in_sql.count("ORDER BY terminal_daily_prices.trade_date DESC") == 2
+    assert lead_in_sql.count("LIMIT ") == 2
 
     (macro_sql, macro_params), *others = reads_of(statements, MACRO_READ)
     assert others == []
@@ -4666,11 +4721,15 @@ async def test_distant_events_read_only_their_windows_and_lead_in(
     assert not any(start <= date(2016, 1, 1) <= end for start, end in ranges)
     assert macro_sql.count("terminal_macro_indicators.observation_date >= ") == 2
 
-    price_reads = reads_of(statements, PRICE_READ)
-    assert [params[:2] for _, params in price_reads] == [
-        (date(2012, 7, 25), date(2013, 8, 30)),
-        (date(2021, 12, 30), date(2023, 2, 3)),
-    ]
+    ((price_sql, price_params),) = reads_of(statements, PRICE_READ)
+    assert price_params[:4] == (
+        date(2012, 7, 25),
+        date(2013, 8, 30),
+        date(2021, 12, 30),
+        date(2023, 2, 3),
+    )
+    assert sorted(price_params[4:]) == sorted(SEEDED_TICKERS)
+    assert price_sql.count("terminal_daily_prices.trade_date BETWEEN ") == 2
 
 
 @pytest.mark.parametrize(
@@ -4738,6 +4797,65 @@ async def test_awaiting_data_request_reads_no_lead_in_prices_or_overlays(
     assert reads_of(statements, " LIMIT ") == []
     assert reads_of(statements, PRICE_READ) == []
     assert reads_of(statements, MACRO_READ) == []
+
+
+EIGHT_EVENTS: Final[list[date]] = [
+    date(2013, 3, 4),
+    date(2014, 6, 1),
+    date(2015, 6, 1),
+    date(2017, 8, 8),
+    date(2019, 6, 1),
+    date(2022, 8, 9),
+    date(2024, 6, 1),
+    date(2027, 8, 10),
+]
+
+
+@pytest.mark.parametrize(
+    ("request_args", "statuses"),
+    [
+        pytest.param(
+            {"event_dates": [date(2013, 3, 4), date(2022, 8, 9)]},
+            ["complete", "complete"],
+            id="2_events",
+        ),
+        pytest.param(
+            {}, ["complete", "complete", "complete", "awaiting_data"], id="4_default_events"
+        ),
+        pytest.param(
+            {"event_dates": EIGHT_EVENTS, "pre_days": 365, "post_days": 365},
+            [*(["complete"] * 7), "partial"],
+            id="8_events_365_days",
+        ),
+    ],
+)
+async def test_daily_price_statements_do_not_grow_with_the_events(
+    seeded_database: SeededDatabase,
+    session: AsyncSession,
+    settings: TerminalSettings,
+    request_args: dict[str, Any],
+    statuses: list[str],
+) -> None:
+    """2, 4 and 8 events issue the same four ``terminal_daily_prices`` statements.
+
+    They are the candidates' latest date, one session read, one lead-in read with a ``LIMIT 30``
+    query per window that holds a session, and one price read. No date bound reaches past the
+    data, so the 2027 window of the default request, which holds no data, adds nothing to them.
+    """
+    with captured_statements(seeded_database.engine) as statements:
+        response = await cs.get_backtest(session, settings, **request_args)
+
+    assert [cycle.status for cycle in response.cycles] == statuses
+    assert_daily_price_reads_bounded(statements)
+    daily_price_reads = reads_of(statements, "FROM terminal_daily_prices")
+    assert len(daily_price_reads) == 4
+    (_, in_window), (_, lead_ins) = reads_of(statements, SESSION_READ)
+    ((_, prices),) = reads_of(statements, PRICE_READ)
+    observed = sum(1 for status in statuses if status != "awaiting_data")
+    assert lead_ins[1::2] == (30,) * observed
+    for bound in (*in_window, *lead_ins[::2], *prices):
+        if isinstance(bound, date):
+            assert bound <= LATEST
 
 
 # ---------------------------------------------------------------------------------------------
@@ -5141,6 +5259,195 @@ async def test_debug_summary_escapes_stored_labels(
     (cycle,) = response.cycles
     assert cycle.label == label
     assert cycle.status == "awaiting_data"
+
+
+# ---------------------------------------------------------------------------------------------
+# Analytic services: computation in a worker thread and abandoned requests (services/offload.py)
+# ---------------------------------------------------------------------------------------------
+#
+# The screener, valuation bands, anomalies, flows and backtest read on the event loop, then run
+# their pure quant computation in a worker thread through ``offload.compute``, in chunks: one per
+# ticker series for the anomaly feed and one per cycle for the backtest. Before each chunk they
+# await the ``abandoned`` check the route passes (``request.is_disconnected``). The contract held
+# here:
+#
+# - **Early stop.** Once the check reports the client gone, the service raises
+#   ``RequestAbandonedError`` before its next chunk, so the remaining series or cycles are never
+#   computed.
+# - **499 for a gone client.** A request whose client has already disconnected is answered 499
+#   (client closed request) with no quant work, on each of the five routes.
+# - **Responsive event loop.** While a chunk computes, other coroutines keep running.
+#
+# Quant work is observed by wrapping the quant function in the service module's namespace, the
+# name the service calls; the wrapper delegates to the real function, so answers are unchanged.
+
+
+class AbandonAfter:
+    """An abandon check answering ``False`` for its first ``checks`` calls and ``True`` after."""
+
+    def __init__(self, checks: int) -> None:
+        self.checks = checks
+        self.calls = 0
+
+    async def __call__(self) -> bool:
+        self.calls += 1
+        return self.calls > self.checks
+
+
+def count_calls(monkeypatch: pytest.MonkeyPatch, module: ModuleType, name: str) -> list[None]:
+    """Wrap ``module.name`` so that each call appends to the returned list, then delegates."""
+    real = getattr(module, name)
+    calls: list[None] = []
+
+    def counted(*args: Any, **kwargs: Any) -> Any:
+        calls.append(None)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(module, name, counted)
+    return calls
+
+
+AbandonableCall = Callable[[AsyncSession, TerminalSettings, AbandonAfter], Awaitable[object]]
+
+
+@pytest.mark.parametrize(
+    ("call", "module", "quant_function", "chunks"),
+    [
+        pytest.param(
+            lambda session, settings, abandoned: ms.get_anomalies(session, abandoned=abandoned),
+            ms,
+            "rolling_zscores",
+            16,
+            id="anomalies_8_tickers_x_2_series",
+        ),
+        pytest.param(
+            lambda session, settings, abandoned: cs.get_backtest(
+                session, settings, abandoned=abandoned
+            ),
+            cs,
+            "run_cycle_backtest",
+            4,
+            id="backtest_4_cycles",
+        ),
+    ],
+)
+async def test_abandoned_request_stops_before_the_next_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+    session: AsyncSession,
+    settings: TerminalSettings,
+    call: AbandonableCall,
+    module: ModuleType,
+    quant_function: str,
+    chunks: int,
+) -> None:
+    """The client leaves after the first chunk: one of the 16 series or 4 cycles is computed."""
+    calls = count_calls(monkeypatch, module, quant_function)
+    abandoned = AbandonAfter(1)
+
+    with pytest.raises(RequestAbandonedError):
+        await call(session, settings, abandoned)
+
+    assert abandoned.calls == 2
+    assert len(calls) == 1
+    assert len(calls) < chunks
+
+
+@pytest.mark.parametrize(
+    ("path", "module", "quant_function"),
+    [
+        pytest.param("/market/screener", ms, "compute_valuation", id="screener"),
+        pytest.param(
+            "/market/valuation-bands?ticker=SCOM", ms, "compute_valuation", id="valuation_bands"
+        ),
+        pytest.param("/market/anomalies", ms, "rolling_zscores", id="anomalies"),
+        pytest.param("/market/flows", ms, "net_flow_series", id="flows"),
+        pytest.param("/cycles/backtest", cs, "run_cycle_backtest", id="backtest"),
+    ],
+)
+async def test_disconnected_client_gets_499_and_no_quant_work(
+    monkeypatch: pytest.MonkeyPatch,
+    app: FastAPI,
+    path: str,
+    module: ModuleType,
+    quant_function: str,
+) -> None:
+    """A raw ASGI request whose ``receive`` reports ``http.disconnect`` is answered 499, empty.
+
+    The route's reads run, but its service stops before the first chunk of computation.
+    """
+    calls = count_calls(monkeypatch, module, quant_function)
+    route, _, query = f"{BASE}{path}".partition("?")
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": route,
+        "raw_path": route.encode(),
+        "query_string": query.encode(),
+        "root_path": "",
+        "headers": [(b"host", b"test")],
+        "client": ("127.0.0.1", 50000),
+        "server": ("test", 80),
+    }
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    await app(scope, receive, send)
+
+    start, body = sent
+    assert start["type"] == "http.response.start"
+    assert start["status"] == CLIENT_CLOSED_REQUEST == 499
+    assert body["type"] == "http.response.body"
+    assert body["body"] == b""
+    assert not body.get("more_body", False)
+    assert calls == []
+
+
+async def test_event_loop_keeps_running_while_a_series_is_scored(
+    monkeypatch: pytest.MonkeyPatch, session: AsyncSession
+) -> None:
+    """Each of SCOM's two series is scored by a rolling Z-score slowed by a 0.2 s sleep.
+
+    A coroutine sleeping 10 ms at a time ticks during each of those sleeps, which it could not do
+    if the scoring held the event loop, and the feed equals the one scored at full speed.
+    """
+    expected = await ms.get_anomalies(session, ticker="SCOM")
+    real = ms.rolling_zscores
+    ticks = 0
+    observed: list[tuple[int, int]] = []
+
+    def slow_rolling_zscores(*args: Any, **kwargs: Any) -> list[Any]:
+        before = ticks
+        time.sleep(0.2)
+        observed.append((before, ticks))
+        return real(*args, **kwargs)
+
+    async def ticker(stop: asyncio.Event) -> None:
+        nonlocal ticks
+        while not stop.is_set():
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    monkeypatch.setattr(ms, "rolling_zscores", slow_rolling_zscores)
+    stop = asyncio.Event()
+    ticking = asyncio.create_task(ticker(stop))
+    try:
+        response = await ms.get_anomalies(session, ticker="SCOM")
+    finally:
+        stop.set()
+        await ticking
+
+    assert response == expected
+    assert len(observed) == 2
+    for before, after in observed:
+        assert after > before
 
 
 # ---------------------------------------------------------------------------------------------

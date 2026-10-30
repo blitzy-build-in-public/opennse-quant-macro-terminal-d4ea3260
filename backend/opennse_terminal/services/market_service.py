@@ -13,6 +13,13 @@ has in ``terminal_daily_prices``, never a holiday list. Each endpoint issues a c
 statements, whatever the number of tickers or days, and price history is read as Core column
 rows rather than ORM entities.
 
+Every read runs on the event loop. The screener, valuation bands, anomalies and flows then hand
+their pure computation to a worker thread through
+:func:`~opennse_terminal.services.offload.compute`, in chunks (one per Z-score series for the
+anomaly feed), so the event loop keeps serving other requests meanwhile. Given an ``abandoned``
+check, such as the route's ``request.is_disconnected``, they stop before the next chunk once the
+client has gone away and raise :class:`~opennse_terminal.services.offload.RequestAbandonedError`.
+
 Units: KES amounts are whole shillings, multiples are ratios (x), yields, returns and changes are
 percentage points, volumes are shares and Z-scores are standard deviations. Closes (per share)
 and turnover are in the equity's listing currency (``currency``, KES by default), read and
@@ -43,7 +50,7 @@ from opennse_terminal.config import TerminalSettings
 from opennse_terminal.models import TerminalDailyPrice, TerminalEquity, TerminalFundamental
 from opennse_terminal.quant.asof import FundamentalsRow, PriceRow, close_as_of, fundamentals_as_of
 from opennse_terminal.quant.backtest import add_months
-from opennse_terminal.quant.bands import BandStatsResult, valuation_bands
+from opennse_terminal.quant.bands import BandsResult, BandStatsResult, valuation_bands
 from opennse_terminal.quant.flows import DEFAULT_FLOW_ROLLING_WINDOW, net_flow_series
 from opennse_terminal.quant.heatmap import (
     CLOSE_MAX_AGE_DAYS,
@@ -86,6 +93,7 @@ from opennse_terminal.schemas.market import (
     SubjectType,
     ValuationBandsResponse,
 )
+from opennse_terminal.services.offload import AbandonCheck, compute
 from opennse_terminal.services.watchlist_service import OwnerPrincipal, owned_watchlist_tickers
 
 __all__ = [
@@ -105,6 +113,7 @@ __all__ = [
     "load_fundamentals_rows",
     "load_market_sessions",
     "load_price_rows",
+    "load_price_rows_in_ranges",
 ]
 
 logger = logging.getLogger("opennse_terminal.services.market_service")
@@ -376,6 +385,44 @@ async def load_price_rows(
     return await _collect_price_rows(session, stmt, keys)
 
 
+async def load_price_rows_in_ranges(
+    session: AsyncSession,
+    tickers: Collection[str],
+    ranges: Sequence[tuple[date, date]],
+) -> dict[str, list[PriceRow]]:
+    """Return price history per ticker within any of several date ranges, in one statement.
+
+    The rows of each ticker dated inside any inclusive ``(start, end)`` range of ``ranges``,
+    ascending by ``trade_date``, with the same columns and units as :func:`load_price_rows`.
+    One ``ticker IN (...) AND (trade_date BETWEEN ... OR ...)`` statement reads them, served by
+    the ``(ticker, trade_date)`` unique index and the ``trade_date`` index, so the history
+    between the ranges is never read. A caller that needs several windows passes them merged
+    and slices each window out of the result, which then holds exactly the rows
+    :func:`load_price_rows` returns for that window.
+
+    Args:
+        session: An async session on the terminal database; it is only read.
+        tickers: Tickers to load (trimmed and upper-cased), each returned as a key even without
+            rows. An empty collection returns ``{}`` without a statement.
+        ranges: Inclusive ``(start, end)`` date ranges. Without any, every key is returned empty
+            and no statement runs.
+    """
+    keys = _normalise_tickers(tickers)
+    if not keys:
+        return {}
+    if not ranges:
+        return {ticker: [] for ticker in keys}
+    stmt = (
+        _price_select()
+        .where(
+            TerminalDailyPrice.ticker.in_(keys),
+            or_(*(TerminalDailyPrice.trade_date.between(start, end) for start, end in ranges)),
+        )
+        .order_by(TerminalDailyPrice.ticker, TerminalDailyPrice.trade_date)
+    )
+    return await _collect_price_rows(session, stmt, keys)
+
+
 async def load_fundamentals_rows(
     session: AsyncSession, tickers: Collection[str] | None
 ) -> dict[str, list[FundamentalsRow]]:
@@ -641,11 +688,71 @@ def _sector_aggregate_rows(
     return aggregates
 
 
+def _screener_rows(
+    equities: Sequence[TerminalEquity],
+    recent: dict[str, list[PriceRow]],
+    sessions: Sequence[date],
+    fundamentals: dict[str, list[FundamentalsRow]],
+    as_of: date,
+    params: ScreenerParams,
+    lag_days: int,
+) -> tuple[dict[str, ValuationResult], list[ScreenerRow]]:
+    """Value every equity with a close on or before ``as_of`` and score its latest session.
+
+    Pure computation over rows already read, which :func:`get_screener` runs in a worker thread.
+    Returns the valuations by ticker, for the sector aggregates, and one quantized row per
+    valued equity in ``equities`` order. Only the latest session is scored (``score_from``),
+    against the up to ``z_window`` rows before it, which serve as its window observations.
+    """
+    valuations: dict[str, ValuationResult] = {}
+    rows: list[ScreenerRow] = []
+    for equity in equities:
+        history = recent.get(equity.ticker)
+        if not history:
+            continue
+        latest = history[-1]
+        valuation = compute_valuation(
+            ValuationInputs(
+                ticker=equity.ticker,
+                sector=equity.sector,
+                shares_outstanding=equity.shares_outstanding,
+                close_price=latest.close_price,
+                price_date=latest.trade_date,
+                as_of=as_of,
+                currency=equity.currency,
+                fundamentals=fundamentals_as_of(
+                    fundamentals.get(equity.ticker, []), as_of, lag_days=lag_days
+                ),
+            )
+        )
+        valuations[equity.ticker] = valuation
+        volume_point = rolling_zscores(
+            _observations(history, "volume"),
+            sessions,
+            window=params.z_window,
+            score_from=latest.trade_date,
+        )[-1]
+        turnover_point = rolling_zscores(
+            _observations(history, "turnover"),
+            sessions,
+            window=params.z_window,
+            score_from=latest.trade_date,
+        )[-1]
+        rows.append(
+            _screener_row(
+                equity, history, valuation, volume_point, turnover_point, params.anomaly_threshold
+            )
+        )
+    return valuations, rows
+
+
 async def get_screener(
     session: AsyncSession,
     params: ScreenerParams,
     principal: OwnerPrincipal,
     settings: TerminalSettings,
+    *,
+    abandoned: AbandonCheck | None = None,
 ) -> ScreenerResponse:
     """Build ``GET /market/screener``: every equity valued as of ``as_of``, filtered and sorted.
 
@@ -669,12 +776,19 @@ async def get_screener(
     sector of the universe as of ``as_of``, independent of the filters. With no price row at
     all, ``as_of`` is today's date in ``settings.timezone`` and both lists are empty.
 
+    The valuation and scoring run in a worker thread after the reads. ``abandoned``, when given,
+    is awaited before it starts.
+
     Errors, in check order:
 
     * 422 ``min_exceeds_max`` (``field`` is the ``min_*`` parameter) for a ``min_*`` above its
       ``max_*``;
     * 404 ``unknown_sector`` for a ``sector`` without equities;
     * 404 ``watchlist_not_found`` for a ``watchlist_id`` the principal does not own.
+
+    Raises:
+        RequestAbandonedError: When ``abandoned`` reports that the client went away; nothing is
+            computed.
     """
     bounds = (
         ("min_pe", params.min_pe, "max_pe", params.max_pe),
@@ -720,41 +834,17 @@ async def get_screener(
     )
     fundamentals = await load_fundamentals_rows(session, None)
 
-    valuations: dict[str, ValuationResult] = {}
-    rows: list[ScreenerRow] = []
-    for equity in equities:
-        history = recent.get(equity.ticker)
-        if not history:
-            continue
-        latest = history[-1]
-        valuation = compute_valuation(
-            ValuationInputs(
-                ticker=equity.ticker,
-                sector=equity.sector,
-                shares_outstanding=equity.shares_outstanding,
-                close_price=latest.close_price,
-                price_date=latest.trade_date,
-                as_of=as_of,
-                currency=equity.currency,
-                fundamentals=fundamentals_as_of(
-                    fundamentals.get(equity.ticker, []),
-                    as_of,
-                    lag_days=settings.fundamentals_lag_days,
-                ),
-            )
-        )
-        valuations[equity.ticker] = valuation
-        volume_point = rolling_zscores(
-            _observations(history, "volume"), sessions, window=params.z_window
-        )[-1]
-        turnover_point = rolling_zscores(
-            _observations(history, "turnover"), sessions, window=params.z_window
-        )[-1]
-        rows.append(
-            _screener_row(
-                equity, history, valuation, volume_point, turnover_point, params.anomaly_threshold
-            )
-        )
+    valuations, rows = await compute(
+        abandoned,
+        _screener_rows,
+        equities,
+        recent,
+        sessions,
+        fundamentals,
+        as_of,
+        params,
+        settings.fundamentals_lag_days,
+    )
 
     selected = _sort_rows(
         [row for row in rows if _passes_filters(row, params, watchlist)], params.sort, params.order
@@ -974,6 +1064,40 @@ def _band_value(result: ValuationResult, metric: BandMetric) -> Decimal | None:
     return result.pe if metric == "pe" else result.pb
 
 
+def _subject_bands(
+    subject: str,
+    subject_type: SubjectType,
+    members: Sequence[TerminalEquity],
+    prices: dict[str, list[PriceRow]],
+    fundamentals: dict[str, list[FundamentalsRow]],
+    sessions: Sequence[date],
+    metric: BandMetric,
+    lag_days: int,
+    requested_start: date,
+) -> tuple[BandsResult, bool]:
+    """The subject's daily ``metric`` summarized into bands, and whether a currency was refused.
+
+    Pure computation over rows already read, which :func:`get_valuation_bands` runs in a worker
+    thread: the counter's daily multiple (:func:`_counter_daily`, from ``members[0]``) or the
+    sector's (:func:`_sector_daily`), then
+    :func:`~opennse_terminal.quant.bands.valuation_bands` over ``sessions`` from
+    ``requested_start``.
+    """
+    if subject_type == "ticker":
+        counter = members[0]
+        daily, refused = _counter_daily(
+            counter, prices[counter.ticker], fundamentals[counter.ticker], metric, lag_days
+        )
+    else:
+        daily, refused = _sector_daily(
+            subject, members, prices, fundamentals, sessions, metric, lag_days
+        )
+    bands = valuation_bands(
+        daily, requested_start=requested_start, sessions=sessions, metric=metric
+    )
+    return bands, refused
+
+
 def _band_stats(stats: BandStatsResult) -> BandStats:
     """Quantize band statistics: every multiple as a ratio (x), the percentile as a percentage."""
     return BandStats(
@@ -1003,6 +1127,7 @@ async def get_valuation_bands(
     metric: BandMetric = "pe",
     lookback_years: int = 5,
     as_of: date | None = None,
+    abandoned: AbandonCheck | None = None,
 ) -> ValuationBandsResponse:
     """Build ``GET /market/valuation-bands``: historical P/E or P/B bands of a counter or sector.
 
@@ -1028,8 +1153,15 @@ async def get_valuation_bands(
     ``no_positive_equity`` (pb) are reserved for a lookback whose sessions are all undefined.
     With no price row at all, ``as_of`` is today's date in ``settings.timezone``.
 
+    The daily series and its statistics are computed in a worker thread after the reads.
+    ``abandoned``, when given, is awaited before that starts.
+
     Errors: 422 ``exactly_one_subject`` unless exactly one of ``ticker`` and ``sector`` is given;
     404 ``unknown_ticker`` or ``unknown_sector``.
+
+    Raises:
+        RequestAbandonedError: When ``abandoned`` reports that the client went away; nothing is
+            computed.
     """
     subject_type: SubjectType
     if ticker is not None and sector is None:
@@ -1055,9 +1187,6 @@ async def get_valuation_bands(
     fundamentals = await load_fundamentals_rows(session, tickers)
     if subject_type == "ticker":
         prices = await load_price_rows(session, tickers, requested_start, resolved)
-        daily, refused = _counter_daily(
-            members[0], prices[members[0].ticker], fundamentals[members[0].ticker], metric, lag_days
-        )
     else:
         prices = await load_price_rows(
             session,
@@ -1065,12 +1194,19 @@ async def get_valuation_bands(
             _days_before(requested_start, SECTOR_BAND_CLOSE_MAX_AGE_DAYS),
             resolved,
         )
-        daily, refused = _sector_daily(
-            subject, members, prices, fundamentals, sessions, metric, lag_days
-        )
 
-    bands = valuation_bands(
-        daily, requested_start=requested_start, sessions=sessions, metric=metric
+    bands, refused = await compute(
+        abandoned,
+        _subject_bands,
+        subject,
+        subject_type,
+        members,
+        prices,
+        fundamentals,
+        sessions,
+        metric,
+        lag_days,
+        requested_start,
     )
     flags = list(bands.flags)
     if refused:
@@ -1135,6 +1271,31 @@ def _anomaly_item(
     )
 
 
+def _series_spikes(
+    ticker: str,
+    metric: _SeriesMetric,
+    rows: Sequence[PriceRow],
+    sessions: Sequence[date],
+    window: int,
+    threshold: Decimal,
+    first_target: date,
+) -> list[AnomalyItem]:
+    """The quantized positive spikes of one ticker's ``metric`` dated ``first_target`` or later.
+
+    Pure computation over rows already read, which :func:`get_anomalies` runs in a worker thread
+    once per series. Only the rows from ``first_target`` on are scored (``score_from``); the
+    earlier rows serve only as their window observations.
+    """
+    items: list[AnomalyItem] = []
+    for point in rolling_zscores(
+        _observations(rows, metric), sessions, window=window, score_from=first_target
+    ):
+        item = _anomaly_item(ticker, metric, point, threshold)
+        if item is not None:
+            items.append(item)
+    return items
+
+
 async def get_anomalies(
     session: AsyncSession,
     *,
@@ -1144,6 +1305,7 @@ async def get_anomalies(
     lookback_sessions: int = 20,
     ticker: str | None = None,
     sector: str | None = None,
+    abandoned: AbandonCheck | None = None,
 ) -> AnomaliesResponse:
     """Build ``GET /market/anomalies``: recent positive volume and turnover spikes.
 
@@ -1161,7 +1323,15 @@ async def get_anomalies(
     ``trade_date`` descending, then ``z_score`` descending, then ticker. An empty price table
     gives no items.
 
+    Each ticker's volume and turnover series is scored in a worker thread, one series at a time,
+    after the reads. ``abandoned``, when given, is awaited before each series, so an abandoned
+    request stops within one series.
+
     Errors: 404 ``unknown_ticker`` or ``unknown_sector``.
+
+    Raises:
+        RequestAbandonedError: When ``abandoned`` reports that the client went away; the series not
+            yet scored are never computed.
     """
     equity = await ensure_ticker(session, ticker) if ticker is not None else None
     if sector is not None:
@@ -1187,12 +1357,19 @@ async def get_anomalies(
     items: list[AnomalyItem] = []
     for name, rows in prices.items():
         for series in _anomaly_metrics(metric):
-            for point in rolling_zscores(_observations(rows, series), sessions, window=window):
-                if point.trade_date < first_target:
-                    continue
-                item = _anomaly_item(name, series, point, threshold)
-                if item is not None:
-                    items.append(item)
+            items.extend(
+                await compute(
+                    abandoned,
+                    _series_spikes,
+                    name,
+                    series,
+                    rows,
+                    sessions,
+                    window,
+                    threshold,
+                    first_target,
+                )
+            )
     items.sort(
         key=lambda item: (
             -item.trade_date.toordinal(),
@@ -1219,6 +1396,7 @@ async def get_flows(
     end: date | None = None,
     rolling_window: int = DEFAULT_FLOW_ROLLING_WINDOW,
     settings: TerminalSettings | None = None,
+    abandoned: AbandonCheck | None = None,
 ) -> FlowsResponse:
     """Build ``GET /market/flows``: estimated foreign versus local net flows of a subject set.
 
@@ -1232,9 +1410,16 @@ async def get_flows(
     same constituents' turnover. ``coverage_pct`` is sessions with flow data over sessions in
     the range (%). With no flow data, ``status`` is ``no_flow_data`` and ``totals`` is null.
 
+    The series is computed in a worker thread after the reads. ``abandoned``, when given, is
+    awaited before that starts.
+
     Errors, in check order: 422 ``conflicting_subjects`` (``field="sector"``) when both a ticker
     and a sector are given; 404 ``unknown_ticker`` or ``unknown_sector``; 422
     ``start_after_end`` (``field="start"``) when the resolved ``start`` is after ``end``.
+
+    Raises:
+        RequestAbandonedError: When ``abandoned`` reports that the client went away; nothing is
+            computed.
     """
     if ticker is not None and sector is not None:
         raise _coded_error(
@@ -1268,7 +1453,9 @@ async def get_flows(
         )
     sessions = await load_market_sessions(session, range_start, range_end)
     prices = await load_price_rows(session, tickers, range_start, range_end)
-    result = net_flow_series(
+    result = await compute(
+        abandoned,
+        net_flow_series,
         [row for rows in prices.values() for row in rows],
         sessions,
         rolling_window=rolling_window,

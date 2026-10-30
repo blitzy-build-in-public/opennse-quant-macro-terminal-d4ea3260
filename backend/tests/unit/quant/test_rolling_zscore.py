@@ -372,6 +372,69 @@ def test_session_without_a_row_produces_no_point() -> None:
     assert [point.trade_date for point in points] == sessions[:20]
 
 
+def test_score_from_the_reference_day_scores_only_it_over_the_full_window() -> None:
+    """``score_from`` on the 21st session scores that row alone, its 20 predecessors kept as W.
+
+    As in the reference: mean = 4000 / 20 = 200, sd = sqrt(200000 / 19) = 102.598...,
+    z = 300 / 102.598 = 2.924... -> 2.92 over 20 observations.
+    """
+    sessions = weekdays(FIRST_MONDAY, 21)
+    rows = obs(sessions, [*REFERENCE_HISTORY, 500])
+
+    (point,) = rolling_zscores(rows, sessions, score_from=sessions[20])
+
+    assert point.trade_date == sessions[20]
+    assert point.rolling_mean == Decimal(200)
+    assert point.rolling_stdev is not None
+    assert str(point.rolling_stdev.quantize(Decimal("0.001"))) == "102.598"
+    assert str(quantize_out(point.z, "z")) == "2.92"
+    assert point.observations_used == 20
+    assert point.flags == []
+
+
+# 30 sessions; the ticker has no row on sessions 7, 15 and 22, so 27 rows. Values vary so that
+# most windows of N = 5 have a defined, non-zero standard deviation.
+_SCORED_SESSIONS = weekdays(FIRST_MONDAY, 30)
+_SCORED_ROWS = obs(
+    [day for index, day in enumerate(_SCORED_SESSIONS) if index not in {7, 15, 22}],
+    [100 + (index * 37) % 250 for index in range(27)],
+)
+
+
+@pytest.mark.parametrize(
+    ("score_from", "scored"),
+    [
+        pytest.param(FIRST_MONDAY - timedelta(days=7), 27, id="before-the-first-row"),
+        pytest.param(_SCORED_SESSIONS[0], 27, id="on-the-first-row"),
+        pytest.param(_SCORED_SESSIONS[12], 16, id="on-a-row"),
+        pytest.param(_SCORED_SESSIONS[15], 13, id="on-a-session-without-a-row"),
+        pytest.param(_SCORED_SESSIONS[29], 1, id="on-the-last-row"),
+        pytest.param(_SCORED_SESSIONS[29] + timedelta(days=1), 0, id="after-the-last-row"),
+    ],
+)
+def test_score_from_returns_the_full_run_points_dated_from_it(
+    score_from: date, scored: int
+) -> None:
+    """Rows before ``score_from`` get no point but stay observations, so every point returned is
+    the unrestricted run's point for that row: all 27 from a date on or before the first row; 16
+    from session 12 (rows on sessions 12-29 less the gaps at 15 and 22); 13 from session 15,
+    which has no row, so the first point is session 16's; 1 on the last row; none after it."""
+    full = rolling_zscores(_SCORED_ROWS, _SCORED_SESSIONS, window=5)
+
+    points = rolling_zscores(_SCORED_ROWS, _SCORED_SESSIONS, window=5, score_from=score_from)
+
+    assert len(points) == scored
+    assert points == [point for point in full if point.trade_date >= score_from]
+
+
+def test_score_from_still_validates_rows_it_does_not_score() -> None:
+    """A NaN in a row dated before ``score_from`` is rejected although that row gets no point."""
+    rows = obs(_DAYS, [1, Decimal("NaN"), 3])
+
+    with pytest.raises(ValueError, match="not finite"):
+        rolling_zscores(rows, _DAYS, window=5, min_periods=2, score_from=_DAYS[2])
+
+
 def test_turnover_values_keep_exact_decimal_arithmetic() -> None:
     """Turnover in KES, window = 5: prior 1000.50, 1002.50, 1000.50, 1002.50, 1001.50, then 1004.00.
 
