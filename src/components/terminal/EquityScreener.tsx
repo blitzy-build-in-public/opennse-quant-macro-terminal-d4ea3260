@@ -22,6 +22,12 @@ import {
 } from "./shared/controlStyles";
 import { FieldErrorText, WidgetFrame } from "./shared/WidgetFrame";
 import { SECTION_HEADING_CLASS } from "./shared/headingAndTileClasses";
+import {
+  SCROLL_FADE_CLASS,
+  SCROLL_FADE_HIDDEN_CLASS,
+  SCROLL_FRAME_CLASS,
+  useOverflowEnd,
+} from "./shared/scrollFade";
 import type {
   DecimalString,
   ScreenerFilters,
@@ -462,33 +468,20 @@ const BODY_DIMMED_CLASS =
 // with the seeded data at each viewport width where it reflows, so the card keeps its height when
 // the data arrives.
 const SKELETON_HEIGHT_CLASS =
-  "h-[44.25rem] min-[337px]:h-[43.25rem] min-[338px]:h-[42.25rem] min-[352px]:h-[41.25rem] min-[375px]:h-[40.25rem] min-[389px]:h-[39rem] min-[431px]:h-[38rem] min-[789px]:h-[37rem]";
+  "h-[49rem] min-[337px]:h-[48rem] min-[338px]:h-[47rem] min-[352px]:h-[46rem] min-[357px]:h-[42.25rem] min-[375px]:h-[41.25rem] min-[389px]:h-[40rem] min-[431px]:h-[39rem] min-[464px]:h-[38rem] min-[789px]:h-[37rem]";
 const CONTEXT_CLASS = "flex flex-wrap gap-x-3 gap-y-1 text-xs text-slate-400";
 const COUNT_CLASS = "font-medium text-slate-200";
 // The applied watchlist's full name; a long one wraps anywhere instead of widening the card.
 const CONTEXT_WATCHLIST_CLASS = "min-w-0 [overflow-wrap:anywhere]";
 // `relative` makes each table's scroller the containing block of its absolutely positioned
-// `sr-only` caption, which would otherwise escape the overflow clip and widen the host page.
+// `sr-only` caption, which would otherwise escape the overflow clip and widen the host page. Each
+// scroller is also an inline-size container, so sizes inside its table can be capped against the
+// scroller's visible width (`cqi`) rather than the table's: the summary's sticky sector names (see
+// SUMMARY_SECTOR_TEXT_CLASS) and both tables' flag lists (see SUMMARY_FLAG_LIST_CLASS). The
+// arbitrary property `[container-type:inline-size]` makes it a container in Tailwind 3 and
+// Tailwind 4 hosts alike; Tailwind 3 has no `@container` utility without a plugin.
 const SCROLL_REGION_CLASS =
-  "relative overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
-// The sector summary's scroller is also an inline-size container, so its sticky sector names can
-// be capped against the scroller's visible width (`cqi`) rather than the table's (see
-// SUMMARY_SECTOR_TEXT_CLASS). The arbitrary property `[container-type:inline-size]` makes it a
-// container in Tailwind 3 and Tailwind 4 hosts alike; Tailwind 3 has no `@container` utility
-// without a plugin.
-const SUMMARY_SCROLL_REGION_CLASS =
   "[container-type:inline-size] relative overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
-// Each scroller sits in a positioned frame with an edge fade over its inline end, shown while
-// columns lie beyond that edge (see useOverflowEnd), since overlay scrollbars give no cue. The
-// fade blends the card surface (slate-900) in over 2rem and ignores the pointer, so the cells
-// beneath stay clickable. It stays inside the scroller's box, clear of its offset focus outline,
-// and is fully transparent once the end is reached or when the table fits, so nothing stays
-// covered. `bg-gradient-to-*` is the gradient direction Tailwind 3 and Tailwind 4 both generate.
-const SCROLL_FRAME_CLASS = "relative";
-const SCROLL_FADE_CLASS =
-  "pointer-events-none absolute inset-y-0 end-0 w-8 bg-gradient-to-l from-slate-900 to-transparent opacity-100 rtl:bg-gradient-to-r motion-safe:transition-opacity motion-safe:duration-150 motion-safe:ease-out";
-const SCROLL_FADE_HIDDEN_CLASS =
-  "pointer-events-none absolute inset-y-0 end-0 w-8 bg-gradient-to-l from-slate-900 to-transparent opacity-0 rtl:bg-gradient-to-r motion-safe:transition-opacity motion-safe:duration-150 motion-safe:ease-out";
 const TABLE_CLASS = "min-w-full border-collapse text-xs";
 const TBODY_CLASS = "divide-y divide-slate-800";
 // The header divider is written as the arbitrary property `[border-block-end-width:1px]`
@@ -558,8 +551,28 @@ const VOLUME_BADGE_CLASS =
 const TURNOVER_BADGE_CLASS =
   "whitespace-nowrap rounded bg-sky-900/60 px-1.5 py-0.5 text-xs font-medium text-sky-200";
 const FLAGS_CELL_CLASS = "px-2 py-1.5 text-start text-xs text-slate-400";
-const FLAG_LIST_CLASS = "flex min-w-[10rem] flex-wrap gap-1";
-const FLAG_CLASS = "rounded bg-slate-800 px-1 py-0.5 font-mono text-xs text-slate-300";
+// A Flags column wider than the room beside its table's sticky first column would slide partly
+// beneath that column at the scroller's end, hiding its header and the start of its codes. So each
+// table's flag list is capped, in its scroller's container units, at that room less the cell's
+// 1rem inline padding (the cells have no side borders). The summary's room is 55cqi, since its
+// sector header is at most 45cqi (SUMMARY_SECTOR_TEXT_CLASS). The counter table's is 100cqi less
+// its pinned ticker column, 4.5rem: the 4rem ticker button less its -mx-1, plus the header's
+// 1rem padding. A ticker longer than seven monospace characters widens that column, so on the
+// narrowest screens the start of that row's codes can still pass beneath it. The 10rem minimum,
+// which keeps short codes side by side rather than one per line, is capped at the same room,
+// because a minimum width overrides a maximum.
+const SUMMARY_FLAG_LIST_CLASS =
+  "flex min-w-[min(10rem,calc(55cqi_-_1rem))] max-w-[calc(55cqi_-_1rem)] flex-wrap gap-1";
+const COUNTER_FLAG_LIST_CLASS =
+  "flex min-w-[min(10rem,calc(100cqi_-_5.5rem))] max-w-[calc(100cqi_-_5.5rem)] flex-wrap gap-1";
+// A code wider than its capped list breaks inside itself. `min-w-0` lets the chip, a flex item,
+// shrink to the list's width; `break-words` then breaks the code only where it cannot fit its
+// line. Unlike `break-all` or `[overflow-wrap:anywhere]`, it leaves the code's min-content width
+// whole: both tables overflow their scrollers, so every column takes its min-content width, and a
+// smaller one would wrap codes on every screen. A code therefore stays on one line wherever its
+// list has room for it.
+const FLAG_CLASS =
+  "min-w-0 break-words rounded bg-slate-800 px-1 py-0.5 font-mono text-xs text-slate-300";
 // Shown in place of the counter table, outside its sideways scroll, with the frame's empty copy
 // style, so it starts at the card's content edge however wide the table would be.
 const NO_RESULT_NOTE_CLASS = "text-sm text-slate-400";
@@ -642,14 +655,24 @@ function ZScoreCell({ metric, value, isAnomaly, flags }: ZScoreCellProps): React
   );
 }
 
+/** Props of {@link FlagsCell}. */
+interface FlagsCellProps {
+  flags: readonly string[];
+  /**
+   * The table's flag list class, {@link SUMMARY_FLAG_LIST_CLASS} or
+   * {@link COUNTER_FLAG_LIST_CLASS}, capped to the room beside that table's sticky first column.
+   */
+  listClassName: string;
+}
+
 /** The reason codes of a row or sector as visible text, so no tooltip is needed to read them. */
-function FlagsCell({ flags }: { flags: readonly string[] }): ReactElement {
+function FlagsCell({ flags, listClassName }: FlagsCellProps): ReactElement {
   return (
     <td data-column="flags" className={FLAGS_CELL_CLASS}>
       {flags.length === 0 ? (
         EMPTY_VALUE
       ) : (
-        <ul className={FLAG_LIST_CLASS}>
+        <ul className={listClassName}>
           {flags.map((flag, index) => (
             <li key={`${flag}#${index}`} className={FLAG_CLASS}>
               {flag}
@@ -825,7 +848,7 @@ function CounterRow({ row, onSelectTicker, selected }: CounterRowProps): ReactEl
         isAnomaly={row.is_turnover_anomaly}
         flags={row.flags}
       />
-      <FlagsCell flags={row.flags} />
+      <FlagsCell flags={row.flags} listClassName={COUNTER_FLAG_LIST_CLASS} />
     </tr>
   );
 }
@@ -903,7 +926,7 @@ function SectorAggregateRow({ aggregate }: { aggregate: SectorAggregate }): Reac
         constituents={constituents}
         flags={aggregate.flags}
       />
-      <FlagsCell flags={aggregate.flags} />
+      <FlagsCell flags={aggregate.flags} listClassName={SUMMARY_FLAG_LIST_CLASS} />
     </tr>
   );
 }
@@ -931,53 +954,6 @@ function isFieldError(error: TerminalApiError | null): error is TerminalApiError
  * effect runs and React 18 warns about layout effects, it is `useEffect`.
  */
 const useBrowserLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
-
-/** Content hidden past a scroller's inline end by at most this many pixels is rounding. */
-const OVERFLOW_TOLERANCE_PX = 1;
-
-/**
- * Whether a horizontal scroller has content hidden beyond its inline-end edge, which drives the
- * edge fade of {@link SCROLL_FADE_CLASS}. Returns a callback ref for the scroller, so a scroller
- * that mounts after the widget (the sector summary) is tracked too, and the flag.
- *
- * The flag starts false, so server and client markup match and no fade shows before layout. It is
- * set only from the scroller's `scroll` events and from a `ResizeObserver` on the scroller and its
- * table, whose first observation arrives once they are laid out and whose later ones follow a
- * resize or a table that grows or shrinks with its rows. `Math.abs(scrollLeft)` keeps the end
- * right in right-to-left layouts, where `scrollLeft` runs from 0 to negative values. Listeners are
- * removed, and the flag cleared, when the scroller unmounts. Without `ResizeObserver` (non-browser
- * test environments) only scrolling updates the flag.
- */
-function useOverflowEnd(): [(node: HTMLElement | null) => void, boolean] {
-  const [overflowEnd, setOverflowEnd] = useState(false);
-  const detach = useRef<(() => void) | null>(null);
-  const ref = useCallback((node: HTMLElement | null) => {
-    detach.current?.();
-    detach.current = null;
-    if (node === null) {
-      setOverflowEnd(false);
-      return;
-    }
-    const update = (): void => {
-      const hidden = node.scrollWidth - node.clientWidth - Math.abs(node.scrollLeft);
-      setOverflowEnd(hidden > OVERFLOW_TOLERANCE_PX);
-    };
-    node.addEventListener("scroll", update, { passive: true });
-    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
-    if (observer !== null) {
-      observer.observe(node);
-      for (const child of Array.from(node.children)) {
-        observer.observe(child);
-      }
-    }
-    detach.current = () => {
-      node.removeEventListener("scroll", update);
-      observer?.disconnect();
-    };
-  }, []);
-  return [ref, overflowEnd];
-}
-
 
 /**
  * Equity screener of `GET /market/screener`: filters on sector, watchlist, P/E, P/B, EV/EBITDA,
@@ -1581,7 +1557,7 @@ export function EquityScreener({
                   aria-labelledby={summaryHeadingId}
                   tabIndex={0}
                   data-overflow-end={summaryOverflowEnd ? "true" : "false"}
-                  className={SUMMARY_SCROLL_REGION_CLASS}
+                  className={SCROLL_REGION_CLASS}
                 >
                   <table className={TABLE_CLASS}>
                     {/* The region keeps the visible heading as its name; the caption names the

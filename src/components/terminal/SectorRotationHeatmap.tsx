@@ -13,6 +13,12 @@ import {
 } from "./lib/format";
 import { useTerminalQuery } from "./lib/useTerminalQuery";
 import { TOGGLE_BUTTON_CLASS, TOGGLE_BUTTON_PRESSED_CLASS } from "./shared/controlStyles";
+import {
+  SCROLL_FADE_CLASS,
+  SCROLL_FADE_HIDDEN_CLASS,
+  SCROLL_FRAME_CLASS,
+  useOverflowEnd,
+} from "./shared/scrollFade";
 import { WidgetFrame } from "./shared/WidgetFrame";
 import type {
   DecimalString,
@@ -109,7 +115,10 @@ const TOGGLE_PRESSED_CLASS = `${TOGGLE_BUTTON_PRESSED_CLASS} aria-disabled:point
 // (`cqi`) rather than the table's. The container is declared with the arbitrary property
 // `[container-type:inline-size]` because Tailwind 3 has no `@container` utility without a plugin.
 // `relative` makes it the containing block of the absolutely positioned `sr-only` caption and
-// "No data" spans, which would otherwise escape the overflow clip and widen the host page.
+// "No data" spans, which would otherwise escape the overflow clip and widen the host page. It sits
+// in the positioned frame of `shared/scrollFade` beside that module's edge fade, which shows over
+// the inline end while periods lie beyond it, since overlay scrollbars give no cue; the legend
+// stays outside the frame.
 const SCROLL_CLASS =
   "[container-type:inline-size] relative overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 const TABLE_CLASS = "w-full border-collapse text-xs tabular-nums";
@@ -297,6 +306,9 @@ interface HeatmapTableProps {
 
 function HeatmapTable({ data, mode }: HeatmapTableProps): ReactElement {
   const captionId = useId();
+  // The table mounts only once its data is ready, so the hook's callback ref attaches when the
+  // scroller first renders.
+  const [scrollRef, overflowEnd] = useOverflowEnd();
   const isWeekly = data.interval === "week";
   const marketByPeriod = cellsByPeriod(data.market);
   const description = `Capitalization-weighted sector returns (%), ${
@@ -308,61 +320,76 @@ function HeatmapTable({ data, mode }: HeatmapTableProps): ReactElement {
       <p aria-hidden="true" className={DESCRIPTION_CLASS}>
         {description}
       </p>
-      <div role="region" aria-labelledby={captionId} tabIndex={0} className={SCROLL_CLASS}>
-        <table className={TABLE_CLASS}>
-          <caption id={captionId} className="sr-only">
-            {description}
-          </caption>
-          <thead>
-            <tr>
-              <th scope="col" className={CORNER_HEADER_CLASS}>
-                <span className={STICKY_HEADER_TEXT_CLASS}>Sector</span>
-              </th>
-              {data.period_ends.map((period, index) => (
-                <th
-                  key={`${index}:${period}`}
-                  scope="col"
-                  data-testid="heatmap-period"
-                  className={PERIOD_HEADER_CLASS}
-                >
-                  <time dateTime={period}>{isWeekly ? formatDate(period) : formatMonth(period)}</time>
+      <div className={SCROLL_FRAME_CLASS}>
+        <div
+          ref={scrollRef}
+          role="region"
+          aria-labelledby={captionId}
+          tabIndex={0}
+          data-overflow-end={overflowEnd ? "true" : "false"}
+          className={SCROLL_CLASS}
+        >
+          <table className={TABLE_CLASS}>
+            <caption id={captionId} className="sr-only">
+              {description}
+            </caption>
+            <thead>
+              <tr>
+                <th scope="col" className={CORNER_HEADER_CLASS}>
+                  <span className={STICKY_HEADER_TEXT_CLASS}>Sector</span>
                 </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {data.sectors.map((row, index) => (
-              <SectorRow
-                key={`${index}:${row.sector}`}
-                row={row}
-                periodEnds={data.period_ends}
-                mode={mode}
-              />
-            ))}
-          </tbody>
-          <tfoot>
-            <tr data-testid="heatmap-market-row">
-              <th scope="row" className={MARKET_HEADER_CLASS}>
-                <span className={STICKY_HEADER_TEXT_CLASS}>Market</span>
-              </th>
-              {data.period_ends.map((period, index) => {
-                const cell = marketByPeriod.get(period);
-                // The market row always shows its absolute return: its relative return is null by
-                // definition, so the mode toggle never applies to it. Its cells carry their own test
-                // id, so `heatmap-cell` counts exactly sectors × periods.
-                return (
-                  <ValueCell
+                {data.period_ends.map((period, index) => (
+                  <th
                     key={`${index}:${period}`}
-                    testId="heatmap-market-cell"
-                    value={cell === undefined ? null : cell.return_pct}
-                    title={marketCellTitle(cell)}
-                    className={MARKET_CELL_CLASS}
-                  />
-                );
-              })}
-            </tr>
-          </tfoot>
-        </table>
+                    scope="col"
+                    data-testid="heatmap-period"
+                    className={PERIOD_HEADER_CLASS}
+                  >
+                    <time dateTime={period}>
+                      {isWeekly ? formatDate(period) : formatMonth(period)}
+                    </time>
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {data.sectors.map((row, index) => (
+                <SectorRow
+                  key={`${index}:${row.sector}`}
+                  row={row}
+                  periodEnds={data.period_ends}
+                  mode={mode}
+                />
+              ))}
+            </tbody>
+            <tfoot>
+              <tr data-testid="heatmap-market-row">
+                <th scope="row" className={MARKET_HEADER_CLASS}>
+                  <span className={STICKY_HEADER_TEXT_CLASS}>Market</span>
+                </th>
+                {data.period_ends.map((period, index) => {
+                  const cell = marketByPeriod.get(period);
+                  // The market row always shows its absolute return: its relative return is null
+                  // by definition, so the mode toggle never applies to it. Its cells carry their
+                  // own test id, so `heatmap-cell` counts exactly sectors × periods.
+                  return (
+                    <ValueCell
+                      key={`${index}:${period}`}
+                      testId="heatmap-market-cell"
+                      value={cell === undefined ? null : cell.return_pct}
+                      title={marketCellTitle(cell)}
+                      className={MARKET_CELL_CLASS}
+                    />
+                  );
+                })}
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+        <div
+          aria-hidden="true"
+          className={overflowEnd ? SCROLL_FADE_CLASS : SCROLL_FADE_HIDDEN_CLASS}
+        />
       </div>
       <div className={LEGEND_CLASS}>
         {/* Only this sentence is a live region: a mode switch announces what the sector values now
