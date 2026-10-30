@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useCallback, useMemo, useState } from "react";
 import type { ReactElement, ReactNode } from "react";
 import {
   CartesianGrid,
@@ -45,9 +45,19 @@ const TARGET_BAND_LOWER_PCT = 2.5;
 const TARGET_BAND_UPPER_PCT = 7.5;
 const TARGET_BAND_LABEL = "CBK target 2.5–7.5%";
 const TARGET_BAND_FILL_OPACITY = 0.12;
+// The band has no edge, but a 16×8 key at the band's faint fill would barely show, so the key
+// adds an edge of the same colour.
+const BAND_SWATCH_EDGE_OPACITY = 0.6;
+// Under forced colours the band label's surface-coloured halo would smear over the forced
+// background, so it is dropped there. Recharts 3.10.1 replaces its own `recharts-label` class
+// with a label's `className` instead of adding to it, so the library class is repeated here to
+// keep the label matching `.recharts-label` selectors.
+const TARGET_BAND_LABEL_CLASS = "recharts-label forced-colors:stroke-none";
 
 const INFLATION_LABEL = "12-month inflation";
 const CBR_LABEL = "Central Bank Rate";
+// Both lines' width in px, which their legend and tooltip keys repeat.
+const LINE_STROKE_WIDTH = 2;
 
 // A line with exactly one plottable point has no segment to stroke, so that point is drawn as a
 // dot in the line's colour; it would otherwise be invisible. Longer lines stay dot-free.
@@ -64,22 +74,44 @@ const CBR_LONE_POINT_DOT = {
   strokeWidth: 1,
 };
 
+// The axis titles, their sizes and the chart's margins follow YieldCurveChart, its sibling on the
+// overview, so both cards label their axes alike.
+const Y_AXIS_WIDTH_PX = 52;
+const X_AXIS_HEIGHT_PX = 40;
+// The widest month label ("May 2026") is about 48px at the axis's 11px in common sans-serif
+// faces; 52px leaves headroom for a wider host font.
+const MONTH_TICK_WIDTH_PX = 52;
+// Clear space kept between neighbouring month labels, as the axis's former `minTickGap` did.
+const MONTH_TICK_GAP_PX = 24;
+// The latest month is labelled centred on the plot's right edge, and the chart's SVG clips what
+// is drawn past its own edge, so the right margin holds half a label.
+const CHART_MARGIN = { top: 8, right: MONTH_TICK_WIDTH_PX / 2, bottom: 4, left: 4 };
+// Chart width assumed until ResponsiveContainer reports the real one; it only decides which
+// months the first frame labels.
+const FALLBACK_CHART_WIDTH_PX = 480;
+
 // Every class below is a complete static string, never assembled from fragments, so Tailwind's
-// source scan and a host's `@source` directive or `content` glob find each one. The swatch
-// colours mirror the chart strokes: amber-400 (`CHART_COLORS.warning`), sky-400
-// (`CHART_COLORS.accent`) and emerald-500 (`CHART_COLORS.positive`).
-// Recharts 3 renders its z-index layers as `<g tabindex="-1">`, which a mouse click focuses and
-// Chrome then outlines. Those layers are never keyboard-reachable, so hiding their outline loses
-// no keyboard indicator; the chart's own `<svg tabindex="0">` keeps its focus ring.
-const CHART_CLASS = "h-64 w-full [&_g[tabindex='-1']]:outline-none";
+// source scan and a host's `@source` directive or `content` glob find each one.
+// Recharts' accessibility layer renders the chart as `<svg class="recharts-surface" tabindex="0">`,
+// which the keyboard reaches and navigates with the arrow keys. Recharts 3 also renders its z-index
+// layers as `<g tabindex="-1">`: Tab never reaches them, but a mouse click on plotted data focuses
+// one, and a click on bare plot area focuses the surface. The browser outlines a focused SVG
+// element even for a mouse click, and an arrow key pressed after the click makes that element
+// :focus-visible. So the layers' outline and the surface's pointer-focus outline are hidden, and
+// the widgets' sky-400 ring is drawn on the surface whenever it or a descendant is :focus-visible:
+// it appears for keyboard use and not for a mouse click. The solid style is explicit because
+// Tailwind 3's `outline-2` sets only the width.
+const CHART_CLASS =
+  "h-64 w-full [&_g[tabindex='-1']]:outline-none [&_.recharts-surface:focus:not(:focus-visible)]:outline-none [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:[outline-style:solid] [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-offset-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-sky-400";
 // `list-none` and `ps-0` keep the legend flat in a host without Tailwind's preflight reset.
 const LEGEND_CLASS =
   "mt-3 mb-0 flex list-none flex-wrap items-center gap-x-4 gap-y-1 ps-0 text-xs text-slate-300";
-const LEGEND_ITEM_CLASS = "flex items-center gap-1.5";
-const INFLATION_SWATCH_CLASS = "h-0.5 w-4 shrink-0 rounded-full bg-amber-400";
-const CBR_SWATCH_CLASS = "h-0.5 w-4 shrink-0 rounded-full bg-sky-400";
-const BAND_SWATCH_CLASS =
-  "h-2.5 w-4 shrink-0 rounded-sm border border-emerald-500/60 bg-emerald-500/15";
+const LEGEND_ITEM_CLASS = "flex items-center gap-2";
+// The keys are inline SVG in the chart's own colours, the form YieldCurveChart's legend uses. A
+// CSS background would be replaced by the forced background colour and vanish under forced
+// colours, so the keys also opt out of colour forcing: they are the only link from a series name
+// to its line.
+const SWATCH_CLASS = "h-2 w-4 shrink-0 forced-color-adjust-none";
 const PARTIAL_COVERAGE_CLASS = "mt-2 mb-0 text-xs text-amber-300";
 // Mirrors `TOOLTIP_CONTENT_STYLE` (slate-900 surface, slate-700 border, slate-300 12px text) with
 // classes, since this custom tooltip is an HTML element rather than Recharts' default content.
@@ -87,7 +119,7 @@ const TOOLTIP_CLASS =
   "rounded border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs text-slate-300";
 const TOOLTIP_TITLE_CLASS = "mt-0 mb-1 font-medium text-slate-100";
 const TOOLTIP_LIST_CLASS = "m-0 grid grid-cols-[auto_auto] items-center gap-x-3 gap-y-0.5";
-const TOOLTIP_TERM_CLASS = "flex items-center gap-1.5";
+const TOOLTIP_TERM_CLASS = "flex items-center gap-2";
 const TOOLTIP_VALUE_CLASS = "m-0 text-end tabular-nums text-slate-100";
 
 /** One month-end of the chart: both series at that date, as chart numbers and exact strings. */
@@ -176,6 +208,33 @@ function buildChartModel(data: MacroOverviewResponse | undefined): ChartModel {
   return { rows, inflationPoints, cbrPoints };
 }
 
+/**
+ * The months that the x-axis labels and the vertical gridlines mark: every `step`-th row counted
+ * back from the latest, so the latest month is always labelled, with `step` the smallest that
+ * keeps neighbouring labels {@link MONTH_TICK_WIDTH_PX} plus {@link MONTH_TICK_GAP_PX} apart.
+ * Recharts spaces the rows evenly from the plot's left edge to its right edge, and a single row
+ * sits alone in the middle. The axis and the grid both take this list, so every dashed gridline
+ * sits on a labelled tick; left to Recharts, the grid thins the months with its own label
+ * measurements and keeps a different set than the axis.
+ */
+function monthTicks(rows: readonly ChartRow[], chartWidth: number): string[] {
+  const lastIndex = rows.length - 1;
+  if (lastIndex < 0) return [];
+  const plotWidth = chartWidth - CHART_MARGIN.left - CHART_MARGIN.right - Y_AXIS_WIDTH_PX;
+  const rowSpacing = lastIndex > 0 && plotWidth > 0 ? plotWidth / lastIndex : 0;
+  // Without room between rows (one row, or a plot with no width) only the latest is labelled.
+  const step =
+    rowSpacing > 0
+      ? Math.max(1, Math.ceil((MONTH_TICK_WIDTH_PX + MONTH_TICK_GAP_PX) / rowSpacing))
+      : rows.length;
+  const ticks: string[] = [];
+  for (let index = lastIndex; index >= 0; index -= step) {
+    const row = rows[index];
+    if (row !== undefined) ticks.push(row.date);
+  }
+  return ticks.reverse();
+}
+
 /** X-axis tick: the month of an ISO date, as `Sep 2026`. */
 function formatMonthTick(value: unknown): string {
   if (typeof value === "string") return formatMonth(value);
@@ -194,6 +253,35 @@ function isChartRow(value: unknown): value is ChartRow {
   );
 }
 
+/** Key of a line series: a stroke in the line's colour and width. Neither line draws dots. */
+function LineSwatch({ color }: { color: string }): ReactElement {
+  return (
+    <svg viewBox="0 0 16 8" aria-hidden="true" focusable="false" className={SWATCH_CLASS}>
+      <line x1="0" y1="4" x2="16" y2="4" stroke={color} strokeWidth={LINE_STROKE_WIDTH} />
+    </svg>
+  );
+}
+
+/** Key of the target band: the band's fill inside an edge of the same colour. */
+function BandSwatch(): ReactElement {
+  return (
+    <svg viewBox="0 0 16 8" aria-hidden="true" focusable="false" className={SWATCH_CLASS}>
+      <rect
+        x="0.5"
+        y="0.5"
+        width="15"
+        height="7"
+        rx="1"
+        fill={CHART_COLORS.positive}
+        fillOpacity={TARGET_BAND_FILL_OPACITY}
+        stroke={CHART_COLORS.positive}
+        strokeOpacity={BAND_SWATCH_EDGE_OPACITY}
+        strokeWidth={1}
+      />
+    </svg>
+  );
+}
+
 /**
  * Tooltip content: the hovered month-end with both rates formatted from the API's exact strings,
  * never from the chart coordinates.
@@ -207,12 +295,12 @@ function InflationTooltip({ active, payload }: TooltipContentProps): ReactNode {
       <p className={TOOLTIP_TITLE_CLASS}>{formatDate(row.date)}</p>
       <dl className={TOOLTIP_LIST_CLASS}>
         <dt className={TOOLTIP_TERM_CLASS}>
-          <span aria-hidden="true" className={INFLATION_SWATCH_CLASS} />
+          <LineSwatch color={CHART_COLORS.warning} />
           {INFLATION_LABEL}
         </dt>
         <dd className={TOOLTIP_VALUE_CLASS}>{formatDecimal(row.inflationRaw, "pct")}</dd>
         <dt className={TOOLTIP_TERM_CLASS}>
-          <span aria-hidden="true" className={CBR_SWATCH_CLASS} />
+          <LineSwatch color={CHART_COLORS.accent} />
           {CBR_LABEL}
         </dt>
         <dd className={TOOLTIP_VALUE_CLASS}>{formatDecimal(row.cbrRaw, "pct")}</dd>
@@ -263,6 +351,16 @@ export function InflationTrajectoryChart(props: InflationTrajectoryChartProps): 
 
   const model = useMemo(() => buildChartModel(data), [data]);
   const coverage = data?.coverage;
+  // The width ResponsiveContainer last measured, rounded as Recharts rounds the chart's own; null
+  // until the first measurement.
+  const [chartWidth, setChartWidth] = useState<number | null>(null);
+  const handleResize = useCallback((width: number) => {
+    if (Number.isFinite(width)) setChartWidth(Math.round(width));
+  }, []);
+  const ticks = useMemo(
+    () => monthTicks(model.rows, chartWidth ?? FALLBACK_CHART_WIDTH_PX),
+    [model.rows, chartWidth],
+  );
 
   return (
     <WidgetFrame
@@ -275,10 +373,10 @@ export function InflationTrajectoryChart(props: InflationTrajectoryChartProps): 
       skeletonClassName="h-64"
     >
       <div className={CHART_CLASS}>
-        <ResponsiveContainer width="100%" height="100%">
+        <ResponsiveContainer width="100%" height="100%" onResize={handleResize}>
           <ComposedChart
             data={model.rows}
-            margin={{ top: 8, right: 16, bottom: 0, left: 0 }}
+            margin={CHART_MARGIN}
             title={`${INFLATION_LABEL} and ${CBR_LABEL}, percent`}
             desc={
               showTargetBand
@@ -286,23 +384,39 @@ export function InflationTrajectoryChart(props: InflationTrajectoryChartProps): 
                 : `Monthly ${INFLATION_LABEL} and ${CBR_LABEL}`
             }
           >
-            <CartesianGrid stroke={CHART_COLORS.grid} strokeDasharray="3 3" />
+            {/* Vertical lines only at the labelled months, without the extra edge lines. */}
+            <CartesianGrid
+              stroke={CHART_COLORS.grid}
+              strokeDasharray="3 3"
+              verticalValues={ticks}
+            />
             <XAxis
               dataKey="date"
               type="category"
+              ticks={ticks}
+              // Every listed month is labelled: the list is already thinned to the plot's width.
+              interval={0}
               tickFormatter={formatMonthTick}
               tick={AXIS_TICK}
               stroke={CHART_COLORS.axis}
-              minTickGap={24}
+              height={X_AXIS_HEIGHT_PX}
+              label={{
+                value: "Month-end",
+                position: "insideBottom",
+                fill: CHART_COLORS.axis,
+                fontSize: 11,
+              }}
             />
             <YAxis
               tick={AXIS_TICK}
               stroke={CHART_COLORS.axis}
-              width={44}
+              width={Y_AXIS_WIDTH_PX}
               label={{
-                value: "%",
+                value: "Rate (%)",
                 angle: -90,
                 position: "insideLeft",
+                // Centres the rotated label on the axis; the position alone anchors it at its start.
+                textAnchor: "middle",
                 fill: CHART_COLORS.axis,
                 fontSize: 11,
               }}
@@ -321,6 +435,7 @@ export function InflationTrajectoryChart(props: InflationTrajectoryChartProps): 
                 label={{
                   value: TARGET_BAND_LABEL,
                   position: "insideBottomRight",
+                  className: TARGET_BAND_LABEL_CLASS,
                   fill: CHART_COLORS.positive,
                   fontSize: 11,
                   stroke: CHART_COLORS.tooltipBg,
@@ -335,7 +450,7 @@ export function InflationTrajectoryChart(props: InflationTrajectoryChartProps): 
               name={INFLATION_LABEL}
               type="monotone"
               stroke={CHART_COLORS.warning}
-              strokeWidth={2}
+              strokeWidth={LINE_STROKE_WIDTH}
               dot={model.inflationPoints === 1 ? INFLATION_LONE_POINT_DOT : false}
               connectNulls
               isAnimationActive={false}
@@ -345,7 +460,7 @@ export function InflationTrajectoryChart(props: InflationTrajectoryChartProps): 
               name={CBR_LABEL}
               type="stepAfter"
               stroke={CHART_COLORS.accent}
-              strokeWidth={2}
+              strokeWidth={LINE_STROKE_WIDTH}
               dot={model.cbrPoints === 1 ? CBR_LONE_POINT_DOT : false}
               connectNulls
               isAnimationActive={false}
@@ -365,7 +480,7 @@ export function InflationTrajectoryChart(props: InflationTrajectoryChartProps): 
           data-point-count={model.inflationPoints}
           className={LEGEND_ITEM_CLASS}
         >
-          <span aria-hidden="true" className={INFLATION_SWATCH_CLASS} />
+          <LineSwatch color={CHART_COLORS.warning} />
           {INFLATION_LABEL}
         </li>
         <li
@@ -374,7 +489,7 @@ export function InflationTrajectoryChart(props: InflationTrajectoryChartProps): 
           data-point-count={model.cbrPoints}
           className={LEGEND_ITEM_CLASS}
         >
-          <span aria-hidden="true" className={CBR_SWATCH_CLASS} />
+          <LineSwatch color={CHART_COLORS.accent} />
           {CBR_LABEL}
         </li>
         {showTargetBand ? (
@@ -383,7 +498,7 @@ export function InflationTrajectoryChart(props: InflationTrajectoryChartProps): 
             data-series="target_band"
             className={LEGEND_ITEM_CLASS}
           >
-            <span aria-hidden="true" className={BAND_SWATCH_CLASS} />
+            <BandSwatch />
             {TARGET_BAND_LABEL}
           </li>
         ) : null}

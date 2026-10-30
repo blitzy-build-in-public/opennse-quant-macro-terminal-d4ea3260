@@ -57,15 +57,25 @@ type Bucket =
 
 // Every class below is a complete static string, never assembled from fragments, so Tailwind's
 // source scan and a host's `@source` directive or `content` glob find each one.
+// The colour scale is what the legend explains, so the cells and the legend chips keep their
+// colours under forced colours; forcing would paint every cell and chip the one background colour
+// and leave the scale unreadable. The translucent shades are made opaque there, because over a
+// light forced background they would pale and their text would lose contrast. No data sits on the
+// card's own surface inside a dashed edge, so it never reads as a 0.00% cell. The collapsed table
+// borders would hide a dashed cell border, so the edge is an inset outline.
 const BUCKET_CLASSES: Record<Bucket, string> = {
-  strongNegative: "bg-rose-700 text-rose-50",
-  negative: "bg-rose-800/80 text-rose-100",
-  slightNegative: "bg-rose-950/70 text-rose-200",
-  flat: "bg-slate-800 text-slate-200",
-  slightPositive: "bg-emerald-950/70 text-emerald-200",
-  positive: "bg-emerald-800/80 text-emerald-100",
-  strongPositive: "bg-emerald-700 text-emerald-50",
-  noData: "bg-slate-800 text-slate-500",
+  strongNegative: "bg-rose-700 text-rose-50 forced-color-adjust-none",
+  negative: "bg-rose-800/80 text-rose-100 forced-color-adjust-none forced-colors:bg-rose-800",
+  slightNegative:
+    "bg-rose-950/70 text-rose-200 forced-color-adjust-none forced-colors:bg-rose-950",
+  flat: "bg-slate-800 text-slate-200 forced-color-adjust-none",
+  slightPositive:
+    "bg-emerald-950/70 text-emerald-200 forced-color-adjust-none forced-colors:bg-emerald-950",
+  positive:
+    "bg-emerald-800/80 text-emerald-100 forced-color-adjust-none forced-colors:bg-emerald-800",
+  strongPositive: "bg-emerald-700 text-emerald-50 forced-color-adjust-none",
+  noData:
+    "bg-slate-900 text-slate-400 outline-1 outline-dashed -outline-offset-2 outline-slate-500 forced-color-adjust-none",
 };
 
 /** Legend entries in scale order; the labels use the U+2212 minus sign of the cell values. */
@@ -86,11 +96,12 @@ const LEGEND: ReadonlyArray<{ bucket: Bucket; label: string }> = [
    target minimum and below the 44px guideline, matching WidgetFrame's Retry button. Flagged for
    designer review. */
 // Both variants dim and stop pointer input while the toggle is `aria-disabled`, which it is
-// whenever no table is on screen to switch.
+// whenever no table is on screen to switch. A press shades one step beyond hover, as the
+// terminal's other buttons do, and the border shifts wherever the fill would match it.
 const TOGGLE_CLASS =
-  "rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-100 hover:bg-slate-700 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "cursor-pointer rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-100 hover:border-slate-500 hover:bg-slate-700 active:bg-slate-600 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const TOGGLE_PRESSED_CLASS =
-  "rounded border border-sky-700 bg-sky-900 px-3 py-1 text-xs font-medium text-sky-100 hover:bg-sky-800 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+  "cursor-pointer rounded border border-sky-700 bg-sky-900 px-3 py-1 text-xs font-medium text-sky-100 hover:bg-sky-800 active:border-sky-600 active:bg-sky-700 aria-disabled:pointer-events-none aria-disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 // The scroller is a keyboard-focusable region, so the periods can be scrolled without a pointer,
 // and a size container, so the caption text can wrap to its visible width.
 const SCROLL_CLASS =

@@ -147,14 +147,22 @@ const INSTRUMENT_LABELS: Record<Instrument, string> = {
 // `@source` directive or `content` glob generate each one. `m-0`, `p-0` and `list-none` keep the
 // layout intact in a host that has no CSS reset.
 const FIGURE_CLASS = "m-0 flex flex-col gap-3";
-// A mouse click focuses one of Recharts' internal SVG layers (tabindex -1), and Chrome then draws
-// its focus ring around part of the plot. The ring is removed only for focus that is not
-// :focus-visible, so keyboard focus on the chart surface keeps its indicator.
-const CHART_CLASS = "h-64 w-full [&_*:focus:not(:focus-visible)]:outline-none";
+// Recharts' accessibility layer renders the chart as `<svg class="recharts-surface" tabindex="0">`,
+// which the keyboard reaches and navigates with the arrow keys. Recharts 3 also renders its z-index
+// layers as `<g tabindex="-1">`: Tab never reaches them, but a mouse click on plotted data focuses
+// one, and a click on bare plot area focuses the surface. The browser outlines a focused SVG
+// element even for a mouse click, and an arrow key pressed after the click makes that element
+// :focus-visible. So the layers' outline and the surface's pointer-focus outline are hidden, and
+// the widgets' sky-400 ring is drawn on the surface whenever it or a descendant is :focus-visible:
+// it appears for keyboard use and not for a mouse click. The solid style is explicit because
+// Tailwind 3's `outline-2` sets only the width.
+const CHART_CLASS =
+  "h-64 w-full [&_g[tabindex='-1']]:outline-none [&_.recharts-surface:focus:not(:focus-visible)]:outline-none [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:[outline-style:solid] [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-offset-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-sky-400";
 const CAPTION_CLASS = "flex flex-col gap-2";
 const LEGEND_CLASS = "m-0 flex list-none flex-wrap gap-x-4 gap-y-1 p-0 text-xs text-slate-300";
 const LEGEND_ITEM_CLASS = "flex items-center gap-2";
-const SWATCH_CLASS = "h-2 w-4 shrink-0";
+// The keys alone link each curve name to its line, so they keep their colours under forced colours.
+const SWATCH_CLASS = "h-2 w-4 shrink-0 forced-color-adjust-none";
 const NOTE_CLASS = "m-0 text-xs text-slate-400";
 // The tooltip shades are those of chartTheme's TOOLTIP_CONTENT_STYLE (slate-900 surface, slate-700
 // border, slate-300 text at 12px), written as utilities because the widgets style their own HTML
