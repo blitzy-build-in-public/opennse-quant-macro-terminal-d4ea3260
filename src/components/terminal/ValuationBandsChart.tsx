@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useCallback, useMemo } from "react";
 import type { ReactElement } from "react";
 import {
   CartesianGrid,
@@ -102,8 +102,17 @@ const PARTIAL_NOTE_CLASS = "text-xs text-slate-400";
 // the widgets' sky-400 ring is drawn on the surface whenever it or a descendant is :focus-visible:
 // it appears for keyboard use and not for a mouse click. The solid style is explicit because
 // Tailwind 3's `outline-2` sets only the width.
+// In forced-colors mode browsers keep an SVG's own colours (`forced-color-adjust:
+// preserve-parent-color`) while the card behind it takes the user's Canvas colour, so colours
+// chosen for the slate-900 surface can fade out on a light Canvas. Under forced colors only, the
+// ring is drawn in Highlight, as the page's other controls are; every chart text (tick labels,
+// axis title and band labels), the axis and tick lines and the hover cursor in CanvasText; and
+// the weekly line and its active dot in Highlight. Band lines that need it take a system colour
+// through BAND_LINES. The grid, which only guides the eye as every band and tick is labelled, is
+// drawn in CanvasText at 30% opacity: about 2:1 on any Canvas, faint as it is on the slate-900
+// surface, where its slate-700 would be darker than the ±1σ lines on a white Canvas.
 const CHART_CLASS =
-  "h-64 w-full [&_g[tabindex='-1']]:outline-none [&_.recharts-surface:focus:not(:focus-visible)]:outline-none [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:[outline-style:solid] [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-offset-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-sky-400";
+  "h-64 w-full [&_g[tabindex='-1']]:outline-none [&_.recharts-surface:focus:not(:focus-visible)]:outline-none [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:[outline-style:solid] [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-offset-2 [&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-sky-400 forced-colors:[&_.recharts-surface:is(:focus-visible,:has(:focus-visible))]:outline-[color:Highlight] forced-colors:[&_text]:[fill:CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:[stroke:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:[stroke:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:[stroke:CanvasText] forced-colors:[&_.recharts-line-curve]:[stroke:Highlight] forced-colors:[&_.recharts-active-dot_.recharts-dot]:[fill:Highlight] forced-colors:[&_.recharts-cartesian-grid_line]:[stroke:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:[stroke-opacity:0.3]";
 // The custom tooltip mirrors TOOLTIP_CONTENT_STYLE (slate-900 surface, slate-700 border, slate-300
 // text, 12px) with utility classes instead of an inline style.
 const TOOLTIP_CLASS =
@@ -151,6 +160,11 @@ const STAT_ITEMS: ReadonlyArray<{
  * Horizontal band lines. A rich multiple (+2σ) is rose and a cheap one (−2σ) emerald; every label
  * names its line, so colour is never the only cue. The ±1σ labels use slate-400 rather than the
  * slate-500 stroke, which is below 4.5:1 for 10px text on the slate-900 surface.
+ *
+ * Under forced colors, where the chart keeps these strokes on the user's Canvas, the slate-300
+ * mean and the emerald −2σ (1.49:1 and 2.47:1 on a white Canvas) are drawn in CanvasText, the
+ * mean still solid and the −2σ still dashed. The rose +2σ and the slate-500 ±1σ keep their
+ * strokes, above 3:1 on a white and on a black Canvas. Every label is CanvasText there.
  */
 const BAND_LINES: ReadonlyArray<{
   name: "plus_2sd" | "plus_1sd" | "mean" | "minus_1sd" | "minus_2sd";
@@ -158,6 +172,8 @@ const BAND_LINES: ReadonlyArray<{
   stroke: string;
   labelFill: string;
   dashed: boolean;
+  /** `ReferenceLine` class drawing the line in a system colour under forced colors. */
+  className?: string;
 }> = [
   {
     name: "plus_2sd",
@@ -179,6 +195,7 @@ const BAND_LINES: ReadonlyArray<{
     stroke: CHART_COLORS.text,
     labelFill: CHART_COLORS.text,
     dashed: false,
+    className: "forced-colors:[&_.recharts-reference-line-line]:[stroke:CanvasText]",
   },
   {
     name: "minus_1sd",
@@ -193,18 +210,37 @@ const BAND_LINES: ReadonlyArray<{
     stroke: CHART_COLORS.positive,
     labelFill: CHART_COLORS.positive,
     dashed: true,
+    className: "forced-colors:[&_.recharts-reference-line-line]:[stroke:CanvasText]",
   },
 ];
 
 const BAND_DASH = "4 4";
 // Band labels sit in the right margin, outside the plot, because inside it the weekly line runs
 // through them wherever the multiple crosses a band. 76px holds a label such as "+2σ 123.45×".
-const CHART_MARGIN = { top: 8, right: 76, bottom: 0, left: 0 };
-const Y_AXIS_LABEL = {
-  value: "×",
-  position: "insideTopLeft" as const,
-  fill: CHART_COLORS.axis,
-  fontSize: 11,
+// The 4px left margin keeps the ascent of the rotated axis title inside the svg.
+const CHART_MARGIN = { top: 8, right: 76, bottom: 0, left: 4 };
+
+/**
+ * Title of the multiple axis: the metric and its `×` unit, as in "P/E (×)". It is rotated and
+ * centred on the axis height in a column of its own at the axis's left edge; the axis is sized
+ * to its content (`width="auto"`), which counts the title, the gap and the widest tick label, so
+ * the title never overlaps or crowds out a tick label such as "1,234.00".
+ */
+function yAxisTitle(metric: BandMetric) {
+  return {
+    value: `${METRIC_LABELS[metric]} (×)`,
+    angle: -90,
+    position: "insideLeft" as const,
+    // Centres the rotated title on the axis; the position alone anchors it at its start.
+    textAnchor: "middle" as const,
+    fill: CHART_COLORS.axis,
+    fontSize: 11,
+  };
+}
+
+const Y_AXIS_TITLES: Readonly<Record<BandMetric, ReturnType<typeof yAxisTitle>>> = {
+  pe: yAxisTitle("pe"),
+  pb: yAxisTitle("pb"),
 };
 
 /** The trimmed value, or `undefined` when it is absent, empty or blank. */
@@ -272,25 +308,212 @@ function monthTick(value: unknown): string {
   return typeof value === "string" ? formatMonth(value) : "";
 }
 
-/** Fraction digits kept from a generated tick position: enough for any step a ratio axis uses. */
-const RATIO_TICK_FRACTION_DIGITS = 6;
+/** The fewest fraction digits of a multiple-axis tick: the 2 dp of the API's ratios. */
+const RATIO_TICK_MIN_FRACTION_DIGITS = 2;
 
 /**
- * `YAxis` tick of the multiple axis (`4`, `12.5`, `1,234.5`, `−2`). A tick is a generated axis
- * coordinate with no server string behind it, so it is written here as a plain decimal — at most
- * {@link RATIO_TICK_FRACTION_DIGITS} fraction digits with trailing zeros dropped, which removes
- * float noise such as `0.15000000000000002`, and never in exponent notation — and then grouped and
- * signed by `formatDecimal`. The `×` unit is left to the axis label. Non-numbers give `""`.
+ * `YAxis` tick of the multiple axis, grouped and signed by `formatDecimal`, so the axis reads like
+ * the 2 dp tooltip and band labels. A tick of `axis` (see {@link ratioAxis}) is written from its
+ * exact decimal text, with the axis's one `fractionDigits` on every tick (`2.25`, `4.50`,
+ * `20.00`, `100,000,000,000,000.10`, `−2.50`), so no float rounding reaches the label at any
+ * magnitude. A tick with no exact text, one of Recharts' automatic domain, is written as a plain
+ * decimal rounded to {@link RATIO_TICK_MIN_FRACTION_DIGITS}, which removes float noise such as
+ * `0.15000000000000002`, and never in exponent notation. The `×` unit is in the axis title.
+ * Non-numbers give `""`.
  */
-function formatRatioTick(value: unknown): string {
+function formatRatioTick(value: unknown, axis: RatioAxis | null): string {
   if (typeof value !== "number" || !Number.isFinite(value)) return "";
+  const exact = axis?.tickTexts.get(value);
+  if (exact !== undefined) return formatDecimal(exact, "ratio", { unit: false });
   // toFixed switches to exponent notation from 10^21; BigInt prints every digit of such an
-  // integral value.
+  // integral value, whose fraction digits are all zero.
   const text =
     Math.abs(value) >= 1e21
-      ? BigInt(Math.round(value)).toString()
-      : value.toFixed(RATIO_TICK_FRACTION_DIGITS).replace(/0+$/, "").replace(/\.$/, "");
+      ? BigInt(Math.round(value)).toString() + "." + "0".repeat(RATIO_TICK_MIN_FRACTION_DIGITS)
+      : value.toFixed(RATIO_TICK_MIN_FRACTION_DIGITS);
   return formatDecimal(text, "ratio", { unit: false });
+}
+
+/**
+ * Round tick steps of one decade, ascending: 1, 2, 2.5 and 5 × 10^k. Each is an integer count of
+ * `units` of 10^(k + shift), so every tick is built from integers.
+ */
+const NICE_STEPS: ReadonlyArray<{ units: number; shift: number }> = [
+  { units: 1, shift: 0 },
+  { units: 2, shift: 0 },
+  { units: 25, shift: -1 },
+  { units: 5, shift: 0 },
+];
+/** Intervals the multiple axis aims for: the step whose axis has the nearest count is used. */
+const RATIO_AXIS_TARGET_INTERVALS = 5;
+/** Most intervals a candidate step may give, which bounds the ticks one axis builds. */
+const RATIO_AXIS_MAX_INTERVALS = 50;
+/**
+ * Largest magnitude, 2^50, of a tick's integer count of its step's power of ten. Up to it every
+ * count and tick index is an exact safe integer, with an eighth of `Number.MAX_SAFE_INTEGER` to
+ * spare; ticks whose counts differ, by at least 1 in 2^50, are distinct floats, which resolve 1 in
+ * 2^53; and a float index such as `low / step` is within a quarter of its exact value.
+ */
+const RATIO_AXIS_MAX_TICK_COUNT = 2 ** 50;
+/**
+ * Least clearance, in steps, between an axis bound and the nearest point or band line, so neither
+ * is drawn on, or a pixel or two from, the axis baseline or the plot's top edge.
+ */
+const RATIO_AXIS_CLEARANCE_STEPS = 0.1;
+/** Spread, as a share of their magnitude, of values that are all equal (1 when they are 0). */
+const RATIO_AXIS_FLAT_PAD = 0.1;
+
+/** The explicit domain and ticks of the multiple axis, and the fraction digits of its ticks. */
+interface RatioAxis {
+  domain: [number, number];
+  ticks: number[];
+  fractionDigits: number;
+  /** Each tick's exact decimal text, with `fractionDigits` fraction digits, keyed by the tick. */
+  tickTexts: ReadonlyMap<number, string>;
+}
+
+/**
+ * `units × 10^exponent`. An integer times or divided by an exact power of ten is rounded once, to
+ * the float nearest the decimal value, so a tick such as `0.3` carries no accumulated noise.
+ */
+function scaledByPowerOfTen(units: number, exponent: number): number {
+  return exponent >= 0 ? units * 10 ** exponent : units / 10 ** -exponent;
+}
+
+/**
+ * `count × 10^exponent` as a plain decimal string with `fractionDigits` fraction digits, or more
+ * where the value needs them, written from the digits of the safe integer `count`, so it is exact
+ * at any magnitude: `(-25, -1, 2)` gives `"-2.50"` and `(1, 14, 2)` `"100000000000000.00"`.
+ */
+function scaledDecimalText(count: number, exponent: number, fractionDigits: number): string {
+  const sign = count < 0 ? "-" : "";
+  const shift = Math.max(0, -exponent);
+  const padded = String(Math.abs(count)).padStart(shift + 1, "0");
+  let whole = padded.slice(0, padded.length - shift);
+  if (exponent > 0 && count !== 0) whole += "0".repeat(exponent);
+  const fraction = padded.slice(padded.length - shift).padEnd(fractionDigits, "0");
+  return sign + whole + (fraction === "" ? "" : "." + fraction);
+}
+
+/** Every value the multiple axis must show: each weekly point and each drawn band line. */
+function axisValues(rows: readonly BandsRow[], stats: BandStats | null): Array<number | null> {
+  const values = rows.map((row) => row.y);
+  if (stats !== null) {
+    for (const band of BAND_LINES) values.push(toChartNumber(stats[band.name]));
+  }
+  return values;
+}
+
+/**
+ * Domain and ticks of the multiple axis over `values` (see {@link axisValues}), or null when none
+ * is finite or no step qualifies, which leaves the axis to Recharts' automatic domain.
+ *
+ * - The step is a round 1, 2, 2.5 or 5 × 10^k: the one whose axis has the interval count nearest
+ *   {@link RATIO_AXIS_TARGET_INTERVALS}, and of two equally near the one spanning less.
+ * - The floor is the largest multiple of the step, and the ceiling the smallest, that lies at
+ *   least {@link RATIO_AXIS_CLEARANCE_STEPS} of a step beyond the lowest and the highest value,
+ *   so no point or band line is drawn on the axis baseline or the plot's top edge. When every
+ *   value is positive the floor is never below 0, which still lies strictly below them.
+ * - Values that are all equal are first spread by {@link RATIO_AXIS_FLAT_PAD} of their
+ *   magnitude either side, or by 1 at zero.
+ * - Each tick is an integer count of the step's power of ten, scaled once by that power, so ticks
+ *   carry no float noise, and `fractionDigits` is what the step needs, at least
+ *   {@link RATIO_TICK_MIN_FRACTION_DIGITS}. `tickTexts` writes each tick exactly from its count.
+ * - The bound: a step qualifies only when the floor's and the ceiling's counts are at most
+ *   {@link RATIO_AXIS_MAX_TICK_COUNT} (2^50) in magnitude, it gives at most
+ *   {@link RATIO_AXIS_MAX_INTERVALS} intervals, every tick is finite and every value lies strictly
+ *   between the floor and the ceiling. The search spans at most four decades and starts no finer
+ *   than the values' magnitude allows, so a step qualifies for any finite values whose span and
+ *   ceiling stay below `Number.MAX_VALUE` and whose step stays above 10^-308, and the ticks come
+ *   from a count loop of at most RATIO_AXIS_MAX_INTERVALS + 1 iterations. Where no step
+ *   qualifies, as at `Number.MAX_VALUE` itself, the result is null.
+ *
+ * @example ratioAxis([0.75, 0.83, 1.33]) gives domain `[0.6, 1.4]`, ticks `0.6, 0.8, 1, 1.2, 1.4`
+ * and 2 fraction digits.
+ */
+function ratioAxis(values: Iterable<number | null>): RatioAxis | null {
+  let lowest = Number.POSITIVE_INFINITY;
+  let highest = Number.NEGATIVE_INFINITY;
+  for (const value of values) {
+    if (value === null || !Number.isFinite(value)) continue;
+    if (value < lowest) lowest = value;
+    if (value > highest) highest = value;
+  }
+  if (lowest > highest) return null;
+  const pad = lowest === highest ? Math.abs(lowest) * RATIO_AXIS_FLAT_PAD || 1 : 0;
+  const low = lowest - pad;
+  const high = highest + pad;
+  const span = high - low;
+  if (!Number.isFinite(span) || span <= 0) return null;
+
+  // Steps from a hundredth to fifty times the power of ten at or below the span cover every
+  // interval count near the target. A step below 10^finest needs counts above the bound at the
+  // values' magnitude, so the search starts no finer; it reaches 10^(finest + 2), whose counts are
+  // within a tenth of the bound, so a step with few intervals is always among the candidates.
+  const decade = Math.floor(Math.log10(span));
+  const magnitude = Math.max(Math.abs(low), Math.abs(high));
+  const finest = Math.floor(Math.log10(magnitude / RATIO_AXIS_MAX_TICK_COUNT));
+  const first = Math.max(decade - 2, finest);
+  const last = Math.max(decade + 1, finest + 2);
+  let best: {
+    lower: number;
+    intervals: number;
+    units: number;
+    exponent: number;
+    miss: number;
+    extent: number;
+  } | null = null;
+  for (let exponent = first; exponent <= last; exponent += 1) {
+    for (const nice of NICE_STEPS) {
+      const stepExponent = exponent + nice.shift;
+      const step = scaledByPowerOfTen(nice.units, stepExponent);
+      if (!Number.isFinite(step) || step <= 0) continue;
+      const clearance = RATIO_AXIS_CLEARANCE_STEPS * step;
+      let lower = Math.floor(low / step - RATIO_AXIS_CLEARANCE_STEPS);
+      let upper = Math.ceil(high / step + RATIO_AXIS_CLEARANCE_STEPS);
+      // Near the count bound these quotients are only within a quarter of their exact value, so
+      // the clearance is checked on the bound ticks and restored by one more step where rounding
+      // lost it.
+      if (low - scaledByPowerOfTen(lower * nice.units, stepExponent) < clearance) lower -= 1;
+      if (scaledByPowerOfTen(upper * nice.units, stepExponent) - high < clearance) upper += 1;
+      if (lowest > 0) lower = Math.max(0, lower);
+      const floorTick = scaledByPowerOfTen(lower * nice.units, stepExponent);
+      const ceilingTick = scaledByPowerOfTen(upper * nice.units, stepExponent);
+      const intervals = upper - lower;
+      const extent = ceilingTick - floorTick;
+      // The negated comparisons also reject NaN and infinite counts; an infinite extent means a
+      // bound tick, or the distance between them, overflows.
+      if (
+        !(Math.abs(lower * nice.units) <= RATIO_AXIS_MAX_TICK_COUNT) ||
+        !(Math.abs(upper * nice.units) <= RATIO_AXIS_MAX_TICK_COUNT) ||
+        intervals > RATIO_AXIS_MAX_INTERVALS ||
+        !Number.isFinite(extent) ||
+        !(floorTick < lowest && highest < ceilingTick)
+      ) {
+        continue;
+      }
+      const miss = Math.abs(intervals - RATIO_AXIS_TARGET_INTERVALS);
+      if (best === null || miss < best.miss || (miss === best.miss && extent < best.extent)) {
+        best = { lower, intervals, units: nice.units, exponent: stepExponent, miss, extent };
+      }
+    }
+  }
+  if (best === null) return null;
+
+  const fractionDigits = Math.max(RATIO_TICK_MIN_FRACTION_DIGITS, -best.exponent);
+  const ticks: number[] = [];
+  const tickTexts = new Map<number, string>();
+  for (let offset = 0; offset <= best.intervals; offset += 1) {
+    const count = (best.lower + offset) * best.units;
+    // `+ 0` turns -0 into 0.
+    const tick = scaledByPowerOfTen(count, best.exponent) + 0;
+    ticks.push(tick);
+    tickTexts.set(tick, scaledDecimalText(count, best.exponent, fractionDigits));
+  }
+  const floor = ticks[0];
+  const ceiling = ticks[ticks.length - 1];
+  if (floor === undefined || ceiling === undefined) return null;
+  return { domain: [floor, ceiling], ticks, fractionDigits, tickTexts };
 }
 
 /** Tooltip of the hovered week: its date and the multiple formatted from the exact string. */
@@ -350,6 +573,8 @@ function BandsBody({
   const metricLabel = METRIC_LABELS[data.metric];
   const rows = useMemo(() => toRows(data.series), [data.series]);
   const { stats, coverage, flags } = data;
+  const yAxis = useMemo(() => ratioAxis(axisValues(rows, stats)), [rows, stats]);
+  const formatTick = useCallback((value: unknown) => formatRatioTick(value, yAxis), [yAxis]);
   const statusNote = statusNoteOf(data.status);
 
   return (
@@ -392,12 +617,14 @@ function BandsBody({
                 stroke={CHART_COLORS.axis}
               />
               <YAxis
-                domain={["auto", "auto"]}
-                tickFormatter={formatRatioTick}
+                domain={yAxis === null ? ["auto", "auto"] : yAxis.domain}
+                ticks={yAxis?.ticks}
+                tickFormatter={formatTick}
                 tick={AXIS_TICK}
                 stroke={CHART_COLORS.axis}
-                width={48}
-                label={Y_AXIS_LABEL}
+                // Sized to the widest tick label plus the title's own column.
+                width="auto"
+                label={Y_AXIS_TITLES[data.metric]}
               />
               <Tooltip content={BandsTooltip} />
               {stats !== null
@@ -409,6 +636,7 @@ function BandsBody({
                       <ReferenceLine
                         key={band.name}
                         y={y}
+                        className={band.className}
                         stroke={band.stroke}
                         strokeDasharray={band.dashed ? BAND_DASH : undefined}
                         ifOverflow="extendDomain"

@@ -16,10 +16,13 @@
  * The suite is read-only against the database: it never creates, renames or deletes a watchlist
  * and never uploads a PDF. Its only POST is `/ipo/valuation`, which is stateless, so repeated
  * runs see the same seeded state. Every request goes to the app's own origin, which proxies the
- * terminal API; no external URL is involved.
+ * terminal API; no external URL is involved. One screener test answers the valuation-bands
+ * request itself through `page.route`, with a multiple no seeded counter has.
  */
 import { expect, test } from "@playwright/test";
 import type { Locator, Page } from "@playwright/test";
+
+import type { ValuationBandsResponse } from "../src/components/terminal/types";
 
 /** Time for a widget fed by a light endpoint to reach `ready`. */
 const READY_TIMEOUT = 20_000;
@@ -333,6 +336,54 @@ test.describe("IPO valuation sandbox (/ipo)", () => {
 });
 
 test.describe("Custom watchlists and screener (/screener)", () => {
+  /**
+   * An `ok` SCOM P/E body of 60 weekly values alternating between 100,000,000,000,000.00 and
+   * 100,000,000,000,000.01 from 2025-08-01, with the statistics the API computes for them. Such a
+   * near-constant 10^14 multiple once gave the multiple axis a 0.01 step whose tick indices passed
+   * 2^53, where adding 1 no longer changes a float, so its tick loop never ended.
+   */
+  function nearConstantHighRatioBands(): ValuationBandsResponse {
+    const weeks = 60;
+    const firstFriday = Date.UTC(2025, 7, 1);
+    const weekMs = 7 * 24 * 60 * 60 * 1000;
+    const weekDate = (week: number): string =>
+      new Date(firstFriday + week * weekMs).toISOString().slice(0, 10);
+    const series = Array.from({ length: weeks }, (_, week) => ({
+      date: weekDate(week),
+      value: week % 2 === 0 ? "100000000000000.00" : "100000000000000.01",
+    }));
+    return {
+      subject: "SCOM",
+      subject_type: "ticker",
+      metric: "pe",
+      as_of: weekDate(weeks - 1),
+      coverage: {
+        requested_start: "2021-09-18",
+        coverage_start: weekDate(0),
+        is_partial_coverage: true,
+      },
+      status: "ok",
+      flags: [],
+      series,
+      stats: {
+        observations: weeks,
+        mean: "100000000000000.01",
+        stdev: "0.01",
+        minus_2sd: "99999999999999.99",
+        minus_1sd: "100000000000000.00",
+        plus_1sd: "100000000000000.01",
+        plus_2sd: "100000000000000.02",
+        min: "100000000000000.00",
+        p25: "100000000000000.00",
+        median: "100000000000000.01",
+        p75: "100000000000000.01",
+        max: "100000000000000.01",
+        current: "100000000000000.01",
+        current_percentile: "100.00",
+      },
+    };
+  }
+
   test("lists eight counters, the sector summary and the seeded watchlist", async ({ page }) => {
     await page.goto("/screener");
 
@@ -424,5 +475,41 @@ test.describe("Custom watchlists and screener (/screener)", () => {
     await expectReady(flows, SLOW_READY_TIMEOUT);
     await expect(flows.getByText("Updating…")).toHaveCount(0, { timeout: SLOW_READY_TIMEOUT });
     await expect(flows.getByTestId("flows-coverage")).toContainText("100.00");
+  });
+
+  test("a near-constant 10^14 P/E still draws a few distinct, finite axis ticks", async ({
+    page,
+  }) => {
+    await page.route("**/api/v1/terminal/market/valuation-bands**", async (route) => {
+      await route.fulfill({ json: nearConstantHighRatioBands() });
+    });
+    await page.goto("/screener");
+
+    const screener = page.getByTestId("terminal-equity-screener");
+    await expectReady(screener, SLOW_READY_TIMEOUT);
+    await withAttributes(screener, "screener-row", { "data-ticker": "SCOM" })
+      .getByRole("button", { name: "SCOM", exact: true })
+      .click();
+
+    const bands = page.getByTestId("terminal-valuation-bands-chart");
+    await expectReady(bands);
+    await expect(bands.getByTestId("bands-meta")).toContainText("SCOM");
+    const chart = bands.getByTestId("bands-chart");
+    await expect(chart).toBeVisible();
+
+    // Recharts 3 draws the tick labels in a z-index layer of their own, outside `.recharts-yAxis`.
+    // Each is a grouped 2 dp decimal such as "100,000,000,000,000.00", read back without its
+    // grouping to prove it is a finite number.
+    const tickLabels = chart.locator(
+      ".recharts-yAxis-tick-labels .recharts-cartesian-axis-tick-value",
+    );
+    await expect.poll(() => tickLabels.count()).toBeGreaterThanOrEqual(2);
+    const labels = await tickLabels.allTextContents();
+    expect(labels.length).toBeLessThanOrEqual(12);
+    expect(new Set(labels).size).toBe(labels.length);
+    for (const label of labels) {
+      expect(label).toMatch(/^\u2212?\d{1,3}(?:,\d{3})*\.\d{2,}$/);
+      expect(Number.isFinite(Number(label.replace(MINUS_SIGN, "-").replace(/,/g, "")))).toBe(true);
+    }
   });
 });
