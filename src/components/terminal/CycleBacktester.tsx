@@ -887,9 +887,11 @@ function glyphOverlapArea(a: { x: number; y: number }, b: { x: number; y: number
 }
 
 /**
- * The vertical pixel offset of each marker glyph, by marker key, that keeps every glyph clear of
- * the others, so no marker hides another and each one's title and tooltip can be reached.
- * {@link useMarkerGlyphLayout} runs it inside the chart for both the glyphs and their leaders.
+ * The vertical pixel offset of each marker glyph, by marker key. A deterministic, bounded search
+ * separates the glyphs wherever it finds room, so each separated glyph's title and tooltip can be
+ * reached; its minimum-overlap fallback lets a glyph overlap those placed before it only when every
+ * candidate within the bound does, and then by the least total area. {@link useMarkerGlyphLayout}
+ * runs it inside the chart for both the glyphs and their leaders.
  *
  * Glyphs are placed one at a time in `anchors` order, so the same markers always get the same
  * layout. A glyph keeps its true x, the marked session's day, and moves only vertically. Its
@@ -1310,8 +1312,9 @@ interface PlacedMarkerProps {
 
 /**
  * One marker of the main chart, rendered by its `ReferenceDot` inside the chart: its glyph at the
- * marked session's day, moved vertically only as far as {@link useMarkerGlyphLayout} needs to
- * clear every other glyph. Without axis scales the glyph stays at its true point.
+ * marked session's day, moved vertically by the offset {@link useMarkerGlyphLayout} gives it,
+ * clear of the other glyphs where the bounded search finds room and least-overlapping otherwise.
+ * Without axis scales the glyph stays at its true point.
  *
  * The marker's `<g data-testid data-event-date>` holds only the `<title>` that names it, as its
  * first child, and the glyph. A moved glyph's leader and anchor dot are drawn by
@@ -1395,9 +1398,9 @@ function MarkerConnectors({ markers }: MarkerConnectorsProps): ReactElement | nu
 
 /**
  * The `ReferenceDot` shape of a marker: a {@link PlacedMarker}, its glyph outlined in the cycle's
- * colour and placed clear of every other marker in `markers`, with a `<title>` naming the cycle,
- * the kind, the selecting metric and value, and the session. `onHover` receives the marker's key
- * when the pointer enters its glyph and null when it leaves.
+ * colour and placed by the bounded layout of every marker in `markers`, with a `<title>` naming
+ * the cycle, the kind, the selecting metric and value, and the session. `onHover` receives the
+ * marker's key when the pointer enters its glyph and null when it leaves.
  */
 function markerShape(
   spec: MarkerSpec,
@@ -2499,10 +2502,10 @@ export function CycleBacktester({
                 {/* Recharts 3 has no `isFront`: a ReferenceDot's default z-index (600) already
                     draws it above every Line (400). Each dot sits at its marker's true session;
                     its shape lays out all the markers, in cycle then kind order, and moves this
-                    glyph vertically only as far as needed to clear the others, so coincident
-                    markers never hide each other. The leaders back to the moved glyphs' sessions
-                    are drawn by MarkerConnectors in the layer just below (599), beneath every
-                    glyph. */}
+                    glyph vertically to the nearest candidate within the bounded search that
+                    clears the glyphs laid out before it, or to the least-overlapping one when
+                    none does. The leaders back to the moved glyphs' sessions are drawn by
+                    MarkerConnectors in the layer just below (599), beneath every glyph. */}
                 <MarkerConnectors markers={chartModel.markers} />
                 {chartModel.markers.map((spec) => (
                   <ReferenceDot

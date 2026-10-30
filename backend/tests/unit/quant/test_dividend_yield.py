@@ -297,7 +297,7 @@ def test_to_decimal_rejects_non_finite_or_malformed_text(text: str) -> None:
 
 def test_to_decimal_rejects_a_float_argument() -> None:
     """A float argument raises TypeError, so no binary-float value can enter a calculation."""
-    # The only float literal in tests/unit/quant: it exists solely to prove this guard.
+    # This float literal is an invalid input used to exercise the type guard.
     with pytest.raises(TypeError):
         to_decimal(0.1)  # type: ignore[arg-type]
 

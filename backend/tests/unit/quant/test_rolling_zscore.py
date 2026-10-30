@@ -562,9 +562,11 @@ def test_invalid_arguments_raise(
 
     An integer volume is rejected because it would turn the mean into a non-``Decimal``. With
     ``min_periods=2`` the third row is scored over a window holding the second, so an Infinity,
-    sNaN, 1E+999999 or 200,001-digit value there, or 1E+999999 as the scored row itself, must be
-    rejected before ``statistics.mean`` turns it into an exact integer ratio: unchecked, 1E+999999
-    in the window ran for about 70 s and as the scored row gave a finite z near 1E+999999.
+    sNaN, 1E+999999 or 200,001-digit value there must be rejected before ``statistics.mean`` and
+    ``stdev`` turn each window value into an exact integer ratio, which a non-finite value lacks
+    and whose size grows with a finite value's exponent and coefficient length. 1E+999999 as the
+    scored row itself is rejected too: every row is checked against the same bounds before any
+    score is computed.
     """
     with pytest.raises(error, match=message):
         rolling_zscores(rows, sessions, window=window, min_periods=min_periods)

@@ -68,13 +68,11 @@ function resolveProxyBodyLimit(raw: string | undefined): number {
  * minutes.
  *
  * By default Next.js destroys a proxied request after 30 s without traffic from the API and
- * answers a plain-text 500, while POST /ingest/pdf sends nothing until its parse ends. A dense
- * 400-page upload (TERMINAL_PDF_MAX_PAGES, about 1,190 words per page) took 45 to 52 s, alone and
- * as one of two concurrent uploads (TERMINAL_PDF_MAX_CONCURRENCY), since each parse runs in its
- * own process. The API stops a parse at 20 s plus 0.4 s per page of TERMINAL_PDF_MAX_PAGES, 180 s
- * at 400 pages, and answers 422 pdf_parse_timeout. Ten minutes is a fixed bound over three times
- * that limit, so the database writes around a parse, on a loaded host or a host's own database,
- * still reach the client as the API's own answer.
+ * answers a plain-text 500, while POST /ingest/pdf sends nothing until its parse ends, so a parse
+ * longer than 30 s would fail although the API answers it. The API stops a parse at 20 s plus 0.4 s
+ * per page of TERMINAL_PDF_MAX_PAGES, 180 s at 400 pages, and answers 422 pdf_parse_timeout. Ten
+ * minutes is a fixed bound over three times that limit, so the database writes around a parse, on a
+ * loaded host or a host's own database, still reach the client as the API's own answer.
  *
  * A client that disconnects still ends the proxied request at once: Next.js destroys the upstream
  * request as soon as the client's response closes. Widget GETs, like every call of the browser

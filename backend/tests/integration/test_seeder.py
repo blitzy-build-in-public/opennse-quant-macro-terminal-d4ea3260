@@ -667,7 +667,7 @@ async def _assert_prices(engine: AsyncEngine) -> None:
             func.count(price.trade_date.distinct()).label("sessions"),
         ),
     )
-    # Nothing is dated after the anchor: future rows would read as observed history.
+    # No price row postdates the anchor: future price rows would be treated as observed history.
     assert (span["first"], span["last"], span["sessions"]) == (
         SERIES_START,
         ANCHOR_DATE,
@@ -1022,7 +1022,8 @@ MULTIHOST_MISSING_PORT_URL = (
 NON_NUMERIC_PORT_URL = f"postgresql+asyncpg://user:{URL_PW_MARKER}@db.example:notaport/db"
 VALID_URL = f"postgresql+asyncpg://user:{URL_PW_MARKER}@db.example:5432/opennse"
 VALID_URL_LABEL = 'database "opennse" on db.example:5432'
-# Nothing listens on port 1, so connecting is refused at once, with no database or network.
+# A loopback port where no server is expected to listen, so a connection attempt is refused;
+# no database server is needed.
 REFUSED_URL = f"postgresql+asyncpg://user:{URL_PW_MARKER}@127.0.0.1:1/opennse"
 URL_PREFIX = "postgresql+asyncpg://"
 DEFAULT_PROG = "python -m opennse_terminal.seed.seed_terminal_db"
@@ -1093,7 +1094,6 @@ class _SessionDouble:
 def _assert_type_only(caplog: pytest.LogCaptureFixture, *texts: str) -> None:
     """No record carries a traceback, and no text holds the owner or URL marker."""
     assert all(record.exc_info is None for record in caplog.records)
-    # The loop variable is not named text: that would shadow sqlalchemy's text() import.
     for output in (caplog.text, *texts):
         assert "Traceback" not in output
         assert OWNER_MARKER not in output
@@ -1749,7 +1749,8 @@ async def test_build_session_factory_is_the_shared_session_configuration(
 # * ``write`` de-duplicates and sorts a table's complete input by its natural key before slicing
 #   it into ``SEED_BATCH_SIZE`` batches, so the batches, concatenated, are in one strictly
 #   ascending key order. Concurrent writers such as the CSV importer lock rows in that order too,
-#   so a seed and an import inserting the same new keys cannot deadlock.
+#   so a seed and an import inserting the same new keys take their row locks in one order, which
+#   reduces lock-order deadlocks between them.
 # * The 30,096 generated price rows, which ``synthetic.generate_prices`` yields per counter with
 #   SCOM first, reach ``upsert_rows`` in ``(ticker, trade_date)`` order, at most
 #   ``SEED_BATCH_SIZE`` rows per call, each call ``DO NOTHING`` on the natural key with the

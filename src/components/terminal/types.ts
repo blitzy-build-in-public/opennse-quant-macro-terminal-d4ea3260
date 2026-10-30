@@ -34,8 +34,10 @@ export interface TerminalWidgetProps {
   /** Base URL of the terminal API, relative or absolute. Default `"/api/v1/terminal"`. */
   apiBaseUrl?: string;
   /**
-   * Returns the headers sent with every request, for host auth such as a bearer token. Called
-   * before each request so tokens can refresh. This is the widgets' only auth channel.
+   * Returns the host's explicit auth headers, such as a bearer token, sent with every request.
+   * Called before each request so tokens can refresh. The widgets also leave fetch's default
+   * `same-origin` credentials, so a host session cookie reaches an API on the page's own origin
+   * without `getHeaders`.
    */
   getHeaders?: () => HeadersInit | Promise<HeadersInit>;
   /** Extra classes merged onto the widget's root element. */

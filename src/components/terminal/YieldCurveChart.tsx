@@ -64,9 +64,7 @@ interface PlottedPoint {
 interface TenorEntry {
   /** The curve's {@link CurveSeries.id}. */
   seriesId: string;
-  /** The curve's name. */
   name: string;
-  /** The curve's colour. */
   color: string;
   /** The curve's API points at this tenor, in server order; never empty. */
   points: readonly YieldCurvePoint[];
@@ -208,7 +206,7 @@ function isComparableTenor(tenor: string): boolean {
 /**
  * Whether two tenor texts are the same tenor: exactly equal decimals, or, for text the exact
  * comparison cannot read, identical text. Chart numbers are coordinates only and are never
- * compared (lib/format.ts).
+ * compared as values (lib/format.ts).
  */
 function isSameTenor(a: string, b: string): boolean {
   const order = compareDecimal(a, b);

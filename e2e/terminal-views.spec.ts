@@ -509,7 +509,6 @@ test.describe("Macro and market overview (/)", () => {
     await expect(banking.nth(2)).toHaveClass(/(^|\s)bg-emerald-/);
     await expect(marketCells).toHaveText(marketValues);
 
-    // And back to the relative returns.
     await toggle.click();
     await expect(toggle).toHaveAttribute("aria-pressed", "false");
     await expect(description).toContainText("Showing: Relative to market");
@@ -3065,8 +3064,9 @@ test.describe("Custom watchlists and screener (/screener)", () => {
   /**
    * An `ok` SCOM P/E body of 60 weekly values alternating between 100,000,000,000,000.00 and
    * 100,000,000,000,000.01 from 2025-08-01, with the statistics the API computes for them. Such a
-   * near-constant 10^14 multiple once gave the multiple axis a 0.01 step whose tick indices passed
-   * 2^53, where adding 1 no longer changes a float, so its tick loop never ended.
+   * near-constant 10^14 multiple calls for a 0.01 step on the multiple axis, whose tick counts
+   * (about 10^16) pass 2^53, above which adding 1 cannot reliably advance a float count; the axis
+   * must still draw a few distinct, finite ticks.
    */
   function nearConstantHighRatioBands(): ValuationBandsResponse {
     const weeks = 60;

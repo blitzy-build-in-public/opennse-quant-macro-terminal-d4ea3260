@@ -144,9 +144,9 @@ const FLAG_CODE_CLASS = "rounded bg-slate-800 px-1.5 py-0.5 font-mono text-xs te
 // The session readout beneath the plot. The Recharts `<Tooltip>` renders its content into this
 // element through its `portal` prop, which positions nothing, so the readout sits in the figure's
 // flow between the plot and the legend rather than floating over the bars: it never hides the
-// session it describes and stays inside the card at any width. It takes no pointer events, as the
-// floating tooltip did: React bubbles a portal's events to the chart, so pointer moves and presses
-// on the readout would otherwise reach the chart's own handlers.
+// session it describes and stays inside the card at any width. It takes no pointer events: React
+// bubbles a portal's events to the chart, so pointer moves and presses on the readout would
+// otherwise reach the chart's own handlers.
 const READOUT_CLASS = "pointer-events-none";
 // The readout's panel, styled like the totals (slate-950 surface, slate-800 border, 12px slate-300
 // text) with utility classes: this content is rendered by the widget, not by the Recharts default

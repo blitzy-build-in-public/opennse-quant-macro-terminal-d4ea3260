@@ -7,10 +7,11 @@
  * {@link DEFAULT_API_BASE_URL}. The client holds no other URL: the widgets talk only to the
  * terminal's own API and never to an exchange or third-party data endpoint.
  *
- * Authentication. Auth is entirely host-supplied through {@link RequestOptions.getHeaders}, which
- * is awaited before every request so a token can refresh. The client stores no token, cookie or
- * session and has no login logic. `credentials` is left at fetch's default (`same-origin`), so
- * cookies reach only the page's own origin: the standalone rewrite or a host proxy.
+ * Authentication. Auth is entirely host-supplied, and the client stores no token, cookie or session
+ * and has no login logic. Explicit headers come from {@link RequestOptions.getHeaders}, awaited
+ * before every request so a token can refresh. The host's cookies also reach the API, because
+ * `credentials` is left at fetch's default (`same-origin`), which sends them only to the page's own
+ * origin (the standalone rewrite or a host proxy) and never to a cross-origin `apiBaseUrl`.
  *
  * Deadline. Every call is bounded by {@link REQUEST_TIMEOUT_MS}, counted from the call itself and
  * covering header resolution, the fetch and the full body read, so a stalled host hook, API or
@@ -77,9 +78,11 @@ export interface RequestOptions {
   /**
    * Host auth hook: returns the headers to send, for example
    * `{ Authorization: "Bearer <token>" }`. Awaited before every request so a token can refresh.
-   * A throw or rejection fails the request with code `headers_error`. The wait counts towards
-   * {@link REQUEST_TIMEOUT_MS}: a hook still pending at the deadline fails it with
-   * `timeout_error`, and its late result is ignored.
+   * An `AbortError` it throws or rejects with (see {@link isAbortError}) is a cancellation: the
+   * call rejects with an `AbortError`. Any other throw or rejection fails the request with code
+   * `headers_error`, as do returned headers that are not valid, such as an invalid header name or
+   * value. The wait counts towards {@link REQUEST_TIMEOUT_MS}: a hook still pending at the
+   * deadline fails the request with `timeout_error`, and its late result is ignored.
    */
   getHeaders?: () => HeadersInit | Promise<HeadersInit>;
   /**

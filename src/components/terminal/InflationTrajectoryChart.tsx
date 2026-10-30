@@ -81,7 +81,7 @@ const X_AXIS_HEIGHT_PX = 40;
 // The widest month label ("May 2026") is about 48px at the axis's 11px in common sans-serif
 // faces; 52px leaves headroom for a wider host font.
 const MONTH_TICK_WIDTH_PX = 52;
-// Clear space kept between neighbouring month labels, as the axis's former `minTickGap` did.
+// Clear space kept between neighbouring month labels; monthTicks adds it to the label width.
 const MONTH_TICK_GAP_PX = 24;
 // The latest month is labelled centred on the plot's right edge, and the chart's SVG clips what
 // is drawn past its own edge, so the right margin holds half a label.

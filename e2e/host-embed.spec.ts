@@ -10,7 +10,10 @@
  *    against it (`uvicorn opennse_terminal.main:app --port 8000`).
  * 2. `npm ci` is done: the host fixture resolves `next`, `react`, `react-dom`, `recharts` and
  *    `tailwindcss` from the repository root's `node_modules`.
- * 3. Then `npm run test:e2e -- --project host-embed`. Playwright starts the fixture itself
+ * 3. `npm run build` is done for the standalone app, with the same `TERMINAL_API_ORIGIN` as this
+ *    run: playwright.config.ts starts both web servers even for `--project host-embed`, including
+ *    `npm run start -- --port 3000`, which serves that build.
+ * 4. Then `npm run test:e2e -- --project host-embed`. Playwright starts the fixture itself
  *    (`npx next dev e2e/host-fixture --port 3100`, see playwright.config.ts).
  *
  * The suite is read-only: its only API call is the widget's own `GET /macro/overview`, sent to

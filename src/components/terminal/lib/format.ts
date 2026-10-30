@@ -301,9 +301,13 @@ export function shiftMonth(iso: string, delta: number): string {
  * Converts a decimal string to a float, solely to place a point on a Recharts axis.
  *
  * This is the only decimal-to-float conversion in the widget library. The result is approximate
- * for magnitudes above 2^53, which at most moves a point by a sub-pixel amount. It must never be
- * displayed, summed, compared or sent back to the API: tooltips and axis labels format the
- * original string with {@link formatDecimal}, and arithmetic uses the scaled-integer helpers.
+ * for magnitudes above 2^53, which at most moves a point by a sub-pixel amount. Coordinates may be
+ * compared and scaled for chart geometry only: axis extents, domains and tick placement. They must
+ * never be displayed as a source value, summed or otherwise used in arithmetic or comparisons on
+ * the values themselves (ordering, thresholds, selection), or sent back to the API as request data;
+ * those use the BigInt scaled-integer helpers at the end of this module. Tooltips and data labels
+ * format the original string with {@link formatDecimal}; generated axis ticks are positions with
+ * no source string, so a tick may be labelled from its own coordinate.
  *
  * Returns `null` for `null`, `undefined`, a blank string or text that does not convert to a
  * finite number, so Recharts leaves a gap instead of plotting a false zero.

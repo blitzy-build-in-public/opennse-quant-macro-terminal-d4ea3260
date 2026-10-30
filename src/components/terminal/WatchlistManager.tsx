@@ -332,7 +332,8 @@ function RemoveIcon(): ReactElement {
  * list after a two-step confirmation, and add or remove single tickers.
  *
  * The widget has no owner field and no login: the API scopes every watchlist to the principal
- * the host resolves, and the host's credentials reach it only through `getHeaders`. The server
+ * the host resolves, and the host's credentials reach it as explicit headers from `getHeaders`
+ * or, on the page's own origin, as cookies, which the browser sends by default. The server
  * owns the state. The widget loads `GET /watchlists` once and afterwards mirrors each mutation's
  * response (`POST /watchlists`, `DELETE /watchlists/{id}`, `PUT` and `DELETE
  * /watchlists/{id}/items/{ticker}`), with no optimistic update to roll back. It loads them again

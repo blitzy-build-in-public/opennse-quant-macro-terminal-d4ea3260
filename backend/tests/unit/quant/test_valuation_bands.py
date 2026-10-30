@@ -498,14 +498,13 @@ def test_unusable_daily_value_raises_before_any_statistic(
     """A value the statistics cannot take is rejected before any of them runs.
 
     The reference series of 61 values alternating 8 and 12 carries the value mid-series (index
-    30) or as the current value (index 60). Without the check NaN and ±Infinity crashed inside
-    ``statistics.stdev`` with ``AttributeError``, sNaN with ``InvalidOperation``, and
-    ±1E+999999 or 1E-999999 ran for about 70 s, because ``statistics.mean`` and ``stdev`` turn
-    each value into an exact integer ratio of about a million digits; the 200,001-digit
-    coefficient took about 8.5 s. Non-zero values with an adjusted exponent beyond ±40 or more
-    than 60 significant digits are rejected, and a float is not a ``Decimal``. The statistics
-    functions are replaced by one that fails the test, so a missing check fails at once instead of
-    stalling. The message names the day and stays short, never listing the value's digits.
+    30) or as the current value (index 60). ``statistics.mean`` and ``stdev`` turn each value into
+    an exact integer ratio: NaN, sNaN and ±Infinity have none, and the ratio's digit count grows
+    with the value's exponent and coefficient length, so every value must pass the bounds before
+    any statistic runs. Non-zero values with an adjusted exponent beyond ±40 or more than 60
+    significant digits are rejected, and a float is not a ``Decimal``. The statistics functions
+    are replaced by one that fails the test, so a missing check fails at once instead of stalling.
+    The message names the day and stays short, never listing the value's digits.
     """
 
     def forbidden(*_args: object, **_kwargs: object) -> NoReturn:
