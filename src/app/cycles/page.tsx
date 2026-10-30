@@ -1,4 +1,10 @@
+import type { Metadata } from "next";
+
 import { CycleBacktester } from "@/components/terminal";
+
+export const metadata: Metadata = {
+  title: "Election & Cycle Backtesting",
+};
 
 // A server component: CycleBacktester carries its own "use client" boundary and is rendered with
 // its default props, so it opens on the ±180-day window over the server's default event dates.

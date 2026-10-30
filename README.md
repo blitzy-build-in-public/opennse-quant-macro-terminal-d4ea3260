@@ -470,7 +470,9 @@ opennse-terminal scheduler
 **Pipelines:** `nse_market_statistics`, `cbk_rates_csv`, `cbk_inflation`, `cbk_fx`, `cbk_bonds` and
 `cbk_reserves`. `ingest cbk` runs the five CBK pipelines in that order, each as its own run, and
 exits with the code of the first that did not exit 0. `--trade-date` resolves an
-`ambiguous_session` NSE run by stating the session the page shows.
+`ambiguous_session` NSE run by stating the session the page shows. That date must be an exchange
+session on or before the run's date in `TERMINAL_TIMEZONE`; otherwise the run ends
+`ambiguous_session` (reason `trade_date_not_a_session` or `trade_date_in_future`).
 
 **Import kinds**, from a `.csv` or `.xlsx` file of at most 50 MiB and 1,000,000 rows:
 
@@ -484,7 +486,10 @@ exits with the code of the first that did not exit 0. `--trade-date` resolves an
 
 Headers are lowercased and trimmed, with spaces replaced by underscores. Thousands separators are
 stripped, parentheses mean negative, an empty cell is null, and dates are `YYYY-MM-DD` or
-`DD/MM/YYYY`. Each import is recorded as `csv_import:<kind>`.
+`DD/MM/YYYY`. A `daily_prices` or `foreign_flows` row whose `trade_date` is after today in
+`TERMINAL_TIMEZONE` (Africa/Nairobi) is rejected (`future_date:trade_date`). Rows repeating a key
+are collapsed, the last one winning; if that row is rejected, every row of its key is rejected
+with it. Each import is recorded as `csv_import:<kind>`.
 
 Every run is recorded in `terminal_ingestion_runs` and ends with one of these statuses:
 

@@ -18,8 +18,9 @@ prices, turnover and flows are compared as ``Decimal`` and volumes as ``int``.
 Covered:
 
 - Statuses: ``succeeded``, ``layout_changed`` (a five-sector page), ``no_new_data`` (stale
-  guard), ``ambiguous_session`` and the operator's ``--trade-date`` override,
-  ``blocked_by_robots``, ``failed`` for a year the exchange calendar does not cover, and
+  guard), ``ambiguous_session`` and the operator's ``--trade-date`` override (itself
+  ``ambiguous_session`` for a non-session or future date), ``blocked_by_robots``, ``failed`` for
+  a year the exchange calendar does not cover, and
   ``partial`` for a row whose turnover, rounded to 0.01, overflows its column.
 - The transaction-scoped advisory lock: a second run fails with "lock held" while the first is
   blocked inside its fetch, and the lock is free again after a run whose parser raises and after
@@ -602,6 +603,48 @@ async def test_ambiguous_session_then_trade_date_override(
     rows = await prices_on(seeded_database, SESSION)
     assert set(rows) == SEEDED_TICKERS
     assert all(row["ingestion_run_id"] == resolved.run_id for row in rows.values())
+
+
+@pytest.mark.parametrize(
+    ("trade_date", "reason"),
+    [
+        # A Thursday session, two months after the 2026-10-28 run.
+        pytest.param(date(2026, 12, 31), "trade_date_in_future", id="future-session"),
+        pytest.param(date(2026, 10, 25), "trade_date_not_a_session", id="sunday"),
+        pytest.param(date(2026, 12, 25), "trade_date_not_a_session", id="christmas-day"),
+    ],
+)
+async def test_trade_date_override_the_page_cannot_show_is_ambiguous(
+    seeded_database: SeededClone,
+    fixture_text: Callable[[str], str],
+    robots: respx.MockRouter,
+    trade_date: date,
+    reason: str,
+) -> None:
+    # Written, such a row would move every market endpoint's default as_of to that date.
+    result = await run(
+        scrape(seeded_database, FixtureFetcher(fixture_text), trade_date=trade_date),
+        seeded_database,
+    )
+
+    assert result.status is RunStatus.AMBIGUOUS_SESSION, result.error_message
+    assert result.error_message == f"ambiguous session: {reason}"
+    assert result.rows_written == 0
+    details = result.details
+    assert details["reason"] == reason
+    assert details["trade_date"] == trade_date.isoformat()
+    assert details["run_date"] == "2026-10-28"
+    assert details["expected_session"] is None
+    assert details["trade_date_override"] is True
+    assert details["link_session"] == "2026-10-27"
+    assert details["label_session"] == "2026-10-28"
+    assert await prices_on(seeded_database, trade_date) == {}
+    assert await prices_on(seeded_database, SESSION) == {}
+    recorded = await run_row(seeded_database, result.run_id)
+    assert recorded["status"] == RunStatus.AMBIGUOUS_SESSION.value
+    assert recorded["rows_written"] == 0
+    assert recorded["details"]["reason"] == reason
+    assert recorded["details"]["run_date"] == "2026-10-28"
 
 
 async def test_robots_disallow_blocks_run(

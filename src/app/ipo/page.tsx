@@ -1,4 +1,10 @@
+import type { Metadata } from "next";
+
 import { IpoValuationSandbox } from "@/components/terminal";
+
+export const metadata: Metadata = {
+  title: "IPO Valuation Sandbox",
+};
 
 // A server component that prerenders statically: the widget is a client component that owns its
 // slider state, debounced valuation requests and loading/error states, and fetches on the client.

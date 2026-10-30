@@ -97,6 +97,7 @@ __all__ = [
     "StoredRow",
     "build_price_rows",
     "check_continuity",
+    "check_trade_date_override",
     "is_stale",
     "parse_page",
     "parse_price_list_date",
@@ -878,9 +879,10 @@ def resolve_session(
 ) -> date:
     """The session a snapshot is written for.
 
-    An operator's ``--trade-date`` override wins. Otherwise the price-list link's file date must
-    equal ``expected_session`` (the latest exchange session before the run's local date). The
-    "Statistics as of" label is recorded as evidence but never decides.
+    An operator's ``--trade-date`` override wins; the caller first checks that it can be a
+    session the page shows (:func:`check_trade_date_override`). Otherwise the price-list link's
+    file date must equal ``expected_session`` (the latest exchange session before the run's local
+    date). The "Statistics as of" label is recorded as evidence but never decides.
 
     Raises:
         AmbiguousSession: No override, and the link date is missing (``link_date_missing``) or
@@ -897,6 +899,49 @@ def resolve_session(
             "link_session": _iso(link_session),
             "label_session": _iso(label_session),
             "reason": "link_date_missing" if link_session is None else "link_date_mismatch",
+        }
+    )
+
+
+def check_trade_date_override(
+    trade_date: date,
+    *,
+    run_date: date,
+    calendar: ExchangeCalendar,
+    link_session: date | None,
+    label_session: date | None,
+) -> None:
+    """Check that an operator's ``--trade-date`` can be the session the page shows.
+
+    The stated date must be an exchange session (a weekday that is not an exchange closure, per
+    ``calendar``) and must not fall after ``run_date``, the run's local date in the configured
+    timezone (Africa/Nairobi by default): a snapshot never shows a day the exchange was closed,
+    nor a session still to come. ``run_date`` itself is accepted, for a run after that day's
+    close. The session check comes first, so a date in an unverified year raises
+    ``CalendarNotVerified`` rather than being judged a future date.
+
+    Raises:
+        CalendarNotVerified: ``trade_date`` lies in a year the calendar does not cover.
+        AmbiguousSession: ``trade_date`` is not an exchange session
+            (``trade_date_not_a_session``) or falls after ``run_date``
+            (``trade_date_in_future``); ``evidence`` holds ``expected_session`` (``None``, as an
+            override replaces it), the link and label sessions, ``trade_date`` and ``run_date``
+            as ISO strings, and the reason.
+    """
+    if not calendar.is_session(trade_date):
+        reason = "trade_date_not_a_session"
+    elif trade_date > run_date:
+        reason = "trade_date_in_future"
+    else:
+        return
+    raise AmbiguousSession(
+        evidence={
+            "expected_session": None,
+            "link_session": _iso(link_session),
+            "label_session": _iso(label_session),
+            "trade_date": trade_date.isoformat(),
+            "run_date": run_date.isoformat(),
+            "reason": reason,
         }
     )
 
@@ -1112,7 +1157,9 @@ class MarketStatisticsPipeline(Pipeline[MarketStatisticsSnapshot, NseQuote]):
     Args:
         settings: The run's settings (spacing, timezone).
         trade_date: The operator's ``--trade-date``; replaces the expected session and the link
-            date check, while validation, the stale guard and the continuity check still run.
+            date check, while validation, the stale guard and the continuity check still run. It
+            must be an exchange session on or before the run's local date, or the run ends
+            ``ambiguous_session`` (:func:`check_trade_date_override`).
         fetcher: Replaces the Playwright fetcher, for example with recorded fixtures.
         calendar: Replaces the shipped exchange calendar.
         now: Returns the current timezone-aware time; defaults to now in ``settings.tzinfo``.
@@ -1220,7 +1267,8 @@ class MarketStatisticsPipeline(Pipeline[MarketStatisticsSnapshot, NseQuote]):
            (the last), and ``details.duplicate_isins`` lists those whose values differ.
         2. **Stale guard** (:func:`is_stale`) against each ticker's latest stored row.
         3. **Session dating** (:func:`resolve_session`) from the exchange calendar's
-           ``expected_session``, or the ``--trade-date`` override.
+           ``expected_session``, or the ``--trade-date`` override, which must be an exchange
+           session not after the run's local date (:func:`check_trade_date_override`).
         4. **Continuity** (:func:`check_continuity`) against the rows stored before the session.
 
         The dating evidence is recorded in ``details`` before any outcome is raised. When the
@@ -1231,7 +1279,8 @@ class MarketStatisticsPipeline(Pipeline[MarketStatisticsSnapshot, NseQuote]):
         Raises:
             NoNewData: No tracked equity holds an ISIN, or the source has not advanced.
             SourceLayoutChanged: No row maps to a tracked equity.
-            AmbiguousSession: The session cannot be established, or continuity fails.
+            AmbiguousSession: The session cannot be established, the override is not an exchange
+                session or falls after the run's local date, or continuity fails.
             CalendarNotVerified: The calendar does not cover a year the dating needs.
         """
         parsed = self._parsed
@@ -1359,14 +1408,13 @@ class MarketStatisticsPipeline(Pipeline[MarketStatisticsSnapshot, NseQuote]):
 
     def _date_session(self, ctx: RunContext, parsed: ParsedPage) -> date:
         override = self._trade_date
+        current = self._now()
+        if current.tzinfo is None:
+            raise ValueError("now() must return a timezone-aware datetime")
+        run_date = current.astimezone(self.settings.tzinfo).date()
         expected: date | None = None
         if override is None:
-            current = self._now()
-            if current.tzinfo is None:
-                raise ValueError("now() must return a timezone-aware datetime")
-            expected = self._calendar.previous_session(
-                current.astimezone(self.settings.tzinfo).date()
-            )
+            expected = self._calendar.previous_session(run_date)
         ctx.details.update(
             {
                 "expected_session": _iso(expected),
@@ -1375,6 +1423,14 @@ class MarketStatisticsPipeline(Pipeline[MarketStatisticsSnapshot, NseQuote]):
             }
         )
         try:
+            if override is not None:
+                check_trade_date_override(
+                    override,
+                    run_date=run_date,
+                    calendar=self._calendar,
+                    link_session=parsed.link_session,
+                    label_session=parsed.label_session,
+                )
             trade_date = resolve_session(
                 expected_session=expected,
                 link_session=parsed.link_session,
@@ -1383,11 +1439,14 @@ class MarketStatisticsPipeline(Pipeline[MarketStatisticsSnapshot, NseQuote]):
             )
         except AmbiguousSession as exc:
             logger.info(
-                "NSE session dating ambiguous (%s): expected %s, link %s, label %s",
+                "NSE session dating ambiguous (%s): expected %s, link %s, label %s, "
+                "--trade-date %s, run date %s",
                 exc.evidence.get("reason"),
                 _iso(expected),
                 _iso(parsed.link_session),
                 _iso(parsed.label_session),
+                _iso(override),
+                run_date,
             )
             raise
         ctx.details["trade_date"] = trade_date.isoformat()

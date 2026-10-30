@@ -1,9 +1,18 @@
+import type { Metadata } from "next";
+
 import {
   InflationTrajectoryChart,
   MacroSnapshot,
   SectorRotationHeatmap,
   YieldCurveChart,
 } from "@/components/terminal";
+
+// `absolute` because the root layout's title template applies only to child segments, and this
+// page shares the root segment; it spells out the same "<view> — <product>" form the template
+// gives the other views.
+export const metadata: Metadata = {
+  title: { absolute: "Macro & Market Overview — OpenNSE Quant & Macro Terminal" },
+};
 
 // Server component: it holds no state and passes no function props, so it prerenders as static
 // HTML and each widget fetches on the client. The widgets keep their default props on purpose:

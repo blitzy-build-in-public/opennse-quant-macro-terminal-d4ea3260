@@ -57,9 +57,9 @@ import uuid
 import zipfile
 import zlib
 from collections import Counter
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, datetime
 from decimal import (
     MAX_EMAX,
     MAX_PREC,
@@ -105,7 +105,6 @@ from opennse_terminal.ingestion.base import (
     RunTrigger,
     SourceLayoutChanged,
     ValidationOutcome,
-    dedupe_by_key,
     execute_pipeline,
     normalize_header,
     parse_decimal_text,
@@ -386,6 +385,9 @@ _DMY_DATE_RE: Final = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{4})")
 _XLSX_WORKSHEET_RE: Final = re.compile(r"xl/worksheets/[^/]+\.xml", re.IGNORECASE)
 _HUNDRED: Final = Decimal(100)
 _DEFAULT_PERIOD_TYPE: Final = "FY"
+_SESSION_KINDS: Final[frozenset[ImportKind]] = frozenset({"daily_prices", "foreign_flows"})
+"""Kinds whose ``trade_date`` names an observed session, so it may not be after today: a future
+row would be read as history and move every market endpoint's default ``as_of``."""
 _IN_CHUNK: Final = 5_000
 _MISSING_KEYS_SAMPLE: Final = 50
 
@@ -1500,19 +1502,31 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
 
     Stages: :meth:`fetch` reads the file (at most :data:`MAX_FILE_BYTES`); :meth:`parse` reads
     the rows, checks the headers and converts the kind's columns; :meth:`validate` mirrors every
-    CHECK and length limit of the target table; :meth:`reconcile` collapses repeated keys and
-    checks stored data (unknown tickers, ISIN owners, currency conflicts, missing price rows);
-    :meth:`upsert` writes through ``opennse_terminal.db.upsert`` and reports, through
-    :meth:`write_rejections`, each fundamentals row whose period a concurrent writer stored in
-    another currency after :meth:`reconcile` (``currency_conflict``) and each foreign_flows row
-    whose price row was deleted after :meth:`reconcile` (``no_price_row``). Rejections at any of
-    these stages count toward the shared thresholds: up to 10% gives ``partial`` (valid rows
-    written), more gives ``layout_changed`` (nothing written); a missing required header or a file
-    without data rows is ``layout_changed`` too.
+    CHECK and length limit of the target table and rejects a ``daily_prices`` or
+    ``foreign_flows`` row dated after today (``future_date:trade_date``); :meth:`reconcile`
+    collapses repeated keys and checks stored data (unknown tickers, ISIN owners, currency
+    conflicts, missing price rows); :meth:`upsert` writes through ``opennse_terminal.db.upsert``
+    and reports, through :meth:`write_rejections`, each fundamentals row whose period a
+    concurrent writer stored in another currency after :meth:`reconcile` (``currency_conflict``)
+    and each foreign_flows row whose price row was deleted after :meth:`reconcile`
+    (``no_price_row``). A key rejected by :meth:`reconcile` or :meth:`upsert` rejects every row
+    collapsed into it as well. Rejections at any of these stages count toward the shared
+    thresholds: up to 10% gives ``partial`` (valid rows written), more gives ``layout_changed``
+    (nothing written); a missing required header or a file without data rows is
+    ``layout_changed`` too.
 
     Instances are single-use. Evidence found during the run (``kind``, ``file_name``, ``sheet``,
     ``file_size_bytes``, ``ignored_columns``, ``blank_rows_skipped``, ``duplicates_collapsed``,
     ``flow_missing_keys``) goes into the run's ``details``.
+
+    Args:
+        settings: The run's settings (database, timezone).
+        kind: The import kind.
+        path: The CSV or ``.xlsx`` file.
+        sheet: The worksheet of an ``.xlsx`` file; the first one when ``None`` or empty.
+        now: Returns the current timezone-aware time; defaults to now in ``settings.tzinfo``.
+            :meth:`validate` calls it once and rejects a ``daily_prices`` or ``foreign_flows`` row
+            dated after that day in ``settings.tzinfo`` (``future_date:trade_date``).
 
     Raises:
         ValueError: ``kind`` is not an import kind, the extension is not ``.csv`` or ``.xlsx``,
@@ -1529,8 +1543,12 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         kind: ImportKind,
         path: Path,
         sheet: str | None = None,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         super().__init__(settings)
+        self._now: Callable[[], datetime] = (
+            now if now is not None else (lambda: datetime.now(settings.tzinfo))
+        )
         self.kind: ImportKind = _require_kind(kind)
         self.spec = KIND_SPECS[self.kind]
         self.path = Path(path)
@@ -1547,6 +1565,9 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
         self._layouts = _RowLayouts()
         # The rows upsert() found it could not write, reported by write_rejections().
         self._write_rejected: list[RejectedRow] = []
+        # By the line of each fundamentals or foreign_flows row reconcile() accepted, the rows of
+        # its key it collapsed, in line order; upsert() rejects them with that row.
+        self._superseded: dict[int, list[TabularRecord]] = {}
 
     @property
     def run_name(self) -> str:
@@ -1711,13 +1732,21 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
           (``invalid_period_type``); ``currency`` defaults to KES; a row with no value column
           (``no_values``).
         - ``macro_indicators``: a row with no indicator value (``no_values``).
+        - ``daily_prices`` and ``foreign_flows``: a ``trade_date`` after today in
+          ``settings.tzinfo`` (``future_date:trade_date``), because a future row would be read
+          as an observed session; today itself is accepted. Today is read once per call from the
+          pipeline's ``now``.
 
         A cell that failed to convert is reported by its conversion code only, never also as
-        ``missing_value`` or ``no_values``. Rejected rows are reported with their line number, the
-        codes joined by ``;`` and their raw cells (NUL shown as U+2400). An accepted row whose
-        values gained defaults or derived values is a new record whose compact row shares every
-        unchanged cell; any other accepted row is returned as it is.
+        ``missing_value``, ``no_values`` or ``future_date``. Rejected rows are reported with their
+        line number, the codes joined by ``;`` and their raw cells (NUL shown as U+2400). An
+        accepted row whose values gained defaults or derived values is a new record whose compact
+        row shares every unchanged cell; any other accepted row is returned as it is.
+
+        Raises:
+            ValueError: ``now`` returned a naive datetime.
         """
+        today = self._today()
         valid: list[TabularRecord] = []
         rejected: list[RejectedRow] = []
         for record in records:
@@ -1733,7 +1762,7 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
                 if column not in failed and values.get(column) is None
             )
             codes.extend(_check_text(values))
-            codes.extend(self._check_kind(values, failed))
+            codes.extend(self._check_kind(values, failed, today))
             if codes:
                 rejected.append(
                     RejectedRow(index=record.row_number, reason=";".join(codes), row=record.raw)
@@ -1751,13 +1780,26 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
             )
         return ValidationOutcome(valid=valid, rejected=rejected)
 
-    def _check_kind(self, values: dict[str, CellValue], failed: set[str]) -> list[str]:
+    def _today(self) -> date:
+        """Today in ``settings.tzinfo``, from ``now``; raises ``ValueError`` for a naive time."""
+        current = self._now()
+        if current.tzinfo is None:
+            raise ValueError("now() must return a timezone-aware datetime")
+        return current.astimezone(self.settings.tzinfo).date()
+
+    def _check_kind(self, values: dict[str, CellValue], failed: set[str], today: date) -> list[str]:
         """The kind's own rules; fills defaults and derived values into ``values``.
 
         ``failed`` names the columns whose cells did not convert: a row with an unconvertible
-        value is reported for that cell, not as ``no_values``.
+        value is reported for that cell, not as ``no_values``. ``today`` is the latest
+        ``trade_date`` a session kind accepts; an unconvertible date is ``None`` here, so it is
+        never also reported as ``future_date``.
         """
         codes: list[str] = []
+        if self.kind in _SESSION_KINDS:
+            trade_date = _date(values, "trade_date")
+            if trade_date is not None and trade_date > today:
+                codes.append("future_date:trade_date")
         if self.kind == "equities":
             free_float = _decimal(values, "free_float_pct")
             if free_float is not None and not 0 <= free_float <= _HUNDRED:
@@ -1803,21 +1845,39 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
           a period another writer stores after this check is caught by :meth:`upsert`.
         - ``foreign_flows``: a ``(ticker, trade_date)`` without a price row (``no_price_row``).
 
-        These rejections count toward the same thresholds as :meth:`validate`'s.
+        A collapsed row is neither written nor rejected while its key's surviving row is
+        accepted. When the surviving row is rejected, every row it superseded is rejected too,
+        with the same reason, its own line number and its raw cells, so each file row stating a
+        rejected key counts toward the same thresholds as :meth:`validate`'s rejections; the
+        rejected rows are returned in line order. The superseded rows of each accepted
+        ``fundamentals`` or ``foreign_flows`` key are kept for :meth:`upsert`, which rejects them
+        with their key's row should it reject that row at write time.
         """
-        unique, collapsed = dedupe_by_key(records, self._key_of)
+        unique, superseded = _collapse_repeated_keys(records, self._key_of)
+        collapsed = len(records) - len(unique)
         ctx.details["duplicates_collapsed"] = collapsed
         if collapsed:
             logger.info("%s import collapsed %d rows that repeat a key", self.kind, collapsed)
         if not unique:
             return ValidationOutcome(valid=[], rejected=[])
         if self.kind == "equities":
-            return await _reconcile_equities(ctx.conn, unique, self._layouts)
-        if self.kind in ("daily_prices", "fundamentals"):
-            return await self._reconcile_tickers(ctx.conn, unique)
-        if self.kind == "foreign_flows":
-            return await _reconcile_flows(ctx.conn, unique)
-        return ValidationOutcome(valid=unique, rejected=[])
+            checked = await _reconcile_equities(ctx.conn, unique, self._layouts)
+        elif self.kind in ("daily_prices", "fundamentals"):
+            checked = await self._reconcile_tickers(ctx.conn, unique)
+        elif self.kind == "foreign_flows":
+            checked = await _reconcile_flows(ctx.conn, unique)
+        else:
+            checked = ValidationOutcome(valid=unique, rejected=[])
+        # Only these kinds' upsert() can still reject an accepted key; for the others, the rows
+        # collapsed into an accepted key are released with the records.
+        if self.kind in ("fundamentals", "foreign_flows"):
+            self._superseded = {
+                record.row_number: superseded[record.row_number]
+                for record in checked.valid
+                if record.row_number in superseded
+            }
+        rejected = sorted(_with_superseded(checked.rejected, superseded), key=lambda row: row.index)
+        return ValidationOutcome(valid=checked.valid, rejected=rejected)
 
     def _key_of(self, record: TabularRecord) -> tuple[CellValue, ...]:
         return tuple(record.values.get(column) for column in self.spec.key)
@@ -1893,8 +1953,11 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
           equity cascade) updates nothing; its row becomes a ``no_price_row`` rejection reported
           by :meth:`write_rejections`, with its line number and raw cells, so it counts toward
           the shared thresholds. Their count is logged once at WARNING with the run id and
-          recorded in ``details.flow_missing_keys`` (the count and the first 50 keys, in key
-          order).
+          recorded in ``details.flow_missing_keys`` (the count of keys and the first 50 keys, in
+          key order).
+
+        Each row :meth:`reconcile` collapsed into a key rejected here is rejected with it, for the
+        same reason, with its own line number and raw cells, and counted in the WARNING line.
 
         Returns the number of rows inserted or updated, summed over the batches. Re-importing a
         file rewrites identical values, so the stored state is unchanged.
@@ -1960,32 +2023,75 @@ class TabularImportPipeline(Pipeline[bytes, TabularRecord]):
                 room = _MISSING_KEYS_SAMPLE - len(missing_sample)
                 missing_sample.extend(outcome.missing_keys[:room])
         if no_price_rows:
+            flow_rejections = _with_superseded(no_price_rows, self._superseded)
             logger.warning(
                 "foreign_flows import run %s rejected %d rows at write time: no_price_row",
                 self._run_id,
-                len(no_price_rows),
+                len(flow_rejections),
             )
             self._details["flow_missing_keys"] = {
                 "count": len(no_price_rows),
                 "sample": [list(key) for key in missing_sample],
             }
-            self._write_rejected.extend(no_price_rows)
+            self._write_rejected.extend(flow_rejections)
         if unwritten:
+            conflicts = _with_superseded(unwritten, self._superseded)
             logger.warning(
                 "fundamentals import run %s rejected %d rows at write time: currency_conflict",
                 self._run_id,
-                len(unwritten),
+                len(conflicts),
             )
-            self._write_rejected.extend(unwritten)
+            self._write_rejected.extend(conflicts)
         return written
 
     def write_rejections(self) -> Sequence[RejectedRow]:
         """The rows :meth:`upsert` could not write, in key order, each with its line number and
         raw cells: fundamentals rows whose period a concurrent writer stored in another currency
         after :meth:`reconcile` (``currency_conflict``), and foreign_flows rows whose price row
-        was deleted after :meth:`reconcile` (``no_price_row``). They count toward the shared
-        thresholds with the earlier stages' rejections. Empty for the other kinds."""
+        was deleted after :meth:`reconcile` (``no_price_row``). A key's rows that
+        :meth:`reconcile` collapsed are reported with it, for the same reason, the key's rows in
+        line order. They count toward the shared thresholds with the earlier stages' rejections.
+        Empty for the other kinds."""
         return tuple(self._write_rejected)
+
+
+def _collapse_repeated_keys(
+    records: Sequence[TabularRecord], key: Callable[[TabularRecord], tuple[CellValue, ...]]
+) -> tuple[list[TabularRecord], dict[int, list[TabularRecord]]]:
+    """Collapse records that share a key as ``base.dedupe_by_key`` does: the **last** occurrence
+    of each key wins, in the position where the key was first seen.
+
+    Returns the surviving records and, by each survivor's line number, the earlier records of its
+    key that it superseded, in file order; a key that does not repeat has no entry.
+    """
+    latest: dict[tuple[CellValue, ...], TabularRecord] = {}
+    earlier: dict[tuple[CellValue, ...], list[TabularRecord]] = {}
+    for record in records:
+        record_key = key(record)
+        previous = latest.get(record_key)
+        if previous is not None:
+            earlier.setdefault(record_key, []).append(previous)
+        # Re-assigning an existing key keeps its original insertion position.
+        latest[record_key] = record
+    superseded = {latest[record_key].row_number: rows for record_key, rows in earlier.items()}
+    return list(latest.values()), superseded
+
+
+def _with_superseded(
+    rejected: Sequence[RejectedRow], superseded: Mapping[int, Sequence[TabularRecord]]
+) -> list[RejectedRow]:
+    """``rejected``, each surviving row preceded by the rows of its key it superseded
+    (``superseded``, by the survivor's line number), rejected for the same reason with their own
+    line numbers and raw cells, so every file row of a rejected key counts toward the shared
+    thresholds."""
+    expanded: list[RejectedRow] = []
+    for row in rejected:
+        expanded.extend(
+            RejectedRow(index=record.row_number, reason=row.reason, row=record.raw)
+            for record in superseded.get(row.index, ())
+        )
+        expanded.append(row)
+    return expanded
 
 
 _Period = tuple[str, date, str]
@@ -2252,7 +2358,8 @@ async def import_file(
       ``nse_market_statistics`` > ``seed``) and set ``source = 'csv_import'``; an empty turnover
       is estimated as volume x close (``turnover_estimated = True``). A non-empty flow sets
       ``foreign_net_flow_kes`` with ``flow_source = 'csv_import'``; an empty one keeps the stored
-      flow.
+      flow. A row dated after today in ``settings.tzinfo`` is rejected
+      (``future_date:trade_date``).
     - ``fundamentals`` (ticker, period_end_date; period_type, currency and the ten value columns
       of ``terminal_fundamentals``): on ``(ticker, period_end_date, period_type)``; each non-empty
       cell is COALESCE-merged and recorded as ``csv_import`` in ``source_by_field``; a row whose
@@ -2261,7 +2368,8 @@ async def import_file(
       ``terminal_macro_indicators`` on ``observation_date``, COALESCE-merged with
       ``source_by_field`` entries ``csv_import``.
     - ``foreign_flows`` (ticker, trade_date, foreign_net_flow_kes): sets only the flow and
-      ``flow_source = 'csv_import'`` of existing price rows; rows without one are rejected.
+      ``flow_source = 'csv_import'`` of existing price rows; rows without one, and rows dated
+      after today in ``settings.tzinfo`` (``future_date:trade_date``), are rejected.
 
     Units: ``*_kes`` whole KES (never thousands), ``*_pct`` percentage points, ``fx_kes_usd`` KES
     per USD, ``fx_reserves_usd_m`` USD millions, share counts and volumes integers up to 10^12.

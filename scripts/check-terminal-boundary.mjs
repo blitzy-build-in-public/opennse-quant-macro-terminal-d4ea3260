@@ -295,11 +295,41 @@ function listAstSpecifiers(sourceFile) {
 }
 
 /**
+ * Start offsets (the opening quote or backtick) of every string literal and no-substitution
+ * template literal in the AST, whatever its role. `listSpecifiers` keeps a `ts.preProcessFile`
+ * hit only where one of these starts. preProcessFile's token scanner has no regex or JSX
+ * context, so a hit it reads from a regex literal's body or from JSX text sits where the AST has
+ * no string token, and is dropped. Every hit on a real string token is kept, in any role and
+ * behind any wrapper (`as`, `satisfies`, `!`, a `<T>` assertion, parentheses), so no form
+ * preProcessFile lists can bypass the boundary by falling outside a list of roles.
+ * @param {import("typescript").SourceFile} sourceFile
+ * @returns {Set<number>}
+ */
+function listStringLiteralStarts(sourceFile) {
+  /** @type {Set<number>} */
+  const starts = new Set();
+  /** @param {import("typescript").Node} node */
+  const visit = (node) => {
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+      starts.add(node.getStart(sourceFile));
+    }
+    // forEachChild stops at the first truthy callback result, so visit must return nothing.
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return starts;
+}
+
+/**
  * Every specifier the file pulls in, from `ts.preProcessFile` (AAP 0.4.4) merged with the AST
  * backstop. `importedFiles` covers import/export-from, side-effect and type-only imports, dynamic
  * `import()` anywhere (type positions included), `import x = require()`, `require()` and module
  * augmentations. `/// <reference path>` and `/// <reference types>` are kept as their own kinds.
  * Ambient `declare module` names in a script file are declarations, not imports, and are skipped.
+ * preProcessFile's token scanner has no regex or JSX context, so it reads a regex literal's body
+ * and JSX text as code and lists an `import "x"` or `require("x")` written there. preProcessFile
+ * stays the lister; the AST only confirms that an `importedFiles` hit starts a real string token
+ * (`listStringLiteralStarts`), and a hit that does not is dropped.
  * @param {import("typescript").SourceFile} sourceFile
  * @returns {SpecifierRef[]} sorted by position; `pos` is the first character of the specifier
  */
@@ -309,6 +339,9 @@ function listSpecifiers(sourceFile) {
     /* readImportFiles */ true,
     /* detectJavaScriptImports */ true,
   );
+  // preProcessFile reports an import at its opening quote, where the AST literal starts.
+  const stringStarts = listStringLiteralStarts(sourceFile);
+  const importedFiles = info.importedFiles.filter((f) => stringStarts.has(f.pos));
   /**
    * @param {import("typescript").FileReference[]} files
    * @param {SpecifierKind} kind
@@ -320,7 +353,7 @@ function listSpecifiers(sourceFile) {
   /** @type {SpecifierRef[]} */
   const refs = [
     // preProcessFile reports an import at its opening quote, a reference at its path text.
-    ...fromReferences(info.importedFiles, "import", 1),
+    ...fromReferences(importedFiles, "import", 1),
     ...listAstSpecifiers(sourceFile),
     ...fromReferences(info.referencedFiles, "reference-path", 0),
     ...fromReferences(info.typeReferenceDirectives, "reference-types", 0),
@@ -889,6 +922,19 @@ const SELF_TEST_CASES = [
       "}\n",
     expect: "accept",
   },
+  {
+    name: "regex literal that only mentions a host import",
+    file: "lib/x.ts",
+    source: 'export const importPattern = /import "next\\/link"/;\n',
+    expect: "accept",
+  },
+  {
+    name: "JSX text that only mentions host imports",
+    file: "X.tsx",
+    source:
+      'export const ImportSample = () => <p>import Link from "next/link"; require("next")</p>;\n',
+    expect: "accept",
+  },
 
   // Every module extension beyond .ts and .tsx; the walk collects each, so each must be checked.
   ...[".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"].map(
@@ -909,6 +955,87 @@ const SELF_TEST_CASES = [
     expect: "reject",
     specifier: "../../app/hostSecret",
     reason: REASON_OUTSIDE,
+  },
+  {
+    name: "module.require() in a CommonJS file (listed by preProcessFile only)",
+    file: "lib/x.cjs",
+    source: 'module.exports = module.require("next/router");\n',
+    expect: "reject",
+    specifier: "next/router",
+    reason: REASON_PACKAGE,
+  },
+  {
+    name: "AMD define() dependency (listed by preProcessFile only)",
+    file: "lib/x.js",
+    source: 'define(["next/link"], function () {});\n',
+    expect: "reject",
+    specifier: "next/link",
+    reason: REASON_PACKAGE,
+  },
+  {
+    name: "AMD define() dependency after a module name (listed by preProcessFile only)",
+    file: "lib/x.js",
+    source: 'define("widget", ["next/link"], function () {});\n',
+    expect: "reject",
+    specifier: "next/link",
+    reason: REASON_PACKAGE,
+  },
+  {
+    name: "new require() (listed by preProcessFile only)",
+    file: "lib/x.js",
+    source: 'export const head = new require("next/head");\n',
+    expect: "reject",
+    specifier: "next/head",
+    reason: REASON_PACKAGE,
+  },
+  // Wrapped specifiers: preProcessFile lists the string token, whatever expression wraps it.
+  {
+    name: "module.require() of a host package behind an as assertion",
+    file: "lib/x.ts",
+    source: 'export const link = module.require("next/link" as string);\n',
+    expect: "reject",
+    specifier: "next/link",
+    reason: REASON_PACKAGE,
+  },
+  {
+    name: "module.require() of a standalone page behind an as assertion",
+    file: "lib/x.ts",
+    source: 'export const page = module.require("../../app/page" as string);\n',
+    expect: "reject",
+    specifier: "../../app/page",
+    reason: REASON_OUTSIDE,
+  },
+  {
+    name: "new require() of a host package behind an as assertion",
+    file: "lib/x.ts",
+    source: 'export const link = new require("next/link" as string);\n',
+    expect: "reject",
+    specifier: "next/link",
+    reason: REASON_PACKAGE,
+  },
+  {
+    name: "module.require() of a host package behind a non-null assertion",
+    file: "lib/x.ts",
+    source: 'export const link = module.require("next/link"!);\n',
+    expect: "reject",
+    specifier: "next/link",
+    reason: REASON_PACKAGE,
+  },
+  {
+    name: "AMD define() dependency array behind an as assertion",
+    file: "lib/x.ts",
+    source: 'define(["next/link"] as string[], function () {});\n',
+    expect: "reject",
+    specifier: "next/link",
+    reason: REASON_PACKAGE,
+  },
+  {
+    name: "AMD define() dependency array behind satisfies",
+    file: "lib/x.ts",
+    source: 'define(["next/link"] satisfies string[], function () {});\n',
+    expect: "reject",
+    specifier: "next/link",
+    reason: REASON_PACKAGE,
   },
   {
     name: "JSX component in a .jsx file",

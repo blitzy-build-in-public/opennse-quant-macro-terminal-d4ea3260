@@ -34,6 +34,7 @@ from opennse_terminal.ingestion.base import (
     SourceLayoutChanged,
     evaluate_thresholds,
 )
+from opennse_terminal.ingestion.calendar import CalendarNotVerified, ExchangeCalendar
 from opennse_terminal.ingestion.http import PoliteClient, build_user_agent
 from opennse_terminal.ingestion.nse.market_statistics import (
     CHANGE_PCT_BOUND,
@@ -51,6 +52,7 @@ from opennse_terminal.ingestion.nse.market_statistics import (
     StoredRow,
     build_price_rows,
     check_continuity,
+    check_trade_date_override,
     is_stale,
     parse_page,
     parse_price_list_date,
@@ -607,6 +609,76 @@ def test_trade_date_override_dates_the_snapshot_whatever_the_page_shows(
     )
 
     assert session == override
+
+
+@pytest.mark.parametrize(
+    ("trade_date", "link_session", "reason"),
+    [
+        pytest.param(date(2026, 10, 25), SESSION, "trade_date_not_a_session", id="sunday"),
+        pytest.param(date(2026, 12, 25), None, "trade_date_not_a_session", id="christmas-day"),
+        # A Thursday session, but two months after the run's local date.
+        pytest.param(date(2026, 12, 31), SESSION, "trade_date_in_future", id="future-session"),
+    ],
+)
+def test_trade_date_override_the_page_cannot_show_is_ambiguous(
+    trade_date: date, link_session: date | None, reason: str
+) -> None:
+    with pytest.raises(AmbiguousSession) as exc_info:
+        check_trade_date_override(
+            trade_date,
+            run_date=FETCHED_AT.date(),
+            calendar=ExchangeCalendar.load_default(),
+            link_session=link_session,
+            label_session=LABEL_DATE,
+        )
+
+    assert exc_info.value.evidence == {
+        "expected_session": None,
+        "link_session": link_session.isoformat() if link_session is not None else None,
+        "label_session": "2026-10-28",
+        "trade_date": trade_date.isoformat(),
+        "run_date": "2026-10-28",
+        "reason": reason,
+    }
+
+
+@pytest.mark.parametrize(
+    "trade_date",
+    [FETCHED_AT.date(), SESSION],
+    ids=["the-run-date-itself", "an-earlier-session"],
+)
+def test_trade_date_override_on_a_session_up_to_the_run_date_is_accepted(
+    trade_date: date,
+) -> None:
+    # Returns without raising: the run date is accepted for a run after that day's close.
+    check_trade_date_override(
+        trade_date,
+        run_date=FETCHED_AT.date(),
+        calendar=ExchangeCalendar.load_default(),
+        link_session=SESSION,
+        label_session=LABEL_DATE,
+    )
+
+
+@pytest.mark.parametrize(
+    "trade_date",
+    # 2028-01-05 is also after the run date: the session check comes first and never guesses.
+    [date(2025, 6, 2), date(2028, 1, 5)],
+    ids=["2025", "2028"],
+)
+def test_trade_date_override_in_an_unverified_year_raises_calendar_not_verified(
+    trade_date: date,
+) -> None:
+    with pytest.raises(CalendarNotVerified) as exc_info:
+        check_trade_date_override(
+            trade_date,
+            run_date=FETCHED_AT.date(),
+            calendar=ExchangeCalendar.load_default(),
+            link_session=SESSION,
+            label_session=LABEL_DATE,
+        )
+
+    assert exc_info.value.year == trade_date.year
 
 
 # --- Continuity check and stale guard ---------------------------------------------------------

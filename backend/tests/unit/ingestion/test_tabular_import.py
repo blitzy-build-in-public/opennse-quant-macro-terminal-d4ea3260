@@ -39,7 +39,7 @@ import zipfile
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Context, Decimal, localcontext
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -63,6 +63,7 @@ from opennse_terminal.ingestion.base import (
     ValidationOutcome,
     classify_exception,
     evaluate_thresholds,
+    execute_pipeline,
 )
 from opennse_terminal.ingestion.files import tabular_import
 from opennse_terminal.ingestion.files.tabular_import import (
@@ -93,6 +94,10 @@ UNREACHABLE_DATABASE_URL = "postgresql+asyncpg://nobody:x@127.0.0.1:1/none"
 RUN_ID = uuid.UUID("2b7e1516-28ae-4d2a-a6f7-15880cf4f3c1")
 SESSION = date(2026, 9, 28)
 NEXT_SESSION = date(2026, 9, 29)
+FROZEN_NOW = datetime(2026, 10, 29, 22, 30, tzinfo=UTC)
+"""The clock the future-date cases inject: 01:30 on 2026-10-30 in Africa/Nairobi (UTC+3) while UTC
+is still on 2026-10-29, so "today" is the Nairobi date whenever the tests run."""
+NAIROBI_TODAY = date(2026, 10, 30)
 PRICE_HEADER = ("Ticker", "Trade Date", "Close Price", "Volume")
 
 REQUIRED_COLUMNS: Mapping[ImportKind, tuple[str, ...]] = {
@@ -304,9 +309,13 @@ def _open(
     *,
     sheet: str | None = None,
     conn: _ScriptedConnection | None = None,
+    now: Callable[[], datetime] | None = None,
 ) -> tuple[TabularImportPipeline, RunContext]:
-    """A fresh pipeline and the run context ``execute_pipeline`` would hand it."""
-    pipeline = TabularImportPipeline(_hermetic_settings(), kind=kind, path=path, sheet=sheet)
+    """A fresh pipeline and the run context ``execute_pipeline`` would hand it; ``now`` replaces
+    the pipeline's clock."""
+    pipeline = TabularImportPipeline(
+        _hermetic_settings(), kind=kind, path=path, sheet=sheet, now=now
+    )
     ctx = RunContext(
         run_id=RUN_ID,
         pipeline=pipeline.run_name,
@@ -334,8 +343,9 @@ async def _stage(
     *,
     sheet: str | None = None,
     conn: _ScriptedConnection | None = None,
+    now: Callable[[], datetime] | None = None,
 ) -> _Staged:
-    pipeline, ctx = _open(kind, path, sheet=sheet, conn=conn)
+    pipeline, ctx = _open(kind, path, sheet=sheet, conn=conn, now=now)
     records = pipeline.parse(await pipeline.fetch(ctx))
     return _Staged(pipeline=pipeline, ctx=ctx, records=records, outcome=pipeline.validate(records))
 
@@ -2397,6 +2407,62 @@ async def test_validate_rejects_a_row_with_its_reason_codes(
     assert staged.outcome.rejected == [RejectedRow(index=2, reason=reason, row=row)]
 
 
+@pytest.mark.parametrize(
+    ("kind", "trade_date", "accepted", "reasons"),
+    [
+        pytest.param(kind, text, accepted, reasons, id=f"{kind}-{label}")
+        for kind in ("daily_prices", "foreign_flows")
+        for label, text, accepted, reasons in (
+            ("today", "2026-10-30", [NAIROBI_TODAY], []),
+            ("today-day-month-year", "30/10/2026", [NAIROBI_TODAY], []),
+            ("tomorrow", "2026-10-31", [], ["future_date:trade_date"]),
+            ("future-day-month-year", "31/12/2026", [], ["future_date:trade_date"]),
+            # Not a date at all, so reported by its conversion code only.
+            ("impossible-future-date", "31/11/2026", [], ["invalid_date:trade_date"]),
+        )
+    ],
+)
+async def test_validate_rejects_a_trade_date_after_today_in_nairobi(
+    tmp_path: Path,
+    kind: ImportKind,
+    trade_date: str,
+    accepted: list[date],
+    reasons: list[str],
+) -> None:
+    """Today is the Nairobi date of the injected clock, read once for the whole file: a session
+    kind accepts it and rejects any later ``trade_date``, which counts toward the thresholds."""
+    readings: list[datetime] = []
+
+    def clock() -> datetime:
+        readings.append(FROZEN_NOW)
+        return FROZEN_NOW
+
+    row = {**VALID_CELLS[kind], "trade_date": trade_date}
+    # A second row, dated in the past: the clock is read once per file, never once per row.
+    path = _write_csv(
+        tmp_path / f"{kind}.csv",
+        [tuple(row), tuple(row.values()), tuple(VALID_CELLS[kind].values())],
+    )
+    staged = await _stage(kind, path, now=clock)
+    assert len(readings) == 1
+    assert [record.values["trade_date"] for record in staged.outcome.valid] == [
+        *accepted,
+        SESSION,
+    ]
+    assert staged.outcome.rejected == [
+        RejectedRow(index=2, reason=reason, row=row) for reason in reasons
+    ]
+
+
+async def test_validate_refuses_a_clock_without_a_timezone(tmp_path: Path) -> None:
+    cells = VALID_CELLS["daily_prices"]
+    path = _write_csv(tmp_path / "prices.csv", [tuple(cells), tuple(cells.values())])
+    pipeline, ctx = _open("daily_prices", path, now=lambda: FROZEN_NOW.replace(tzinfo=None))
+    records = pipeline.parse(await pipeline.fetch(ctx))
+    with pytest.raises(ValueError, match=re.escape("now() must return a timezone-aware datetime")):
+        pipeline.validate(records)
+
+
 PRICES_CSV_HEADER = b"Ticker,Trade Date,Close Price,Volume\n"
 KCB_PRICE_ROW = b"KCB,2026-09-28,40.10,500\n"
 KCB_PRICE_VALUES = {
@@ -2895,6 +2961,48 @@ async def test_daily_prices_reconcile_rejects_unknown_tickers(tmp_path: Path) ->
     ]
     assert [_query(statement) for statement in conn.statements] == [
         (["terminal_equities"], [["KQ", "SCOM"]])
+    ]
+    assert conn.unanswered == 0
+
+
+async def test_reconcile_rejects_every_row_of_a_rejected_repeated_key_in_line_order(
+    tmp_path: Path,
+) -> None:
+    """Rows repeating a key collapse into the last one. A rejected key rejects each of its rows,
+    in line order among the other rejections; the earlier row of an accepted key is neither
+    accepted nor rejected."""
+    path = _write_csv(
+        tmp_path / "prices.csv",
+        [
+            PRICE_HEADER,
+            ("ZZZZ", SESSION, "1.00", 1),
+            ("KQ", SESSION, "3.85", 2),
+            ("SCOM", SESSION, "28.40", 3),
+            ("ZZZZ", SESSION, "1.10", 4),
+            ("SCOM", SESSION, "28.45", 5),
+        ],
+    )
+    conn = _ScriptedConnection([("SCOM",)])
+    staged = await _stage("daily_prices", path, conn=conn)
+    reconciled = await staged.pipeline.reconcile(staged.ctx, staged.outcome.valid)
+    assert [(record.row_number, record.values["close_price"]) for record in reconciled.valid] == [
+        (6, Decimal("28.45"))
+    ]
+    assert [(row.index, row.reason, dict(row.row)) for row in reconciled.rejected] == [
+        (
+            line,
+            "unknown_ticker",
+            {"ticker": ticker, "trade_date": "2026-09-28", "close_price": close, "volume": volume},
+        )
+        for line, ticker, close, volume in (
+            (2, "ZZZZ", "1.00", "1"),
+            (3, "KQ", "3.85", "2"),
+            (5, "ZZZZ", "1.10", "4"),
+        )
+    ]
+    assert staged.ctx.details["duplicates_collapsed"] == 2
+    assert [_query(statement) for statement in conn.statements] == [
+        (["terminal_equities"], [["KQ", "SCOM", "ZZZZ"]])
     ]
     assert conn.unanswered == 0
 
@@ -3398,6 +3506,50 @@ async def test_foreign_flows_upsert_records_keys_that_lost_their_price_row(
     ]
 
 
+async def test_foreign_flows_upsert_rejects_the_rows_collapsed_into_a_key_without_a_price_row(
+    tmp_path: Path, writers: _Writers, caplog: pytest.LogCaptureFixture
+) -> None:
+    """SCOM's line 4 superseded its line 2 at reconcile; when its price row is gone at write time,
+    both lines are rejected, while the flow details still count one missing key."""
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    path = _write_csv(
+        tmp_path / "flows.csv",
+        [
+            SAMPLES["foreign_flows"].header,
+            ("SCOM", SESSION, "100"),
+            ("EQTY", SESSION, "200"),
+            ("SCOM", SESSION, "300"),
+        ],
+    )
+    staged = await _stage(
+        "foreign_flows", path, conn=_ScriptedConnection([("EQTY", SESSION), ("SCOM", SESSION)])
+    )
+    reconciled = await staged.pipeline.reconcile(staged.ctx, staged.outcome.valid)
+    assert (len(reconciled.valid), reconciled.rejected) == (2, [])
+    writers.missing_flow_keys = (("SCOM", SESSION),)
+    written = await staged.pipeline.upsert(
+        cast(AsyncConnection, _ScriptedConnection()), reconciled.valid, RUN_ID
+    )
+    assert written == 1
+    assert [
+        (row.index, row.reason, dict(row.row)) for row in staged.pipeline.write_rejections()
+    ] == [
+        (
+            line,
+            "no_price_row",
+            {"ticker": "SCOM", "trade_date": "2026-09-28", "foreign_net_flow_kes": flow},
+        )
+        for line, flow in ((2, "100"), (4, "300"))
+    ]
+    assert staged.ctx.details["flow_missing_keys"] == {
+        "count": 1,
+        "sample": [["SCOM", SESSION]],
+    }
+    assert caplog.messages == [
+        f"foreign_flows import run {RUN_ID} rejected 2 rows at write time: no_price_row"
+    ]
+
+
 async def test_foreign_flows_upsert_fails_on_a_missing_key_its_batch_does_not_hold(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -3493,6 +3645,66 @@ async def test_fundamentals_upsert_rejects_a_row_skipped_for_a_currency_stored_s
     # The run id and the count only: never the file's name or a value.
     assert caplog.messages == [
         f"fundamentals import run {RUN_ID} rejected 1 rows at write time: currency_conflict"
+    ]
+
+
+async def test_fundamentals_upsert_rejects_the_rows_collapsed_into_a_period_stored_since(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """EQTY's line 4 superseded its line 3 at reconcile; when a concurrent writer has stored the
+    period in KES by the write, both USD lines are rejected for it."""
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+
+    async def skip_one(
+        executor: object,
+        rows: Sequence[Mapping[str, object]],
+        *,
+        source: str,
+        filing_id: uuid.UUID | None = None,
+    ) -> int:
+        return len(rows) - 1
+
+    monkeypatch.setattr(tabular_import, "upsert_fundamentals", skip_one)
+    path = _write_csv(
+        tmp_path / "fundamentals.csv",
+        [
+            FUNDAMENTALS_HEADER,
+            SCOM_LINE,
+            ("EQTY", date(2026, 6, 30), "H1", "USD", "1"),
+            EQTY_H1_LINE,
+        ],
+    )
+    # Both tickers are known and neither period is stored when reconcile reads them.
+    staged = await _stage(
+        "fundamentals", path, conn=_ScriptedConnection([("EQTY",), ("SCOM",)], [])
+    )
+    reconciled = await staged.pipeline.reconcile(staged.ctx, staged.outcome.valid)
+    assert (len(reconciled.valid), reconciled.rejected) == (2, [])
+    conn = _ScriptedConnection(
+        [("EQTY", date(2026, 6, 30), "H1", "KES"), ("SCOM", date(2026, 3, 31), "FY", "KES")]
+    )
+
+    written = await staged.pipeline.upsert(cast(AsyncConnection, conn), reconciled.valid, RUN_ID)
+
+    assert written == 1
+    assert [
+        (row.index, row.reason, dict(row.row)) for row in staged.pipeline.write_rejections()
+    ] == [
+        (
+            line,
+            "currency_conflict",
+            {
+                "ticker": "EQTY",
+                "period_end_date": "2026-06-30",
+                "period_type": "H1",
+                "currency": "USD",
+                "revenue_kes": revenue,
+            },
+        )
+        for line, revenue in ((3, "1"), (4, "2"))
+    ]
+    assert caplog.messages == [
+        f"fundamentals import run {RUN_ID} rejected 2 rows at write time: currency_conflict"
     ]
 
 
@@ -3956,6 +4168,204 @@ async def test_daily_prices_layout_change_writes_nothing(
     assert await _stored_prices(engine) == before
 
 
+async def test_a_price_row_dated_after_today_is_rejected_and_writes_nothing(
+    seeded_database: _Clone, tmp_path: Path
+) -> None:
+    """EABL dated 31/12/2026, imported on 2026-10-30 in Nairobi: its only row is rejected, so the
+    run is ``layout_changed`` and the latest stored ``trade_date``, every market endpoint's
+    default ``as_of``, stays the seeded 2026-09-30."""
+    engine = seeded_database.engine
+    before = await _stored_prices(engine)
+    assert max(day for _ticker, day in before) == date(2026, 9, 30)
+    path = _write_csv(
+        tmp_path / "prices.csv", [PRICE_HEADER, ("EABL", "31/12/2026", "269.505", "22494")]
+    )
+    pipeline = TabularImportPipeline(
+        seeded_database.settings, kind="daily_prices", path=path, now=lambda: FROZEN_NOW
+    )
+
+    result = await execute_pipeline(pipeline, engine, trigger="cli")
+
+    assert (result.status, result.rows_fetched, result.rows_written, result.rows_rejected) == (
+        RunStatus.LAYOUT_CHANGED,
+        1,
+        0,
+        1,
+    )
+    assert result.details["rejected"] == [
+        {
+            "index": 2,
+            "reason": "future_date:trade_date",
+            "row": {
+                "ticker": "EABL",
+                "trade_date": "31/12/2026",
+                "close_price": "269.505",
+                "volume": "22494",
+            },
+        }
+    ]
+    assert await _run_row(engine, result.run_id) == {
+        "pipeline": "csv_import:daily_prices",
+        "trigger": "cli",
+        "status": "layout_changed",
+        "rows_fetched": 1,
+        "rows_written": 0,
+        "rows_rejected": 1,
+    }
+    assert await _stored_prices(engine) == before
+
+
+EQUITY_READ_COLUMNS = (
+    "isin",
+    "company_name",
+    "sector",
+    "shares_outstanding",
+    "free_float_pct",
+    "currency",
+    "source",
+    "updated_at",
+)
+
+
+async def _stored_import_targets(engine: AsyncEngine) -> StoredRows:
+    """Every stored price, fundamentals and equity row, keyed by table name and natural key."""
+    stored: StoredRows = {}
+    for model, key, columns in (
+        (TerminalDailyPrice, PRICE_KEY, PRICE_READ_COLUMNS),
+        (TerminalFundamental, FUNDAMENTAL_KEY, FUNDAMENTAL_READ_COLUMNS),
+        (TerminalEquity, ("ticker",), EQUITY_READ_COLUMNS),
+    ):
+        rows = await _rows_by_key(engine, model, key, columns)
+        stored.update({(model.__tablename__, *row_key): row for row_key, row in rows.items()})
+    return stored
+
+
+def _raw_cells(header: Sequence[object], row: Sequence[object]) -> dict[str, str]:
+    """A written CSV row as a rejection records it: its text by normalized column."""
+    return {
+        normalize_column_name(name): _csv_cell(value)
+        for name, value in zip(header, row, strict=True)
+    }
+
+
+TEN_ROWS = range(1, 11)
+REPEATED_KEY_FILES = [
+    pytest.param(
+        "daily_prices",
+        [PRICE_HEADER, *(("ZZZZ", date(2026, 9, 30), "1.00", n) for n in TEN_ROWS)],
+        "unknown_ticker",
+        RunStatus.LAYOUT_CHANGED,
+        {},
+        id="daily-prices-unknown-ticker",
+    ),
+    pytest.param(
+        "foreign_flows",
+        [
+            ("Ticker", "Trade Date", "Foreign Net Flow KES"),
+            # Sunday: no seeded price row.
+            *(("SCOM", date(2026, 9, 27), f"{n},000.00") for n in TEN_ROWS),
+        ],
+        "no_price_row",
+        RunStatus.LAYOUT_CHANGED,
+        {},
+        id="foreign-flows-no-price-row",
+    ),
+    pytest.param(
+        "fundamentals",
+        [
+            ("Ticker", "Period End Date", "Period Type", "Currency", "Revenue KES"),
+            # Seeded in KES.
+            *(("SCOM", date(2026, 3, 31), "FY", "USD", f"{n},000,000.00") for n in TEN_ROWS),
+        ],
+        "currency_conflict",
+        RunStatus.LAYOUT_CHANGED,
+        {},
+        id="fundamentals-currency-conflict",
+    ),
+    pytest.param(
+        "equities",
+        [
+            ("Ticker", "Company Name", "Sector", "Shares Outstanding", "ISIN"),
+            # Equity Group's seeded ISIN.
+            *(
+                ("SCOM", "Safaricom PLC", "Telecommunication", 40_065_428_000 + n, "KE0000000554")
+                for n in TEN_ROWS
+            ),
+        ],
+        "isin_conflict",
+        RunStatus.LAYOUT_CHANGED,
+        {},
+        id="equities-isin-conflict",
+    ),
+    pytest.param(
+        "daily_prices",
+        [PRICE_HEADER, *(("SCOM", date(2026, 9, 30), f"33.{n:02d}", n * 1_000) for n in TEN_ROWS)],
+        None,
+        RunStatus.SUCCEEDED,
+        {
+            ("terminal_daily_prices", "SCOM", date(2026, 9, 30)): {
+                "close_price": Decimal("33.10"),
+                "volume": 10_000,
+                "turnover_kes": Decimal("331000.00"),
+                "turnover_estimated": True,
+                "source": "csv_import",
+            }
+        },
+        id="daily-prices-valid-last-row",
+    ),
+]
+
+
+@pytest.mark.parametrize(("kind", "rows", "reason", "status", "changes"), REPEATED_KEY_FILES)
+async def test_every_row_of_a_rejected_repeated_key_counts_toward_the_thresholds(
+    seeded_database: _Clone,
+    tmp_path: Path,
+    kind: ImportKind,
+    rows: list[tuple[object, ...]],
+    reason: str | None,
+    status: RunStatus,
+    changes: Mapping[tuple[object, ...], Mapping[str, object]],
+) -> None:
+    """Ten rows of one key collapse into the last. When it is rejected, all ten rows are, so the
+    run is ``layout_changed`` and writes nothing; when it is valid, it alone is written and the
+    nine rows it superseded are neither written nor rejected."""
+    engine = seeded_database.engine
+    before = await _stored_import_targets(engine)
+    path = _write_csv(tmp_path / f"{kind}.csv", rows)
+
+    result = await import_file(kind, path, settings=seeded_database.settings)
+
+    header, *data = rows
+    rejected = [
+        {"index": line, "reason": reason, "row": _raw_cells(header, row)}
+        for line, row in enumerate(data, start=2)
+        if reason is not None
+    ]
+    written = 0 if rejected else 1
+    assert (result.status, result.rows_fetched, result.rows_written, result.rows_rejected) == (
+        status,
+        10,
+        written,
+        len(rejected),
+    )
+    assert result.details["duplicates_collapsed"] == 9
+    assert result.details.get("rejected", []) == rejected
+    assert await _run_row(engine, result.run_id) == {
+        "pipeline": f"csv_import:{kind}",
+        "trigger": "cli",
+        "status": status.value,
+        "rows_fetched": 10,
+        "rows_written": written,
+        "rows_rejected": len(rejected),
+    }
+    after = await _stored_import_targets(engine)
+    assert set(after) == set(before)
+    for key, columns in changes.items():
+        assert {name: after[key][name] for name in columns} == columns
+    untouched = set(before) - set(changes)
+    assert {key: after[key] for key in untouched} == {key: before[key] for key in untouched}
+
+
 FLOW_UPDATES: Mapping[tuple[str, date], Decimal] = {
     ("SCOM", NEXT_SESSION): Decimal("-1250000.50"),
     ("EQTY", NEXT_SESSION): Decimal("2340500.00"),
@@ -3976,13 +4386,14 @@ async def test_foreign_flows_set_only_the_flow_of_existing_price_rows(
 ) -> None:
     engine = seeded_database.engine
     flows = [(ticker, day, _amount_text(flow)) for (ticker, day), flow in FLOW_UPDATES.items()]
-    # Line 7 has no price row: SCOM did not trade on 2026-10-30 in the seeded history.
+    # Line 7 has no price row: SCOM did not trade on Sunday 2026-09-27 in the seeded history. The
+    # date is in the past, so the row reaches the price-row check whatever day the test runs.
     path = _write_csv(
         tmp_path / "flows.csv",
         [
             ("Ticker", "Trade Date", "Foreign Net Flow KES"),
             *flows[:5],
-            ("SCOM", date(2026, 10, 30), "1,000.00"),
+            ("SCOM", date(2026, 9, 27), "1,000.00"),
             *flows[5:],
         ],
     )
@@ -3997,7 +4408,7 @@ async def test_foreign_flows_set_only_the_flow_of_existing_price_rows(
         10,
         1,
     )
-    assert _rejections(result, PRICE_KEY) == {("SCOM", "2026-10-30"): (7, "no_price_row")}
+    assert _rejections(result, PRICE_KEY) == {("SCOM", "2026-09-27"): (7, "no_price_row")}
     assert (await _run_row(engine, result.run_id))["pipeline"] == "csv_import:foreign_flows"
     after = await _stored_prices(engine, since=SAMPLE_START)
     assert set(after) == set(before)
