@@ -18,7 +18,8 @@
  * runs see the same seeded state. Every request goes to the app's own origin, which proxies the
  * terminal API; no external URL is involved. Some tests answer API requests themselves through
  * `page.route`, and every such handler is read-only against the database as well: it answers a
- * request from memory or passes a GET request through to the real API.
+ * request from memory, passes a GET request through to the real API, or passes the stateless
+ * `/ipo/valuation` POST through.
  * - The watchlist tests answer every `/watchlists` request from an in-memory store, which reads
  *   the seeded lists once through `GET /watchlists` and never forwards a request.
  * - A screener request filtered by one of those in-memory lists is sent to the API without its
@@ -30,9 +31,12 @@
  *   block every other method.
  * - One cycle test blanks overlay rates in a fetched backtest response before the page receives
  *   it.
+ * - The IPO tests hold or answer valuation requests, some with responses derived from the
+ *   server's own, let the sandbox abort the held ones it no longer needs, and drive its debounce
+ *   with Playwright's browser clock.
  */
 import { expect, test } from "@playwright/test";
-import type { Locator, Page } from "@playwright/test";
+import type { Locator, Page, Request, Response, Route } from "@playwright/test";
 
 import { CHART_COLORS } from "../src/components/terminal/lib/chartTheme";
 import type {
@@ -43,6 +47,7 @@ import type {
   DecimalString,
   FlowsResponse,
   IpoScenario,
+  IpoValuationResponse,
   MacroOverviewResponse,
   ScreenerResponse,
   ScreenerRow,
@@ -58,6 +63,10 @@ const SLOW_READY_TIMEOUT = 30_000;
 
 const MACRO_OVERVIEW_PATH = "/api/v1/terminal/macro/overview";
 const FLOWS_PATH = "/api/v1/terminal/market/flows";
+/** Path of `POST /ipo/valuation`, the only POST the sandbox sends. */
+const IPO_VALUATION_PATH = "/api/v1/terminal/ipo/valuation";
+/** The valuation endpoint as a `page.route` pattern. */
+const IPO_VALUATION_ROUTE = `**${IPO_VALUATION_PATH}`;
 
 /** U+2212, the minus sign `lib/format.ts` renders for negative values. */
 const MINUS_SIGN = "\u2212";
@@ -240,8 +249,9 @@ async function expectFlowsReadouts(flows: Locator, body: FlowsResponse): Promise
   await expect(line).toHaveAttribute("d", /^M[^L]+L[^L]+L/);
 }
 
-// Uncaught page errors fail the test. Console errors do not: the cross-field IPO test receives a
-// legitimate 422, which the browser logs as a failed resource.
+// Uncaught page errors fail the test. Console errors do not: several tests involve legitimate 4xx
+// and 5xx responses and aborted requests, such as the IPO field-error and lifecycle tests, which the
+// browser logs as failed resources.
 let pageErrors: Error[] = [];
 
 test.beforeEach(async ({ page }) => {
@@ -1456,6 +1466,112 @@ test.describe("IPO valuation sandbox (/ipo)", () => {
     return { sandbox, blended };
   }
 
+  /** A decoded JSON object, such as a valuation request or response body. */
+  type JsonObject = Readonly<Record<string, unknown>>;
+
+  /** A valuation POST the page sent: its request, its decoded body and, once received, response. */
+  interface ValuationPost {
+    request: Request;
+    body: unknown;
+    response: Response | null;
+  }
+
+  /** `value` as a JSON object; anything else fails the test. */
+  function jsonObject(value: unknown): JsonObject {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error(`Expected a JSON object, got ${JSON.stringify(value)}`);
+    }
+    return value as JsonObject;
+  }
+
+  /** The decoded JSON object of a valuation response; no response or other JSON fails the test. */
+  async function valuationJson(response: Response | null): Promise<JsonObject> {
+    if (response === null) throw new Error("The valuation request received no response");
+    return jsonObject(await response.json());
+  }
+
+  /** True for the sandbox's `POST /ipo/valuation`. */
+  function isValuationPost(request: Request): boolean {
+    return request.method() === "POST" && new URL(request.url()).pathname === IPO_VALUATION_PATH;
+  }
+
+  /**
+   * Every valuation POST the page sends from now on, in send order, each with its response once
+   * that arrives. Register it before the input whose requests it must see.
+   */
+  function recordValuationPosts(page: Page): ValuationPost[] {
+    const posts: ValuationPost[] = [];
+    page.on("request", (request) => {
+      if (isValuationPost(request)) {
+        const body: unknown = request.postDataJSON();
+        posts.push({ request, body, response: null });
+      }
+    });
+    page.on("response", (response) => {
+      const post = posts.find((candidate) => candidate.request === response.request());
+      if (post !== undefined) post.response = response;
+    });
+    return posts;
+  }
+
+  /** The preset's sensitivity axes as the API returns them: WACC rows, base-margin columns, %. */
+  const OUTPUT_MATRIX_WACC = ["16.00", "17.00", "18.00", "19.00", "20.00"] as const;
+  const OUTPUT_MATRIX_MARGINS = ["3.00", "3.50", "4.00", "4.50", "5.00", "5.50", "6.00"] as const;
+  /** The preset's KES 7.50 offer in hundredths, the threshold of the matrix and bar colours. */
+  const OUTPUT_OFFER_CENTS = 750;
+  /** `SensitivityMatrix` cell tones: at or above the offer, below it, and not comparable. */
+  const OUTPUT_TONE_AT_OR_ABOVE_OFFER = "bg-emerald-900/60 text-emerald-100";
+  const OUTPUT_TONE_BELOW_OFFER = "bg-rose-900/60 text-rose-100";
+  const OUTPUT_TONE_NOT_COMPARABLE = "bg-slate-800 text-slate-400";
+  /** Method bar fills of `lib/chartTheme.ts`: emerald-500 at or above the offer, rose-500 below. */
+  const OUTPUT_BAR_FILL_AT_OR_ABOVE_OFFER = "#00bc7d";
+  const OUTPUT_BAR_FILL_BELOW_OFFER = "#ff2056";
+  /** U+00D7, the suffix `lib/format.ts` renders after a ratio. */
+  const OUTPUT_RATIO_SIGN = "\u00d7";
+  /**
+   * Preset matrix cells whose fair values are known without the blended result, in hundredths of
+   * a KES: the four hand-calculated corners, then the cells just below (7.49) and just above
+   * (7.73) the offer.
+   */
+  const OUTPUT_REFERENCE_CELLS = [
+    { wacc: "16.00", margin: "3.00", cents: 297, tone: OUTPUT_TONE_BELOW_OFFER },
+    { wacc: "16.00", margin: "6.00", cents: 1250, tone: OUTPUT_TONE_AT_OR_ABOVE_OFFER },
+    { wacc: "20.00", margin: "3.00", cents: 214, tone: OUTPUT_TONE_BELOW_OFFER },
+    { wacc: "20.00", margin: "6.00", cents: 1016, tone: OUTPUT_TONE_AT_OR_ABOVE_OFFER },
+    { wacc: "20.00", margin: "5.00", cents: 749, tone: OUTPUT_TONE_BELOW_OFFER },
+    { wacc: "16.00", margin: "4.50", cents: 773, tone: OUTPUT_TONE_AT_OR_ABOVE_OFFER },
+  ] as const;
+  /** The flag of a matrix cell whose WACC does not exceed terminal growth. */
+  const OUTPUT_NULL_CELL_FLAG = "wacc_not_above_terminal_growth";
+  /** The flag of a comparables value for a non-positive base EBITDA. */
+  const OUTPUT_NULL_COMPS_FLAG = "comps_non_positive_ebitda";
+
+  /** The matrix cell at a WACC and base margin, each as the API's 2-decimal string. */
+  function outputMatrixCell(matrix: Locator, wacc: string, margin: string): Locator {
+    return withAttributes(matrix, "sensitivity-cell", { "data-wacc": wacc, "data-margin": margin });
+  }
+
+  /** One computed style property of an element, as the browser resolves it. */
+  async function outputComputedStyle(
+    locator: Locator,
+    property: "backgroundColor" | "boxShadow",
+  ): Promise<string> {
+    return locator.evaluate((element, name) => getComputedStyle(element)[name], property);
+  }
+
+  /** An SVG element's box in its chart's user coordinates, where y grows downward. */
+  async function outputSvgBox(
+    locator: Locator,
+  ): Promise<{ x: number; y: number; width: number; height: number }> {
+    return locator.evaluate((element) => {
+      if (!(element instanceof SVGGraphicsElement)) {
+        throw new Error(`<${element.tagName}> is not an SVG graphics element`);
+      }
+      const box = element.getBBox();
+      return { x: box.x, y: box.y, width: box.width, height: box.height };
+    });
+  }
+
   test("values the Quickmart preset at KES 6.82 with a 5 × 7 sensitivity matrix", async ({
     page,
   }) => {
@@ -1463,6 +1579,57 @@ test.describe("IPO valuation sandbox (/ipo)", () => {
 
     expect(toCents(await blended.textContent())).toBe(682);
     await expect(sandbox.getByTestId("ipo-upside")).toContainText(`${MINUS_SIGN}9.11%`);
+
+    // The per-method cards, and the implied multiple at the offer: (7.50 × 1,000,000,000 shares
+    // + 4,000,000,000 net debt) ÷ (45,000,000,000 × 4.50%) = 5.68×. A blended value below the
+    // offer is labelled as downside, in the rose tone.
+    await expect(sandbox.getByTestId("ipo-dcf-fair-value")).toHaveText("KES 5.48");
+    await expect(sandbox.getByTestId("ipo-comps-fair-value")).toHaveText("KES 8.15");
+    await expect(sandbox.getByTestId("ipo-implied-ev-ebitda")).toHaveText(
+      `5.68${OUTPUT_RATIO_SIGN}`,
+    );
+    const upside = sandbox.getByTestId("ipo-upside");
+    await expect(upside.locator("xpath=preceding-sibling::dt")).toHaveText("Downside vs offer");
+    await expect(upside).toContainClass("text-rose-400");
+    await expect(upside).not.toContainClass("text-emerald-400");
+
+    // The method chart: DCF, comparables and blended bars, left to right and as tall as their
+    // values rank (5.48 < 6.82 < 8.15), coloured against the offer. Only the comparables bar
+    // reaches above the labelled offer line. The chart's description gives every value.
+    const chart = sandbox.getByTestId("ipo-fair-value-chart");
+    const bars = chart.locator(".recharts-bar-rectangle path.recharts-rectangle");
+    await expect(bars).toHaveCount(3);
+    const dcfBar = bars.nth(0);
+    const compsBar = bars.nth(1);
+    const blendedBar = bars.nth(2);
+    await expect(dcfBar).toHaveAttribute("fill", OUTPUT_BAR_FILL_BELOW_OFFER);
+    await expect(compsBar).toHaveAttribute("fill", OUTPUT_BAR_FILL_AT_OR_ABOVE_OFFER);
+    await expect(blendedBar).toHaveAttribute("fill", OUTPUT_BAR_FILL_BELOW_OFFER);
+    for (const bar of [dcfBar, compsBar, blendedBar]) {
+      await expect
+        .poll(async () => {
+          const box = await outputSvgBox(bar);
+          return Math.min(box.width, box.height);
+        })
+        .toBeGreaterThan(0);
+    }
+    const dcfBox = await outputSvgBox(dcfBar);
+    const compsBox = await outputSvgBox(compsBar);
+    const blendedBox = await outputSvgBox(blendedBar);
+    expect(dcfBox.x).toBeLessThan(compsBox.x);
+    expect(compsBox.x).toBeLessThan(blendedBox.x);
+    expect(dcfBox.height).toBeLessThan(blendedBox.height);
+    expect(blendedBox.height).toBeLessThan(compsBox.height);
+    const offerLine = chart.locator("line.recharts-reference-line-line");
+    await expect(offerLine).toHaveCount(1);
+    const offerY = (await outputSvgBox(offerLine)).y;
+    expect(compsBox.y).toBeLessThan(offerY);
+    expect(dcfBox.y).toBeGreaterThan(offerY);
+    expect(blendedBox.y).toBeGreaterThan(offerY);
+    await expect(chart.locator("text.recharts-label")).toHaveText(["Offer KES 7.50"]);
+    await expect(chart.locator("svg.recharts-surface > desc")).toHaveText(
+      "DCF KES 5.48, Comparables KES 8.15, Blended KES 6.82; offer KES 7.50",
+    );
 
     // 5 WACC rows (16–20%) × 7 base-margin columns (3.0–6.0%); the preset's 18% × 4.5% cell is
     // the one outlined.
@@ -1473,64 +1640,1099 @@ test.describe("IPO valuation sandbox (/ipo)", () => {
     expect(toCents(await selectedCell.getAttribute("data-wacc"))).toBe(1800);
     expect(toCents(await selectedCell.getAttribute("data-margin"))).toBe(450);
 
+    // The headers: the corner, the margins left to right, the WACC values top to bottom. Each row
+    // holds one cell per margin column, carrying its row's WACC and its column's margin, coloured
+    // by its own fair value against the offer, compared in hundredths.
+    await expect(matrix.locator("thead th")).toHaveText([
+      /WACC.*Margin/,
+      ...OUTPUT_MATRIX_MARGINS.map((margin) => `${margin}%`),
+    ]);
+    await expect(matrix.locator("tbody th")).toHaveText(
+      OUTPUT_MATRIX_WACC.map((wacc) => `${wacc}%`),
+    );
+    const bodyRows = matrix.locator("tbody tr");
+    await expect(bodyRows).toHaveCount(OUTPUT_MATRIX_WACC.length);
+    for (const [rowIndex, wacc] of OUTPUT_MATRIX_WACC.entries()) {
+      const rowCells = bodyRows.nth(rowIndex).getByTestId("sensitivity-cell");
+      await expect(rowCells).toHaveCount(OUTPUT_MATRIX_MARGINS.length);
+      for (const [columnIndex, margin] of OUTPUT_MATRIX_MARGINS.entries()) {
+        const cell = rowCells.nth(columnIndex);
+        await expect(cell).toHaveAttribute("data-wacc", wacc);
+        await expect(cell).toHaveAttribute("data-margin", margin);
+        const atOrAboveOffer = toCents(await cell.textContent()) >= OUTPUT_OFFER_CENTS;
+        await expect(cell).toContainClass(
+          atOrAboveOffer ? OUTPUT_TONE_AT_OR_ABOVE_OFFER : OUTPUT_TONE_BELOW_OFFER,
+        );
+        await expect(cell).not.toContainClass(
+          atOrAboveOffer ? OUTPUT_TONE_BELOW_OFFER : OUTPUT_TONE_AT_OR_ABOVE_OFFER,
+        );
+      }
+    }
+
+    // Cell values independent of the blended result, each in its expected tone.
+    for (const reference of OUTPUT_REFERENCE_CELLS) {
+      const cell = outputMatrixCell(matrix, reference.wacc, reference.margin);
+      await expect(cell).toHaveCount(1);
+      expect(toCents(await cell.textContent())).toBe(reference.cents);
+      await expect(cell).toContainClass(reference.tone);
+    }
+
+    // The tone classes are compiled: the emerald 7.73 and rose 7.49 cells paint different,
+    // non-transparent backgrounds.
+    const emeraldBackground = await outputComputedStyle(
+      outputMatrixCell(matrix, "16.00", "4.50"),
+      "backgroundColor",
+    );
+    const roseBackground = await outputComputedStyle(
+      outputMatrixCell(matrix, "20.00", "5.00"),
+      "backgroundColor",
+    );
+    expect(emeraldBackground).not.toBe(roseBackground);
+    expect([emeraldBackground, roseBackground]).not.toContain("rgba(0, 0, 0, 0)");
+
+    // The outlined cell is the only current one for assistive technology, holds the preset's own
+    // valuation and draws its sky ring, which no other cell has.
+    await expect(matrix.locator("[aria-current]")).toHaveCount(1);
+    await expect(selectedCell).toHaveAttribute("aria-current", "true");
+    await expect(
+      withAttributes(matrix, "sensitivity-cell", { "data-selected": "false" }),
+    ).toHaveCount(34);
+    expect(toCents(await selectedCell.textContent())).toBe(682);
+    await expect(selectedCell).toContainText(`${MINUS_SIGN}9.11%`);
+    await expect(selectedCell).toHaveAttribute(
+      "title",
+      `Downside ${MINUS_SIGN}9.11% vs offer KES 7.50`,
+    );
+    await expect(selectedCell).toContainClass("ring-2 ring-inset ring-sky-400");
+    await expect(matrix.locator(".ring-sky-400")).toHaveCount(1);
+    expect(await outputComputedStyle(selectedCell, "boxShadow")).not.toBe("none");
+    expect(
+      await outputComputedStyle(outputMatrixCell(matrix, "18.00", "4.00"), "boxShadow"),
+    ).toBe("none");
+
     await expect(sandbox.getByTestId("ipo-risk-scenario")).toHaveCount(3);
   });
+
+  test("a null matrix cell and comparables value show an em dash explained by their flags", async ({
+    page,
+  }) => {
+    // The server's own preset valuation, except that the 16% × 3.0% cell is null with the flag a
+    // WACC at or below terminal growth gives it, and the comparables value is null with the flag
+    // of a non-positive base EBITDA. Only the rendering of null values is under test.
+    let fulfilledValuations = 0;
+    await page.route(IPO_VALUATION_ROUTE, async (route) => {
+      const response = await route.fetch();
+      if (!response.ok()) {
+        await route.fulfill({ response });
+        return;
+      }
+      const valuation = (await response.json()) as IpoValuationResponse;
+      valuation.sensitivity.cells = valuation.sensitivity.cells.map((row) =>
+        row.map((cell) =>
+          cell.wacc_pct === "16.00" && cell.ebitda_margin_pct === "3.00"
+            ? {
+                ...cell,
+                fair_value_per_share_kes: null,
+                upside_pct: null,
+                flags: [OUTPUT_NULL_CELL_FLAG],
+              }
+            : cell,
+        ),
+      );
+      valuation.comparables = {
+        ...valuation.comparables,
+        enterprise_value_kes: null,
+        equity_value_kes: null,
+        fair_value_per_share_kes: null,
+        flags: [OUTPUT_NULL_COMPS_FLAG],
+      };
+      valuation.flags = [...valuation.flags, OUTPUT_NULL_COMPS_FLAG, OUTPUT_NULL_CELL_FLAG];
+      fulfilledValuations += 1;
+      await route.fulfill({ response, json: valuation });
+    });
+
+    const { sandbox } = await openSandbox(page);
+    expect(fulfilledValuations).toBeGreaterThanOrEqual(1);
+
+    // The null cell: an em dash for sighted users, its flag for screen readers and as its pointer
+    // tooltip, in the neutral tone rather than either comparison colour.
+    const matrix = sandbox.getByTestId("terminal-sensitivity-matrix");
+    const nullCell = outputMatrixCell(matrix, "16.00", "3.00");
+    await expect(nullCell).toHaveAttribute("title", OUTPUT_NULL_CELL_FLAG);
+    await expect(nullCell.locator('[aria-hidden="true"]')).toHaveText(EMPTY_VALUE);
+    await expect(nullCell.locator(".sr-only")).toHaveText(
+      `Not computable: ${OUTPUT_NULL_CELL_FLAG}`,
+    );
+    await expect(nullCell).toContainClass(OUTPUT_TONE_NOT_COMPARABLE);
+    await expect(nullCell).not.toContainClass(OUTPUT_TONE_AT_OR_ABOVE_OFFER);
+    await expect(nullCell).not.toContainClass(OUTPUT_TONE_BELOW_OFFER);
+    const neutralBackground = await outputComputedStyle(nullCell, "backgroundColor");
+    for (const [wacc, margin] of [
+      ["16.00", "4.50"],
+      ["16.00", "3.50"],
+    ] as const) {
+      expect(neutralBackground).not.toBe(
+        await outputComputedStyle(outputMatrixCell(matrix, wacc, margin), "backgroundColor"),
+      );
+    }
+    // The rest of the matrix is still compared with the offer.
+    const corner = outputMatrixCell(matrix, "16.00", "6.00");
+    expect(toCents(await corner.textContent())).toBe(1250);
+    await expect(corner).toContainClass(OUTPUT_TONE_AT_OR_ABOVE_OFFER);
+
+    // The keyboard explanation: the matrix's only button, described by a tooltip holding the
+    // flag, which keyboard focus shows and Escape hides.
+    const explanation = nullCell.getByRole("button");
+    await expect(matrix.getByRole("button")).toHaveCount(1);
+    await expect(explanation).toHaveAccessibleDescription(OUTPUT_NULL_CELL_FLAG);
+    const tooltip = nullCell.getByRole("tooltip", { includeHidden: true });
+    await expect(tooltip).toHaveText(OUTPUT_NULL_CELL_FLAG);
+    await expect(tooltip).toBeHidden();
+    await explanation.focus();
+    await expect(tooltip).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(tooltip).toBeHidden();
+
+    // The comparables card: an em dash, explained by its flag as the tooltip and to screen
+    // readers; the chart's description and the valuation's flag list carry the flags too.
+    const comps = sandbox.getByTestId("ipo-comps-fair-value");
+    await expect(comps).toHaveAttribute("title", OUTPUT_NULL_COMPS_FLAG);
+    await expect(comps).toHaveText(`${EMPTY_VALUE}: ${OUTPUT_NULL_COMPS_FLAG}`);
+    await expect(comps.locator(".sr-only")).toHaveText(`: ${OUTPUT_NULL_COMPS_FLAG}`);
+    await expect(
+      sandbox.getByTestId("ipo-fair-value-chart").locator("svg.recharts-surface > desc"),
+    ).toContainText(`Comparables ${EMPTY_VALUE}`);
+    await expect(sandbox.getByTestId("ipo-flag")).toHaveText([
+      OUTPUT_NULL_COMPS_FLAG,
+      OUTPUT_NULL_CELL_FLAG,
+    ]);
+  });
+
+  // Request lifecycle of the valuation. The browser clock and the valuation route are under the
+  // tests' control, so the debounce and the held, superseded and suppressed requests are proven
+  // without wall-clock waits. Expected bodies are input literals and expected fair values are
+  // the server's own responses; no valuation is computed here.
+
+  /** The sandbox's default debounce: inputs left unchanged this long are posted. */
+  const LIFECYCLE_DEBOUNCE_MS = 150;
+  /**
+   * Fake time well past the debounce and well below the client's 20 s request deadline, so a held
+   * request never times out while the clock advances.
+   */
+  const LIFECYCLE_IDLE_MS = 5_000;
+  /** How far past the page's own time the paused clock is set; also below the 20 s deadline. */
+  const LIFECYCLE_PAUSE_LEAD_MS = 5_000;
+  /** The longest the settled valuation may take after the final slider input. */
+  const LIFECYCLE_SETTLE_BUDGET_MS = 2_000;
+  /** The output's class while a valuation is pending. */
+  const LIFECYCLE_DIMMED_CLASS = /(?:^|\s)opacity-60(?:\s|$)/;
+  /** U+2026, the ellipsis of the "Recalculating…" indicator. */
+  const LIFECYCLE_RECALCULATING_TEXT = "Recalculating\u2026";
+
+  /**
+   * The body posted for the seeded Quickmart preset: sliders serialized from their positions at
+   * each slider's scale (net debt in whole KES, DCF weight in whole percent), text inputs as the
+   * preset's own strings, counts as JSON integers, and no sensitivity axes.
+   */
+  const LIFECYCLE_PRESET_BODY: Readonly<Record<string, string | number>> = {
+    offer_price_kes: "7.50",
+    revenue_growth_pct: "10.00",
+    ebitda_margin_pct: "4.50",
+    margin_expansion_pct: "0.50",
+    wacc_pct: "18.00",
+    terminal_growth_pct: "5.00",
+    net_debt_kes: "4000000000",
+    nwc_pct_revenue: "-3.00",
+    peer_ev_ebitda_multiple: "6.00",
+    dcf_weight_pct: "50",
+    capex_pct_revenue: "2.00",
+    da_pct_revenue: "1.50",
+    tax_rate_pct: "30.00",
+    forecast_years: 5,
+    base_revenue_kes: "45000000000.00",
+    shares_outstanding: 1_000_000_000,
+    shares_offered: 500_000_000,
+    primary_proceeds_kes: "0.00",
+  };
+
+  /** Each slider, and the exact string one ArrowRight step from its preset position sends. */
+  const LIFECYCLE_SLIDER_STEPS = [
+    { field: "offer_price_kes", sent: "7.55" },
+    { field: "revenue_growth_pct", sent: "10.50" },
+    { field: "ebitda_margin_pct", sent: "4.75" },
+    { field: "margin_expansion_pct", sent: "0.75" },
+    { field: "wacc_pct", sent: "18.25" },
+    { field: "terminal_growth_pct", sent: "5.25" },
+    { field: "net_debt_kes", sent: "4250000000" },
+    { field: "nwc_pct_revenue", sent: "-2.50" },
+    { field: "peer_ev_ebitda_multiple", sent: "6.25" },
+    { field: "dcf_weight_pct", sent: "55" },
+  ] as const;
+
+  /**
+   * Each text input, a valid string typed into it and what it sends: the typed string unchanged,
+   * trailing zeros included, and counts as JSON integers.
+   */
+  const LIFECYCLE_TEXT_ENTRIES = [
+    { field: "capex_pct_revenue", typed: "2.5", sent: "2.5" },
+    { field: "da_pct_revenue", typed: "1.25", sent: "1.25" },
+    { field: "tax_rate_pct", typed: "25.0000", sent: "25.0000" },
+    { field: "forecast_years", typed: "7", sent: 7 },
+    { field: "base_revenue_kes", typed: "50000000000.50", sent: "50000000000.50" },
+    { field: "shares_outstanding", typed: "1200000000", sent: 1_200_000_000 },
+    { field: "shares_offered", typed: "400000000", sent: 400_000_000 },
+    { field: "primary_proceeds_kes", typed: "1000000.10", sent: "1000000.10" },
+  ] as const;
+
+  /**
+   * Tax rates refused by the field's own check (0–50, 4 dp, no spaces around it, since it is sent
+   * as typed), and the message shown for each.
+   */
+  const LIFECYCLE_INVALID_TAX_RATES = [
+    { typed: "abc", message: "Enter a valid number" },
+    { typed: "60", message: "Must be at most 50" },
+    { typed: " 25 ", message: "Remove the spaces around the number" },
+  ] as const;
+
+  /** A late answer attempted for a superseded valuation request. */
+  interface LifecycleStaleAnswer {
+    kind: string;
+    /** The answer, built from the server's response to the preset. */
+    answer: (preset: JsonObject) => { status: number; json: unknown };
+  }
+
+  /**
+   * A success carrying a blended value no valuation of these inputs gives, and a server error
+   * that would raise the general error; neither may ever be shown.
+   */
+  const LIFECYCLE_STALE_ANSWERS: readonly LifecycleStaleAnswer[] = [
+    {
+      kind: "success",
+      answer: (preset) => ({
+        status: 200,
+        json: { ...preset, blended_fair_value_per_share_kes: "99.99" },
+      }),
+    },
+    {
+      kind: "error",
+      answer: () => ({ status: 500, json: { detail: "Stale valuation failure" } }),
+    },
+  ];
+
+  /** A valuation POST held by the test's route until the test answers it. */
+  interface LifecycleHeldPost {
+    route: Route;
+    request: Request;
+    body: unknown;
+  }
+
+  /** What the sandbox has shown since {@link lifecycleWatchOutput} started watching it. */
+  interface LifecycleShown {
+    /** Each successive distinct text of the blended fair value card. */
+    blended: string[];
+    /** Whether the general error banner ever appeared. */
+    generalError: boolean;
+  }
+
+  /**
+   * Holds every valuation POST the page sends from now on, in send order. Each stays pending
+   * until the test continues or fulfils it, or the page aborts it.
+   */
+  async function lifecycleHoldPosts(page: Page): Promise<LifecycleHeldPost[]> {
+    const held: LifecycleHeldPost[] = [];
+    await page.route(IPO_VALUATION_ROUTE, async (route, request) => {
+      if (!isValuationPost(request)) {
+        await route.fallback();
+        return;
+      }
+      const body: unknown = request.postDataJSON();
+      held.push({ route, request, body });
+    });
+    return held;
+  }
+
+  /** Held POST number `count` (1-based), once the page has sent it. */
+  async function lifecycleHeld(
+    held: readonly LifecycleHeldPost[],
+    count: number,
+  ): Promise<LifecycleHeldPost> {
+    await expect
+      .poll(() => held.length, { message: `valuation POST ${count} is held` })
+      .toBeGreaterThanOrEqual(count);
+    const post = held[count - 1];
+    if (post === undefined) throw new Error(`No held valuation POST ${count}`);
+    return post;
+  }
+
+  /** The blended fair value per share of a decoded valuation response, as the API's string. */
+  function lifecycleBlended(served: JsonObject): string {
+    const value = served.blended_fair_value_per_share_kes;
+    if (typeof value !== "string") {
+      throw new Error(`No blended fair value in ${JSON.stringify(served)}`);
+    }
+    return value;
+  }
+
+  /** Lets a held POST through to the API and returns the server's decoded 200 response. */
+  async function lifecycleRelease(post: LifecycleHeldPost): Promise<JsonObject> {
+    await post.route.continue();
+    const response = await post.request.response();
+    expect(response?.status(), "the released valuation's status").toBe(200);
+    return valuationJson(response);
+  }
+
+  /**
+   * Waits until valuation POST number `count` (1-based) is answered 200 and the sandbox has
+   * settled on it, with no "Recalculating…" left, and returns the server's decoded response.
+   */
+  async function lifecycleSettle(
+    sandbox: Locator,
+    posts: readonly ValuationPost[],
+    count: number,
+  ): Promise<JsonObject> {
+    await expect
+      .poll(() => posts[count - 1]?.response?.status() ?? null, {
+        message: `valuation POST ${count} is answered`,
+      })
+      .toBe(200);
+    await expect(sandbox.getByTestId("ipo-recalculating")).toHaveCount(0);
+    return valuationJson(posts[count - 1]?.response ?? null);
+  }
+
+  /** The page-load POST is the only one so far and carries exactly the preset's body. */
+  async function lifecycleExpectPresetPost(posts: readonly ValuationPost[]): Promise<void> {
+    await expect.poll(() => posts.length, { message: "page-load valuation POSTs" }).toBe(1);
+    expect(posts[0]?.body).toEqual(LIFECYCLE_PRESET_BODY);
+  }
+
+  /**
+   * Opens the sandbox with the browser clock installed and running, so the preset loads and
+   * settles normally, then pauses the clock: from then on no timer, the debounce included, fires
+   * until the test advances it.
+   *
+   * `started()` counts the valuation POSTs the page has handed to `fetch` since the pause. The
+   * count is kept in the page and read by a fresh evaluation, which runs only once every promise
+   * callback queued before it has run, so it already includes a request started by a timer the
+   * last clock advance fired. Playwright's own request events carry no such ordering.
+   */
+  async function lifecycleOpenPaused(page: Page): Promise<{
+    sandbox: Locator;
+    blended: Locator;
+    started: () => Promise<number>;
+  }> {
+    await page.addInitScript((path) => {
+      const counter = { valuationPosts: 0 };
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+        let url: string;
+        let method = init?.method;
+        if (typeof input === "string") {
+          url = input;
+        } else if (input instanceof URL) {
+          url = input.href;
+        } else {
+          url = input.url;
+          method ??= input.method;
+        }
+        const pathname = new URL(url, window.location.href).pathname;
+        if ((method ?? "GET").toUpperCase() === "POST" && pathname === path) {
+          counter.valuationPosts += 1;
+        }
+        return originalFetch(input, init);
+      };
+      (window as unknown as { lifecycleCounter?: typeof counter }).lifecycleCounter = counter;
+    }, IPO_VALUATION_PATH);
+    const readCount = (): Promise<number> =>
+      page.evaluate(() => {
+        const store = window as unknown as { lifecycleCounter?: { valuationPosts: number } };
+        return store.lifecycleCounter?.valuationPosts ?? Number.NaN;
+      });
+    await page.clock.install();
+    const opened = await openSandbox(page);
+    const pageNow = await page.evaluate(() => Date.now());
+    await page.clock.pauseAt(pageNow + LIFECYCLE_PAUSE_LEAD_MS);
+    const atPause = await readCount();
+    return { ...opened, started: async () => (await readCount()) - atPause };
+  }
+
+  /**
+   * Records in the page, with a MutationObserver on the sandbox root, every text the blended
+   * fair value card shows and whether the general error banner ever appears, so a result shown
+   * only briefly is caught even between two assertions. Returns a reader of the record.
+   */
+  async function lifecycleWatchOutput(sandbox: Locator): Promise<() => Promise<LifecycleShown>> {
+    await sandbox.evaluate((root) => {
+      const shown: LifecycleShown = { blended: [], generalError: false };
+      const record = (): void => {
+        const card = root.querySelector('[data-testid="ipo-blended-fair-value"]');
+        const text = card?.textContent ?? "";
+        if (shown.blended.at(-1) !== text) shown.blended.push(text);
+        if (root.querySelector('[data-testid="ipo-general-error"]') !== null) {
+          shown.generalError = true;
+        }
+      };
+      record();
+      new MutationObserver(record).observe(root, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+      });
+      (window as unknown as { lifecycleShown?: LifecycleShown }).lifecycleShown = shown;
+    });
+    return () =>
+      sandbox.page().evaluate(() => {
+        const shown = (window as unknown as { lifecycleShown?: LifecycleShown }).lifecycleShown;
+        if (shown === undefined) throw new Error("The sandbox output is not being watched");
+        return shown;
+      });
+  }
 
   test("moving the WACC slider to 16.00% raises the blended fair value within 2 s", async ({
     page,
   }) => {
     const { sandbox, blended } = await openSandbox(page);
+    const posts = recordValuationPosts(page);
 
     // The slider holds hundredths of a percentage point with a 25-unit step, so eight
     // ArrowLeft presses move it from 1800 (18.00%) to 1600 (16.00%).
     const wacc = sandbox.getByTestId("ipo-input-wacc_pct");
     await expect(wacc).toHaveValue("1800");
     await wacc.focus();
-    for (let press = 0; press < 8; press += 1) {
+    for (let press = 1; press < 8; press += 1) {
       await wacc.press("ArrowLeft");
     }
-    await expect(wacc).toHaveValue("1600");
-    await expect(sandbox.getByTestId("ipo-value-wacc_pct")).toContainText("16.00");
+    // One 2 s budget, started just before the eighth and final input, covers every check of the
+    // settled result below; each waits only for the time left of it.
+    const finalInputAt = Date.now();
+    await wacc.press("ArrowLeft");
+    const timeLeft = (): { timeout: number } => ({
+      // At least 1 ms: a zero timeout would mean no limit at all.
+      timeout: Math.max(1, finalInputAt + LIFECYCLE_SETTLE_BUDGET_MS - Date.now()),
+    });
+    await expect(wacc).toHaveValue("1600", timeLeft());
+    await expect(sandbox.getByTestId("ipo-value-wacc_pct")).toHaveText("16.00%", timeLeft());
 
+    // The settled request is the last POST sent, for exactly "16.00", answered 200; a response
+    // to an intermediate WACC never matches.
     await expect
-      .poll(async () => toCents(await blended.textContent()), { timeout: 2_000 })
-      .toBeGreaterThan(682);
+      .poll(
+        () => {
+          const last = posts.at(-1);
+          return last === undefined
+            ? null
+            : { wacc: jsonObject(last.body).wacc_pct, status: last.response?.status() };
+        },
+        { ...timeLeft(), message: "the last valuation POST is WACC 16.00, answered 200" },
+      )
+      .toEqual({ wacc: "16.00", status: 200 });
+    const settled = posts.at(-1);
+    const servedBlended = lifecycleBlended(await valuationJson(settled?.response ?? null));
+    expect(toCents(servedBlended)).toBeGreaterThan(682);
 
-    // The settled result is the server's valuation at 16.00%: the outlined matrix cell moves to
-    // the 16% row and carries the same blended value.
-    await expect(sandbox.getByTestId("ipo-recalculating")).toHaveCount(0);
+    // The screen shows that response: no indicator, its blended value, and the outlined matrix
+    // cell in the 16% row carrying the same value.
+    await expect(sandbox.getByTestId("ipo-recalculating")).toHaveCount(0, timeLeft());
+    await expect
+      .poll(async () => toCents(await blended.textContent()), timeLeft())
+      .toBe(toCents(servedBlended));
     const selectedCell = withAttributes(sandbox, "sensitivity-cell", { "data-selected": "true" });
-    await expect(selectedCell).toHaveCount(1);
-    expect(toCents(await selectedCell.getAttribute("data-wacc"))).toBe(1600);
-    expect(toCents(await selectedCell.textContent())).toBe(toCents(await blended.textContent()));
+    await expect(selectedCell).toHaveCount(1, timeLeft());
+    await expect(selectedCell).toHaveAttribute("data-wacc", "16.00", timeLeft());
+    await expect(selectedCell).toHaveAttribute("data-margin", "4.50", timeLeft());
+    expect(toCents(await selectedCell.textContent())).toBe(toCents(servedBlended));
 
-    await expect(sandbox).toHaveAttribute("data-state", "ready");
-    await expect(sandbox.getByTestId("field-error-wacc_pct")).toHaveCount(0);
-    await expect(sandbox.getByTestId("ipo-general-error")).toHaveCount(0);
+    await expect(sandbox).toHaveAttribute("data-state", "ready", timeLeft());
+    await expect(sandbox.getByTestId("field-error-wacc_pct")).toHaveCount(0, timeLeft());
+    await expect(sandbox.getByTestId("ipo-general-error")).toHaveCount(0, timeLeft());
+    expect(posts.at(-1)).toBe(settled);
+    expect(Date.now() - finalInputAt).toBeLessThanOrEqual(LIFECYCLE_SETTLE_BUDGET_MS);
   });
+
+  test("slider changes show at once, and only the last is posted, 150 ms after it", async ({
+    page,
+  }) => {
+    const { sandbox, blended, started } = await lifecycleOpenPaused(page);
+    const posts = recordValuationPosts(page);
+
+    // Four changes 100 ms apart: each shows beside its slider at once and posts nothing. The
+    // burst lasts twice the debounce, but the inputs never stay unchanged for 150 ms.
+    const burst = [
+      { field: "wacc_pct", key: "ArrowLeft", shown: "17.75%" },
+      { field: "wacc_pct", key: "ArrowLeft", shown: "17.50%" },
+      { field: "terminal_growth_pct", key: "ArrowRight", shown: "5.25%" },
+      { field: "offer_price_kes", key: "ArrowRight", shown: "KES 7.55" },
+    ] as const;
+    for (const [index, change] of burst.entries()) {
+      if (index > 0) await page.clock.runFor(100);
+      await sandbox.getByTestId(`ipo-input-${change.field}`).press(change.key);
+      await expect(sandbox.getByTestId(`ipo-value-${change.field}`)).toHaveText(change.shown);
+      expect(await started()).toBe(0);
+    }
+
+    // The debounce runs from the last change only: 149 ms after it nothing is sent, and 1 ms
+    // later exactly one POST carries every change of the burst.
+    await page.clock.runFor(LIFECYCLE_DEBOUNCE_MS - 1);
+    expect(await started()).toBe(0);
+    await page.clock.runFor(1);
+    expect(await started()).toBe(1);
+    await expect.poll(() => posts.length).toBe(1);
+    expect(posts[0]?.body).toEqual({
+      ...LIFECYCLE_PRESET_BODY,
+      wacc_pct: "17.50",
+      terminal_growth_pct: "5.25",
+      offer_price_kes: "7.55",
+    });
+
+    const served = await lifecycleSettle(sandbox, posts, 1);
+    await expect
+      .poll(async () => toCents(await blended.textContent()))
+      .toBe(toCents(lifecycleBlended(served)));
+    expect(await started()).toBe(1);
+    expect(posts).toHaveLength(1);
+  });
+
+  for (const { field, sent } of LIFECYCLE_SLIDER_STEPS) {
+    test(`one step of the ${field} slider posts the preset body with ${field} "${sent}"`, async ({
+      page,
+    }) => {
+      const posts = recordValuationPosts(page);
+      const { sandbox, blended } = await openSandbox(page);
+      await lifecycleExpectPresetPost(posts);
+
+      await sandbox.getByTestId(`ipo-input-${field}`).press("ArrowRight");
+      const served = await lifecycleSettle(sandbox, posts, 2);
+      expect(posts[1]?.body).toEqual({ ...LIFECYCLE_PRESET_BODY, [field]: sent });
+      expect(posts).toHaveLength(2);
+      await expect
+        .poll(async () => toCents(await blended.textContent()))
+        .toBe(toCents(lifecycleBlended(served)));
+    });
+  }
+
+  for (const { field, typed, sent } of LIFECYCLE_TEXT_ENTRIES) {
+    test(`typing ${JSON.stringify(typed)} into ${field} posts the preset body with ${field} ${JSON.stringify(sent)}`, async ({
+      page,
+    }) => {
+      const posts = recordValuationPosts(page);
+      const { sandbox, blended } = await openSandbox(page);
+      await lifecycleExpectPresetPost(posts);
+
+      await sandbox.getByTestId(`ipo-input-${field}`).fill(typed);
+      const served = await lifecycleSettle(sandbox, posts, 2);
+      expect(posts[1]?.body).toEqual({ ...LIFECYCLE_PRESET_BODY, [field]: sent });
+      expect(posts).toHaveLength(2);
+      await expect(sandbox.getByTestId(`field-error-${field}`)).toHaveCount(0);
+      await expect
+        .poll(async () => toCents(await blended.textContent()))
+        .toBe(toCents(lifecycleBlended(served)));
+    });
+  }
+
+  test("a pending valuation keeps the previous result on screen, dimmed, until it settles", async ({
+    page,
+  }) => {
+    const { sandbox, blended, started } = await lifecycleOpenPaused(page);
+    const held = await lifecycleHoldPosts(page);
+    const output = sandbox.getByTestId("ipo-valuation-output");
+    const indicator = sandbox.getByTestId("ipo-recalculating");
+    await expect(output).not.toHaveClass(LIFECYCLE_DIMMED_CLASS);
+    await expect(output).toHaveCSS("opacity", "1");
+
+    await sandbox.getByTestId("ipo-input-wacc_pct").press("ArrowLeft");
+    await expect(sandbox.getByTestId("ipo-value-wacc_pct")).toHaveText("17.75%");
+    await page.clock.runFor(LIFECYCLE_DEBOUNCE_MS);
+    const pending = await lifecycleHeld(held, 1);
+    expect(pending.body).toEqual({ ...LIFECYCLE_PRESET_BODY, wacc_pct: "17.75" });
+
+    // Fake seconds pass with the request held: the preset's result stays, dimmed to 60% opacity
+    // beneath the indicator, and nothing else is sent.
+    await page.clock.runFor(LIFECYCLE_IDLE_MS);
+    expect(await started()).toBe(1);
+    expect(held).toHaveLength(1);
+    await expect(blended).toHaveText("KES 6.82");
+    await expect(output).toHaveClass(LIFECYCLE_DIMMED_CLASS);
+    await expect(output).toHaveCSS("opacity", "0.6");
+    await expect(indicator).toBeVisible();
+    await expect(indicator).toHaveText(LIFECYCLE_RECALCULATING_TEXT);
+    await expect(sandbox).toHaveAttribute("data-state", "ready");
+    await expect(sandbox.getByTestId("ipo-general-error")).toHaveCount(0);
+
+    // The server's answer replaces it at full opacity, and the indicator goes.
+    const servedBlended = lifecycleBlended(await lifecycleRelease(pending));
+    expect(toCents(servedBlended)).not.toBe(682);
+    await expect
+      .poll(async () => toCents(await blended.textContent()))
+      .toBe(toCents(servedBlended));
+    await expect(indicator).toHaveCount(0);
+    await expect(output).not.toHaveClass(LIFECYCLE_DIMMED_CLASS);
+    await expect(output).toHaveCSS("opacity", "1");
+    expect(await started()).toBe(1);
+    expect(held).toHaveLength(1);
+  });
+
+  for (const stale of LIFECYCLE_STALE_ANSWERS) {
+    test(`a superseded valuation is aborted, and a late ${stale.kind} answer to it is never shown`, async ({
+      page,
+    }) => {
+      const posts = recordValuationPosts(page);
+      const { sandbox, blended, started } = await lifecycleOpenPaused(page);
+      await lifecycleExpectPresetPost(posts);
+      const preset = await valuationJson(posts[0]?.response ?? null);
+      const held = await lifecycleHoldPosts(page);
+      const shown = await lifecycleWatchOutput(sandbox);
+      const wacc = sandbox.getByTestId("ipo-input-wacc_pct");
+      const waccValue = sandbox.getByTestId("ipo-value-wacc_pct");
+
+      // Request A, for WACC 17.75%, is sent and held.
+      await wacc.press("ArrowLeft");
+      await expect(waccValue).toHaveText("17.75%");
+      await page.clock.runFor(LIFECYCLE_DEBOUNCE_MS);
+      const requestA = await lifecycleHeld(held, 1);
+      expect(requestA.body).toEqual({ ...LIFECYCLE_PRESET_BODY, wacc_pct: "17.75" });
+
+      // Moving on to 17.50% aborts A at once, before B is even due.
+      await wacc.press("ArrowLeft");
+      await expect(waccValue).toHaveText("17.50%");
+      await expect
+        .poll(() => requestA.request.failure()?.errorText ?? null, { message: "request A failed" })
+        .toBe("net::ERR_ABORTED");
+      expect(await started()).toBe(1);
+      // The late answer to A. Playwright may refuse to answer a request the page has cancelled;
+      // either way, nothing of it may reach the screen.
+      await requestA.route.fulfill(stale.answer(preset)).catch(() => undefined);
+
+      // Request B is posted after the debounce and its server answer is the only one shown.
+      await page.clock.runFor(LIFECYCLE_DEBOUNCE_MS);
+      expect(await started()).toBe(2);
+      const requestB = await lifecycleHeld(held, 2);
+      expect(requestB.body).toEqual({ ...LIFECYCLE_PRESET_BODY, wacc_pct: "17.50" });
+      const servedBlended = lifecycleBlended(await lifecycleRelease(requestB));
+      await expect
+        .poll(async () => toCents(await blended.textContent()))
+        .toBe(toCents(servedBlended));
+      await expect(sandbox.getByTestId("ipo-recalculating")).toHaveCount(0);
+      await expect(sandbox.getByTestId("ipo-general-error")).toHaveCount(0);
+      await expect(sandbox).toHaveAttribute("data-state", "ready");
+      expect(await started()).toBe(2);
+      expect(held).toHaveLength(2);
+      expect(posts).toHaveLength(3);
+
+      // From the preset's result straight to B's: no other value and no error ever appeared.
+      const record = await shown();
+      expect(record.blended.map(toCents)).toEqual([682, toCents(servedBlended)]);
+      expect(record.generalError).toBe(false);
+    });
+  }
+
+  for (const { typed, message } of LIFECYCLE_INVALID_TAX_RATES) {
+    test(`tax rate ${JSON.stringify(typed)} is refused locally, aborting the valuation in flight and posting nothing`, async ({
+      page,
+    }) => {
+      const { sandbox, blended, started } = await lifecycleOpenPaused(page);
+      const posts = recordValuationPosts(page);
+      const held = await lifecycleHoldPosts(page);
+      const output = sandbox.getByTestId("ipo-valuation-output");
+      const indicator = sandbox.getByTestId("ipo-recalculating");
+      const taxRate = sandbox.getByTestId("ipo-input-tax_rate_pct");
+      const fieldError = sandbox.getByTestId("field-error-tax_rate_pct");
+
+      // A valid change is posted and held in flight.
+      await sandbox.getByTestId("ipo-input-wacc_pct").press("ArrowLeft");
+      await expect(sandbox.getByTestId("ipo-value-wacc_pct")).toHaveText("17.75%");
+      await page.clock.runFor(LIFECYCLE_DEBOUNCE_MS);
+      const inFlight = await lifecycleHeld(held, 1);
+
+      // The invalid text shows its message beneath the input and aborts the request in flight.
+      // Well past the debounce nothing is posted, and the preset's result stays, undimmed.
+      await taxRate.fill(typed);
+      await expect(fieldError).toHaveText(message);
+      await expect(taxRate).toHaveAttribute("aria-invalid", "true");
+      await expect
+        .poll(() => inFlight.request.failure()?.errorText ?? null, {
+          message: "the request in flight failed",
+        })
+        .toBe("net::ERR_ABORTED");
+      await page.clock.runFor(LIFECYCLE_IDLE_MS);
+      expect(await started()).toBe(1);
+      expect(posts).toHaveLength(1);
+      await expect(blended).toHaveText("KES 6.82");
+      await expect(indicator).toHaveCount(0);
+      await expect(output).not.toHaveClass(LIFECYCLE_DIMMED_CLASS);
+      await expect(output).toHaveCSS("opacity", "1");
+      await expect(sandbox).toHaveAttribute("data-state", "ready");
+      await expect(sandbox.getByTestId("ipo-general-error")).toHaveCount(0);
+
+      // Correcting the text clears the message and posts exactly once, after the debounce.
+      await taxRate.fill("25");
+      await expect(fieldError).toHaveCount(0);
+      await page.clock.runFor(LIFECYCLE_DEBOUNCE_MS - 1);
+      expect(await started()).toBe(1);
+      await page.clock.runFor(1);
+      expect(await started()).toBe(2);
+      const corrected = await lifecycleHeld(held, 2);
+      expect(corrected.body).toEqual({
+        ...LIFECYCLE_PRESET_BODY,
+        wacc_pct: "17.75",
+        tax_rate_pct: "25",
+      });
+      const servedBlended = lifecycleBlended(await lifecycleRelease(corrected));
+      await expect
+        .poll(async () => toCents(await blended.textContent()))
+        .toBe(toCents(servedBlended));
+      await expect(indicator).toHaveCount(0);
+      expect(await started()).toBe(2);
+      expect(posts).toHaveLength(2);
+    });
+  }
+
+  /** The server's coded 422 message for the preset with primary proceeds of 3,750,000,000.01. */
+  const FIELD_ERRORS_PRIMARY_MESSAGE =
+    "Primary proceeds (KES 3,750,000,000.01) cannot exceed the offer size (KES 3,750,000,000.00, " +
+    "offer price times shares offered): the difference would be negative secondary proceeds.";
+  /** The server's coded 422 message for the preset with WACC 8.00% and terminal growth 10.00%. */
+  const FIELD_ERRORS_WACC_MESSAGE = "WACC (8.00%) must be above the terminal growth rate (10.00%).";
+  /**
+   * Fake-clock time run after a change: far past the 150 ms debounce, and far short of the API
+   * client's 20 s request timeout, which the same clock drives.
+   */
+  const FIELD_ERRORS_PAST_DEBOUNCE_MS = 1_000;
+
+  /** Body fields a valuation POST must carry, each with its exact JSON value. */
+  type FieldErrorsBodyFields = Readonly<Record<string, string | number>>;
+  /** One change to an input: a key pressed on a slider, or the text typed into a text input. */
+  type FieldErrorsChange = { readonly press: string } | { readonly fill: string };
+
+  /** The response to the next valuation POST carrying `fields`; start it before the change. */
+  function fieldErrorsValuationResponse(
+    page: Page,
+    fields: FieldErrorsBodyFields,
+  ): Promise<Response> {
+    return page.waitForResponse((response) => {
+      const request = response.request();
+      if (!isValuationPost(request)) return false;
+      const body = jsonObject(request.postDataJSON());
+      return Object.entries(fields).every(([field, value]) => body[field] === value);
+    });
+  }
+
+  /** Makes `change` to `input` the way a user would: a key press, or typing the whole text. */
+  async function fieldErrorsChangeInput(input: Locator, change: FieldErrorsChange): Promise<void> {
+    if ("press" in change) {
+      await input.press(change.press);
+    } else {
+      await input.fill(change.fill);
+    }
+  }
+
+  /**
+   * Asserts `message`, exactly, beneath the input of `field`: inside that input's own field
+   * container, named by the input's `aria-describedby`, with the input marked `aria-invalid`.
+   */
+  async function fieldErrorsExpectBesideInput(
+    sandbox: Locator,
+    field: string,
+    message: string,
+  ): Promise<void> {
+    const input = sandbox.getByTestId(`ipo-input-${field}`);
+    const fieldError = input.locator("xpath=..").getByTestId(`field-error-${field}`);
+    await expect(fieldError).toHaveText(message);
+    await expect(input).toHaveAttribute("aria-invalid", "true");
+    const errorId = await fieldError.getAttribute("id");
+    expect(errorId).toBeTruthy();
+    expect((await input.getAttribute("aria-describedby"))?.split(" ")).toContain(errorId);
+  }
+
+  /** Asserts that the input of `field` shows no error and is no longer marked invalid. */
+  async function fieldErrorsExpectNone(sandbox: Locator, field: string): Promise<void> {
+    await expect(sandbox.getByTestId(`field-error-${field}`)).toHaveCount(0);
+    await expect(sandbox.getByTestId(`ipo-input-${field}`)).not.toHaveAttribute("aria-invalid");
+  }
+
+  /** Asserts that the result on screen is settled: undimmed, no indicator, the root `ready`. */
+  async function fieldErrorsExpectSettled(sandbox: Locator): Promise<void> {
+    await expect(sandbox.getByTestId("ipo-recalculating")).toHaveCount(0);
+    await expect(sandbox.getByTestId("ipo-valuation-output")).toHaveCSS("opacity", "1");
+    await expect(sandbox).toHaveAttribute("data-state", "ready");
+  }
 
   test("primary proceeds above the offer size show the server's field error beside the input", async ({
     page,
   }) => {
     const { sandbox, blended } = await openSandbox(page);
+    const primaryProceeds = sandbox.getByTestId("ipo-input-primary_proceeds_kes");
+    const primaryProceedsCard = sandbox.getByTestId("ipo-primary-proceeds");
+    const generalError = sandbox.getByTestId("ipo-general-error");
+    await expect(primaryProceeds).toHaveValue("0.00");
+    await expect(primaryProceedsCard).toHaveText("KES 0.00");
 
     // KES 7.50 × 500,000,000 shares offered is 3,750,000,000.00; one cent more passes the
-    // single-field check and is rejected by the server as primary_exceeds_offer_size.
-    const primaryProceeds = sandbox.getByTestId("ipo-input-primary_proceeds_kes");
-    const fieldError = sandbox.getByTestId("field-error-primary_proceeds_kes");
+    // single-field check and is rejected by the server as primary_exceeds_offer_size, a coded
+    // detail object rather than FastAPI's list.
+    const rejected = fieldErrorsValuationResponse(page, { primary_proceeds_kes: "3750000000.01" });
     await primaryProceeds.fill("3750000000.01");
-    await expect(fieldError).toBeVisible();
-    await expect(fieldError).toHaveText(/\S/);
-    await expect(blended).toContainText("6.82");
-    await expect(sandbox).toHaveAttribute("data-state", "ready");
-    await expect(sandbox.getByTestId("ipo-general-error")).toHaveCount(0);
+    const rejection = await rejected;
+    expect(rejection.status()).toBe(422);
+    expect(await rejection.json()).toEqual({
+      detail: {
+        code: "primary_exceeds_offer_size",
+        field: "primary_proceeds_kes",
+        message: FIELD_ERRORS_PRIMARY_MESSAGE,
+      },
+    });
+    await fieldErrorsExpectBesideInput(
+      sandbox,
+      "primary_proceeds_kes",
+      FIELD_ERRORS_PRIMARY_MESSAGE,
+    );
+    // The preset's result stays on screen, settled.
+    await fieldErrorsExpectSettled(sandbox);
+    expect(toCents(await blended.textContent())).toBe(682);
+    await expect(primaryProceedsCard).toHaveText("KES 0.00");
+    await expect(generalError).toHaveCount(0);
 
+    // "0" is sent as typed, which is not the preset's "0.00", so restoring it is a new valuation:
+    // the error clears once the server has answered it.
+    const recovered = fieldErrorsValuationResponse(page, { primary_proceeds_kes: "0" });
     await primaryProceeds.fill("0");
-    await expect(fieldError).toHaveCount(0);
-    await expect(sandbox.getByTestId("ipo-recalculating")).toHaveCount(0);
-    await expect(blended).toContainText("6.82");
-    await expect(sandbox).toHaveAttribute("data-state", "ready");
+    const recovery = await recovered;
+    expect(recovery.status()).toBe(200);
+    const recoveryBody = await valuationJson(recovery);
+    expect(recoveryBody.blended_fair_value_per_share_kes).toBe("6.82");
+    expect(recoveryBody.primary_proceeds_kes).toBe("0.00");
+    await fieldErrorsExpectNone(sandbox, "primary_proceeds_kes");
+    await fieldErrorsExpectSettled(sandbox);
+    expect(toCents(await blended.textContent())).toBe(
+      toCents(String(recoveryBody.blended_fair_value_per_share_kes)),
+    );
+    await expect(primaryProceedsCard).toHaveText("KES 0.00");
+    await expect(generalError).toHaveCount(0);
   });
+
+  test("WACC at or below terminal growth shows the server's coded error beneath the WACC slider", async ({
+    page,
+  }) => {
+    const { sandbox, blended } = await openSandbox(page);
+    const wacc = sandbox.getByTestId("ipo-input-wacc_pct");
+    const terminalGrowth = sandbox.getByTestId("ipo-input-terminal_growth_pct");
+    const generalError = sandbox.getByTestId("ipo-general-error");
+
+    // Home takes WACC to its 8.00% minimum, still above the preset's 5.00% terminal growth.
+    const lowered = fieldErrorsValuationResponse(page, {
+      wacc_pct: "8.00",
+      terminal_growth_pct: "5.00",
+    });
+    await wacc.focus();
+    await wacc.press("Home");
+    const lowWacc = await lowered;
+    expect(lowWacc.status()).toBe(200);
+    const lowWaccBlended = String((await valuationJson(lowWacc)).blended_fair_value_per_share_kes);
+    await fieldErrorsExpectSettled(sandbox);
+    expect(toCents(await blended.textContent())).toBe(toCents(lowWaccBlended));
+
+    // End takes terminal growth to its 10.00% maximum, so WACC no longer exceeds it.
+    const rejected = fieldErrorsValuationResponse(page, {
+      wacc_pct: "8.00",
+      terminal_growth_pct: "10.00",
+    });
+    await terminalGrowth.focus();
+    await terminalGrowth.press("End");
+    const rejection = await rejected;
+    expect(rejection.status()).toBe(422);
+    expect(await rejection.json()).toEqual({
+      detail: {
+        code: "wacc_not_above_terminal_growth",
+        field: "wacc_pct",
+        message: FIELD_ERRORS_WACC_MESSAGE,
+      },
+    });
+    await fieldErrorsExpectBesideInput(sandbox, "wacc_pct", FIELD_ERRORS_WACC_MESSAGE);
+    await fieldErrorsExpectNone(sandbox, "terminal_growth_pct");
+    await expect(sandbox.getByTestId("ipo-value-terminal_growth_pct")).toHaveText("10.00%");
+    // The 8.00% valuation stays on screen, settled.
+    await fieldErrorsExpectSettled(sandbox);
+    expect(toCents(await blended.textContent())).toBe(toCents(lowWaccBlended));
+    await expect(generalError).toHaveCount(0);
+
+    // End takes WACC up to 30.00%, above terminal growth again: valued and cleared.
+    const recovered = fieldErrorsValuationResponse(page, {
+      wacc_pct: "30.00",
+      terminal_growth_pct: "10.00",
+    });
+    await wacc.focus();
+    await wacc.press("End");
+    const recovery = await recovered;
+    expect(recovery.status()).toBe(200);
+    const recoveredBlended = String(
+      (await valuationJson(recovery)).blended_fair_value_per_share_kes,
+    );
+    expect(toCents(recoveredBlended)).not.toBe(toCents(lowWaccBlended));
+    await fieldErrorsExpectNone(sandbox, "wacc_pct");
+    await expect(wacc).not.toHaveAttribute("aria-describedby");
+    await fieldErrorsExpectSettled(sandbox);
+    expect(toCents(await blended.textContent())).toBe(toCents(recoveredBlended));
+    await expect(generalError).toHaveCount(0);
+  });
+
+  test("FastAPI's standard 422 list puts each item beneath its input, or in the general error", async ({
+    page,
+  }) => {
+    const { sandbox, blended } = await openSandbox(page);
+    // Pydantic's list for two request fields that have inputs, a text input and a slider, and
+    // one for a request field that has none.
+    const inputItems = [
+      {
+        type: "decimal_max_places",
+        loc: ["body", "tax_rate_pct"],
+        msg: "Decimal input should have no more than 4 decimal places",
+        input: "31",
+      },
+      {
+        type: "less_than_equal",
+        loc: ["body", "ebitda_margin_pct"],
+        msg: "Input should be less than or equal to 15",
+        input: "4.50",
+      },
+    ] as const;
+    const unmatchedItem = {
+      type: "too_long",
+      loc: ["body", "sensitivity_wacc_pct"],
+      msg: "List should have at most 9 items after validation, not 10",
+      input: ["10", "11", "12", "13", "14", "15", "16", "17", "18", "19"],
+    } as const;
+    const answeredBodies: JsonObject[] = [];
+    await page.route(
+      IPO_VALUATION_ROUTE,
+      async (route) => {
+        answeredBodies.push(jsonObject(route.request().postDataJSON()));
+        await route.fulfill({
+          status: 422,
+          contentType: "application/json",
+          body: JSON.stringify({ detail: [...inputItems, unmatchedItem] }),
+        });
+      },
+      { times: 1 },
+    );
+
+    const answered = fieldErrorsValuationResponse(page, { tax_rate_pct: "31" });
+    await sandbox.getByTestId("ipo-input-tax_rate_pct").fill("31");
+    expect((await answered).status()).toBe(422);
+    expect(answeredBodies.map((body) => body.tax_rate_pct)).toEqual(["31"]);
+
+    // Each item's msg sits beneath the input its last loc element names; the item that names no
+    // input is shown in the general error with its field, without a Retry.
+    for (const item of inputItems) {
+      await fieldErrorsExpectBesideInput(sandbox, item.loc[1], item.msg);
+    }
+    await expect(sandbox.locator('[data-testid^="field-error-"]')).toHaveCount(inputItems.length);
+    await expect(sandbox.getByTestId("ipo-general-error").locator("p")).toHaveText([
+      `${unmatchedItem.msg} (${unmatchedItem.loc[1]})`,
+    ]);
+    await expect(sandbox.getByTestId("ipo-retry")).toHaveCount(0);
+    // The preset's result stays on screen, settled.
+    await fieldErrorsExpectSettled(sandbox);
+    expect(toCents(await blended.textContent())).toBe(682);
+  });
+
+  /**
+   * Detours away from the preset's inputs and back to its body, byte for byte, so the result on
+   * screen already answers them: one reverted inside the debounce, one after the server rejected
+   * it. A further change follows, whose POST must be the only one since the return.
+   */
+  const FIELD_ERRORS_RETURN_CASES: readonly {
+    title: string;
+    field: string;
+    detour: FieldErrorsChange;
+    /** The detour's body value and coded rejection when it outlasts the debounce, else null. */
+    rejection: { bodyValue: string; code: string; message: string } | null;
+    restore: FieldErrorsChange;
+    next: FieldErrorsChange;
+    nextBodyValue: string;
+  }[] = [
+    {
+      title: "a WACC step reverted inside the debounce",
+      field: "wacc_pct",
+      detour: { press: "ArrowRight" },
+      rejection: null,
+      restore: { press: "ArrowLeft" },
+      next: { press: "ArrowLeft" },
+      nextBodyValue: "17.75",
+    },
+    {
+      title: "rejected primary proceeds retyped as the preset's 0.00",
+      field: "primary_proceeds_kes",
+      detour: { fill: "3750000000.01" },
+      rejection: {
+        bodyValue: "3750000000.01",
+        code: "primary_exceeds_offer_size",
+        message: FIELD_ERRORS_PRIMARY_MESSAGE,
+      },
+      restore: { fill: "0.00" },
+      next: { fill: "1" },
+      nextBodyValue: "1",
+    },
+  ];
+
+  for (const scenario of FIELD_ERRORS_RETURN_CASES) {
+    test(`returning to the result on screen after ${scenario.title} sends no request`, async ({
+      page,
+    }) => {
+      const { sandbox, blended } = await openSandbox(page);
+      const input = sandbox.getByTestId(`ipo-input-${scenario.field}`);
+      const output = sandbox.getByTestId("ipo-valuation-output");
+      const recalculating = sandbox.getByTestId("ipo-recalculating");
+      const posts = recordValuationPosts(page);
+      // From here the page's timers run only when the test advances the paused clock, so the
+      // debounce cannot elapse between two changes, however slowly they are made.
+      const installedAt = Date.now();
+      await page.clock.install({ time: installedAt });
+      await page.clock.pauseAt(installedAt + FIELD_ERRORS_PAST_DEBOUNCE_MS);
+
+      await fieldErrorsChangeInput(input, scenario.detour);
+      await expect(recalculating).toBeVisible();
+      await expect(output).toHaveCSS("opacity", "0.6");
+      expect(posts).toHaveLength(0);
+      if (scenario.rejection !== null) {
+        const rejected = fieldErrorsValuationResponse(page, {
+          [scenario.field]: scenario.rejection.bodyValue,
+        });
+        await page.clock.runFor(FIELD_ERRORS_PAST_DEBOUNCE_MS);
+        const rejection = await rejected;
+        expect(rejection.status()).toBe(422);
+        expect(await rejection.json()).toEqual({
+          detail: {
+            code: scenario.rejection.code,
+            field: scenario.field,
+            message: scenario.rejection.message,
+          },
+        });
+        await fieldErrorsExpectBesideInput(sandbox, scenario.field, scenario.rejection.message);
+        await expect(recalculating).toHaveCount(0);
+      }
+      const sentBeforeReturn = posts.length;
+
+      // Back at the preset's body: the change resolves before any timer runs, clearing the
+      // server's error, and nothing is scheduled once the clock runs past the debounce.
+      await fieldErrorsChangeInput(input, scenario.restore);
+      await fieldErrorsExpectNone(sandbox, scenario.field);
+      await fieldErrorsExpectSettled(sandbox);
+      await page.clock.runFor(FIELD_ERRORS_PAST_DEBOUNCE_MS);
+      await fieldErrorsExpectSettled(sandbox);
+      expect(toCents(await blended.textContent())).toBe(682);
+      await expect(sandbox.getByTestId("ipo-general-error")).toHaveCount(0);
+
+      // A further change is posted as usual. Requests are reported in the order they are sent,
+      // so its POST being the only one since the return proves that the return sent none.
+      const nextAnswered = fieldErrorsValuationResponse(page, {
+        [scenario.field]: scenario.nextBodyValue,
+      });
+      await fieldErrorsChangeInput(input, scenario.next);
+      await page.clock.runFor(FIELD_ERRORS_PAST_DEBOUNCE_MS);
+      expect((await nextAnswered).status()).toBe(200);
+      expect(
+        posts.slice(sentBeforeReturn).map((post) => jsonObject(post.body)[scenario.field]),
+      ).toEqual([scenario.nextBodyValue]);
+    });
+  }
 });
 
 const WATCHLISTS_PATH = "/api/v1/terminal/watchlists";

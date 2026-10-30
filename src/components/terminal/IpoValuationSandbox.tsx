@@ -193,7 +193,9 @@ const SLIDERS: Record<SliderField, SliderSpec> = {
 /**
  * A text input keeps the typed string unchanged. It is checked against the field's single-field
  * range before anything is sent; cross-field rules (shares offered within shares outstanding,
- * primary proceeds within the offer size) are the server's, reported as coded field errors.
+ * primary proceeds within the offer size) are the server's, reported as coded field errors. A
+ * decimal text is sent exactly as typed and the server reads only plain decimal text, so spaces
+ * around it fail the same check.
  */
 interface TextSpec {
   label: string;
@@ -471,15 +473,23 @@ function formatBound(bound: string | undefined): string {
   return formatDecimal(bound, "kes", { unit: false });
 }
 
-/** The message for a text value outside its single-field range, or null when it is valid. */
+/**
+ * The message for a text value its field's own check refuses, or null when it is valid. A decimal
+ * text is sent exactly as typed, and the server refuses spaces around a decimal, so they are
+ * refused here before anything is sent. A count is sent as a JSON integer, never as its text, so
+ * spaces around it are harmless.
+ */
 function localErrorMessage(spec: TextSpec, value: string): string | null {
   const { rule } = spec;
+  const text = value.trim();
+  if (rule.integer !== true && text !== "" && text !== value) {
+    return "Remove the spaces around the number";
+  }
   switch (checkDecimalRange(value, rule)) {
     case "ok":
       return null;
     case "invalid": {
       if (rule.integer === true) return "Enter a whole number";
-      const text = value.trim();
       // A well-formed decimal is rejected only for carrying more decimal places than the field.
       return parseScaled(text, fractionDigits(text)) === null
         ? "Enter a valid number"
@@ -513,9 +523,9 @@ function toJsonInteger(text: string): number {
 
 /**
  * The `POST /ipo/valuation` body for valid inputs: sliders as their held preset values, else
- * serialized from their positions; decimal texts trimmed but otherwise unchanged, integer texts
- * as JSON integers. The sensitivity axes are omitted, so the server's 5 WACC × 7 margin defaults
- * apply.
+ * serialized from their positions; decimal texts exactly as typed, which the local check has
+ * already found free of surrounding spaces; integer texts as JSON integers. The sensitivity axes are omitted, so the server's
+ * 5 WACC × 7 margin defaults apply.
  */
 function buildRequest(
   positions: SliderPositions,
@@ -533,14 +543,14 @@ function buildRequest(
     nwc_pct_revenue: sliderValue(positions, held, "nwc_pct_revenue"),
     peer_ev_ebitda_multiple: sliderValue(positions, held, "peer_ev_ebitda_multiple"),
     dcf_weight_pct: sliderValue(positions, held, "dcf_weight_pct"),
-    capex_pct_revenue: texts.capex_pct_revenue.trim(),
-    da_pct_revenue: texts.da_pct_revenue.trim(),
-    tax_rate_pct: texts.tax_rate_pct.trim(),
+    capex_pct_revenue: texts.capex_pct_revenue,
+    da_pct_revenue: texts.da_pct_revenue,
+    tax_rate_pct: texts.tax_rate_pct,
     forecast_years: toJsonInteger(texts.forecast_years),
-    base_revenue_kes: texts.base_revenue_kes.trim(),
+    base_revenue_kes: texts.base_revenue_kes,
     shares_outstanding: toJsonInteger(texts.shares_outstanding),
     shares_offered: toJsonInteger(texts.shares_offered),
-    primary_proceeds_kes: texts.primary_proceeds_kes.trim(),
+    primary_proceeds_kes: texts.primary_proceeds_kes,
   };
 }
 
@@ -918,6 +928,10 @@ function TextControl({
 interface ValuationResult {
   request: IpoValuationRequest;
   response: IpoValuationResponse;
+  /** The body as posted, which is the request key the result answers. */
+  key: string;
+  /** The `apiBaseUrl` the request was sent to; a result from another API is never reused. */
+  apiBaseUrl: string | undefined;
 }
 
 interface OutputCardProps {
@@ -1072,15 +1086,22 @@ interface SandboxWorkspaceProps {
  *
  * Recalculation: every change updates only its own input state, so a slider's `<output>` follows
  * each input event. The derived request key changes, and once it has been stable for
- * `debounceMs` the body is posted. The moment the key changes, before the debounce elapses, the
- * request in flight is aborted and its sequence number retired; that includes a change to a null
- * key, when a text input fails its single-field check and nothing is sent, and unmounting. A
- * response or error for inputs that have since changed is therefore never applied. A newer
- * request, such as a Retry of the same key, likewise aborts the one in flight, and the sequence
- * counter discards any response that is not the latest. The last valid result stays on screen,
- * dimmed with "Recalculating…", until the latest request settles. A field error from the server
- * appears beneath its input and leaves the last result in place. When a settled request clears
- * the general error while its Retry button holds focus, focus moves to the Valuation heading.
+ * `debounceMs` the body is posted, unless it is the body of the result on screen, valued by the
+ * same `apiBaseUrl`. Inputs that return to that result, inside the debounce or after a rejected
+ * request, post nothing: the result is their valuation, so it shows undimmed without
+ * "Recalculating…", and the server's field and general errors from the inputs in between are
+ * cleared at once. The comparison is byte for byte on the body, which carries typed text
+ * unchanged, so primary proceeds typed as `"0"` differ from the preset's `"0.00"` and are posted.
+ * The moment the key changes, before the debounce elapses, the request in flight is aborted and
+ * its sequence number retired; that includes a change to a null key, when a text input fails its
+ * single-field check and nothing is sent, and unmounting. A response or error for inputs that
+ * have since changed is therefore never applied. A newer request, such as a Retry of the same
+ * key, likewise aborts the one in flight, and the sequence counter discards any response that is
+ * not the latest. The last valid result stays on screen, dimmed with "Recalculating…", until the
+ * latest request settles. A field error from the server appears beneath its input and leaves the
+ * last result in place. When the general error is cleared, by a settled request or by a return
+ * to the result on screen, while its Retry button holds focus, focus moves to the Valuation
+ * heading.
  */
 function SandboxWorkspace({
   scenario,
@@ -1099,16 +1120,20 @@ function SandboxWorkspace({
   const [result, setResult] = useState<ValuationResult | null>(null);
   const [serverFieldErrors, setServerFieldErrors] = useState<Record<string, string>>({});
   const [generalError, setGeneralError] = useState<string | null>(null);
-  /** Key of the latest request once it has settled; null while it is pending. */
+  /**
+   * Key of the latest request once it has settled; null while it is pending. When the inputs
+   * return to the result on screen, it becomes that result's key without a request being sent.
+   */
   const [settledKey, setSettledKey] = useState<string | null>(null);
 
   const controllerRef = useRef<AbortController | null>(null);
   const sequenceRef = useRef(0);
   const retryButtonRef = useRef<HTMLButtonElement>(null);
   const valuationHeadingRef = useRef<HTMLHeadingElement>(null);
-  // Set when a settled request clears the general error, and with it the Retry button, while that
-  // button holds focus; the effect after the commit then moves focus to the Valuation heading
-  // rather than leaving it to fall back to the document body.
+  // Set when the general error is cleared, and with it the Retry button, while that button holds
+  // focus: by a settled request, or without one when the inputs or the API return to the result
+  // on screen (see attachRetryButton). The effect after the commit then moves focus to the
+  // Valuation heading rather than leaving it to fall back to the document body.
   const focusValuationRef = useRef(false);
   // The request options are read through a ref so that a host passing a new `getHeaders`
   // function on every render does not restart the debounce, which would re-post endlessly.
@@ -1124,7 +1149,32 @@ function SandboxWorkspace({
     () => (hasLocalErrors ? null : JSON.stringify(buildRequest(positions, heldValues, texts))),
     [hasLocalErrors, positions, heldValues, texts],
   );
-  const isRecalculating = requestKey !== null && requestKey !== settledKey;
+  /** Key of the result on screen; null when there is none or another API computed it. */
+  const displayedKey = result !== null && result.apiBaseUrl === apiBaseUrl ? result.key : null;
+  /** Whether the inputs serialize to the very body of the result on screen, their valuation. */
+  const showsDisplayedResult = requestKey !== null && requestKey === displayedKey;
+  const hasServerFieldErrors = Object.keys(serverFieldErrors).length > 0;
+  // Back at the result on screen, the inputs' request has settled to that result, and no server
+  // error from the inputs in between applies. The state is adjusted during render, as in
+  // FairValueTooltip, rather than in an effect; the pass that follows finds nothing left to
+  // adjust, so the render settles at once.
+  if (
+    showsDisplayedResult &&
+    (settledKey !== requestKey || generalError !== null || hasServerFieldErrors)
+  ) {
+    setSettledKey(requestKey);
+    if (generalError !== null) setGeneralError(null);
+    if (hasServerFieldErrors) setServerFieldErrors({});
+  }
+  const isRecalculating = requestKey !== null && !showsDisplayedResult && requestKey !== settledKey;
+
+  // The Retry button's ref. React detaches a removed element's ref before taking the element out
+  // of the document, so a general error cleared without a request while Retry holds focus is
+  // seen here and hands focus to the Valuation heading, as a settled request's does.
+  const attachRetryButton = useCallback((node: HTMLButtonElement | null): void => {
+    if (node === null && holdsFocus(retryButtonRef.current)) focusValuationRef.current = true;
+    retryButtonRef.current = node;
+  }, []);
 
   const send = useCallback(async (key: string): Promise<void> => {
     controllerRef.current?.abort();
@@ -1144,7 +1194,7 @@ function SandboxWorkspace({
       });
       if (controller.signal.aborted || sequence !== sequenceRef.current) return;
       focusValuationRef.current = holdsFocus(retryButtonRef.current);
-      setResult({ request, response });
+      setResult({ request, response, key, apiBaseUrl: options.apiBaseUrl });
       setServerFieldErrors({});
       setGeneralError(null);
       setSettledKey(key);
@@ -1180,9 +1230,11 @@ function SandboxWorkspace({
   // `apiBaseUrl` is a dependency so that pointing the widget at another API revalues the
   // current assumptions there; `send` reads it from the ref, updated by the effect above. The
   // cleanup runs whenever the request key changes, to a new body or to null, so it retires the
-  // request for the superseded inputs at once rather than when the next one is posted.
+  // request for the superseded inputs at once rather than when the next one is posted. The body
+  // of the result on screen is never posted again: that result already answers it, from this
+  // API, and nothing is in flight for it to retire.
   useEffect(() => {
-    if (requestKey === null) return undefined;
+    if (requestKey === null || requestKey === displayedKey) return undefined;
     const timer = setTimeout(() => {
       void send(requestKey);
     }, debounceMs);
@@ -1190,7 +1242,7 @@ function SandboxWorkspace({
       clearTimeout(timer);
       abortInFlight();
     };
-  }, [requestKey, debounceMs, apiBaseUrl, send, abortInFlight]);
+  }, [requestKey, displayedKey, debounceMs, apiBaseUrl, send, abortInFlight]);
 
   useEffect(() => abortInFlight, [abortInFlight]);
 
@@ -1312,7 +1364,7 @@ function SandboxWorkspace({
                 ))}
                 {generalError === null || requestKey === null ? null : (
                   <button
-                    ref={retryButtonRef}
+                    ref={attachRetryButton}
                     type="button"
                     data-testid="ipo-retry"
                     onClick={() => {
