@@ -37,7 +37,8 @@ export interface CycleBacktesterProps extends TerminalWidgetProps {
   /**
    * Event dates T to compare, as ISO `YYYY-MM-DD` strings, at most 8. When omitted or empty, the
    * server's defaults apply: every `terminal_cycles` row (the seeded election dates 2013-03-04,
-   * 2017-08-08, 2022-08-09 and 2027-08-10). The user can then remove and add dates.
+   * 2017-08-08, 2022-08-09 and 2027-08-10). The user can then remove and add dates. The chips,
+   * like the charts and the table, list the dates in ascending order, whatever the order given.
    */
   defaultEventDates?: string[];
   /**
@@ -285,8 +286,11 @@ const SELECT_CLASS =
   "m-0 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-100 [color-scheme:dark] hover:border-slate-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
 const SELECT_LABEL_CLASS = "inline-flex items-center gap-2 text-xs text-slate-400";
 // The wrapper scrolls horizontally on narrow cards, so it is focusable for keyboard scrolling.
+// `relative` makes it the containing block of the absolutely positioned `sr-only` text inside the
+// table (the caption and each cohort count's name); without it that text escapes the overflow
+// clip and widens the host page beyond a narrow viewport.
 const TABLE_WRAPPER_CLASS =
-  "min-w-0 overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
+  "relative min-w-0 overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400";
 const TABLE_CLASS = "w-full border-collapse text-xs";
 // Headers and the window cell may wrap between words, so the table fits narrower cards.
 const TH_CLASS = "px-2 py-1.5 text-start align-bottom font-medium text-slate-400";
@@ -301,6 +305,16 @@ const TD_NUMERIC_CLASS = "whitespace-nowrap px-2 py-1.5 text-end align-top tabul
 const TD_FLAGS_CLASS = "min-w-[11rem] break-words px-2 py-1.5 align-top text-slate-500";
 const CYCLE_LABEL_CLASS = "block font-medium text-slate-100";
 const CYCLE_DATE_CLASS = "block text-slate-400";
+// A cohort count with tickers is a disclosure that lists them in place, so they are reachable by
+// keyboard and touch, not only from its hover tooltip. Closed, it is an end-aligned count with a
+// dotted underline and a chevron; open, the list wraps beneath it within a bounded width.
+const TICKER_DISCLOSURE_CLASS = "group/tickers m-0 p-0";
+const TICKER_SUMMARY_CLASS =
+  "m-0 inline-flex cursor-pointer list-none items-center gap-0.5 rounded p-0 text-slate-200 underline decoration-slate-500 decoration-dotted underline-offset-2 hover:text-slate-100 hover:decoration-slate-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 [&::-webkit-details-marker]:hidden motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+const TICKER_ICON_CLASS =
+  "h-3 w-3 shrink-0 text-slate-400 group-open/tickers:rotate-180 motion-safe:transition-transform motion-safe:duration-150 motion-safe:ease-out";
+const TICKER_LIST_CLASS =
+  "mb-0 me-0 ms-auto mt-1 w-max max-w-64 whitespace-normal break-words p-0 text-start text-slate-400";
 const TOOLTIP_CLASS =
   "flex min-w-[12rem] flex-col gap-1 rounded border border-slate-700 bg-slate-900 px-2.5 py-2 text-xs text-slate-300 shadow-lg";
 const TOOLTIP_TITLE_CLASS = "m-0 font-medium text-slate-100";
@@ -311,9 +325,6 @@ const TOOLTIP_META_CLASS = "text-slate-400";
 const TOOLTIP_VALUE_CLASS = "tabular-nums font-medium text-slate-100";
 
 const CHART_MARGIN = { top: 12, right: 16, bottom: 4, left: 4 };
-const MAIN_CHART_DESCRIPTION =
-  "Solid lines are observed cycles and dashed lines are projections; circles mark valuation " +
-  "floors and diamonds mark volume exhaustion.";
 const AXIS_LABEL_STYLE = { fill: CHART_COLORS.axis, fontSize: 11 };
 
 // ---------------------------------------------------------------------------------------------
@@ -362,6 +373,30 @@ function eventDateRangePhrase(preset: WindowPreset): string {
   return (
     `between ${formatDate(bounds.min)} and ${formatDate(bounds.max)} ` +
     `for the ${windowLabel} window`
+  );
+}
+
+/**
+ * Why switching to `preset` was refused: the selected event `dates` fall outside its accepted
+ * range, so its request would fail with `window_out_of_range`. For example `4 Jul 9999 is outside
+ * the ±12 months window, which accepts event dates between 1 Jan 0002 and 31 Dec 9998. Remove it
+ * to use that window.`
+ */
+function describeWindowBlock(preset: WindowPreset, dates: readonly string[]): string {
+  const bounds = EVENT_DATE_BOUNDS[preset];
+  const windowLabel = WINDOW_OPTIONS.find((option) => option.value === preset)?.label ?? preset;
+  const list = dates.reduce(
+    (text, date, index) =>
+      index === 0
+        ? formatDate(date)
+        : text + (index === dates.length - 1 ? " and " : ", ") + formatDate(date),
+    "",
+  );
+  const several = dates.length > 1;
+  return (
+    `${list} ${several ? "are" : "is"} outside the ${windowLabel} window, which accepts event ` +
+    `dates between ${formatDate(bounds.min)} and ${formatDate(bounds.max)}. ` +
+    `Remove ${several ? "them" : "it"} to use that window.`
   );
 }
 
@@ -494,8 +529,55 @@ function tooltipOffset(label: string | number | undefined): number | null {
   return null;
 }
 
+/** The label the server gives an event date with no stored cycle: `Event YYYY-MM-DD`. */
+const GENERIC_EVENT_LABEL_PATTERN = /^Event (\d{4}-\d{2}-\d{2})$/;
+
+/** The label the server gives `date` when no stored cycle names it. */
+function genericEventLabel(date: string): string {
+  return `Event ${date}`;
+}
+
+/** The ISO date a label of the server's generic `Event YYYY-MM-DD` form names, else null. */
+function genericLabelDate(label: string): string | null {
+  return GENERIC_EVENT_LABEL_PATTERN.exec(label)?.[1] ?? null;
+}
+
+/**
+ * A cycle label as displayed. The server's generic `Event 2024-02-29` names its date in the short
+ * format every other date uses, `Event 29 Feb 2024`; a stored label such as `2013 Cycle` is
+ * returned unchanged.
+ */
+function displayLabel(label: string): string {
+  const date = genericLabelDate(label);
+  return date === null ? label : `Event ${formatDate(date)}`;
+}
+
+/** Whether `label` already names `date`, so the date is not shown a second time beside it. */
+function labelNamesDate(label: string, date: string): boolean {
+  return genericLabelDate(label) === date;
+}
+
+/**
+ * `known` with the label of each of `cycles` recorded under its event date; `known` itself when
+ * that adds or changes nothing.
+ */
+function withCycleLabels(
+  known: Readonly<Record<string, string>>,
+  cycles: readonly CycleResult[] | undefined,
+): Readonly<Record<string, string>> {
+  let merged: Record<string, string> | null = null;
+  for (const cycle of cycles ?? []) {
+    if (known[cycle.event_date] === cycle.label) continue;
+    merged ??= { ...known };
+    merged[cycle.event_date] = cycle.label;
+  }
+  return merged ?? known;
+}
+
 function projectionName(basis: readonly string[]): string {
-  return basis.length > 0 ? "Projection (mean of " + basis.join(", ") + ")" : "Projection";
+  return basis.length > 0
+    ? "Projection (mean of " + basis.map(displayLabel).join(", ") + ")"
+    : "Projection";
 }
 
 /** The `<title>` of a marker, for example "Valuation floor (pe_ratio 8.12) on 15 Mar 2013". */
@@ -593,6 +675,50 @@ function buildChartModel(cycles: readonly CycleResult[], metric: Metric): ChartM
   const xDomain: [number, number] | null =
     drawnRange === null ? null : [Math.min(drawnRange[0], 0), Math.max(drawnRange[1], 0)];
   return { series, markers, xDomain, xTicks: offsetTicks(xDomain) };
+}
+
+/**
+ * Whether a main-chart line draws a visible segment: at least two of its rows have a coordinate.
+ * Every main-chart `Line` has `dot` and `activeDot` off and `connectNulls` on, so Recharts joins
+ * the rows that have a coordinate and draws no dot, and a lone coordinate draws nothing.
+ */
+function drawsSegment(rows: readonly (ObservedRow | ProjectionRow)[] | null): boolean {
+  return rows !== null && rows.filter((row) => row.y !== null).length >= 2;
+}
+
+/**
+ * The `<desc>` of the main chart, naming only what `model` draws: solid observed lines, dashed
+ * projection lines, circles for valuation floors and diamonds for volume exhaustion, in the
+ * singular where exactly one of a kind is drawn. A line with fewer than two coordinates for the
+ * plotted metric is not counted, since it draws nothing; markers are counted on their own, since
+ * a `ReferenceDot` draws whether or not its cycle's line does.
+ */
+function describeMainChart(model: ChartModel): string {
+  const observed = model.series.filter((item) => drawsSegment(item.observed)).length;
+  const projected = model.series.filter((item) => drawsSegment(item.projection)).length;
+  const floors = model.markers.filter((spec) => spec.kind === "valuation_floor").length;
+  const exhaustions = model.markers.filter((spec) => spec.kind === "volume_exhaustion").length;
+
+  const lines: string[] = [];
+  if (observed === 1) lines.push("the solid line is the observed cycle");
+  else if (observed > 1) lines.push("solid lines are observed cycles");
+  if (projected === 1) lines.push("the dashed line is a projection");
+  else if (projected > 1) lines.push("dashed lines are projections");
+
+  const marks: string[] = [];
+  if (floors === 1) marks.push("the circle marks the valuation floor");
+  else if (floors > 1) marks.push("circles mark valuation floors");
+  if (exhaustions === 1) marks.push("the diamond marks volume exhaustion");
+  else if (exhaustions > 1) marks.push("diamonds mark volume exhaustion");
+
+  const clauses = [lines, marks]
+    .filter((group) => group.length > 0)
+    .map((group) => group.join(" and "));
+  if (clauses.length === 0) {
+    return "No line or marker is drawn for this metric in this window.";
+  }
+  const sentence = clauses.join("; ");
+  return sentence.charAt(0).toUpperCase() + sentence.slice(1) + ".";
 }
 
 /** The display value of a main-chart row for `metric`, from its raw decimal string. */
@@ -717,7 +843,7 @@ function CycleChartTooltip({
     if (observed !== undefined) {
       entries.push({
         key: item.key + "-observed",
-        name: item.cycle.label,
+        name: displayLabel(item.cycle.label),
         color: item.color,
         row: observed,
       });
@@ -727,7 +853,7 @@ function CycleChartTooltip({
       if (projected !== undefined) {
         entries.push({
           key: item.key + "-projection",
-          name: "Projection \u00b7 " + item.cycle.label,
+          name: "Projection \u00b7 " + displayLabel(item.cycle.label),
           color: item.color,
           row: projected,
         });
@@ -795,20 +921,141 @@ function OverlayTooltip({ active, label, rows }: OverlayTooltipProps): ReactElem
   );
 }
 
-/** The cycle's status badge; an awaiting cycle also says when its window opens. */
-function StatusBadge({ cycle }: { cycle: CycleResult }): ReactElement {
+/**
+ * Why a cycle has no observed session to draw, so each such cycle carries an inline explanation:
+ * - `future`: its window opens after the latest data (`days_until_window_start` is set);
+ * - `outside_coverage`: its window ends before `data_available_through`, so data exists after
+ *   it, yet none lies inside it. The response gives only the latest date of the data, never its
+ *   first, so a window before the data's first session cannot be told from one in a gap between
+ *   sessions, and neither is claimed;
+ * - `empty_cohort`: its window has sessions, but no candidate qualified for the cohort;
+ * - `no_data`: no candidate has any price yet;
+ * - `unexplained`: the response states no reason.
+ */
+type NoSessionCause =
+  | "future"
+  | "outside_coverage"
+  | "empty_cohort"
+  | "no_data"
+  | "unexplained";
+
+/** The order in which {@link noSessionsMessage} names causes, those that end in "yet" last. */
+const NO_SESSION_CAUSE_ORDER: readonly NoSessionCause[] = [
+  "outside_coverage",
+  "empty_cohort",
+  "unexplained",
+  "future",
+  "no_data",
+];
+
+/** A base close must fall on the anchor or within this many market sessions before it. */
+const BASE_CLOSE_MAX_SESSIONS = 10;
+
+/**
+ * Why `cycle` has no observed session, or null when it has some. It reads only the cycle's own
+ * status, `days_until_window_start` and `window_end`, and the response's `data_available_through`,
+ * so a cycle's cause never depends on which other cycles are selected. An `awaiting_data` cycle
+ * without `days_until_window_start` whose window ends before `data_available_through` (ISO dates
+ * order correctly as strings) is `outside_coverage`: data exists after the window and none inside
+ * it. The response carries no coverage start, so a window before the data's first session and one
+ * in a gap between sessions are not told apart.
+ */
+function noSessionCause(
+  cycle: CycleResult,
+  response: BacktestResponse | undefined,
+): NoSessionCause | null {
+  if (cycle.points.length > 0) return null;
+  if (cycle.status === "no_constituents") return "empty_cohort";
+  if (cycle.status !== "awaiting_data") return "unexplained";
+  if (cycle.days_until_window_start !== null) return "future";
+  const dataThrough = response?.data_available_through ?? null;
+  if (dataThrough === null) return "no_data";
+  return cycle.window_end < dataThrough ? "outside_coverage" : "unexplained";
+}
+
+/**
+ * The legend note of a cycle without observed sessions: "no observed sessions" while its data is
+ * still to come, otherwise why it has none. An empty cohort names the base-close rule and, with
+ * `currency_mismatch`, the excluded non-KES listings.
+ */
+function noSessionNote(cycle: CycleResult, cause: NoSessionCause | null): string {
+  if (cause === "outside_coverage") return "outside data coverage";
+  if (cause !== "empty_cohort") return "no observed sessions";
+  const baseClose = `closed on or within ${BASE_CLOSE_MAX_SESSIONS} sessions before the anchor`;
+  return cycle.flags.includes("currency_mismatch")
+    ? `no constituents: non-KES listings are excluded and no other candidate ${baseClose}`
+    : `no constituents: no candidate ${baseClose}`;
+}
+
+/**
+ * One clause of {@link noSessionsMessage} for the `count` of `total` cycles sharing `cause`, such
+ * as "every window is outside data coverage" or "1 cycle has no qualifying constituents".
+ */
+function describeNoSessionCause(cause: NoSessionCause, count: number, total: number): string {
+  if (cause === "no_data") return "no prices are loaded yet";
+  const noun = cause === "empty_cohort" || cause === "unexplained" ? "cycle" : "window";
+  const all = count === total;
+  const plural = !all && count !== 1;
+  let subject = `${formatInteger(count)} ${plural ? noun + "s" : noun}`;
+  if (all) subject = total === 1 ? `the ${noun}` : `every ${noun}`;
+  const has = plural ? "have" : "has";
+  const is = plural ? "are" : "is";
+  if (cause === "outside_coverage") return `${subject} ${is} outside data coverage`;
+  if (cause === "empty_cohort") return `${subject} ${has} no qualifying constituents`;
+  if (cause === "future") return `${subject} ${has} no data yet`;
+  return `${subject} ${has} no observed sessions`;
+}
+
+/**
+ * The sentence shown in place of a chart with nothing to draw: `lead`, then why the cycles have no
+ * observed session, for example "No cycle has observed sessions: 1 window is outside data coverage
+ * and 1 window has no data yet." It says "yet" only for data still to come.
+ */
+function noSessionsMessage(lead: string, response: BacktestResponse | undefined): string {
+  const cycles = response?.cycles ?? [];
+  const counts = new Map<NoSessionCause, number>();
+  for (const cycle of cycles) {
+    const cause = noSessionCause(cycle, response);
+    if (cause !== null) counts.set(cause, (counts.get(cause) ?? 0) + 1);
+  }
+  const clauses: string[] = [];
+  for (const cause of NO_SESSION_CAUSE_ORDER) {
+    const count = counts.get(cause);
+    if (count !== undefined) clauses.push(describeNoSessionCause(cause, count, cycles.length));
+  }
+  if (clauses.length === 0) return `${lead}.`;
+  const head = clauses.slice(0, -1);
+  const last = clauses.slice(-1).join("");
+  return `${lead}: ${head.length > 0 ? `${head.join(", ")} and ${last}` : last}.`;
+}
+
+/**
+ * The cycle's status badge. An awaiting cycle also says when its window opens, or, by its
+ * {@link NoSessionCause}, that its window is outside the data's coverage.
+ */
+function StatusBadge({
+  cycle,
+  cause,
+}: {
+  cycle: CycleResult;
+  cause: NoSessionCause | null;
+}): ReactElement {
   const badge: { text: string; className: string } | undefined = STATUS_BADGES[cycle.status];
   const days = cycle.days_until_window_start;
-  const opensIn =
-    cycle.status === "awaiting_data" && days !== null
-      ? ` \u00b7 opens in ${formatInteger(days)} ${days === 1 ? "day" : "days"}`
-      : "";
+  let detail = "";
+  if (cycle.status === "awaiting_data") {
+    if (days !== null) {
+      detail = ` \u00b7 opens in ${formatInteger(days)} ${days === 1 ? "day" : "days"}`;
+    } else if (cause === "outside_coverage") {
+      detail = " \u00b7 outside data coverage";
+    }
+  }
   return (
     <span
       data-testid={"cycle-status-" + cycle.event_date}
       className={badge?.className ?? UNKNOWN_STATUS_CLASS}
     >
-      {(badge?.text ?? String(cycle.status)) + opensIn}
+      {(badge?.text ?? String(cycle.status)) + detail}
     </span>
   );
 }
@@ -819,6 +1066,52 @@ function formatSummary(
   field: keyof NonNullable<CycleResult["summary"]>,
 ): string {
   return formatDecimal(cycle.summary?.[field] ?? null, "pct", { signed: true });
+}
+
+/**
+ * The size of a cycle's cohort list. With tickers it is a native disclosure: the count, which
+ * also carries the list as its tooltip, opens the comma-separated tickers in place. Its
+ * accessible name gives the count, what is counted and the action, such as "3 constituents, show
+ * tickers". An empty list is the bare count.
+ */
+function TickerCount({
+  tickers,
+  noun,
+  testId,
+}: {
+  tickers: readonly string[];
+  /** What is counted, singular and plural, completing the count's accessible name. */
+  noun: { one: string; other: string };
+  /** `data-testid` of the element whose text is the count. */
+  testId?: string;
+}): ReactElement {
+  const count = formatInteger(tickers.length);
+  if (tickers.length === 0) return <span data-testid={testId}>{count}</span>;
+  const list = tickers.join(", ");
+  return (
+    <details className={TICKER_DISCLOSURE_CLASS}>
+      <summary title={list} className={TICKER_SUMMARY_CLASS}>
+        <span data-testid={testId}>{count}</span>
+        <span className="sr-only">
+          {` ${tickers.length === 1 ? noun.one : noun.other}, show tickers`}
+        </span>
+        <svg
+          viewBox="0 0 12 12"
+          aria-hidden="true"
+          focusable="false"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className={TICKER_ICON_CLASS}
+        >
+          <path d="M3 4.5l3 3 3-3" />
+        </svg>
+      </summary>
+      <p className={TICKER_LIST_CLASS}>{list}</p>
+    </details>
+  );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -854,17 +1147,29 @@ export function CycleBacktester({
   const [windowPreset, setWindowPreset] = useState<WindowPreset>(() =>
     defaultWindow === "12m" ? "12m" : "180d",
   );
+  // A preset switch refused because these selected dates fall outside its range; the applied
+  // preset is kept, so no request is sent. It lasts until the next switch attempt or until its
+  // dates are removed.
+  const [windowBlock, setWindowBlock] = useState<{
+    preset: WindowPreset;
+    dates: string[];
+  } | null>(null);
   // null means "the server's default events"; an empty prop list means the same. A repeated date
-  // is kept once, at its first position, so every chip is keyed by its date.
+  // is kept once, so every chip is keyed by its date, and the list is sorted (ISO dates order
+  // correctly as strings) so the chips follow the server's ascending cycle order, as added
+  // dates do.
   const [eventDates, setEventDates] = useState<string[] | null>(() =>
     defaultEventDates !== undefined && defaultEventDates.length > 0
-      ? Array.from(new Set(defaultEventDates))
+      ? Array.from(new Set(defaultEventDates)).sort()
       : null,
   );
   const [metric, setMetric] = useState<Metric>("price_index");
   const [overlayEventDate, setOverlayEventDate] = useState<string | null>(null);
   const [customDate, setCustomDate] = useState("");
   const [chipError, setChipError] = useState<string | null>(null);
+  // The label of every event date a response has named, by date, recorded whenever the events
+  // change, so a re-added stored date keeps its label while the new result loads.
+  const [knownLabels, setKnownLabels] = useState<Readonly<Record<string, string>>>({});
   const removeButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const dateInputRef = useRef<HTMLInputElement>(null);
   const pendingChipFocus = useRef<ChipFocusTarget | null>(null);
@@ -872,6 +1177,7 @@ export function CycleBacktester({
   const chipsLabelId = useId();
   const dateInputId = useId();
   const chipErrorId = useId();
+  const windowErrorId = useId();
   const mainTitleId = useId();
   const overlayTitleId = useId();
   const overlaySelectId = useId();
@@ -932,8 +1238,16 @@ export function CycleBacktester({
     else dateInputRef.current?.focus();
   }, [eventDates]);
 
-  function chipLabel(date: string): string | null {
-    return cycles?.find((cycle) => cycle.event_date === date)?.label ?? null;
+  /**
+   * The label of `date`'s chip: the shown result's, else the last one a response gave it, else the
+   * server's generic label, which every date without a stored cycle eventually receives.
+   */
+  function chipLabel(date: string): string {
+    return (
+      cycles?.find((cycle) => cycle.event_date === date)?.label ??
+      knownLabels[date] ??
+      genericEventLabel(date)
+    );
   }
 
   function handleRemoveChip(event: MouseEvent<HTMLButtonElement>, date: string): void {
@@ -952,7 +1266,15 @@ export function CycleBacktester({
         neighbour !== undefined ? { kind: "remove", date: neighbour } : { kind: "date-input" };
     }
     setEventDates(remaining);
+    setKnownLabels(withCycleLabels(knownLabels, cycles));
     setChipError(null);
+    // A removed date no longer blocks the refused switch, so re-adding it never revives the
+    // refusal; the refusal ends with its last date.
+    setWindowBlock((block) => {
+      if (block === null || !block.dates.includes(date)) return block;
+      const dates = block.dates.filter((blocked) => blocked !== date);
+      return dates.length > 0 ? { preset: block.preset, dates } : null;
+    });
   }
 
   function handleCustomDateChange(event: ChangeEvent<HTMLInputElement>): void {
@@ -991,9 +1313,33 @@ export function CycleBacktester({
     }
     // ISO dates order correctly as strings.
     setEventDates([...chips, candidate].sort());
+    setKnownLabels(withCycleLabels(knownLabels, cycles));
     setCustomDate("");
     setChipError(null);
   }
+
+  // A switch is refused while a selected date lies outside the new preset's range, since the
+  // server would reject the request with `window_out_of_range`: the applied preset stays and no
+  // request is sent.
+  function handleWindowChange(preset: WindowPreset): void {
+    const outside = chips.filter((date) =>
+      isOutsideEventDateRange(date, EVENT_DATE_BOUNDS[preset]),
+    );
+    if (outside.length > 0) {
+      setWindowBlock({ preset, dates: outside });
+      return;
+    }
+    setWindowBlock(null);
+    if (preset !== windowPreset) {
+      setWindowPreset(preset);
+      // An add-date message names the previous window's range.
+      setChipError(null);
+    }
+  }
+
+  // The refusal names only the dates still selected, so it clears once they are removed.
+  const blockedDates = windowBlock?.dates.filter((date) => chips.includes(date)) ?? [];
+  const blockedPreset = windowBlock !== null && blockedDates.length > 0 ? windowBlock.preset : null;
 
   const controls = (
     <div className={CONTROLS_CLASS}>
@@ -1008,7 +1354,8 @@ export function CycleBacktester({
               type="button"
               data-testid={option.testId}
               aria-pressed={windowPreset === option.value}
-              onClick={() => setWindowPreset(option.value)}
+              aria-describedby={blockedPreset === option.value ? windowErrorId : undefined}
+              onClick={() => handleWindowChange(option.value)}
               className={windowPreset === option.value ? TOGGLE_ACTIVE_CLASS : TOGGLE_CLASS}
             >
               {option.label}
@@ -1033,6 +1380,16 @@ export function CycleBacktester({
           ))}
         </div>
       </div>
+      {blockedPreset !== null ? (
+        <p
+          id={windowErrorId}
+          role="alert"
+          data-testid="cycle-window-error"
+          className={CHIP_ERROR_CLASS}
+        >
+          {describeWindowBlock(blockedPreset, blockedDates)}
+        </p>
+      ) : null}
 
       <div className={GROUP_CLASS}>
         <span id={chipsLabelId} className={GROUP_LABEL_CLASS}>
@@ -1044,6 +1401,9 @@ export function CycleBacktester({
           <ul aria-labelledby={chipsLabelId} className={CHIP_LIST_CLASS}>
             {chips.map((date) => {
               const label = chipLabel(date);
+              const shownLabel = displayLabel(label);
+              // A generic label already names the date; a stored one is followed by it.
+              const shownDate = labelNamesDate(label, date) ? null : formatDate(date);
               return (
                 <li key={date}>
                   <span
@@ -1051,13 +1411,17 @@ export function CycleBacktester({
                     data-event-date={date}
                     className={CHIP_CLASS}
                   >
-                    <span>{label ?? `Event ${date}`}</span>
-                    {label !== null ? (
-                      <span className={CHIP_DATE_CLASS}> {formatDate(date)}</span>
+                    <span>{shownLabel}</span>
+                    {shownDate !== null ? (
+                      <span className={CHIP_DATE_CLASS}> {shownDate}</span>
                     ) : null}
                     <button
                       type="button"
-                      aria-label={`Remove ${date}`}
+                      aria-label={
+                        shownDate === null
+                          ? `Remove ${shownLabel}`
+                          : `Remove ${shownLabel} (${shownDate})`
+                      }
                       disabled={chips.length <= 1}
                       onClick={(event) => handleRemoveChip(event, date)}
                       ref={(element) => {
@@ -1140,6 +1504,7 @@ export function CycleBacktester({
   const drawnProjections = chartModel.series.filter((item) => item.projection !== null);
   const hasPlot =
     chartModel.series.some((item) => item.observed.length > 0) || drawnProjections.length > 0;
+  const mainChartDescription = describeMainChart(chartModel);
   const hasAnyProjection = (cycles ?? []).some((cycle) => cycle.projection !== null);
 
   const body = (
@@ -1159,7 +1524,7 @@ export function CycleBacktester({
               <LineChart
                 margin={CHART_MARGIN}
                 title={(metricOption?.label ?? "") + " of each cycle by days from the event"}
-                desc={MAIN_CHART_DESCRIPTION}
+                desc={mainChartDescription}
               >
                 <CartesianGrid stroke={CHART_COLORS.grid} strokeDasharray="3 3" />
                 <XAxis
@@ -1228,7 +1593,7 @@ export function CycleBacktester({
                       key={item.key + "-observed"}
                       data={item.observed}
                       dataKey="y"
-                      name={item.cycle.label}
+                      name={displayLabel(item.cycle.label)}
                       type="linear"
                       stroke={item.color}
                       strokeWidth={2}
@@ -1271,7 +1636,9 @@ export function CycleBacktester({
             </ResponsiveContainer>
           </div>
         ) : (
-          <p className={MUTED_TEXT_CLASS}>No observed or projected sessions in this window yet.</p>
+          <p className={MUTED_TEXT_CLASS}>
+            {noSessionsMessage("No observed or projected sessions", data)}
+          </p>
         )}
         <ul aria-label="Cycles" className={LEGEND_CLASS}>
           {chartModel.series.map((item) => (
@@ -1282,9 +1649,11 @@ export function CycleBacktester({
               className={LEGEND_ITEM_CLASS}
             >
               <LineSwatch color={item.color} />
-              <span>{item.cycle.label}</span>
+              <span>{displayLabel(item.cycle.label)}</span>
               {item.observed.length === 0 ? (
-                <span className={TOOLTIP_META_CLASS}> (no observed sessions)</span>
+                <span className={TOOLTIP_META_CLASS}>
+                  {` (${noSessionNote(item.cycle, noSessionCause(item.cycle, data))})`}
+                </span>
               ) : null}
             </li>
           ))}
@@ -1298,7 +1667,9 @@ export function CycleBacktester({
               <LineSwatch color={item.color} dashed />
               <span>
                 {item.projectionName}{" "}
-                <span className={TOOLTIP_META_CLASS}>{"\u00b7 " + item.cycle.label}</span>
+                <span className={TOOLTIP_META_CLASS}>
+                  {"\u00b7 " + displayLabel(item.cycle.label)}
+                </span>
               </span>
             </li>
           ))}
@@ -1346,7 +1717,7 @@ export function CycleBacktester({
               >
                 {overlayCandidates.map((cycle, index) => (
                   <option key={`${index}-${cycle.event_date}`} value={cycle.event_date}>
-                    {cycle.label}
+                    {displayLabel(cycle.label)}
                   </option>
                 ))}
               </select>
@@ -1362,7 +1733,7 @@ export function CycleBacktester({
                   margin={CHART_MARGIN}
                   title={
                     "12-month inflation and 91- and 364-day T-bill yields around " +
-                    overlayCycle.label
+                    displayLabel(overlayCycle.label)
                   }
                   desc="Percentage points as of each session, on the main chart's day axis."
                 >
@@ -1425,7 +1796,9 @@ export function CycleBacktester({
             </ul>
           </>
         ) : (
-          <p className={MUTED_TEXT_CLASS}>No cycle has observed sessions in this window yet.</p>
+          <p className={MUTED_TEXT_CLASS}>
+            {noSessionsMessage("No cycle has observed sessions", data)}
+          </p>
         )}
       </section>
 
@@ -1489,8 +1862,13 @@ export function CycleBacktester({
                   className={TR_CLASS}
                 >
                   <th scope="row" className={TH_ROW_CLASS}>
-                    <span className={CYCLE_LABEL_CLASS}>{cycle.label}</span>{" "}
-                    <span className={CYCLE_DATE_CLASS}>{formatDate(cycle.event_date)}</span>
+                    <span className={CYCLE_LABEL_CLASS}>{displayLabel(cycle.label)}</span>
+                    {labelNamesDate(cycle.label, cycle.event_date) ? null : (
+                      <>
+                        {" "}
+                        <span className={CYCLE_DATE_CLASS}>{formatDate(cycle.event_date)}</span>
+                      </>
+                    )}
                   </th>
                   <td className={TD_WRAP_CLASS}>
                     <span className={NOWRAP_CLASS}>
@@ -1499,7 +1877,7 @@ export function CycleBacktester({
                     <span className={NOWRAP_CLASS}>{formatDate(cycle.window_end)}</span>
                   </td>
                   <td className={TD_CLASS}>
-                    <StatusBadge cycle={cycle} />
+                    <StatusBadge cycle={cycle} cause={noSessionCause(cycle, data)} />
                   </td>
                   <td className={TD_CLASS}>{formatDate(cycle.anchor_date)}</td>
                   <td className={TD_NUMERIC_CLASS}>
@@ -1515,22 +1893,17 @@ export function CycleBacktester({
                     {formatSummary(cycle, "pe_compression_pct")}
                   </td>
                   <td className={TD_NUMERIC_CLASS}>
-                    <span title={cycle.constituents.join(", ") || undefined}>
-                      {formatInteger(cycle.constituents.length)}
-                    </span>
+                    <TickerCount
+                      tickers={cycle.constituents}
+                      noun={{ one: "constituent", other: "constituents" }}
+                    />
                   </td>
                   <td className={TD_NUMERIC_CLASS}>
-                    <span
-                      data-testid="cycle-excluded-count"
-                      title={cycle.excluded_constituents.join(", ") || undefined}
-                    >
-                      {formatInteger(cycle.excluded_constituents.length)}
-                    </span>
-                    {cycle.excluded_constituents.length > 0 ? (
-                      <span className="sr-only">
-                        {": " + cycle.excluded_constituents.join(", ")}
-                      </span>
-                    ) : null}
+                    <TickerCount
+                      tickers={cycle.excluded_constituents}
+                      noun={{ one: "excluded", other: "excluded" }}
+                      testId="cycle-excluded-count"
+                    />
                   </td>
                   <td className={TD_FLAGS_CLASS}>
                     {cycle.flags.length > 0 ? cycle.flags.join(", ") : EMPTY_VALUE}
