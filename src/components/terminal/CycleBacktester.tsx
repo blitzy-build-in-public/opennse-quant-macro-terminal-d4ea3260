@@ -107,6 +107,10 @@ interface ChartSeries {
   /** `strokeWidth` of the dashed projection line, half a pixel thinner than the observed one. */
   projectionStrokeWidth: number;
   observed: ObservedRow[];
+  /** The {@link GridRow} field of the observed line, `o<index>`. */
+  observedField: string;
+  /** The {@link GridRow} field of the projection line, `p<index>`. */
+  projectionField: string;
   /** Projection rows for the current metric; null when no projection line is drawn. */
   projection: ProjectionRow[] | null;
   /** "Projection (mean of …)"; null when no projection line is drawn. */
@@ -128,12 +132,31 @@ interface ChartModel {
   series: ChartSeries[];
   markers: MarkerSpec[];
   /**
-   * Offset range of every drawn row, widened to reach the event (0) so its reference line is
-   * always on the axis; shared by both charts; null when nothing is drawn.
+   * Offset range of every cycle's requested window (its `window_start` and `window_end` in
+   * calendar days from its event) and of every drawn row, widened to reach the event (0) so its
+   * reference line is always on the axis; shared by both charts; null when there are no cycles.
    */
   xDomain: [number, number] | null;
-  /** Ticks of that offset axis; empty when nothing is drawn. */
-  xTicks: number[];
+  /** The value axis: automatic, or the metric's base band when no row has a coordinate. */
+  yAxis: ValueAxisScale;
+}
+
+/** `YAxis` `domain`, `ticks` and `allowDataOverflow`; `ticks` undefined lets Recharts choose. */
+interface ValueAxisScale {
+  domain: [number, number] | ["auto", "auto"];
+  ticks: number[] | undefined;
+  allowDataOverflow: boolean;
+}
+
+/**
+ * One integer day of the shared offset axis: a chart-level `data` row of both charts. Each line
+ * reads its own field, which is null on days without a row of its series. Recharts snaps the
+ * tooltip to the nearest row of the chart's data, so rows on every day make both charts snap a
+ * given x to the same day. The fields are coordinates only.
+ */
+interface GridRow {
+  x: number;
+  [field: string]: number | null;
 }
 
 /** One session of the overlay chart; the numeric fields are coordinates only. */
@@ -203,6 +226,15 @@ const MARKER_LAYOUT_STEP = 2 * MARKER_GLYPH_HALF_EXTENT + MARKER_GLYPH_GAP;
 const MARKER_LAYOUT_MAX_STEPS = 8;
 /** Radius of the dot that keeps a moved glyph's true session marked on its line. */
 const MARKER_ANCHOR_RADIUS = 2;
+/**
+ * Inner padding in px at both ends of each chart's offset and value axes, so a marker on a
+ * domain edge is drawn whole inside the plot: a glyph covers {@link MARKER_GLYPH_HALF_EXTENT} px
+ * on each side of its centre. The value axis padding also grows with the chart text, so its end
+ * ticks keep clear of the offset ticks and the top.
+ */
+const AXIS_EDGE_PADDING = Math.ceil(MARKER_GLYPH_HALF_EXTENT);
+// Both charts pad the offset axis identically, so a given day sits at the same x in each.
+const X_AXIS_PADDING = { left: AXIS_EDGE_PADDING, right: AXIS_EDGE_PADDING };
 
 const WINDOW_OPTIONS: ReadonlyArray<{ value: WindowPreset; label: string; testId: string }> = [
   { value: "180d", label: "±180 days", testId: "cycle-window-180d" },
@@ -380,6 +412,14 @@ const MAIN_CHART_CLASS =
   "h-80 w-full [&_.recharts-surface:focus-visible]:outline-2 [&_.recharts-surface:focus-visible]:outline-offset-2 [&_.recharts-surface:focus-visible]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none forced-colors:[&_text]:fill-[CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:stroke-[color:GrayText] forced-colors:[&_.recharts-line-curve]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_g[data-testid^='marker-']]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_g[data-marker-connectors]]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
 const OVERLAY_CHART_CLASS =
   "h-48 w-full [&_.recharts-surface:focus-visible]:outline-2 [&_.recharts-surface:focus-visible]:outline-offset-2 [&_.recharts-surface:focus-visible]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none forced-colors:[&_text]:fill-[CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:stroke-[color:GrayText] forced-colors:[&_.recharts-line-curve]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_.recharts-active-dot]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
+// On a body narrower than the chart's minimum width, each chart wrapper scrolls horizontally
+// and, like the summary table's wrapper, is focusable for keyboard scrolling. Its overflow clips
+// whatever is drawn outside it, so the surface's focus ring is drawn inset there. The
+// forced-colours rules are those of the non-scrolling classes.
+const MAIN_CHART_SCROLL_CLASS =
+  "h-80 w-full overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 [&_.recharts-surface:focus-visible]:outline-2 [&_.recharts-surface:focus-visible]:-outline-offset-2 [&_.recharts-surface:focus-visible]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none forced-colors:[&_text]:fill-[CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:stroke-[color:GrayText] forced-colors:[&_.recharts-line-curve]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_g[data-testid^='marker-']]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_g[data-marker-connectors]]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
+const OVERLAY_CHART_SCROLL_CLASS =
+  "h-48 w-full overflow-x-auto rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 [&_.recharts-surface:focus-visible]:outline-2 [&_.recharts-surface:focus-visible]:-outline-offset-2 [&_.recharts-surface:focus-visible]:outline-sky-400 [&_g[tabindex='-1']]:outline-none [&_*:focus:not(:focus-visible)]:outline-none forced-colors:[&_text]:fill-[CanvasText] forced-colors:[&_.recharts-cartesian-axis-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-axis-tick-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-reference-line-line]:stroke-[color:CanvasText] forced-colors:[&_.recharts-tooltip-cursor]:stroke-[color:CanvasText] forced-colors:[&_.recharts-cartesian-grid_line]:stroke-[color:GrayText] forced-colors:[&_.recharts-line-curve]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)] forced-colors:[&_.recharts-active-dot]:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
 const LEGEND_CLASS = "m-0 flex list-none flex-wrap gap-x-4 gap-y-1 p-0 text-xs text-slate-300";
 const LEGEND_ITEM_CLASS = "inline-flex items-center gap-1.5";
 // Line and marker swatches get the plotted shapes' forced-colours `CanvasText` casing.
@@ -387,9 +427,12 @@ const SWATCH_CLASS =
   "h-2 w-5 shrink-0 forced-colors:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
 const MARKER_SWATCH_CLASS =
   "h-3 w-3 shrink-0 forced-colors:[filter:drop-shadow(1px_0_0_CanvasText)_drop-shadow(-1px_0_0_CanvasText)_drop-shadow(0_1px_0_CanvasText)_drop-shadow(0_-1px_0_CanvasText)]";
+// The select drops below its label, and narrows to the card, when the two do not fit one line
+// (a narrow card with a large text setting).
 const SELECT_CLASS =
-  "m-0 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-100 [color-scheme:dark] hover:border-slate-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
-const SELECT_LABEL_CLASS = "inline-flex items-center gap-2 text-xs text-slate-400";
+  "m-0 max-w-full rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-100 [color-scheme:dark] hover:border-slate-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out";
+const SELECT_LABEL_CLASS =
+  "inline-flex min-w-0 flex-wrap items-center gap-2 text-xs text-slate-400";
 // The wrapper scrolls horizontally on narrow cards, so it is focusable for keyboard scrolling.
 // `relative` makes it the containing block of the absolutely positioned `sr-only` text inside the
 // table (the caption and each cohort count's name); without it that text escapes the overflow
@@ -441,6 +484,27 @@ const TOOLTIP_HOVERED_MARKER_CLASS =
   "m-0 flex items-center gap-1.5 border-b border-slate-700 pb-1.5 font-medium text-slate-100";
 
 const CHART_MARGIN = { top: 12, right: 16, bottom: 4, left: 4 };
+/**
+ * px of 1rem at the browser's default text size, the size the chart's px values below are set
+ * for; it is also assumed until the root font size is first read.
+ */
+const DEFAULT_REM_PX = 16;
+/** Offset axis height in px at {@link DEFAULT_REM_PX}: ticks plus the "Days from event" title. */
+const X_AXIS_HEIGHT = 40;
+/** Value axis width in px at {@link DEFAULT_REM_PX}: ticks plus the rotated axis title. */
+const Y_AXIS_WIDTH = 76;
+/** Recharts' default `Label` offset: the value axis title's px inset at {@link DEFAULT_REM_PX}. */
+const AXIS_TITLE_OFFSET = 5;
+/**
+ * Value axis width in px at {@link DEFAULT_REM_PX} on a body narrower than
+ * {@link COMPACT_BODY_REM}: the least that keeps the rotated title clear of five-character ticks
+ * such as `1,050`, `−1.5B`, `15.5%` and `−195M`.
+ */
+const Y_AXIS_COMPACT_WIDTH = 56;
+/** Body width in rem below which both charts use {@link Y_AXIS_COMPACT_WIDTH}. */
+const COMPACT_BODY_REM = 30;
+/** Plot width that each offset tick needs, in multiples of the chart's scaled 1rem. */
+const OFFSET_TICK_SPACING_REM = 2;
 const AXIS_LABEL_STYLE = { fill: CHART_COLORS.axis, fontSize: 11 };
 
 // ---------------------------------------------------------------------------------------------
@@ -486,6 +550,34 @@ function isCalendarDate(iso: string): boolean {
   const isLeapYear = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
   const daysInMonth = [31, isLeapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
   return day <= (daysInMonth[month - 1] ?? 0);
+}
+
+/**
+ * Days from 1970-01-01 to the ISO date `iso` in the proleptic Gregorian calendar, or null when
+ * `iso` is not a real `YYYY-MM-DD` day. Integer days-from-civil arithmetic is exact across the
+ * API's whole 0001–9999 calendar, where `Date.UTC` would read years 0–99 as 1900–1999.
+ */
+function isoDayNumber(iso: string): number | null {
+  const match = ISO_DATE_PATTERN.exec(iso);
+  if (match === null || !isCalendarDate(iso)) return null;
+  const year = parseInt(match[1] ?? "", 10);
+  const month = parseInt(match[2] ?? "", 10);
+  const day = parseInt(match[3] ?? "", 10);
+  // Years are counted from 1 March, so a leap day is the last day of its year.
+  const marchYear = month <= 2 ? year - 1 : year;
+  const era = Math.floor(marchYear / 400);
+  const yearOfEra = marchYear - era * 400;
+  const dayOfYear = Math.floor((153 * ((month + 9) % 12) + 2) / 5) + day - 1;
+  const dayOfEra =
+    yearOfEra * 365 + Math.floor(yearOfEra / 4) - Math.floor(yearOfEra / 100) + dayOfYear;
+  return era * 146097 + dayOfEra - 719468;
+}
+
+/** Calendar days from `fromIso` to `toIso`, negative when `toIso` is earlier, or null. */
+function calendarDaysBetween(fromIso: string, toIso: string): number | null {
+  const from = isoDayNumber(fromIso);
+  const to = isoDayNumber(toIso);
+  return from === null || to === null ? null : to - from;
 }
 
 /**
@@ -568,7 +660,25 @@ function formatKesAxisTick(value: unknown): string {
 
 const OFFSET_TICK_STEPS = [5, 10, 15, 30, 60, 90, 180, 365] as const;
 const LARGEST_OFFSET_TICK_STEP = 365;
+/** Bounds of the offset tick budget, which otherwise follows the plot width. */
+const MIN_OFFSET_TICKS = 3;
 const MAX_OFFSET_TICKS = 9;
+
+const AUTO_VALUE_AXIS: ValueAxisScale = {
+  domain: ["auto", "auto"],
+  ticks: undefined,
+  allowDataOverflow: false,
+};
+
+/**
+ * The value axis of a chart whose rows have no coordinate at all: Recharts finds no domain in
+ * them and drops the Y ticks and the event reference line, so the axis is fixed to a band around
+ * `base` with `base` as its only tick. Recharts applies a fixed domain to an axis without data
+ * only with `allowDataOverflow`. The rows themselves stay null; nothing is drawn there.
+ */
+function emptyValueAxis(base: number): ValueAxisScale {
+  return { domain: [base - 1, base + 1], ticks: [base], allowDataOverflow: true };
+}
 
 /** The `[min, max]` of the rows' offsets, or null when there are no rows. */
 function offsetRange(rows: Iterable<{ x: number }>): [number, number] | null {
@@ -583,16 +693,15 @@ function offsetRange(rows: Iterable<{ x: number }>): [number, number] | null {
 
 /**
  * Ticks of an offset axis over `range`: multiples of the smallest round step that gives at most
- * 9 ticks. Ticks are anchored at the event, so 0 is a tick whenever it is in range, even when a
- * window's first session falls a day or two after its start.
+ * `maxTicks` ticks. Ticks are anchored at the event, so 0 is a tick whenever it is in range, even
+ * when a window's first session falls a day or two after its start.
  */
-function offsetTicks(range: [number, number] | null): number[] {
+function offsetTicks(range: [number, number] | null, maxTicks: number): number[] {
   if (range === null) return [];
   const [min, max] = range;
   const step =
     OFFSET_TICK_STEPS.find(
-      (candidate) =>
-        Math.floor(max / candidate) - Math.ceil(min / candidate) + 1 <= MAX_OFFSET_TICKS,
+      (candidate) => Math.floor(max / candidate) - Math.ceil(min / candidate) + 1 <= maxTicks,
     ) ?? LARGEST_OFFSET_TICK_STEP;
   const ticks: number[] = [];
   for (let k = Math.ceil(min / step); k <= Math.floor(max / step); k += 1) {
@@ -644,8 +753,8 @@ function formatIndexAxisTick(value: unknown): string {
 
 /**
  * The row at or before offset `x`: the latest row with `row.x <= x`, or undefined when `x` lies
- * outside the rows' range. Each line keeps its own sessions, so a hovered offset is paired with
- * that line's own last session rather than with an unrelated row at the same array index.
+ * outside the rows' range. A cycle has no session on most days, so a hovered day is paired with
+ * each line's own last session on or before it.
  */
 function rowAtOrBefore<R extends { x: number }>(rows: readonly R[], x: number): R | undefined {
   let found: R | undefined;
@@ -871,6 +980,8 @@ function buildChartModel(cycles: readonly CycleResult[], metric: Metric): ChartM
       strokeWidth,
       projectionStrokeWidth: strokeWidth - PROJECTION_STROKE_INSET,
       observed,
+      observedField: `o${index}`,
+      projectionField: `p${index}`,
       projection,
       projectionName: name,
     });
@@ -886,15 +997,33 @@ function buildChartModel(cycles: readonly CycleResult[], metric: Metric): ChartM
       }
     }
   });
-  const drawnRange = offsetRange(
-    series.flatMap((item) => [...item.observed, ...(item.projection ?? [])]),
-  );
+  // The axis spans each cycle's requested window, not only what the metric draws, so it matches
+  // the window caption for every metric: no projection is drawn for cumulative flow, and a
+  // cycle's sessions need not reach either end of its window.
+  const windowEdges: Array<{ x: number }> = [];
+  for (const cycle of cycles) {
+    for (const edge of [cycle.window_start, cycle.window_end]) {
+      const x = calendarDaysBetween(cycle.event_date, edge);
+      if (x !== null) windowEdges.push({ x });
+    }
+  }
+  const range = offsetRange([
+    ...windowEdges,
+    ...series.flatMap((item) => [...item.observed, ...(item.projection ?? [])]),
+  ]);
   // Recharts discards a reference line outside the axis domain, so the domain always reaches 0:
   // a partial cycle observed only before the event, or a cycle observed only after it, still
   // shows the event line and a 0 tick.
   const xDomain: [number, number] | null =
-    drawnRange === null ? null : [Math.min(drawnRange[0], 0), Math.max(drawnRange[1], 0)];
-  return { series, markers, xDomain, xTicks: offsetTicks(xDomain) };
+    range === null ? null : [Math.min(range[0], 0), Math.max(range[1], 0)];
+  // A marker's coordinate is a row's coordinate, so markers need no separate check. The empty
+  // axis is centred on what the metric starts from: 100 for an index ("anchor = 100"), 0 for
+  // cumulative flow.
+  const hasCoordinate = series.some((item) =>
+    [...item.observed, ...(item.projection ?? [])].some((row) => row.y !== null),
+  );
+  const yAxis = hasCoordinate ? AUTO_VALUE_AXIS : emptyValueAxis(isIndexMetric(metric) ? 100 : 0);
+  return { series, markers, xDomain, yAxis };
 }
 
 /**
@@ -953,6 +1082,70 @@ function formatRowValue(row: ObservedRow | ProjectionRow, metric: Metric): strin
   if (row.kind === "observed") raw = row.point[metric];
   else if (isIndexMetric(metric)) raw = row.point[metric];
   return formatDecimal(raw, metric === "cumulative_foreign_net_kes" ? "kes" : "index");
+}
+
+/**
+ * The {@link GridRow}s of `domain`, one per integer day, with each column's coordinate on the
+ * days of its own rows and null on every other day; a missing value is never filled in.
+ */
+function buildGridRows(
+  domain: [number, number] | null,
+  columns: ReadonlyArray<{ field: string; rows: ReadonlyArray<{ x: number; y: number | null }> }>,
+): GridRow[] {
+  if (domain === null) return [];
+  const [min, max] = domain;
+  const grid: GridRow[] = [];
+  for (let x = min; x <= max; x += 1) {
+    const row: GridRow = { x };
+    for (const column of columns) row[column.field] = null;
+    grid.push(row);
+  }
+  for (const column of columns) {
+    for (const source of column.rows) {
+      const row = grid[source.x - min];
+      if (row !== undefined) row[column.field] = source.y;
+    }
+  }
+  return grid;
+}
+
+/** The computed root font size in px (the size of 1rem), or {@link DEFAULT_REM_PX} if unusable. */
+function rootFontSizePx(): number {
+  const size = parseFloat(getComputedStyle(document.documentElement).fontSize);
+  return Number.isFinite(size) && size > 0 ? size : DEFAULT_REM_PX;
+}
+
+/** The root font size and an element's content width, both in CSS px. */
+interface ChartMetrics {
+  rem: number;
+  /** null until the element is first measured. */
+  width: number | null;
+}
+
+/**
+ * The root font size, which follows the user's text-size setting, and the content width of
+ * `element`, read when the element mounts and on every resize it reports. The widget body is
+ * sized in rem, so a root font-size change resizes it as well. The initial value is
+ * {@link DEFAULT_REM_PX} with no width, so the server and the first client render agree.
+ */
+function useChartMetrics(element: HTMLElement | null): ChartMetrics {
+  const [metrics, setMetrics] = useState<ChartMetrics>({ rem: DEFAULT_REM_PX, width: null });
+  useEffect(() => {
+    if (element === null) return undefined;
+    const measure = (): void => {
+      const rem = rootFontSizePx();
+      const width = element.clientWidth;
+      setMetrics((previous) =>
+        previous.rem === rem && previous.width === width ? previous : { rem, width },
+      );
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return undefined;
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [element]);
+  return metrics;
 }
 
 
@@ -1218,12 +1411,13 @@ type CycleTooltipEntry =
     };
 
 /**
- * Main-chart tooltip: for the hovered offset, each cycle's own session at or before it and each
- * drawn projection's value there. Rows are resolved from the series rather than from Recharts'
- * payload, which pairs lines that have their own `data` by array index when a line has no row at
- * exactly the hovered offset, and would show an unrelated session. When a cycle's session is its
- * valuation floor or volume exhaustion, a row beneath it names the marker with its glyph and
- * selecting value ("Valuation floor · P/E 10.55×").
+ * Main-chart tooltip: for the hovered day, each cycle's own session at or before it and each
+ * drawn projection's value at or before it. Rows are resolved from the series rather than from
+ * Recharts' payload, which is null on every day that is not a session of the line. Both charts
+ * snap to the same {@link GridRow} day and resolve it with `rowAtOrBefore`, so a given x shows
+ * the same session of a cycle in both tooltips. When a cycle's session is its valuation floor or
+ * volume exhaustion, a row beneath it names the marker with its glyph and selecting value
+ * ("Valuation floor · P/E 10.55×").
  *
  * A marker glyph spans several days, so the hovered offset, taken from the pointer's x, is often
  * not the marked session. While the pointer is on a glyph, `hoveredMarker` is that marker, and a
@@ -1289,7 +1483,7 @@ function CycleChartTooltip({
 
   return (
     <div className={TOOLTIP_CLASS}>
-      <p className={TOOLTIP_TITLE_CLASS}>Day {formatOffset(x)} from event</p>
+      <p className={TOOLTIP_TITLE_CLASS}>On or before day {formatOffset(x)} from event</p>
       {hoveredMarker !== null ? (
         <p
           data-testid="cycle-tooltip-hovered-marker"
@@ -1653,6 +1847,9 @@ export function CycleBacktester({
   const removeButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const dateInputRef = useRef<HTMLInputElement>(null);
   const pendingChipFocus = useRef<ChipFocusTarget | null>(null);
+  // The result body mounts only once data has loaded, so it is held in state, not a ref object.
+  const [bodyElement, setBodyElement] = useState<HTMLDivElement | null>(null);
+  const chartMetrics = useChartMetrics(bodyElement);
 
   const chipsLabelId = useId();
   const dateInputId = useId();
@@ -1712,12 +1909,43 @@ export function CycleBacktester({
         point,
       }),
     );
-    return { candidates, selected, selectedIndex, rows };
+    const hasCoordinate = rows.some((row) =>
+      OVERLAY_SERIES.some((series) => row[series.field] !== null),
+    );
+    const yAxis = hasCoordinate ? AUTO_VALUE_AXIS : emptyValueAxis(0);
+    return { candidates, selected, selectedIndex, rows, yAxis };
   }, [cycles, overlayEventDate]);
   const overlayCandidates = overlay.candidates;
   const overlayCycle = overlay.selected;
   const overlayCycleIndex = overlay.selectedIndex;
   const overlayRows = overlay.rows;
+  const overlayYAxis = overlay.yAxis;
+
+  // Both charts take one chart-level row per day of the shared domain (see GridRow).
+  const mainGridRows = useMemo(
+    () =>
+      buildGridRows(
+        chartModel.xDomain,
+        chartModel.series.flatMap((item) => [
+          { field: item.observedField, rows: item.observed },
+          ...(item.projection !== null
+            ? [{ field: item.projectionField, rows: item.projection }]
+            : []),
+        ]),
+      ),
+    [chartModel],
+  );
+  const overlayGridRows = useMemo(
+    () =>
+      buildGridRows(
+        chartModel.xDomain,
+        OVERLAY_SERIES.map((series) => ({
+          field: series.field,
+          rows: overlayRows.map((row) => ({ x: row.x, y: row[series.field] })),
+        })),
+      ),
+    [chartModel.xDomain, overlayRows],
+  );
 
   // Runs once the removed chip and its focused Remove button have unmounted.
   useEffect(() => {
@@ -2014,8 +2242,76 @@ export function CycleBacktester({
   const mainChartDescription = describeMainChart(chartModel);
   const hasAnyProjection = (cycles ?? []).some((cycle) => cycle.projection !== null);
 
+  // Chart text and the axis sizes that hold it follow the user's root font size at every body
+  // width, as every other text of the widget does through rem units. A body too narrow for the
+  // scaled layout (a phone with a large text setting) scrolls the charts instead of shrinking
+  // their text (see `minChartWidth`).
+  const bodyWidth = chartMetrics.width;
+  const textScale = chartMetrics.rem / DEFAULT_REM_PX;
+  const axisTick = { ...AXIS_TICK, fontSize: AXIS_TICK.fontSize * textScale };
+  const axisLabelStyle = { ...AXIS_LABEL_STYLE, fontSize: AXIS_LABEL_STYLE.fontSize * textScale };
+  const xAxisHeight = X_AXIS_HEIGHT * textScale;
+  // The right margin holds half of the last offset tick label, so it grows with the text too.
+  const chartMargin = { ...CHART_MARGIN, right: CHART_MARGIN.right * textScale };
+  const valuePadding = AXIS_EDGE_PADDING * Math.max(1, textScale);
+  const yAxisPadding = { top: valuePadding, bottom: valuePadding };
+  // On a narrow body the value axis narrows too, identically on both charts so their days align,
+  // and the offset axis gets only as many ticks as the plot width holds.
+  const compactYAxis = bodyWidth !== null && bodyWidth < COMPACT_BODY_REM * chartMetrics.rem;
+  const yAxisWidth = (compactYAxis ? Y_AXIS_COMPACT_WIDTH : Y_AXIS_WIDTH) * textScale;
+  // Chart px outside the plot: the value axis, both chart margins and the offset axis padding.
+  const plotInset = yAxisWidth + chartMargin.left + chartMargin.right + 2 * AXIS_EDGE_PADDING;
+  const offsetTickSpacing = OFFSET_TICK_SPACING_REM * DEFAULT_REM_PX * textScale;
+  /**
+   * The narrowest width in px that holds the scaled chart layout: `plotInset` plus a plot
+   * of {@link MIN_OFFSET_TICKS} offset ticks at the scaled {@link OFFSET_TICK_SPACING_REM}
+   * spacing, 188px at the default text size with the compact value axis. Both charts render at
+   * least this wide, so they keep identical widths and a given day at the same x in each; on a
+   * narrower body each scrolls horizontally inside its own wrapper.
+   */
+  const minChartWidth = plotInset + MIN_OFFSET_TICKS * offsetTickSpacing;
+  const needsScroll = bodyWidth !== null && bodyWidth < minChartWidth;
+  const chartWidth = bodyWidth === null ? null : Math.max(bodyWidth, minChartWidth);
+  const tickBudget =
+    chartWidth === null
+      ? MAX_OFFSET_TICKS
+      : Math.floor((chartWidth - plotInset) / offsetTickSpacing);
+  const maxOffsetTicks = Math.min(MAX_OFFSET_TICKS, Math.max(MIN_OFFSET_TICKS, tickBudget));
+  const xTicks = useMemo(
+    () => offsetTicks(chartModel.xDomain, maxOffsetTicks),
+    [chartModel.xDomain, maxOffsetTicks],
+  );
+  // Axis and event labels shared by both charts.
+  const offsetAxisLabel = {
+    value: "Days from event",
+    position: "insideBottom",
+    ...axisLabelStyle,
+  } as const;
+  // The label sits left of the event line, unless 0 is the domain's left edge, where it goes
+  // right of it, off the Y axis.
+  const eventLabel = {
+    value: "Event",
+    position: chartModel.xDomain?.[0] === 0 ? "insideTopLeft" : "insideTopRight",
+    ...axisLabelStyle,
+  } as const;
+  // The rotated title's centre moves in from the chart's left edge as the text grows, so its
+  // glyphs stay inside the chart.
+  const valueAxisTitle = (value: string) =>
+    ({
+      value,
+      angle: -90,
+      position: "insideLeft",
+      textAnchor: "middle",
+      offset: (chartMargin.left + AXIS_TITLE_OFFSET) * textScale - chartMargin.left,
+      ...axisLabelStyle,
+    }) as const;
+
   const body = (
-    <div className={isFetching ? BODY_FETCHING_CLASS : BODY_CLASS} aria-busy={isFetching}>
+    <div
+      ref={setBodyElement}
+      className={isFetching ? BODY_FETCHING_CLASS : BODY_CLASS}
+      aria-busy={isFetching}
+    >
       <section aria-labelledby={mainTitleId} className={SECTION_CLASS}>
         <div className={SECTION_HEADER_CLASS}>
           <h3 id={mainTitleId} className={SECTION_HEADING_CLASS}>
@@ -2026,10 +2322,21 @@ export function CycleBacktester({
           ) : null}
         </div>
         {hasPlot ? (
-          <div data-testid="cycle-main-chart" className={MAIN_CHART_CLASS}>
-            <ResponsiveContainer width="100%" height="100%">
+          <div
+            data-testid="cycle-main-chart"
+            role={needsScroll ? "region" : undefined}
+            aria-label={
+              needsScroll
+                ? (metricOption?.label ?? "") + " chart, scrolls horizontally"
+                : undefined
+            }
+            tabIndex={needsScroll ? 0 : undefined}
+            className={needsScroll ? MAIN_CHART_SCROLL_CLASS : MAIN_CHART_CLASS}
+          >
+            <ResponsiveContainer width="100%" height="100%" minWidth={minChartWidth}>
               <LineChart
-                margin={CHART_MARGIN}
+                data={mainGridRows}
+                margin={chartMargin}
                 title={(metricOption?.label ?? "") + " of each cycle by days from the event"}
                 desc={mainChartDescription}
                 onMouseLeave={() => setHoveredMarkerKey(null)}
@@ -2039,39 +2346,36 @@ export function CycleBacktester({
                   type="number"
                   dataKey="x"
                   domain={chartModel.xDomain ?? ["dataMin", "dataMax"]}
+                  padding={X_AXIS_PADDING}
                   allowDecimals={false}
-                  ticks={chartModel.xTicks}
-                  tick={AXIS_TICK}
+                  ticks={xTicks}
+                  tick={axisTick}
                   stroke={CHART_COLORS.axis}
                   tickFormatter={formatOffsetTick}
-                  height={40}
-                  label={{
-                    value: "Days from event",
-                    position: "insideBottom",
-                    ...AXIS_LABEL_STYLE,
-                  }}
+                  height={xAxisHeight}
+                  label={offsetAxisLabel}
                 />
                 <YAxis
                   type="number"
-                  domain={["auto", "auto"]}
-                  tick={AXIS_TICK}
+                  domain={chartModel.yAxis.domain}
+                  ticks={chartModel.yAxis.ticks}
+                  allowDataOverflow={chartModel.yAxis.allowDataOverflow}
+                  padding={yAxisPadding}
+                  tick={axisTick}
                   stroke={CHART_COLORS.axis}
-                  width={76}
+                  width={yAxisWidth}
                   tickFormatter={
                     metric === "cumulative_foreign_net_kes"
                       ? formatKesAxisTick
                       : formatIndexAxisTick
                   }
-                  label={{
-                    value: metricOption?.axisLabel ?? "",
-                    angle: -90,
-                    position: "insideLeft",
-                    textAnchor: "middle",
-                    ...AXIS_LABEL_STYLE,
-                  }}
+                  label={valueAxisTitle(metricOption?.axisLabel ?? "")}
                 />
+                {/* filterNull is off: Recharts hides the tooltip when every payload value is
+                    null, but the content resolves its own rows and shows a null as "—". */}
                 <Tooltip
                   isAnimationActive={false}
+                  filterNull={false}
                   cursor={{ stroke: CHART_COLORS.muted }}
                   content={(props) => (
                     <CycleChartTooltip
@@ -2083,25 +2387,15 @@ export function CycleBacktester({
                     />
                   )}
                 />
-                {/* The label sits left of the line, unless 0 is the domain's left edge (every
-                    drawn session after the event), where it goes right of it, off the Y axis. */}
-                <ReferenceLine
-                  x={0}
-                  stroke={CHART_COLORS.axis}
-                  label={{
-                    value: "Event",
-                    position: chartModel.xDomain?.[0] === 0 ? "insideTopLeft" : "insideTopRight",
-                    ...AXIS_LABEL_STYLE,
-                  }}
-                />
-                {/* activeDot is off: with per-line data Recharts can place it on another line's
-                    index, while the tooltip resolves each line's own session. */}
+                <ReferenceLine x={0} stroke={CHART_COLORS.axis} label={eventLabel} />
+                {/* activeDot is off: a line has a value only on its own sessions, so the dot
+                    would vanish on other days, while the tooltip shows each line's session on
+                    or before the hovered day. */}
                 {chartModel.series.map((item) =>
                   item.observed.length > 0 ? (
                     <Line
                       key={item.key + "-observed"}
-                      data={item.observed}
-                      dataKey="y"
+                      dataKey={item.observedField}
                       name={displayLabel(item.cycle.label)}
                       type="linear"
                       stroke={item.color}
@@ -2116,8 +2410,7 @@ export function CycleBacktester({
                 {drawnProjections.map((item) => (
                   <Line
                     key={item.key + "-projection"}
-                    data={item.projection ?? []}
-                    dataKey="y"
+                    dataKey={item.projectionField}
                     name={item.projectionName ?? "Projection"}
                     type="linear"
                     stroke={item.color}
@@ -2164,12 +2457,18 @@ export function CycleBacktester({
               className={LEGEND_ITEM_CLASS}
             >
               <LineSwatch color={item.color} width={item.strokeWidth} />
-              <span>{displayLabel(item.cycle.label)}</span>
-              {item.observed.length === 0 ? (
-                <span className={TOOLTIP_META_CLASS}>
-                  {` (${noSessionNote(item.cycle, noSessionCause(item.cycle, data))})`}
-                </span>
-              ) : null}
+              {/* One text run, so the label and its note wrap together on a narrow card. */}
+              <span>
+                {displayLabel(item.cycle.label)}
+                {item.observed.length === 0 ? (
+                  <>
+                    {" "}
+                    <span className={TOOLTIP_META_CLASS}>
+                      {`(${noSessionNote(item.cycle, noSessionCause(item.cycle, data))})`}
+                    </span>
+                  </>
+                ) : null}
+              </span>
             </li>
           ))}
           {drawnProjections.map((item) => (
@@ -2252,11 +2551,19 @@ export function CycleBacktester({
         </div>
         {overlayCycle !== undefined ? (
           <>
-            <div data-testid="cycle-overlay-chart" className={OVERLAY_CHART_CLASS}>
-              <ResponsiveContainer width="100%" height="100%">
+            <div
+              data-testid="cycle-overlay-chart"
+              role={needsScroll ? "region" : undefined}
+              aria-label={
+                needsScroll ? "Inflation and T-bill overlay chart, scrolls horizontally" : undefined
+              }
+              tabIndex={needsScroll ? 0 : undefined}
+              className={needsScroll ? OVERLAY_CHART_SCROLL_CLASS : OVERLAY_CHART_CLASS}
+            >
+              <ResponsiveContainer width="100%" height="100%" minWidth={minChartWidth}>
                 <LineChart
-                  data={overlayRows}
-                  margin={CHART_MARGIN}
+                  data={overlayGridRows}
+                  margin={chartMargin}
                   title={
                     "12-month inflation and 91- and 364-day T-bill yields around " +
                     displayLabel(overlayCycle.label)
@@ -2264,28 +2571,37 @@ export function CycleBacktester({
                   desc="Percentage points as of each session, on the main chart's day axis."
                 >
                   <CartesianGrid stroke={CHART_COLORS.grid} strokeDasharray="3 3" />
-                  {/* The overlay shares the main chart's offset domain and ticks (and its Y
-                      axis width), so both charts place a given day at the same position. */}
+                  {/* The overlay shares the main chart's offset domain, ticks and padding (and
+                      its Y axis width), so both charts place a given day at the same position. */}
                   <XAxis
                     type="number"
                     dataKey="x"
                     domain={chartModel.xDomain ?? ["dataMin", "dataMax"]}
+                    padding={X_AXIS_PADDING}
                     allowDecimals={false}
-                    ticks={chartModel.xTicks}
-                    tick={AXIS_TICK}
+                    ticks={xTicks}
+                    tick={axisTick}
                     stroke={CHART_COLORS.axis}
                     tickFormatter={formatOffsetTick}
+                    height={xAxisHeight}
+                    label={offsetAxisLabel}
                   />
                   <YAxis
                     type="number"
-                    domain={["auto", "auto"]}
-                    tick={AXIS_TICK}
+                    domain={overlayYAxis.domain}
+                    ticks={overlayYAxis.ticks}
+                    allowDataOverflow={overlayYAxis.allowDataOverflow}
+                    padding={yAxisPadding}
+                    tick={axisTick}
                     stroke={CHART_COLORS.axis}
-                    width={76}
+                    width={yAxisWidth}
                     tickFormatter={formatPctAxisTick}
+                    label={valueAxisTitle("Rate (%)")}
                   />
+                  {/* filterNull is off, as on the main chart, so null rates show as "—". */}
                   <Tooltip
                     isAnimationActive={false}
+                    filterNull={false}
                     cursor={{ stroke: CHART_COLORS.muted }}
                     content={(props) => (
                       <OverlayTooltip
@@ -2295,7 +2611,10 @@ export function CycleBacktester({
                       />
                     )}
                   />
-                  <ReferenceLine x={0} stroke={CHART_COLORS.axis} />
+                  <ReferenceLine x={0} stroke={CHART_COLORS.axis} label={eventLabel} />
+                  {/* activeDot is off, as on the main chart: a rate has a value only on the
+                      cycle's sessions, while the tooltip shows the session on or before the
+                      hovered day. */}
                   {OVERLAY_SERIES.map((overlay) => (
                     <Line
                       key={overlay.field}
@@ -2307,6 +2626,7 @@ export function CycleBacktester({
                       strokeDasharray={overlay.dash}
                       strokeLinecap={overlay.linecap}
                       dot={false}
+                      activeDot={false}
                       connectNulls
                       isAnimationActive={false}
                     />
